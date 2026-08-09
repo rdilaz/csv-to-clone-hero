@@ -60,7 +60,8 @@ class StorageConfig(BaseModel):
 
 
 class NetworkConfig(BaseModel):
-    request_delay_seconds: float = 0.25
+    request_delay_seconds: float = 0.5
+    concurrency: int = 2
     retries: int = 3
     timeout_seconds: float = 30.0
     cache_ttl_days: int = 7

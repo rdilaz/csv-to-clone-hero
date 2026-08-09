@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -93,41 +94,98 @@ def run_scan(config: AppConfig, db: Database, overrides: Overrides) -> ScanStats
 
 
 # -------------------------------------------------------------------- search
-def _search_song_cached(
-    config: AppConfig, db: Database, source: ChartSource, artist: str, title: str
-) -> tuple[list[ChartCandidate], str | None, bool]:
-    """Returns (candidates, error, from_cache)."""
-    key = db.query_key("song", source.name, artist.casefold(), title.casefold())
-    cached = db.get_cached_query(key, config.network.cache_ttl_days)
-    if cached is not None:
-        return cached[0], cached[1], True
+def _fetch(source: ChartSource, kind: str, artist: str, title: str = "") -> tuple[list, str | None]:
+    """Network-only fetch (runs on worker threads). Never touches the DB."""
     try:
-        candidates = source.search_song(artist, title)
-        error = None
+        if kind == "song":
+            return source.search_song(artist, title), None
+        return source.search_artist(artist), None
     except SourceError as exc:
-        candidates, error = [], str(exc)
-    for candidate in candidates:
-        db.upsert_candidate(candidate)
-    db.record_query(key, "song", f"{artist} - {title}", candidates, error)
-    return candidates, error, False
+        return [], str(exc)
 
 
-def _search_artist_cached(
-    config: AppConfig, db: Database, source: ChartSource, artist: str
-) -> tuple[list[ChartCandidate], str | None]:
-    key = db.query_key("artist", source.name, artist.casefold())
-    cached = db.get_cached_query(key, config.network.cache_ttl_days)
-    if cached is not None:
-        return cached[0], cached[1]
-    try:
-        candidates = source.search_artist(artist)
-        error = None
-    except SourceError as exc:
-        candidates, error = [], str(exc)
-    for candidate in candidates:
-        db.upsert_candidate(candidate)
-    db.record_query(key, "artist", artist, candidates, error)
-    return candidates, error
+def _resolve_queries(
+    config: AppConfig,
+    db: Database,
+    sources: list[ChartSource],
+    queries: list[tuple[str, str, str]],
+    progress_label: str,
+    on_progress=None,
+) -> dict[str, tuple[list, str | None]]:
+    """Resolve (kind, source, artist, title) queries to candidates.
+
+    Fresh cache entries are used as-is; misses are fetched concurrently
+    (network only) and recorded on the main thread. Errors are NOT cached,
+    so transient failures are retried on the next run.
+
+    ``queries`` items are (kind, artist, title); returns a map of
+    query_key -> (candidates, error).
+    """
+    ttl = config.network.cache_ttl_days
+    outcomes: dict[str, tuple[list, str | None]] = {}
+    misses: dict[str, tuple[str, ChartSource, str, str]] = {}
+
+    for kind, artist, title in queries:
+        for source in sources:
+            key = db.query_key(kind, source.name, artist.casefold(), title.casefold())
+            if key in outcomes or key in misses:
+                continue
+            cached = db.get_cached_query(key, ttl)
+            if cached is not None:
+                outcomes[key] = (cached[0], cached[1])
+            else:
+                misses[key] = (kind, source, artist, title)
+
+    if misses:
+        workers = max(1, config.network.concurrency)
+        fetched: dict[str, tuple[list, str | None]] = {}
+        with _progress() as progress:
+            task = progress.add_task(progress_label, total=len(misses))
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futures = {
+                    pool.submit(_fetch, source, kind, artist, title): key
+                    for key, (kind, source, artist, title) in misses.items()
+                }
+                done = 0
+                for future in as_completed(futures):
+                    key = futures[future]
+                    fetched[key] = future.result()
+                    progress.advance(task)
+                    done += 1
+                    if on_progress is not None:
+                        on_progress(done, len(misses))
+
+        # Record results on the main thread (single SQLite writer).
+        for key, (kind, source, artist, title) in misses.items():
+            candidates, error = fetched[key]
+            for candidate in candidates:
+                db.upsert_candidate(candidate)
+            if error is None:
+                db.record_query(key, kind, f"{artist} - {title}".strip(" -"), candidates)
+            outcomes[key] = (candidates, error)
+
+    return outcomes
+
+
+def _query_outcomes(
+    config: AppConfig,
+    db: Database,
+    sources: list[ChartSource],
+    outcomes: dict[str, tuple[list, str | None]],
+    kind: str,
+    artist: str,
+    title: str = "",
+) -> tuple[list, list[str]]:
+    """Collect (candidates, errors) for one logical query across sources."""
+    candidates: list = []
+    errors: list[str] = []
+    for source in sources:
+        key = db.query_key(kind, source.name, artist.casefold(), title.casefold())
+        found, error = outcomes.get(key, ([], None))
+        candidates.extend(found)
+        if error:
+            errors.append(error)
+    return candidates, errors
 
 
 def _decide_track(
@@ -154,6 +212,7 @@ def run_search(
     db: Database,
     sources: list[ChartSource],
     overrides: Overrides,
+    on_progress=None,
 ) -> SearchStats:
     stats = SearchStats()
     tracks = db.get_tracks()
@@ -161,20 +220,23 @@ def run_search(
     reject_charts = set(overrides.reject_charts)
 
     # ---------------- exact playlist pass ----------------
-    with _progress() as progress:
-        task = progress.add_task("Searching exact playlist songs", total=len(tracks))
-        for track in tracks:
+    queries = [
+        ("song", track.primary_artist, overrides.title_alias(track.title) or track.title)
+        for track in tracks
+    ]
+    outcomes = _resolve_queries(
+        config, db, sources, queries, "Searching exact playlist songs", on_progress
+    )
+
+    for track in tracks:
             query_title = overrides.title_alias(track.title) or track.title
-            all_candidates: list[ChartCandidate] = []
-            had_error = False
-            for source in sources:
-                candidates, error, _ = _search_song_cached(
-                    config, db, source, track.primary_artist, query_title
-                )
-                if error:
-                    had_error = True
-                    db.record_error("search", error, track.track_key)
-                all_candidates.extend(c for c in candidates if c.chart_id not in reject_charts)
+            found, errors = _query_outcomes(
+                config, db, sources, outcomes, "song", track.primary_artist, query_title
+            )
+            had_error = bool(errors)
+            for error in errors:
+                db.record_error("search", error, track.track_key)
+            all_candidates = [c for c in found if c.chart_id not in reject_charts]
             outcome = _decide_track(config, db, track, all_candidates)
 
             # Manual force-accept wins over the automatic decision.
@@ -196,11 +258,10 @@ def run_search(
                 # REJECTED = candidates existed but none cleared the review
                 # threshold; they are listed in rejected_candidates.csv.
                 stats.no_match += 1
-            progress.advance(task)
 
     # ---------------- artist expansion pass ----------------
     if config.expansion.enabled:
-        _run_expansion(config, db, sources, overrides, stats)
+        _run_expansion(config, db, sources, overrides, stats, on_progress)
 
     db.set_meta("search_stats", json.dumps(vars(stats)))
     return stats
@@ -212,6 +273,7 @@ def _run_expansion(
     sources: list[ChartSource],
     overrides: Overrides,
     stats: SearchStats,
+    on_progress=None,
 ) -> None:
     tracks = db.get_tracks()
     primary_counts, featured_only_counts = artist_track_counts(tracks)
@@ -268,34 +330,38 @@ def _run_expansion(
 
     artist_db_ids = {row["artist_norm"]: row["id"] for row in db.get_expansion_artists()}
 
-    with _progress() as progress:
-        task = progress.add_task("Searching artist expansion", total=len(eligible))
-        for artist in eligible:
-            search_name = overrides.artist_alias(artist["artist_norm"]) or artist["artist_name"]
-            all_candidates: list[ChartCandidate] = []
-            for source in sources:
-                candidates, error = _search_artist_cached(config, db, source, search_name)
-                if error:
-                    db.record_error("expansion_search", error, artist["artist_norm"])
-                all_candidates.extend(candidates)
-            accepted = 0
-            for candidate in all_candidates:
-                breakdown = score_expansion_candidate(artist["artist_norm"], candidate, config)
-                db.record_expansion_candidate(
-                    artist_db_ids[artist["artist_norm"]],
-                    candidate.db_id,
-                    breakdown.final_score,
-                    json.dumps({"explanation": breakdown.explain()}),
-                )
-                if breakdown.decision == "AUTO_ACCEPT":
-                    accepted += 1
-            stats.expansion_candidates += accepted
-            progress.advance(task)
+    queries = [
+        ("artist", overrides.artist_alias(a["artist_norm"]) or a["artist_name"], "")
+        for a in eligible
+    ]
+    outcomes = _resolve_queries(
+        config, db, sources, queries, "Searching artist expansion", on_progress
+    )
+
+    for artist in eligible:
+        search_name = overrides.artist_alias(artist["artist_norm"]) or artist["artist_name"]
+        all_candidates, errors = _query_outcomes(
+            config, db, sources, outcomes, "artist", search_name
+        )
+        for error in errors:
+            db.record_error("expansion_search", error, artist["artist_norm"])
+        accepted = 0
+        for candidate in all_candidates:
+            breakdown = score_expansion_candidate(artist["artist_norm"], candidate, config)
+            db.record_expansion_candidate(
+                artist_db_ids[artist["artist_norm"]],
+                candidate.db_id,
+                breakdown.final_score,
+                json.dumps({"explanation": breakdown.explain()}),
+            )
+            if breakdown.decision == "AUTO_ACCEPT":
+                accepted += 1
+        stats.expansion_candidates += accepted
 
 
 # ---------------------------------------------------------------------- plan
 def run_plan(
-    config: AppConfig, db: Database, sources: list[ChartSource]
+    config: AppConfig, db: Database, sources: list[ChartSource], on_progress=None
 ) -> PlanStats:
     def size_lookup(candidate: ChartCandidate) -> int | None:
         for source in sources:
@@ -303,10 +369,12 @@ def run_plan(
                 return source.head_size(candidate)
         return None
 
-    # Only do live HEAD size lookups when downloading is actually possible or
-    # when not in dry-run estimation mode... estimation is wanted in dry-run too,
-    # so always attempt, but failures fall back to the conservative estimate.
-    plan = build_plan(config, db, size_lookup=size_lookup)
+    # Real download sizes make the storage estimate accurate; failures fall
+    # back to the conservative estimate from config.
+    plan = build_plan(
+        config, db, size_lookup=size_lookup,
+        workers=max(1, config.network.concurrency), on_progress=on_progress,
+    )
 
     stats = PlanStats()
     for entry in plan:
@@ -324,14 +392,14 @@ def run_plan(
 
 # --------------------------------------------------------------------- build
 def run_downloads(
-    config: AppConfig, db: Database, sources: list[ChartSource]
+    config: AppConfig, db: Database, sources: list[ChartSource], on_progress=None
 ) -> tuple[int, int, int]:
     """Download all selected charts. Returns (downloaded, errors, bytes)."""
     manager = DownloadManager(config, db)
     source_by_name = {s.name: s for s in sources}
     selections = db.get_selections(status="selected")
 
-    downloaded = errors = bytes_total = 0
+    downloaded = errors = bytes_total = done = 0
     with _progress() as progress:
         task = progress.add_task("Downloading charts", total=len(selections))
         for row in selections:
@@ -351,6 +419,9 @@ def run_downloads(
                 errors += 1
                 db.record_error("download", message, candidate.name)
             progress.advance(task)
+            done += 1
+            if on_progress is not None:
+                on_progress(done, len(selections))
     return downloaded, errors, bytes_total
 
 

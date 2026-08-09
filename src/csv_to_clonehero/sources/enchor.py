@@ -20,6 +20,7 @@ checksum validation.
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from pathlib import Path
 
@@ -68,13 +69,33 @@ class EnchorSource:
             follow_redirects=True,
         )
         self._last_request = 0.0
+        self._throttle_lock = threading.Lock()
+        # Adaptive delay (AIMD): starts at request_delay, backs off hard on
+        # HTTP 429, relaxes slowly on success. Enchor rate-limits aggressively
+        # and its limits vary, so a fixed delay is always wrong somewhere.
+        self._min_delay = request_delay
+        self._current_delay = request_delay
 
     # ------------------------------------------------------------------ http
     def _throttle(self) -> None:
-        elapsed = time.monotonic() - self._last_request
-        if elapsed < self.request_delay:
-            time.sleep(self.request_delay - elapsed)
-        self._last_request = time.monotonic()
+        # httpx.Client is thread-safe; the lock keeps the rate limit global
+        # across worker threads.
+        with self._throttle_lock:
+            elapsed = time.monotonic() - self._last_request
+            if elapsed < self._current_delay:
+                time.sleep(self._current_delay - elapsed)
+            self._last_request = time.monotonic()
+
+    def _note_success(self) -> None:
+        with self._throttle_lock:
+            # Additive decrease: ~20 consecutive successes shave 1s off.
+            self._current_delay = max(self._min_delay, self._current_delay - 0.05)
+
+    def _note_rate_limited(self, retry_after: float | None = None) -> None:
+        with self._throttle_lock:
+            floor = retry_after if retry_after else 2.0
+            self._current_delay = min(max(self._current_delay * 2, floor), 30.0)
+            log.info("Enchor rate limited; request delay now %.1fs", self._current_delay)
 
     def _post(self, path: str, payload: dict) -> dict:
         @retry(
@@ -86,17 +107,33 @@ class EnchorSource:
         def _do() -> dict:
             self._throttle()
             response = self._client.post(f"{API_BASE}{path}", json=payload)
+            if response.status_code == 429:
+                retry_after = response.headers.get("Retry-After")
+                try:
+                    delay = min(float(retry_after), 60.0) if retry_after else None
+                except ValueError:
+                    delay = None
+                self._note_rate_limited(delay)
+                response.raise_for_status()  # retried by tenacity
             if response.status_code >= 500:
                 response.raise_for_status()
             if not 200 <= response.status_code < 300:
                 raise SourceError(
-                    f"Enchor {path} returned HTTP {response.status_code}: {response.text[:200]}"
+                    f"Enchor {path} returned HTTP {response.status_code}: {response.text[:200]}",
+                    status=response.status_code,
                 )
+            self._note_success()
             return response.json()
 
         try:
             return _do()
-        except (httpx.TransportError, httpx.HTTPStatusError) as exc:
+        except httpx.HTTPStatusError as exc:
+            status = exc.response.status_code if exc.response is not None else None
+            raise SourceError(
+                f"Enchor request failed after {self.retries} attempts (HTTP {status})",
+                status=status,
+            ) from exc
+        except httpx.TransportError as exc:
             raise SourceError(f"Enchor request failed after retries: {exc}") from exc
 
     # ---------------------------------------------------------------- search
@@ -108,8 +145,10 @@ class EnchorSource:
         query = f"{artist} {clean_title}".strip()
         try:
             return self._search(query)
-        except SourceError:
-            if clean_title and clean_title != query:
+        except SourceError as exc:
+            # Only fall back for server-side query parsing failures (500) -
+            # never compound rate limiting (429) with extra requests.
+            if exc.status == 500 and clean_title and clean_title != query:
                 log.debug("retrying search with title only: %s", clean_title)
                 return self._search(clean_title)
             raise

@@ -228,6 +228,21 @@ def cmd_doctor(config, _args) -> int:
     return 1
 
 
+def cmd_web(config, args) -> int:
+    import webbrowser
+
+    from csv_to_clonehero.webapp import create_app
+
+    app = create_app(config)
+    url = f"http://127.0.0.1:{args.port}"
+    console.print(f"[green bold]Web interface running at {url}[/green bold]")
+    console.print("Press Ctrl+C to stop.")
+    if not args.no_browser:
+        webbrowser.open(url)
+    app.run(host="127.0.0.1", port=args.port)
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="csv_to_clonehero",
@@ -248,6 +263,10 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("report", help="regenerate reports from stored state")
     sub.add_parser("doctor", help="check setup and connectivity")
     sub.add_parser("reset-cache", help="clear search cache (keeps downloads)")
+
+    web = sub.add_parser("web", help="start the local web interface")
+    web.add_argument("--port", type=int, default=8765)
+    web.add_argument("--no-browser", action="store_true", help="don't open the browser")
     return parser
 
 
@@ -264,5 +283,6 @@ def main(argv: list[str] | None = None) -> int:
         "report": cmd_report,
         "doctor": cmd_doctor,
         "reset-cache": cmd_reset_cache,
+        "web": cmd_web,
     }
     return handlers[args.command](config, args)

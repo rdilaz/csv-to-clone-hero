@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from csv_to_clonehero.config import AppConfig
@@ -46,6 +47,8 @@ def build_plan(
     config: AppConfig,
     db: Database,
     size_lookup=None,
+    workers: int = 1,
+    on_progress=None,
 ) -> list[dict]:
     """Build the selection list from scored state.
 
@@ -169,16 +172,33 @@ def build_plan(
         )
 
     # ---- resolve sizes and apply the storage budget ------------------------
+    if size_lookup is not None and plan:
+        sizes: list[int | None] = [None] * len(plan)
+        counter = {"done": 0}
+
+        def _lookup(index: int) -> None:
+            try:
+                sizes[index] = size_lookup(plan[index]["_candidate"])
+            except Exception as exc:  # network failures are non-fatal here
+                log.debug("size lookup failed: %s", exc)
+            finally:
+                counter["done"] += 1
+                if on_progress is not None:
+                    on_progress(counter["done"], len(plan))
+
+        if workers > 1:
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                list(pool.map(_lookup, range(len(plan))))
+        else:
+            for i in range(len(plan)):
+                _lookup(i)
+        for entry, size in zip(plan, sizes):
+            entry["_size"] = size
+
     budget = config.storage.max_library_bytes
     used = 0
     for entry in plan:
-        candidate = entry["_candidate"]
-        size = None
-        if size_lookup is not None:
-            try:
-                size = size_lookup(candidate)
-            except Exception as exc:  # network failures are non-fatal here
-                log.debug("size lookup failed for %s: %s", candidate.name, exc)
+        size = entry.pop("_size", None)
         planned = size if size else estimate
         entry["planned_bytes"] = planned
         if used + planned <= budget:

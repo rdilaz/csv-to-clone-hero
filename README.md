@@ -3,8 +3,9 @@
 Turn exported Spotify playlist CSV files into a personalized Clone Hero song
 library — automatically.
 
-**Drop CSV files in a folder → double-click `BUILD_LIBRARY.bat` → get an
-organized Clone Hero song library.**
+**Double-click `WEB_INTERFACE.bat` → upload your CSVs in the browser → click
+"Build library".** (Or, if you prefer: drop CSVs into `input_playlists` and
+double-click `BUILD_LIBRARY.bat`.)
 
 The program reads your playlists, finds every song on the
 [Chorus Encore (Enchor)](https://enchor.us) chart index, intelligently scores
@@ -18,26 +19,54 @@ Clone Hero can scan directly.
 
 1. **Install Python 3.11 or newer** from <https://www.python.org/downloads/>.
    During installation, tick **"Add python.exe to PATH"**.
-2. **Export your Spotify playlists to CSV** with a tool like
-   [Chosic](https://www.chosic.com/spotify-playlist-exporter/) or
-   Exportify, and put the `.csv` files into the **`input_playlists`** folder.
-3. *(Optional)* Open **`config.yaml`** in Notepad and set
+2. **Double-click `WEB_INTERFACE.bat`.** A local web page opens
+   (everything runs on your own computer; nothing is sent anywhere except the
+   chart search server). The first run takes a minute to set up Python —
+   that's normal.
+3. In the web page:
+   - **Step 1** has direct links to the
+     [Chosic exporter](https://www.chosic.com/spotify-playlist-exporter/) and
+     [Exportify](https://exportify.net/) — log in with Spotify there and
+     download your playlists as CSV.
+   - **Step 2**: drag the downloaded CSV files onto the page (or use the
+     file picker). You can remove files there too.
+   - **Step 3**: click **"Dry run"** first (searches and plans, downloads
+     nothing) and look at the results; then click **"Build library"**.
+4. *(Optional)* Edit **`config.yaml`** in Notepad and set
    `clone_hero_songs_path` to your Clone Hero songs folder, e.g.
    `X:\Windows Standalone\PlayerData\Songs`.
    If you skip this, the library is built in the local `output_library` folder.
-4. **Double-click `DRY_RUN.bat`.** This searches and plans everything but
-   downloads *nothing*. Read the summary it prints.
-5. **Double-click `BUILD_LIBRARY.bat`.** This downloads the charts.
-   The first run takes a minute to set up Python for you — that's normal.
-6. Open Clone Hero → **Settings → Scan Songs** (or just restart it).
-7. Play. 🎸
+5. Open Clone Hero → **Settings → Scan Songs** (or just restart it).
+6. Play. 🎸
 
-You can re-run `BUILD_LIBRARY.bat` any time. It remembers what it already
-downloaded and won't download things twice. Adding a new playlist CSV and
-re-running just adds the new songs.
+Prefer the classic way? Put the CSVs in **`input_playlists`** and
+double-click **`DRY_RUN.bat`** then **`BUILD_LIBRARY.bat`** — same engine, no
+browser.
+
+You can re-run the build any time. It remembers what it already downloaded
+and won't download things twice. Adding a new playlist CSV and re-running
+just adds the new songs. Large collections take a while the first time —
+Enchor rate-limits searches, so ~3000 songs means roughly an hour of polite,
+rate-limited searching (leave the page open; progress is shown). Results are
+cached for 7 days, so later runs and retries are much faster. You can trade
+speed for politeness via `network.concurrency` / `request_delay_seconds` in
+`config.yaml`.
 
 If anything goes wrong, double-click **`CHECK_SETUP.bat`** — it checks your
 Python, folders, disk space and internet connection and tells you what's wrong.
+
+### Using it from another device (phone, etc.)
+
+The web interface binds to `127.0.0.1` (this computer only) on purpose, for
+safety. To use it from your phone on the same Wi-Fi, start it manually with
+
+```
+python -m csv_to_clonehero web --port 8765
+```
+
+from a terminal *after* editing `webapp.py`'s host from `127.0.0.1` to
+`0.0.0.0`, then browse to `http://<your-computer-ip>:8765`. Only do this on a
+network you trust — there is no login.
 
 ---
 
@@ -146,6 +175,7 @@ You never need this file for normal use.
 The `.bat` files cover normal use, but everything is also available directly:
 
 ```
+python -m csv_to_clonehero web           # local web interface (browser UI)
 python -m csv_to_clonehero scan          # parse CSVs only
 python -m csv_to_clonehero search        # search + score charts
 python -m csv_to_clonehero plan          # compute the download plan

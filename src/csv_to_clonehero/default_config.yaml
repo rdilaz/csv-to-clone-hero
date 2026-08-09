@@ -72,8 +72,12 @@ storage:
   estimated_chart_bytes: 31457280   # 30 MiB, conservative
 
 network:
-  # Delay between API requests, in seconds (be polite to the Enchor server).
-  request_delay_seconds: 0.25
+  # Delay between API requests, in seconds. Enchor rate-limits aggressively
+  # (HTTP 429); 0.5 with low concurrency is empirically safe.
+  request_delay_seconds: 0.5
+  # Concurrent search workers. Enchor 429s above ~2-4 req/s, so keep this
+  # low. Raise at your own risk (429s are handled with backoff, but slowly).
+  concurrency: 2
   # Number of retries for transient network failures (exponential backoff).
   retries: 3
   # Per-request timeout in seconds.
