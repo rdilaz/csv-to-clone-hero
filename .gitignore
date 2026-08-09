@@ -1,0 +1,19 @@
+# User data - never commit private playlist exports
+input_playlists/*.csv
+
+# Application state and output
+state/
+output_library/
+reports/
+logs/
+*.part
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+build/
+dist/
+.pytest_cache/

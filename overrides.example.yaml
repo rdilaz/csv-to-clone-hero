@@ -1,0 +1,31 @@
+# =============================================================================
+# Manual overrides (optional). Copy this file to "overrides.yaml" to activate.
+# You do NOT need this file for normal operation.
+# =============================================================================
+
+# Force-accept a specific chart for a specific Spotify track.
+# track_key is shown in reports/no_matches.csv and reports/review_needed.csv.
+force_accept:
+  # - track_key: "the rolling stones|paint it black"
+  #   chart_id: 349764          # Enchor chartId from review_needed.csv
+
+# Reject a specific chart everywhere (useful for bad/inaccurate charts).
+reject_charts:
+  # - 349764
+
+# Ignore specific Spotify tracks entirely (no search, no download).
+ignore_tracks:
+  # - "the rolling stones|paint it black"
+
+# Artist-level tweaks.
+artists:
+  # "Weird Al" Yankovic:
+  #   expansion_disabled: true
+  # Metallica:
+  #   expansion_cap: 5
+  # Kyuss:
+  #   alias: "Queens of the Stone Age"   # search this name instead
+
+# Alias a song title when the chart database uses a different name.
+title_aliases:
+  # "Paint It, Black": "Paint It Black"

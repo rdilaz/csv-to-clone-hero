@@ -1,0 +1,98 @@
+# =============================================================================
+# CSV to Clone Hero - configuration
+# All settings have sensible defaults; you only need to edit what you care about.
+# Relative paths are resolved against the folder containing this file.
+# =============================================================================
+
+paths:
+  # Folder containing your exported Spotify playlist CSV files.
+  input_dir: input_playlists
+
+  # Where the organized library is written when clone_hero_songs_path is empty.
+  output_dir: output_library
+
+  # Optional: point directly at your Clone Hero songs folder, e.g.
+  #   clone_hero_songs_path: X:\Windows Standalone\PlayerData\Songs
+  # When set, the library is built under
+  #   <clone_hero_songs_path>\00 - His Music\...
+  clone_hero_songs_path: ""
+
+  # Folder for reports (CSV/JSON/TXT summaries).
+  reports_dir: reports
+
+  # SQLite state database (caches searches, remembers downloads).
+  database: state/library.db
+
+build:
+  # Dry run: search, score and plan, but download nothing.
+  dry_run: false
+
+  # Master switch for automated downloads. If false, the program finds, scores
+  # and reports charts but never downloads files.
+  direct_download_enabled: true
+
+matching:
+  # Score >= auto_accept_threshold is downloaded automatically.
+  auto_accept_threshold: 90.0
+  # Score >= review_threshold (but below auto) is flagged for manual review.
+  review_threshold: 70.0
+  # If true, review-tier matches are also downloaded. Default false: they are
+  # only reported in reports/review_needed.csv.
+  download_review_matches: false
+  # Artist similarity below this is treated as an artist conflict (hard reject).
+  artist_conflict_threshold: 55.0
+
+instruments:
+  # Require a playable 5-fret lead guitar chart (recommended).
+  require_five_fret_guitar: true
+  # Allow charts that only have 6-fret (Guitar Hero Live) guitar.
+  allow_six_fret_only: false
+  # Allow charts with no guitar at all (drums/vocals only). Not recommended.
+  allow_no_guitar: false
+  # Exclude modcharts (charts with gameplay-altering modifications).
+  exclude_modcharts: true
+
+expansion:
+  enabled: true
+  # Additional charts downloaded per artist, based on how many unique playlist
+  # songs the artist has as PRIMARY artist.
+  cap_many_songs: 50      # artist has >= min_songs_many unique songs
+  min_songs_many: 5
+  cap_some_songs: 25      # artist has 2-4 unique songs
+  cap_one_song: 10        # artist has exactly 1 unique song
+  cap_featured_only: 0    # artist appears only as a featured/collab artist
+  # Minimum quality score (0-100) for an expansion chart to be selected.
+  min_score: 80.0
+
+storage:
+  # Maximum total size of the chart library, in GiB. The target USB has ~58.8 GB
+  # usable and also holds Clone Hero itself, so 48 GiB leaves breathing room.
+  max_library_gib: 48.0
+  # Assumed size of a chart when the real size cannot be determined (bytes).
+  estimated_chart_bytes: 31457280   # 30 MiB, conservative
+
+network:
+  # Delay between API requests, in seconds (be polite to the Enchor server).
+  request_delay_seconds: 0.25
+  # Number of retries for transient network failures (exponential backoff).
+  retries: 3
+  # Per-request timeout in seconds.
+  timeout_seconds: 30
+  # How long cached search results stay valid, in days.
+  cache_ttl_days: 7
+
+sources:
+  # Currently only the Enchor (Chorus Encore) source is built in. It exposes
+  # legitimate direct downloads, so it supports automated downloading.
+  enabled: [enchor]
+
+hierarchy:
+  # Folder layout under the output root. {section} is "Exact Playlist Songs" or
+  # "Artist Expansion", {artist} is the artist name.
+  root_folder: "00 - His Music"
+  exact_section: "Exact Playlist Songs"
+  expansion_section: "Artist Expansion"
+
+logging:
+  # DEBUG, INFO, WARNING or ERROR
+  level: INFO
