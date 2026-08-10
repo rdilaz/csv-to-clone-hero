@@ -32,6 +32,10 @@ Clone Hero can scan directly.
      file picker). You can remove files there too.
    - **Step 3**: click **"Dry run"** first (searches and plans, downloads
      nothing) and look at the results; then click **"Build library"**.
+   - **Step 4 (optional)**: click **"Load review list"** to see the matches
+     the program wasn't sure about (score 70–89). Click ✓ to accept one
+     (it downloads on the next build) or ✗ to reject it permanently.
+     Decisions apply the next time you run a dry run or build.
 4. *(Optional)* Edit **`config.yaml`** in Notepad and set
    `clone_hero_songs_path` to your Clone Hero songs folder, e.g.
    `X:\Windows Standalone\PlayerData\Songs`.
@@ -87,7 +91,7 @@ be accepted for *Flo Rida's* `Low`, no matter how exact the title is.
 | Score   | Outcome                                             |
 |---------|-----------------------------------------------------|
 | 90–100  | **Auto-accepted** — downloaded automatically        |
-| 70–89   | **Review** — listed in `reports/review_needed.csv`  |
+| 70–89   | **Review** — in the web UI (step 4) and `reports/review_needed.csv`; not downloaded unless you accept |
 | below 70| **Rejected** — listed in `reports/no_matches.csv` / `reports/rejected_candidates.csv` |
 
 Thresholds are configurable in `config.yaml`.

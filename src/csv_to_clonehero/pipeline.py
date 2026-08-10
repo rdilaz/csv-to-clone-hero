@@ -15,7 +15,7 @@ from csv_to_clonehero.config import AppConfig
 from csv_to_clonehero.csv_import import artist_track_counts, import_playlist_dir
 from csv_to_clonehero.database import Database
 from csv_to_clonehero.downloader import DownloadManager
-from csv_to_clonehero.matching import pick_best, score_expansion_candidate
+from csv_to_clonehero.matching import score_candidate, score_expansion_candidate
 from csv_to_clonehero.models import ChartCandidate, Track
 from csv_to_clonehero.normalization import normalize_artist
 from csv_to_clonehero.overrides import Overrides
@@ -189,17 +189,45 @@ def _query_outcomes(
 
 
 def _decide_track(
-    config: AppConfig, db: Database, track: Track, candidates: list[ChartCandidate]
+    config: AppConfig,
+    db: Database,
+    track: Track,
+    candidates: list[ChartCandidate],
+    decisions: dict[int, str] | None = None,
 ) -> str:
-    """Score all candidates for a track; return the track-level outcome."""
-    best_chart, best_score, scored = pick_best(track, candidates, config)
-    for chart, breakdown in scored:
+    """Score all candidates for a track; return the track-level outcome.
+
+    ``decisions`` maps chart_id -> 'accept' | 'reject' (manual/web review).
+    Manually accepted charts are promoted to AUTO_ACCEPT (unless the chart is
+    instrument-incompatible); rejected ones are forced to REJECT.
+    """
+    decisions = decisions or {}
+    scored: list[tuple[ChartCandidate, object]] = []
+    for chart in candidates:
+        breakdown = score_candidate(track, chart, config)
+        manual = decisions.get(chart.chart_id)
+        if manual == "accept":
+            if breakdown.decision == "INCOMPATIBLE":
+                breakdown.reasons.append("manual accept ignored: instrument incompatible")
+            else:
+                breakdown.decision = "AUTO_ACCEPT"
+                breakdown.final_score = max(
+                    breakdown.final_score, config.matching.auto_accept_threshold
+                )
+                breakdown.reasons.append("manually accepted")
+        elif manual == "reject":
+            breakdown.decision = "REJECT"
+            breakdown.final_score = 0.0
+            breakdown.reasons.append("manually rejected")
+        scored.append((chart, breakdown))
         db.record_match_score(
             track.db_id, chart.db_id, breakdown.final_score, breakdown.decision,
             json.dumps({"explanation": breakdown.explain()}),
         )
     if not scored:
         return "NO_MATCH"
+    scored.sort(key=lambda pair: pair[1].final_score, reverse=True)
+    best_score = scored[0][1]
     if best_score.decision == "INCOMPATIBLE":
         return "NO_MATCH"
     return {"AUTO_ACCEPT": "AUTO_ACCEPTED", "REVIEW": "REVIEW", "REJECT": "REJECTED"}.get(
@@ -218,6 +246,7 @@ def run_search(
     tracks = db.get_tracks()
     force_accept = {(r.track_key, r.chart_id) for r in overrides.force_accept}
     reject_charts = set(overrides.reject_charts)
+    manual_decisions = db.get_manual_decisions()
 
     # ---------------- exact playlist pass ----------------
     queries = [
@@ -237,7 +266,12 @@ def run_search(
             for error in errors:
                 db.record_error("search", error, track.track_key)
             all_candidates = [c for c in found if c.chart_id not in reject_charts]
-            outcome = _decide_track(config, db, track, all_candidates)
+            track_decisions = {
+                chart_id: decision
+                for (tkey, _src, chart_id), decision in manual_decisions.items()
+                if tkey == track.track_key
+            }
+            outcome = _decide_track(config, db, track, all_candidates, track_decisions)
 
             # Manual force-accept wins over the automatic decision.
             for chart in all_candidates:

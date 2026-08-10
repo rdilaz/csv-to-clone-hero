@@ -237,6 +237,77 @@ def create_app(
     def status():
         return jsonify(state.snapshot())
 
+    # -------------------------------------------------------------- review
+    @app.get("/api/review")
+    def review_items():
+        """Candidates in the review band for human calls.
+
+        ?include_rejected=1 also returns REJECTed candidates (a much larger
+        list); the UI only asks for them when the checkbox is ticked.
+        """
+        include_rejected = request.args.get("include_rejected") == "1"
+        wanted = ("REVIEW", "REJECT") if include_rejected else ("REVIEW",)
+        db = Database(config.database_path)
+        try:
+            decisions = db.get_manual_decisions()
+            items = []
+            for row in db.get_match_scores():
+                if row["decision"] not in wanted:
+                    continue
+                candidate = db.get_candidate(row["candidate_id"])
+                if candidate is None:
+                    continue
+                explanation = ""
+                try:
+                    import json as _json
+
+                    explanation = _json.loads(row["breakdown_json"]).get("explanation", "")
+                except ValueError:
+                    pass
+                items.append(
+                    {
+                        "track_key": row["track_key"],
+                        "spotify_artist": row["track_artist"],
+                        "spotify_title": row["track_title"],
+                        "candidate_artist": candidate.artist,
+                        "candidate_title": candidate.name,
+                        "source": candidate.source,
+                        "chart_id": candidate.chart_id,
+                        "score": round(row["score"], 1),
+                        "decision": row["decision"],
+                        "explanation": explanation,
+                        "charter": candidate.charter,
+                        "instruments": candidate.instruments,
+                        "diff_guitar": candidate.diff_guitar,
+                        "url": candidate.url,
+                        "manual": decisions.get(
+                            (row["track_key"], candidate.source, candidate.chart_id), ""
+                        ),
+                    }
+                )
+            items.sort(
+                key=lambda i: (i["spotify_artist"].lower(), i["spotify_title"].lower(), -i["score"])
+            )
+            return jsonify(items)
+        finally:
+            db.close()
+
+    @app.post("/api/review/decide")
+    def review_decide():
+        payload = request.json or {}
+        track_key = payload.get("track_key", "")
+        source = payload.get("source", "")
+        chart_id = int(payload.get("chart_id", 0))
+        decision = payload.get("decision", "")
+        if decision not in ("accept", "reject", "clear") or not track_key or not source:
+            return {"error": "invalid decision payload"}, 400
+        db = Database(config.database_path)
+        try:
+            db.set_manual_decision(track_key, source, chart_id, decision)
+        finally:
+            db.close()
+        return jsonify({"ok": True})
+
     # ------------------------------------------------------------ reports
     @app.get("/api/summary")
     def summary():
@@ -336,7 +407,19 @@ _PAGE = """<!doctype html>
     <div id="stages" style="margin-top:12px"></div>
   </div>
 
-  <h2>4 · Results</h2>
+  <h2>4 · Review matches <span class="muted">(optional)</span></h2>
+  <div class="card">
+    <p class="muted">Charts that scored 70&ndash;89 are not downloaded automatically.
+       Accept the good ones here (they download on the next build), reject the
+       wrong ones so they never come back.</p>
+    <button id="loadReview">Load review list</button>
+    <label class="muted" style="margin-left:12px">
+      <input type="checkbox" id="showRejected"> also show rejected candidates</label>
+    <input type="text" id="reviewFilter" placeholder="filter…" style="margin-left:12px; background:#0d1017; border:1px solid #2a3247; color:#e6e9ef; border-radius:6px; padding:6px 10px;">
+    <div id="review" style="margin-top:10px"></div>
+  </div>
+
+  <h2>5 · Results</h2>
   <div class="card">
     <div id="summary" class="muted">No results yet — run a dry run first.</div>
     <div class="reports" id="reports" style="margin-top:10px"></div>
@@ -396,6 +479,7 @@ async function poll() {
   else {
     $('dry').disabled = $('build').disabled = false;
     refreshSummary(); refreshReports();
+    if (reviewLoaded) loadReview();
   }
 }
 
@@ -420,6 +504,79 @@ async function refreshReports() {
     ? 'Reports: ' + files.map(f => `<a href="/reports/${f}">${f}</a>`).join('')
     : '';
 }
+
+// ------------------------------------------------------------- review UI
+let reviewItems = [];
+let reviewLoaded = false;
+const REVIEW_LIMIT = 300;
+let reviewShowAll = false;
+
+function esc(s) {
+  return String(s ?? '').replace(/[&<>"']/g, c =>
+    ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+async function loadReview() {
+  $('review').innerHTML = '<p class="muted">Loading…</p>';
+  const showRejected = $('showRejected').checked;
+  reviewItems = await (await fetch(
+    '/api/review' + (showRejected ? '?include_rejected=1' : ''))).json();
+  reviewLoaded = true;
+  renderReview();
+}
+
+function renderReview() {
+  const filter = $('reviewFilter').value.trim().toLowerCase();
+  let items = reviewItems;
+  if (filter) {
+    items = items.filter(i =>
+      (i.spotify_artist + ' ' + i.spotify_title + ' ' +
+       i.candidate_artist + ' ' + i.candidate_title).toLowerCase().includes(filter));
+  }
+  if (!items.length) {
+    $('review').innerHTML = '<p class="muted">Nothing to review. Run a dry run first, ' +
+      'or everything was already decided.</p>';
+    return;
+  }
+  const shown = reviewShowAll ? items : items.slice(0, REVIEW_LIMIT);
+  const rows = shown.map((i, idx) => {
+    const key = `${i.track_key}|${i.source}|${i.chart_id}`;
+    const state = i.manual === 'accept' ? 'style="background:#1d3a28;border-radius:8px"'
+                : i.manual === 'reject' ? 'style="background:#3a1d24;border-radius:8px;opacity:.6"' : '';
+    const link = i.url ? ` <a href="${esc(i.url)}" target="_blank" rel="noopener">view</a>` : '';
+    return `<div class="file-row" ${state} id="rv-${esc(key)}">
+      <span title="${esc(i.explanation)}">
+        <b>${esc(i.spotify_artist)}</b> — ${esc(i.spotify_title)}<br>
+        <span class="muted">⇒ ${esc(i.candidate_artist)} — ${esc(i.candidate_title)}
+          · ${i.score} · ${esc(i.charter || 'unknown charter')}
+          · ${esc((i.instruments || []).join(', '))}${link}</span>
+      </span>
+      <span style="white-space:nowrap">
+        <button style="background:#2f7d4f" onclick="decide('${esc(i.track_key)}','${esc(i.source)}',${i.chart_id},'accept')">✓</button>
+        <button style="background:#54303a" onclick="decide('${esc(i.track_key)}','${esc(i.source)}',${i.chart_id},'reject')">✗</button>
+      </span>
+    </div>`;
+  }).join('');
+  const more = (!reviewShowAll && items.length > REVIEW_LIMIT)
+    ? `<p class="muted">Showing ${REVIEW_LIMIT} of ${items.length} —
+       <a href="#" onclick="reviewShowAll=true;renderReview();return false">show all</a></p>` : '';
+  $('review').innerHTML = `<p class="muted">${items.length} candidates to review
+    (accepts/rejects apply on the next run)</p>` + rows + more;
+}
+
+async function decide(trackKey, source, chartId, decision) {
+  await fetch('/api/review/decide', {method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({track_key: trackKey, source, chart_id: chartId, decision})});
+  const item = reviewItems.find(i =>
+    i.track_key === trackKey && i.source === source && i.chart_id === chartId);
+  if (item) item.manual = decision;
+  renderReview();
+}
+
+$('loadReview').addEventListener('click', loadReview);
+$('showRejected').addEventListener('change', loadReview);
+$('reviewFilter').addEventListener('input', renderReview);
 
 $('dry').addEventListener('click', () => run('dry-run'));
 $('build').addEventListener('click', () => {

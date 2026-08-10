@@ -136,6 +136,16 @@ CREATE TABLE IF NOT EXISTS errors (
     occurred_at REAL NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS manual_decisions (
+    id INTEGER PRIMARY KEY,
+    track_key TEXT NOT NULL,
+    source TEXT NOT NULL,
+    chart_id INTEGER NOT NULL,
+    decision TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    UNIQUE (track_key, source, chart_id)
+);
+
 CREATE TABLE IF NOT EXISTS meta (
     key TEXT PRIMARY KEY,
     value TEXT
@@ -521,6 +531,35 @@ class Database:
             sql += " WHERE status = ?"
             return list(self._conn.execute(sql, (status,)))
         return list(self._conn.execute(sql))
+
+    # ---------------------------------------------------- manual decisions
+    def set_manual_decision(
+        self, track_key: str, source: str, chart_id: int, decision: str
+    ) -> None:
+        """Record a human accept/reject; decision='clear' removes it."""
+        with self._conn:
+            if decision == "clear":
+                self._conn.execute(
+                    "DELETE FROM manual_decisions WHERE track_key = ? AND source = ? AND chart_id = ?",
+                    (track_key, source, chart_id),
+                )
+            else:
+                self._conn.execute(
+                    """INSERT INTO manual_decisions (track_key, source, chart_id, decision, created_at)
+                       VALUES (?, ?, ?, ?, ?)
+                       ON CONFLICT(track_key, source, chart_id) DO UPDATE SET
+                           decision = excluded.decision, created_at = excluded.created_at""",
+                    (track_key, source, chart_id, decision, time.time()),
+                )
+
+    def get_manual_decisions(self) -> dict[tuple[str, str, int], str]:
+        """Return {(track_key, source, chart_id): 'accept' | 'reject'}."""
+        return {
+            (row["track_key"], row["source"], row["chart_id"]): row["decision"]
+            for row in self._conn.execute(
+                "SELECT track_key, source, chart_id, decision FROM manual_decisions"
+            )
+        }
 
     # ----------------------------------------------------------------- errors
     def record_error(self, stage: str, message: str, detail: str = "") -> None:
