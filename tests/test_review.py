@@ -7,7 +7,7 @@ import time
 import pytest
 
 from csv_to_clonehero.database import Database
-from csv_to_clonehero.pipeline import run_search
+from csv_to_clonehero.pipeline import run_plan, run_search
 from csv_to_clonehero.webapp import create_app
 
 from .conftest import FIXTURES, FakeSource, make_chart, make_track
@@ -27,12 +27,12 @@ class TestDecisionsInPipeline:
 
         from csv_to_clonehero.overrides import Overrides
 
-        stats = run_search(config, db, [source], Overrides())
+        stats = run_search(config, db, [source], Overrides(), include_expansion=False)
         assert stats.review == 1  # remix alone does not auto-accept
 
         # Human accepts it -> next run auto-accepts.
         db.set_manual_decision(track.track_key, "test", 1, "accept")
-        stats = run_search(config, db, [source], Overrides())
+        stats = run_search(config, db, [source], Overrides(), include_expansion=False)
         assert stats.auto == 1
         row = db.get_match_scores()[0]
         assert row["decision"] == "AUTO_ACCEPT"
@@ -47,11 +47,11 @@ class TestDecisionsInPipeline:
 
         from csv_to_clonehero.overrides import Overrides
 
-        stats = run_search(config, db, [source], Overrides())
+        stats = run_search(config, db, [source], Overrides(), include_expansion=False)
         assert stats.auto == 1
 
         db.set_manual_decision(track.track_key, "test", 1, "reject")
-        stats = run_search(config, db, [source], Overrides())
+        stats = run_search(config, db, [source], Overrides(), include_expansion=False)
         assert stats.auto == 0
         assert stats.no_match == 1
         db.close()
@@ -66,7 +66,7 @@ class TestDecisionsInPipeline:
 
         db.set_manual_decision(track.track_key, "test", 1, "reject")
         db.set_manual_decision(track.track_key, "test", 1, "clear")
-        stats = run_search(config, db, [source], Overrides())
+        stats = run_search(config, db, [source], Overrides(), include_expansion=False)
         assert stats.auto == 1
         db.close()
 
@@ -96,12 +96,13 @@ class TestReviewApi:
         http, config = client
         track = self._seed_scores(config)
 
-        items = http.get("/api/review").get_json()
-        assert len(items) == 1
-        item = items[0]
+        payload = http.get("/api/review").get_json()
+        assert len(payload["tracks"]) == 1
+        item = payload["tracks"][0]
         assert item["spotify_title"] == "Low"
-        assert item["candidate_title"] == "Low (Travis Barker Remix)"
-        assert item["manual"] == ""
+        assert item["candidates"][0]["candidate_title"] == "Low (Travis Barker Remix)"
+        assert item["candidates"][0]["manual"] == ""
+        assert payload["progress"]["review_track_count"] == 1
 
         response = http.post(
             "/api/review/decide",
@@ -109,13 +110,96 @@ class TestReviewApi:
                   "chart_id": 1, "decision": "accept"},
         )
         assert response.status_code == 200
-        assert http.get("/api/review").get_json()[0]["manual"] == "accept"
+        assert (
+            http.get("/api/review").get_json()["tracks"][0]["candidates"][0]["manual"]
+            == "accept"
+        )
 
         http.post("/api/review/decide",
                   json={"track_key": track.track_key, "source": "test",
                         "chart_id": 1, "decision": "clear"})
-        assert http.get("/api/review").get_json()[0]["manual"] == ""
+        assert (
+            http.get("/api/review").get_json()["tracks"][0]["candidates"][0]["manual"]
+            == ""
+        )
 
     def test_decide_validates_payload(self, client):
         http, _ = client
         assert http.post("/api/review/decide", json={"decision": "maybe"}).status_code == 400
+
+    def test_accept_all_accepts_best_review_candidate(self, client):
+        http, config = client
+        track = self._seed_scores(config)
+
+        response = http.post("/api/review/accept-all")
+        assert response.status_code == 200
+        assert response.get_json()["accepted"] == 1
+
+        db = Database(config.database_path)
+        assert db.get_manual_decisions()[(track.track_key, "test", 1)] == "accept"
+        db.close()
+
+    def test_grouped_alternatives_are_sorted_and_rejected_are_optional(self, client):
+        http, config = client
+        db = Database(config.database_path)
+        track = _seed_track(config, db, make_track("Low", "Flo Rida"))
+        first = make_chart("Low (Travis Barker Remix)", "Flo Rida ft. T-Pain", chart_id=1)
+        second = make_chart("Low", "Flo Rida", chart_id=2)
+        rejected = make_chart("Low (Live)", "Flo Rida", chart_id=3)
+        for chart in (first, second, rejected):
+            db.upsert_candidate(chart)
+        db.record_match_score(
+            track.db_id, first.db_id, 83.0, "REVIEW", json.dumps({"explanation": "first"})
+        )
+        db.record_match_score(
+            track.db_id, second.db_id, 74.0, "REVIEW", json.dumps({"explanation": "second"})
+        )
+        db.record_match_score(
+            track.db_id, rejected.db_id, 61.0, "REJECT", json.dumps({"explanation": "rejected"})
+        )
+        db.close()
+
+        payload = http.get("/api/review").get_json()
+        assert len(payload["tracks"]) == 1
+        assert [c["chart_id"] for c in payload["tracks"][0]["candidates"]] == [1, 2]
+        all_payload = http.get("/api/review?include_rejected=1").get_json()
+        assert [c["chart_id"] for c in all_payload["tracks"][0]["candidates"]] == [1, 2, 3]
+
+
+def test_manual_accept_is_definitive_even_when_lower_scored(config):
+    db = Database(config.database_path)
+    track = _seed_track(config, db, make_track("Low", "Flo Rida"))
+    exact = make_chart("Low", "Flo Rida", chart_id=1)
+    remix = make_chart("Low (Travis Barker Remix)", "Flo Rida ft. T-Pain", chart_id=2)
+    source = FakeSource(song_results={("Flo Rida", "Low"): [exact, remix]})
+    from csv_to_clonehero.overrides import Overrides
+
+    first = run_search(config, db, [source], Overrides(), include_expansion=False)
+    assert first.auto == 1
+    db.set_manual_decision(track.track_key, "test", 2, "accept")
+    second = run_search(config, db, [source], Overrides(), include_expansion=False)
+    assert second.auto == 1
+    rows = {row["candidate_id"]: row for row in db.get_match_scores()}
+    remix_row = rows[remix.db_id]
+    exact_row = rows[exact.db_id]
+    assert remix_row["decision"] == "AUTO_ACCEPT"
+    assert exact_row["decision"] == "REJECT"
+    assert "not selected because another candidate was manually accepted" in json.loads(
+        exact_row["breakdown_json"]
+    )["explanation"]
+    plan = run_plan(config, db, [source], include_expansion=False)
+    assert plan.exact_selected == 1
+    assert db.get_selections()[0]["candidate_id"] == remix_row["candidate_id"]
+    db.close()
+
+
+def test_accepting_one_candidate_clears_other_accepts(config):
+    db = Database(config.database_path)
+    db.set_manual_decision("track", "test", 1, "accept")
+    db.set_manual_decision("track", "test", 2, "reject")
+    db.set_manual_decision("track", "other", 3, "accept")
+    decisions = db.get_manual_decisions()
+    assert ("track", "test", 1) not in decisions
+    assert decisions[("track", "test", 2)] == "reject"
+    assert decisions[("track", "other", 3)] == "accept"
+    db.close()

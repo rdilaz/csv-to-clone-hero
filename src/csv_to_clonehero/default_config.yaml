@@ -20,8 +20,38 @@ paths:
   # Folder for reports (CSV/JSON/TXT summaries).
   reports_dir: reports
 
-  # SQLite state database (caches searches, remembers downloads).
-  database: state/library.db
+  # SQLite state database (caches searches, remembers downloads). Kept outside
+  # the output folder on purpose: per-run output overrides never move state.
+  database: state/csv_to_clonehero.db
+
+  # Verified export artifacts and ownership manifests stay in app state, never
+  # in the Songs folder. One manifest is kept per destination.
+  state_dir: state
+  artifact_cache_dir: state/export-artifacts
+  manifest_dir: state/export-manifests
+
+spotify:
+  # Public Spotify application ID. Leave blank to read SPOTIFY_CLIENT_ID from
+  # the environment. This PKCE flow intentionally has no client secret.
+  client_id: ""
+  client_id_env: SPOTIFY_CLIENT_ID
+  redirect_port: 8765
+  redirect_path: /api/auth/spotify/callback
+  # To publish the app for use from another computer, put its HTTPS public URL
+  # here, for example https://charts.example.com. Register the resulting
+  # callback URL with Spotify. Leave blank for the normal local app.
+  public_base_url: ""
+  # Read-only scopes needed for profile, private/collaborative playlists and
+  # the user's saved tracks. Refresh tokens are kept in the OS keyring.
+  scopes:
+    - user-read-private
+    - playlist-read-private
+    - playlist-read-collaborative
+    - user-library-read
+  keyring:
+    service: csv-to-clonehero.spotify
+    # Blank uses a stable client-specific fallback; it is not a secret.
+    user: ""
 
 build:
   # Dry run: search, score and plan, but download nothing.
@@ -41,6 +71,13 @@ matching:
   download_review_matches: false
   # Artist similarity below this is treated as an artist conflict (hard reject).
   artist_conflict_threshold: 55.0
+  # Spotify workflow names for the existing legacy thresholds.
+  recommendation_threshold: 90.0
+  export_floor: 70.0
+  # Duration evidence is considered a match within this many milliseconds.
+  duration_tolerance_ms: 5000
+  # Changing this invalidates matcher-sensitive discovery cache keys.
+  matcher_version: spotify-v1
 
 instruments:
   # Require a playable 5-fret lead guitar chart (recommended).
@@ -85,14 +122,91 @@ network:
   # How long cached search results stay valid, in days.
   cache_ttl_days: 7
 
+cache:
+  # Persistent query results make interrupted scans resumable. Transient
+  # errors are never treated as successful cached results.
+  enabled: true
+  ttl_days: 7
+  cache_errors: false
+  resume: true
+
+scan:
+  # The Spotify/source scan completes before the browser enters selection.
+  blocking: true
+  resume: true
+  persist_progress: true
+  retry_failed_queries: true
+  status_poll_interval_ms: 1200
+
+search:
+  # Catalog-first exact pass: artists with at least artist_catalog_min_songs
+  # unique primary-artist tracks get ONE paginated catalog fetch; their songs
+  # are scored locally. Per-song fallback runs automatically when the catalog
+  # misses or errors, so recall stays identical while request count drops.
+  artist_catalog_first: true
+  artist_catalog_min_songs: 3
+  # Maximum normal results retained for one logical query/source.
+  result_cap: 250
+  max_search_pages: 20
+  # Full source responses remain cached; score only the strongest local matches.
+  candidate_shortlist_size: 12
+
 sources:
   # Currently only the Enchor (Chorus Encore) source is built in. It exposes
   # legitimate direct downloads, so it supports automated downloading.
   enabled: [enchor]
 
+export:
+  # Managed sync removes only files listed in an app-owned manifest.
+  managed_sync: false
+  overwrite_owned: true
+  include_manifest_in_zip: true
+  minimum_free_bytes: 0
+
+songs_folder_detection:
+  # Non-destructive hints used by the local UI/doctor for common Clone Hero,
+  # YARG and portable Songs locations.
+  enabled: true
+  include_configured_output: true
+  include_portable: true
+  common_paths:
+    - "~/Documents/My Games/Clone Hero/Songs"
+    - "~/Documents/My Games/YARG/Songs"
+    - "~/AppData/Roaming/YARG/Songs"
+    - "~/AppData/Local/YARG/Songs"
+    - Songs
+  max_candidates: 32
+
+inventory:
+  # Read-only archive scan limits. Invalid files are reported and never deleted.
+  max_files: 100000
+  max_depth: 64
+  max_file_bytes: 2147483648
+  max_total_bytes: 0
+  max_metadata_bytes: 1048576
+  max_members: 4096
+  max_member_bytes: 536870912
+  max_archive_bytes: 2147483648
+  max_compression_ratio: 10000
+  hash_files: false
+  poll_interval_ms: 1200
+
+library:
+  # Folder layout under the library root:
+  #   hybrid       - exact songs: <Artist>/<Album>/ (no album -> Singles/),
+  #                  expansion songs: <Pack Name>/ (no pack -> <Artist>/)
+  #   artist_album - everything under <Artist>/<Album>/
+  #   pack         - everything under <Pack Name>/ (fallback <Artist>/)
+  #   legacy       - <root_folder>/<Exact Playlist Songs|Artist Expansion>/<Artist>/
+  #                  (uses the hierarchy keys below; how older versions laid out
+  #                  the library)
+  # Existing downloads are relocated automatically on the next build when you
+  # switch layouts.
+  layout: hybrid
+
 hierarchy:
-  # Folder layout under the output root. {section} is "Exact Playlist Songs" or
-  # "Artist Expansion", {artist} is the artist name.
+  # Folder layout under the output root, only used by library.layout: legacy.
+  # {section} is "Exact Playlist Songs" or "Artist Expansion".
   root_folder: "00 - His Music"
   exact_section: "Exact Playlist Songs"
   expansion_section: "Artist Expansion"
@@ -100,3 +214,64 @@ hierarchy:
 logging:
   # DEBUG, INFO, WARNING or ERROR
   level: INFO
+
+# Production (multi-user) deployment. The single-user local web interface and
+# CLI ignore these keys.
+server:
+  # Public HTTPS origin, e.g. https://charts.ryo-nd.com. Doubles as the
+  # Spotify OAuth redirect origin. You can also set APP_BASE_URL in the env.
+  base_url: ""
+  base_url_env: APP_BASE_URL
+  # Session signing key. ALWAYS from the environment (SECRET_KEY), never here.
+  secret_key_env: SECRET_KEY
+  # When true, the multi-user server refuses to start without SECRET_KEY set.
+  enforce_secret_key: true
+  # Optional absolute sqlite path override via DATABASE_URL env.
+  database_url: ""
+  database_url_env: DATABASE_URL
+
+crypto:
+  # Fernet key used to encrypt each user's Spotify refresh token at rest.
+  # ALWAYS from the environment (TOKEN_ENCRYPTION_KEY), never here.
+  key_env: TOKEN_ENCRYPTION_KEY
+
+sessions:
+  # Server-side session cookie for the multi-user app.
+  cookie_name: c2ch_session
+  cookie_same_site: Lax
+  # None -> require HTTPS automatically in production.
+  cookie_secure: null
+  max_age_seconds: 2592000   # 30 days
+  domain: ""
+
+notifications:
+  # Optional email when a long job finishes (completion only; never the account
+  # identity). provider: resend | smtp | log.
+  enabled: true
+  provider: resend
+  api_key_env: NOTIFICATIONS_API_KEY
+  from_address: "noreply@ryo-nd.com"
+  smtp_host: ""
+  smtp_port: 587
+  smtp_user_env: ""
+  smtp_password_env: ""
+  smtp_use_tls: true
+
+monetization:
+  # Tasteful ad placements. Set a slot (e.g. an ad-client/unit id) or leave
+  # empty to render nothing.
+  ads_enabled: true
+  ad_banner_slot: ""
+  ad_sidebar_slot: ""
+  # Core platform mission: the Clone Hero creator's GoFundMe (he has cancer).
+  gofundme_enabled: true
+  gofundme_banner: true
+  gofundme_url_env: GOFUNDME_URL
+  gofundme_url: ""
+
+admin:
+  # The legacy single-user CSV/upload flow does not fit the public
+  # download-to-browser model. It is only reachable when enabled AND the
+  # signed-in user's Spotify id is listed here.
+  enable_legacy_csv: false
+  admins: []

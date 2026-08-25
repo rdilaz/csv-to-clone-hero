@@ -1,4 +1,9 @@
-from csv_to_clonehero.matching import instrument_compatible, pick_best, score_candidate
+from csv_to_clonehero.matching import (
+    instrument_compatible,
+    pick_best,
+    score_candidate,
+    score_expansion_candidate,
+)
 
 from .conftest import make_chart, make_track
 
@@ -78,3 +83,79 @@ def test_score_explanation_present(config):
     assert "artist=" in explanation
     assert "final=" in explanation
     assert "decision=" in explanation
+
+
+# ------------------------------------------------------------- quality gates
+def test_no_content_chart_hard_rejected_exact(config):
+    track = make_track("Song", "Artist")
+    chart = make_chart("Song", "Artist", instruments=[], diff_guitar=None)
+    result = score_candidate(track, chart, config)
+    assert result.decision == "REJECT"
+    assert result.final_score == 0.0
+    assert any("no playable chart content" in r for r in result.reasons)
+
+
+def test_no_content_chart_hard_rejected_expansion(config):
+    chart = make_chart("Song", "Artist", instruments=[], diff_guitar=None)
+    result = score_expansion_candidate("artist", chart, config)
+    assert result.decision == "REJECT"
+    assert any("no playable chart content" in r for r in result.reasons)
+
+
+def test_difficulty_only_chart_has_content(config):
+    # No instrument list but a rated guitar difficulty counts as content.
+    track = make_track("Song", "Artist")
+    chart = make_chart("Song", "Artist", instruments=[], diff_guitar=4)
+    result = score_candidate(track, chart, config)
+    assert result.decision != "REJECT" or not any(
+        "no playable chart content" in r for r in result.reasons
+    )
+
+
+def test_single_instrument_penalized_below_full_band(config):
+    # Imperfect title similarity keeps both scores below the 100 cap so the
+    # quality gap is observable in final_score.
+    track = make_track("Song One", "Artist")
+    guitar_only = make_chart("Song 1", "Artist", chart_id=1, instruments=["guitar"])
+    full_band = make_chart("Song 1", "Artist", chart_id=2)
+    guitar_score = score_candidate(track, guitar_only, config)
+    band_score = score_candidate(track, full_band, config)
+    assert band_score.final_score > guitar_score.final_score
+    assert any(
+        "single-instrument" in label for label, _ in guitar_score.penalties
+    )
+    # The full-band chart is the planner's winner for the same song.
+    best, breakdown, _ = pick_best(track, [guitar_only, full_band], config)
+    assert best is full_band
+    assert breakdown.decision == "AUTO_ACCEPT"
+
+
+def test_unrated_guitar_difficulty_penalized(config):
+    # Featured-artist credit keeps scores below the cap so the small penalty
+    # is observable in final_score.
+    track = make_track("Song One", "Artist")
+    unrated = make_chart("Song 1", "Artist ft. Guest", chart_id=1, diff_guitar=None)
+    rated = make_chart("Song 1", "Artist ft. Guest", chart_id=2, diff_guitar=3)
+    unrated_score = score_candidate(track, unrated, config)
+    rated_score = score_candidate(track, rated, config)
+    assert any(
+        "guitar difficulty unrated" in label for label, _ in unrated_score.penalties
+    )
+    assert rated_score.final_score > unrated_score.final_score
+
+
+def test_has_issues_penalty_increased(config):
+    track = make_track("Song", "Artist")
+    chart = make_chart("Song", "Artist")
+    chart.has_issues = True
+    result = score_candidate(track, chart, config)
+    assert ("chart/metadata issues reported", 10) in result.penalties
+
+
+def test_expansion_full_band_beats_single_instrument(config):
+    guitar_only = make_chart("Song", "Artist", chart_id=1, instruments=["guitar"])
+    full_band = make_chart("Song", "Artist", chart_id=2)
+    single = score_expansion_candidate("artist", guitar_only, config)
+    band = score_expansion_candidate("artist", full_band, config)
+    assert any("single-instrument" in label for label, _ in single.penalties)
+    assert band.final_score > single.final_score

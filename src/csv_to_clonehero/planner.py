@@ -15,24 +15,13 @@ from __future__ import annotations
 import json
 import logging
 from concurrent.futures import ThreadPoolExecutor
-from pathlib import Path
 
 from csv_to_clonehero.config import AppConfig
 from csv_to_clonehero.database import Database
-from csv_to_clonehero.filesystem import sanitize_component
-from csv_to_clonehero.models import ChartCandidate
+from csv_to_clonehero.filesystem import destination_path
+from csv_to_clonehero.models import ChartCandidate, Track
 
 log = logging.getLogger(__name__)
-
-
-def _target_relpath(config: AppConfig, section: str, artist: str, name: str, charter: str) -> Path:
-    """<root>/<section>/<Artist>/<Artist> - <Title> [<Charter>].sng"""
-    artist_dir = sanitize_component(artist)
-    filename = f"{artist} - {name}"
-    if charter:
-        filename += f" [{charter}]"
-    filename = sanitize_component(filename, fallback="chart") + ".sng"
-    return Path(config.hierarchy.root_folder) / section / artist_dir / filename
 
 
 def _expansion_tier(score: float) -> int:
@@ -43,12 +32,22 @@ def _expansion_tier(score: float) -> int:
     return 3
 
 
+def _row_quality(row) -> float:
+    """Net bonus/penalty quality persisted with the score (tie-breaker for
+    scores saturated at the 100 cap)."""
+    try:
+        return float(json.loads(row["breakdown_json"]).get("quality", 0.0))
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def build_plan(
     config: AppConfig,
     db: Database,
     size_lookup=None,
     workers: int = 1,
     on_progress=None,
+    include_expansion: bool | None = None,
 ) -> list[dict]:
     """Build the selection list from scored state.
 
@@ -59,6 +58,8 @@ def build_plan(
     Returns the selection dicts (also persisted to the selections table).
     """
     estimate = config.storage.estimated_chart_bytes
+    if include_expansion is None:
+        include_expansion = config.expansion.enabled
 
     # ---- gather exact-match winners ---------------------------------------
     exact_rows = [
@@ -67,17 +68,21 @@ def build_plan(
         if row["decision"] == "AUTO_ACCEPT"
         or (config.matching.download_review_matches and row["decision"] == "REVIEW")
     ]
-    # Best candidate per track only.
+    # Best candidate per track only (score first, quality tie-break).
     best_per_track: dict[int, object] = {}
     for row in exact_rows:
         current = best_per_track.get(row["track_id"])
-        if current is None or row["score"] > current["score"]:
+        if current is None or (row["score"], _row_quality(row)) > (
+            current["score"],
+            _row_quality(current),
+        ):
             best_per_track[row["track_id"]] = row
 
     plan: list[dict] = []
     seen_md5: set[str] = set()
     seen_song: set[str] = set()
     seen_path: set[str] = set()
+    tracks_by_id = {track.db_id: track for track in db.get_tracks()}
 
     def _try_add(kind, candidate, score, explanation, tier, track_id=None, artist_norm=""):
         if candidate.md5 and candidate.md5 in seen_md5:
@@ -85,10 +90,8 @@ def build_plan(
         song_key = f"{candidate.artist_norm}|{candidate.name_norm}"
         if song_key in seen_song:
             return False
-        section = (
-            config.hierarchy.exact_section if kind == "exact" else config.hierarchy.expansion_section
-        )
-        relpath = _target_relpath(config, section, candidate.artist, candidate.name, candidate.charter)
+        track: Track | None = tracks_by_id.get(track_id) if track_id else None
+        relpath = destination_path(config, candidate, kind, track=track)
         path_key = str(relpath).casefold()
         if path_key in seen_path:
             # Same destination from a differently-cased duplicate chart.
@@ -127,49 +130,53 @@ def build_plan(
             track_id=row["track_id"],
         )
 
-    # ---- gather expansion candidates --------------------------------------
-    # Group by artist so caps apply per artist; best score per song only.
-    expansion_rows = db.get_expansion_candidates()
-    by_artist: dict[str, list] = {}
-    artist_caps: dict[str, int] = {
-        row["artist_norm"]: row["cap"] for row in db.get_expansion_artists()
-    }
-    best_per_song: dict[tuple[str, str], object] = {}
-    for row in expansion_rows:
-        if row["score"] < config.expansion.min_score:
-            continue
-        candidate = db.get_candidate(row["candidate_id"])
-        if candidate is None:
-            continue
-        song_key = (row["artist_norm"], f"{candidate.artist_norm}|{candidate.name_norm}")
-        current = best_per_song.get(song_key)
-        if current is None or row["score"] > current["score"]:
-            best_per_song[song_key] = row
+    if include_expansion:
+        # ---- gather expansion candidates ----------------------------------
+        # Group by artist so caps apply per artist; best score per song only.
+        expansion_rows = db.get_expansion_candidates()
+        by_artist: dict[str, list] = {}
+        artist_caps: dict[str, int] = {
+            row["artist_norm"]: row["cap"] for row in db.get_expansion_artists()
+        }
+        best_per_song: dict[tuple[str, str], object] = {}
+        for row in expansion_rows:
+            if row["score"] < config.expansion.min_score:
+                continue
+            candidate = db.get_candidate(row["candidate_id"])
+            if candidate is None:
+                continue
+            song_key = (row["artist_norm"], f"{candidate.artist_norm}|{candidate.name_norm}")
+            current = best_per_song.get(song_key)
+            if current is None or (row["score"], _row_quality(row)) > (
+                current["score"],
+                _row_quality(current),
+            ):
+                best_per_song[song_key] = row
 
-    for (artist_norm, _), row in best_per_song.items():
-        by_artist.setdefault(artist_norm, []).append(row)
+        for (artist_norm, _), row in best_per_song.items():
+            by_artist.setdefault(artist_norm, []).append(row)
 
-    expansion_pool: list[dict] = []
-    for artist_norm, rows in by_artist.items():
-        cap = artist_caps.get(artist_norm, 0)
-        rows.sort(key=lambda r: r["score"], reverse=True)
-        for row in rows[:cap]:
-            expansion_pool.append(row)
+        expansion_pool: list[dict] = []
+        for artist_norm, rows in by_artist.items():
+            cap = artist_caps.get(artist_norm, 0)
+            rows.sort(key=lambda r: r["score"], reverse=True)
+            for row in rows[:cap]:
+                expansion_pool.append(row)
 
-    # Sort expansion by evidence tier, then score descending.
-    expansion_pool.sort(key=lambda r: (_expansion_tier(r["score"]), -r["score"]))
-    for row in expansion_pool:
-        candidate = db.get_candidate(row["candidate_id"])
-        if candidate is None:
-            continue
-        _try_add(
-            "expansion",
-            candidate,
-            row["score"],
-            json.loads(row["breakdown_json"]).get("explanation", ""),
-            _expansion_tier(row["score"]),
-            artist_norm=row["artist_norm"],
-        )
+        # Sort expansion by evidence tier, then score descending.
+        expansion_pool.sort(key=lambda r: (_expansion_tier(r["score"]), -r["score"]))
+        for row in expansion_pool:
+            candidate = db.get_candidate(row["candidate_id"])
+            if candidate is None:
+                continue
+            _try_add(
+                "expansion",
+                candidate,
+                row["score"],
+                json.loads(row["breakdown_json"]).get("explanation", ""),
+                _expansion_tier(row["score"]),
+                artist_norm=row["artist_norm"],
+            )
 
     # ---- resolve sizes and apply the storage budget ------------------------
     if size_lookup is not None and plan:

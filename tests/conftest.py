@@ -22,7 +22,7 @@ def config(tmp_path) -> AppConfig:
     cfg.paths.input_dir = "input_playlists"
     cfg.paths.output_dir = "output_library"
     cfg.paths.reports_dir = "reports"
-    cfg.paths.database = "state/library.db"
+    cfg.paths.database = "state/csv_to_clonehero.db"
     return cfg
 
 
@@ -91,10 +91,17 @@ class FakeSource:
         self.downloads: list[str] = []
 
     def search_song(self, artist, title):
-        return list(self.song_results.get((artist, title), []))
+        # Real adapters stamp each chart with their own source name.
+        results = list(self.song_results.get((artist, title), []))
+        for chart in results:
+            chart.source = self.name
+        return results
 
     def search_artist(self, artist):
-        return list(self.artist_results.get(artist, []))
+        results = list(self.artist_results.get(artist, []))
+        for chart in results:
+            chart.source = self.name
+        return results
 
     def get_chart_metadata(self, chart_id):
         return None

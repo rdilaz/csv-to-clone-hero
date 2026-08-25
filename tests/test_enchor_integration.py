@@ -44,3 +44,11 @@ def test_download_info(source):
     info = source.get_download_info(results[0])
     assert info.supports_direct_download
     assert info.url.startswith("https://files.enchor.us/")
+
+
+def test_search_artist_pagination_returns_many_unique_charts(source):
+    """A prolific cataloged artist should return >250 unique chart ids."""
+    results = source.search_artist("Metallica")
+    chart_ids = {c.chart_id for c in results}
+    assert len(chart_ids) > 250, f"expected pagination to exceed 250 charts, got {len(chart_ids)}"
+    assert len(chart_ids) == len(results), "pagination returned duplicate chart ids"

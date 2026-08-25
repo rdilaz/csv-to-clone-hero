@@ -110,7 +110,23 @@ def test_expansion_cap_respected(config):
     db.close()
 
 
+def test_exact_only_plan_ignores_persisted_expansion(config):
+    db = _setup_db(config)
+    track = make_track("Song A", "Artist A")
+    _insert_track(db, track)
+    exact = make_chart("Song A", "Artist A", chart_id=1)
+    expansion = make_chart("Song B", "Artist A", chart_id=2)
+    _record_exact(db, config, track, exact)
+    _record_expansion(db, "Artist A", "artist a", expansion, score=95.0)
+
+    plan = build_plan(config, db, include_expansion=False)
+    assert [entry["kind"] for entry in plan] == ["exact"]
+    assert db.get_selections()[0]["kind"] == "exact"
+    db.close()
+
+
 def test_windows_safe_target_paths(config):
+    config.library.layout = "legacy"
     db = _setup_db(config)
     track = make_track("Song: Live?", "AC/DC")
     chart = make_chart("Song: Live?", "AC/DC", chart_id=1)

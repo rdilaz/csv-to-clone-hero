@@ -1,0 +1,24 @@
+{% extends "base.html" %}
+{% block title %}Mission — CSV to Clone Hero{% endblock %}
+{% block content %}
+<section class="card">
+  <h1>Our mission</h1>
+  <p>CSV to Clone Hero is a free community tool that finds every song in your
+     Spotify library that already has a playable chart on Chorus Encore, so you
+     can drop a complete, organized collection into Clone Hero or YARG.</p>
+  <h2>Support the people behind the game</h2>
+  <p>Clone Hero is a free, fan-made rhythm game built by one dedicated creator
+     and the community. That creator is currently fighting cancer, and the game
+     lives on because of people who give back. If you love what we all play,
+     please consider chipping in.</p>
+  {% if config.monetization.effective_gofundme_url %}
+  <p><a class="btn" href="{{ config.monetization.effective_gofundme_url }}" target="_blank" rel="noopener">GoFundMe — help the Clone Hero creator</a></p>
+  {% endif %}
+  <h2>How we respect you and this community</h2>
+  <ul>
+    <li>We never store chart files. Downloads stream to your computer.</li>
+    <li>Your Spotify refresh token is encrypted at rest and used only to find songs.</li>
+    <li>This site runs ads to cover hosting; the ad experience is meant to stay tasteful.</li>
+  </ul>
+</section>
+{% endblock %}

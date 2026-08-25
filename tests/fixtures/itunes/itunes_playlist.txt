@@ -1,0 +1,5 @@
+Name	Artist	Album	Genre	Time	Year
+Everlong	Foo Fighters	The Colour and the Shape	Rock	4:10	1997
+Midnight City	M83	Hurry Up, We're Dreaming	Electronic	4:03	2011
+Orphans	Coldplay	Everyday Life	Alternative	3:17	2019
+Loose Track	Solo Artist		Folk	2:30	2005

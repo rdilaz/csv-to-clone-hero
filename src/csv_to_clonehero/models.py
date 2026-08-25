@@ -7,6 +7,10 @@ source-specific (e.g. Enchor) payload shapes.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Any
+
+# Album bucket for tracks with no album metadata (master list + library layout).
+SINGLES_ALBUM_LABEL = "Singles"
 
 
 @dataclass
@@ -26,6 +30,15 @@ class Track:
     spotify_id: str = ""
     playlists: list[str] = field(default_factory=list)
     db_id: int | None = None
+    # Spotify/library metadata is optional so CSV and iTunes callers keep the
+    # original constructor contract.
+    duration_ms: int | None = None
+    isrc: str = ""
+    spotify_url: str = ""
+    origin_metadata: dict[str, Any] = field(default_factory=dict)
+    album_id: str = ""
+    added_at: str | None = None
+    origin: str = ""
 
 
 @dataclass
@@ -60,6 +73,63 @@ class ChartCandidate:
     url: str = ""
     supports_download: bool = True
     db_id: int | None = None
+    # Source-owned provenance and review metadata.  ``artwork_url`` and
+    # ``artwork_id`` are retained as convenient aliases for integrations that
+    # do not use the more explicit source-prefixed names.
+    source_artwork_url: str = ""
+    source_artwork_id: str = ""
+    issue_details: list[str] = field(default_factory=list)
+    issue_severity: str = ""
+    review_status: str = ""
+    review_url: str = ""
+    song_id: int | str | None = None
+    version_id: int | str | None = None
+    version_group_id: int | str | None = None
+    group_id: int | str | None = None
+    source_total: int | None = None
+    cap_reached: bool = False
+    returned_count: int | None = None
+    # Normalized Bridge/Enchor difficulty fields.  The original six fields
+    # above remain untouched for legacy matchers and callers.
+    diff_band: int | None = None
+    diff_guitar_coop: int | None = None
+    diff_rhythm: int | None = None
+    diff_drums_real: int | None = None
+    diff_guitar_coop_ghl: int | None = None
+    diff_rhythm_ghl: int | None = None
+    diff_bassghl: int | None = None
+    diff_guitar_ghl: int | None = None
+    diff_bass_ghl: int | None = None
+    diff_vocals_harm1: int | None = None
+    diff_vocals_harm2: int | None = None
+    diff_vocals_harm3: int | None = None
+    difficulty_fields: dict[str, int | None] = field(default_factory=dict)
+    difficulties: dict[str, int | None] = field(default_factory=dict)
+    source_metadata: dict[str, Any] = field(default_factory=dict)
+    artwork_url: str = ""
+    artwork_id: str = ""
+    issues: list[str] = field(default_factory=list)
+    diff_guitarghl_coop: int | None = None
+    diff_rhythmghl: int | None = None
+
+    def __post_init__(self) -> None:
+        """Keep source-artwork aliases in sync without changing old callers."""
+        if isinstance(self.issue_details, str):
+            self.issue_details = [self.issue_details]
+        if isinstance(self.issues, str):
+            self.issues = [self.issues]
+        if not self.source_artwork_url and self.artwork_url:
+            self.source_artwork_url = self.artwork_url
+        if not self.artwork_url and self.source_artwork_url:
+            self.artwork_url = self.source_artwork_url
+        if not self.source_artwork_id and self.artwork_id:
+            self.source_artwork_id = self.artwork_id
+        if not self.artwork_id and self.source_artwork_id:
+            self.artwork_id = self.source_artwork_id
+        if not self.issue_details and self.issues:
+            self.issue_details = list(self.issues)
+        if not self.issues and self.issue_details:
+            self.issues = list(self.issue_details)
 
     @property
     def has_five_fret_guitar(self) -> bool:
@@ -95,6 +165,12 @@ class ScoreBreakdown:
     final_score: float = 0.0
     decision: str = "REJECT"  # AUTO_ACCEPT | REVIEW | REJECT | INCOMPATIBLE
     reasons: list[str] = field(default_factory=list)
+
+    @property
+    def quality(self) -> float:
+        """Net bonus/penalty signal. Breaks ties when final_score saturates
+        at the 100 cap, so higher-quality charts still win the plan."""
+        return sum(v for _, v in self.bonuses) - sum(v for _, v in self.penalties)
 
     def explain(self) -> str:
         parts = [

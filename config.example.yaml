@@ -1,0 +1,148 @@
+# =============================================================================
+# CSV to Clone Hero - example configuration (COMMIT-SAFE; contains no secrets)
+#
+# On first run the app writes a fresh config.yaml next to base config defaults,
+# and config.yaml is gitignored. For a production deployment, copy this file to
+# config.yaml (or let the app create it) and set all secrets via the
+# environment / secret manager instead of editing them here.
+#
+# Required secrets (see .env.example):
+#   SPOTIFY_CLIENT_ID          - public Spotify app client id
+#   APP_BASE_URL               - public HTTPS origin of this product
+#   SECRET_KEY                 - session signing key (python -m csv_to_clonehero keys)
+#   TOKEN_ENCRYPTION_KEY       - Fernet key for per-user refresh tokens
+#   NOTIFICATIONS_API_KEY      - optional transactional email provider key
+#   GOFUNDME_URL               - optional GoFundMe campaign URL
+# =============================================================================
+
+server:
+  # Public HTTPS origin. Also the Spotify OAuth redirect base, so register
+  # <origin>/api/auth/spotify/callback in the Spotify Developer Dashboard.
+  base_url: ""
+  base_url_env: APP_BASE_URL
+  secret_key_env: SECRET_KEY
+  enforce_secret_key: true
+  database_url_env: DATABASE_URL
+  database_url: ""
+
+crypto:
+  key_env: TOKEN_ENCRYPTION_KEY
+
+sessions:
+  cookie_name: c2ch_session
+  cookie_same_site: Lax
+  cookie_secure: null      # auto-enable over HTTPS
+  max_age_seconds: 2592000
+  domain: ""
+
+notifications:
+  enabled: true
+  provider: resend         # resend | smtp | log
+  api_key_env: NOTIFICATIONS_API_KEY
+  from_address: "noreply@ryo-nd.com"
+
+monetization:
+  ads_enabled: true
+  ad_banner_slot: ""
+  ad_sidebar_slot: ""
+  gofundme_enabled: true
+  gofundme_banner: true
+  gofundme_url_env: GOFUNDME_URL
+  gofundme_url: ""
+
+admin:
+  # Legacy single-user CSV/upload UI. Only shown to listed Spotify user ids.
+  enable_legacy_csv: false
+  admins: []
+
+spotify:
+  # Public application id. Leave "" to read SPOTIFY_CLIENT_ID from env.
+  client_id: ""
+  client_id_env: SPOTIFY_CLIENT_ID
+  redirect_path: /api/auth/spotify/callback
+  scopes:
+    - user-read-private
+    - playlist-read-private
+    - playlist-read-collaborative
+    - user-library-read
+  keyring:
+    service: csv-to-clonehero.spotify
+    user: ""
+
+build:
+  dry_run: false
+  direct_download_enabled: true
+
+matching:
+  auto_accept_threshold: 90.0
+  review_threshold: 70.0
+  download_review_matches: false
+  artist_conflict_threshold: 55.0
+  recommendation_threshold: 90.0
+  export_floor: 70.0
+  duration_tolerance_ms: 5000
+  matcher_version: spotify-v1
+
+instruments:
+  require_five_fret_guitar: true
+  allow_six_fret_only: false
+  allow_no_guitar: false
+  exclude_modcharts: true
+
+expansion:
+  enabled: true
+  cap_many_songs: 50
+  min_songs_many: 5
+  cap_some_songs: 25
+  cap_one_song: 10
+  cap_featured_only: 0
+  min_score: 80.0
+
+storage:
+  max_library_gib: 48.0
+  estimated_chart_bytes: 31457280
+
+network:
+  # Enchor rate-limits hard (~1-2 req/s per IP). A public app shares one IP,
+  # so keep global concurrency LOW and rely on the adaptive throttle + 7-day
+  # cache. Being slow is fine; correctness and completion messaging matter more.
+  request_delay_seconds: 0.5
+  concurrency: 1
+  retries: 3
+  timeout_seconds: 60
+  cache_ttl_days: 7
+
+cache:
+  enabled: true
+  ttl_days: 7
+  cache_errors: false
+  resume: true
+
+scan:
+  blocking: true
+  resume: true
+  persist_progress: true
+  retry_failed_queries: true
+  status_poll_interval_ms: 1500
+
+search:
+  artist_catalog_first: true
+  artist_catalog_min_songs: 3
+  result_cap: 250
+  max_search_pages: 20
+  candidate_shortlist_size: 12
+
+sources:
+  enabled: [enchor]
+
+export:
+  managed_sync: false
+  overwrite_owned: true
+  include_manifest_in_zip: true
+  minimum_free_bytes: 0
+
+library:
+  layout: hybrid
+
+logging:
+  level: INFO

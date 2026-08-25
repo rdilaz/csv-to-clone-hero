@@ -1,0 +1,54 @@
+# A single stateful backend host for ALL of the operator's products.
+# Consolidation: each product is its own container + subdomain on one host,
+# sharing one SQLite volume each. Cloudflare stays as DNS/edge in front.
+#
+#   docker compose up -d --build
+#   docker compose down           # stop
+#   docker compose run --rm backupper-backup      # documented in docs/runbook.md
+#
+# Secrets come from the environment / .env (gitignored). See .env.example.
+services:
+  clonehero:
+    image: csv-to-clonehero:latest
+    build: .
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      APP_BASE_URL: ${APP_BASE_URL:?APP_BASE_URL is required}
+      SPOTIFY_CLIENT_ID: ${SPOTIFY_CLIENT_ID:?SPOTIFY_CLIENT_ID is required}
+      SECRET_KEY: ${SECRET_KEY:?SECRET_KEY is required}
+      TOKEN_ENCRYPTION_KEY: ${TOKEN_ENCRYPTION_KEY:?TOKEN_ENCRYPTION_KEY is required}
+      DATABASE_URL: sqlite:////data/csv_to_clonehero.db
+      NOTIFICATIONS_API_KEY: ${NOTIFICATIONS_API_KEY:-}
+      GOFUNDME_URL: ${GOFUNDME_URL:-}
+    ports:
+      - "127.0.0.1:8000:8000"     # only reachable via the edge (see runbook)
+    volumes:
+      - clonehero-data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=4)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # Small sidecar for documented backups (only monthly if you prefer).
+  # Docs: `docker compose run --rm backupper` writes to ./backups (gitignored).
+  backupper:
+    image: alpine:3.20
+    profiles: ["backup"]
+    restart: "no"
+    volumes:
+      - clonehero-data:/data:ro
+      - ${PWD}/backups:/backups
+    entrypoint: >
+      /bin/sh -c "apk add --no-cache sqlite >/dev/null 2>&1;
+      mkdir -p /backups &&
+      . /etc/alpine-release && \
+      sqlite3 /data/csv_to_clonehero.db '.backup /backups/csv_to_clonehero_$$(date +%Y%m%d_%H%M%S).db'"
+
+volumes:
+  clonehero-data:
+    # On a plain VPS this is a bind mount or local volume; document where it
+    # lives and back it up (docs/runbook.md).

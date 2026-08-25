@@ -1,7 +1,10 @@
 @echo off
 rem ===========================================================================
 rem  CSV to Clone Hero - web interface (no terminal needed)
-rem  Opens a local web page where you can upload CSVs and build the library.
+rem  Opens a local web page: sign in, sync Spotify, choose a search scope, and
+rem  find charts. Existing Songs inventory is read-only; /advanced is CSV mode.
+rem  Same-Wi-Fi mode: WEB_INTERFACE.bat --lan
+rem  Public HTTPS mode: WEB_INTERFACE.bat --public-url https://your-address
 rem ===========================================================================
 setlocal
 cd /d "%~dp0"
@@ -35,7 +38,8 @@ if not exist ".venv\Scripts\python.exe" (
     if errorlevel 1 goto :setup_failed
 )
 
-".venv\Scripts\python.exe" -m csv_to_clonehero web %*
+rem The reloader restarts Flask after source changes; refresh the browser to see them.
+".venv\Scripts\python.exe" -m csv_to_clonehero web --reload %*
 pause
 exit /b 0
 

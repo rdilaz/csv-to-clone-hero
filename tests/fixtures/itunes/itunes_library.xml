@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple Computer//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Major Version</key><integer>1</integer>
+	<key>Minor Version</key><integer>1</integer>
+	<key>Application Version</key><string>12.9.5</string>
+	<key>Music Folder</key><string>file://localhost/C:/Users/test/Music/iTunes/iTunes%20Media/</string>
+	<key>Tracks</key>
+	<dict>
+		<key>101</key>
+		<dict>
+			<key>Track ID</key><integer>101</integer>
+			<key>Name</key><string>Everlong</string>
+			<key>Artist</key><string>Foo Fighters</string>
+			<key>Album</key><string>The Colour and the Shape</string>
+			<key>Kind</key><string>MPEG audio file</string>
+			<key>Total Time</key><integer>250000</integer>
+		</dict>
+		<key>102</key>
+		<dict>
+			<key>Track ID</key><integer>102</integer>
+			<key>Name</key><string>Midnight City</string>
+			<key>Artist</key><string>M83</string>
+			<key>Album</key><string>Hurry Up, We're Dreaming</string>
+			<key>Kind</key><string>MPEG audio file</string>
+		</dict>
+		<key>103</key>
+		<dict>
+			<key>Track ID</key><integer>103</integer>
+			<key>Name</key><string>Untitled Bonus</string>
+			<key>Album Artist</key><string>Various Artists</string>
+			<key>Album</key><string>Compilation</string>
+		</dict>
+		<key>104</key>
+		<dict>
+			<key>Track ID</key><integer>104</integer>
+			<key>Name</key><string></string>
+			<key>Artist</key><string></string>
+		</dict>
+	</dict>
+	<key>Playlists</key>
+	<array/>
+</dict>
+</plist>

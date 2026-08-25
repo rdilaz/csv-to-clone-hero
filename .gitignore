@@ -1,12 +1,32 @@
 # User data - never commit private playlist exports
 input_playlists/*.csv
 
+# Secrets and local configuration - NEVER commit
+config.yaml
+.env
+.env.*
+!.env.example
+*.local
+*.pem
+*.key
+
 # Application state and output
 state/
 output_library/
 reports/
 logs/
+backups/
 *.part
+*.sng.part
+
+# Local tooling and stray files (never commit)
+.kilo/
+*.png
+csv to clone hero/
+
+# Operator launchers that may embed machine-specific access tokens
+WEB_REMOTE.bat
+REMOTE_TUNNEL.bat
 
 # Python
 __pycache__/

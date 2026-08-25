@@ -1,0 +1,121 @@
+{% extends "base.html" %}
+{% block title %}CSV to Clone Hero{% endblock %}
+{% block content %}
+{% if not authenticated %}
+<section class="card">
+  <h1>Get every song that already has a Chart</h1>
+  <p>Sign in with Spotify. We find every song in your library that already has a
+     playable chart on <strong>Chorus Encore</strong>, score the best match, and hand
+     you a ZIP to drop into your Clone Hero / YARG <code>Songs</code> folder.</p>
+  <ul>
+    <li>No account, no password — just your real Spotify login.</li>
+    <li>Charts stream to <strong>your</strong> computer; we never store them.</li>
+    <li>Your Spotify refresh token is encrypted at rest; we hold only query cache and job state.</li>
+  </ul>
+  <p><a class="btn" href="/login">Continue with Spotify</a></p>
+  <p class="muted">By continuing you agree to our <a href="/terms">Terms</a> and
+     <a href="/privacy">Privacy Policy</a>.</p>
+</section>
+{% else %}
+<section class="card">
+  <h1>Welcome, {{ user.display_name }}</h1>
+  <p class="muted">Scanning may take a while — Enchor rate-limits us, so we go
+     slowly and safely. You'll stay on this page and watch progress; you can
+     optionally be emailed when it finishes.</p>
+  <div class="field">
+    <button class="btn" id="startBtn" onclick="startJob()">Find my songs' charts</button>
+    <button class="btn ghost" id="downloadBtn" style="display:none" onclick="downloadZip()">Download selected (.zip)</button>
+  </div>
+  <div id="status" style="display:none">
+    <div id="statusMsg"></div>
+    <div class="bar"><span id="bar"></span></div>
+  </div>
+  <div id="error" class="error" style="display:none"></div>
+  <div id="review" style="display:none">
+    <h2>Matches — select which to download</h2>
+    <div id="cards"></div>
+  </div>
+</section>
+{% endif %}
+{% endblock %}
+
+{% block scripts %}{% if authenticated %}
+<script>
+let jobId = null, pollTimer = null, tracks = [];
+
+function show(msg, pct) {
+  document.getElementById('status').style.display = 'block';
+  document.getElementById('statusMsg').textContent = msg;
+  document.getElementById('bar').style.width = (pct||0) + '%';
+}
+function fail(msg) {
+  const el = document.getElementById('error');
+  el.textContent = msg; el.style.display = 'block';
+}
+
+async function startJob() {
+  document.getElementById('startBtn').disabled = true;
+  try {
+    const d = await api('/api/jobs', {method:'POST', body: JSON.stringify({kind:'discovery'})});
+    jobId = d.job.id; pollTimer = setInterval(poll, 1500); poll();
+  } catch (e) { fail(e.message); document.getElementById('startBtn').disabled = false; }
+}
+async function poll() {
+  const d = await api('/api/jobs/' + jobId);
+  const j = d.job;
+  const prog = j.progress || {};
+  const total = prog.total_work || prog.scoring_tasks_total || 1;
+  const done = prog.completed_work || prog.scoring_tasks_completed || 0;
+  const pct = Math.min(100, Math.round(done/total*100));
+  show(j.message || j.phase, pct);
+  document.getElementById('startBtn').textContent = 'Searching… ' + pct + '%';
+  if (['complete','partial','failed'].includes(j.status)) {
+    clearInterval(pollTimer);
+    document.getElementById('startBtn').textContent = j.status === 'failed' ? 'Search again' : 'Search again';
+    document.getElementById('startBtn').disabled = false;
+    if (j.status === 'failed') { fail(j.error || 'Search failed'); }
+    if (j.status !== 'failed') { await loadWorkspace(); }
+  }
+}
+async function loadWorkspace() {
+  const d = await api('/api/workspace');
+  tracks = d.tracks || [];
+  document.getElementById('startBtn').style.display = 'none';
+  document.getElementById('downloadBtn').style.display = '';
+  const cards = document.getElementById('cards');
+  const host = document.getElementById('review');
+  host.style.display = 'block';
+  cards.innerHTML = tracks.map(t => `
+    <div class="card" style="margin-top:10px">
+      <strong>${esc(t.artist)} — ${esc(t.title)}</strong> <span class="muted">(${esc(t.album||'')})</span>
+      <ul>
+      ${(t.candidates||[]).map(c => `
+        <li>
+          <input type="checkbox" ${c.selected?'checked':''}
+                 onchange="toggle('${t.track_key}', ${c.candidate_id}, ${c.selected?1:0})">
+          <strong>${esc(c.artist)}</strong> — ${esc(c.title)}
+          <span class="muted">score ${Math.round(c.score)} · ${esc(c.eligibility)}</span>
+        </li>`).join('')}
+      </ul>
+    </div>`).join('') || '<p class="muted">No matches yet.</p>';
+}
+async function toggle(trackKey, candidateId, currentlySelected) {
+  const action = currentlySelected ? 'clear' : 'select';
+  await api('/api/selection', {method:'POST', body: JSON.stringify({
+    track_key: trackKey, candidate_id: candidateId, action, elig_ok:true
+  })});
+  await loadWorkspace();
+}
+async function downloadZip() {
+  document.getElementById('downloadBtn').disabled = true;
+  try {
+    const d = await api('/api/download', {method:'POST', body: JSON.stringify({})});
+    window.location.href = '/api/download/' + d.download.token;
+    setTimeout(() => document.getElementById('downloadBtn').disabled = false, 5000);
+  } catch (e) { fail(e.message); document.getElementById('downloadBtn').disabled = false; }
+}
+function esc(v) {
+  return String(v ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+</script>
+{% endif %}{% endblock %}

@@ -1,0 +1,62 @@
+{% extends "base.html" %}
+{% block title %}{{ page }} — CSV to Clone Hero{% endblock %}
+{% block content %}
+<section class="card">
+  <h1>{{ page }}</h1>
+
+  {% if page == "Terms of Service" %}
+  <p class="muted">Last updated: {{ now_year }}. This is a plain-English summary; legally binding terms follow the same intent.</p>
+  <h2>1. What this service does</h2>
+  <p>CSV to Clone Hero connects your Spotify library to chart files hosted by
+     independent chart authors (via Chorus Encore). We help you find and
+     download those chart files.</p>
+  <h2>2. Your account</h2>
+  <p>There is no separate account or password. You sign in with your own Spotify
+     account (PKCE OAuth). We store minimal account data — your Spotify user id,
+     display name, and an encrypted refresh token used only to read your library.</p>
+  <h2>3. Acceptable use</h2>
+  <p>You agree to use this service only for personal, non-commercial rhythm-game
+     play. Do not redistribute chart files, scrape, or automate access.</p>
+  <h2>4. No warranties</h2>
+  <p>This service is provided "as is" without warranties of any kind. We are not
+     liable for the chart files made available through Chorus Encore.</p>
+  <h2>5. Limitation of liability</h2>
+  <p>Our liability is limited to the maximum extent permitted by law.</p>
+
+  {% elif page == "Privacy Policy" %}
+  <p class="muted">Last updated: {{ now_year }}.</p>
+  <h2>What we collect</h2>
+  <ul>
+    <li><strong>Spotify identity:</strong> your Spotify user id and display name (used as your login).</li>
+    <li><strong>Encrypted refresh token:</strong> stored at rest encrypted with a server key; used only to read your library on your behalf.</li>
+    <li><strong>Query cache:</strong> anonymized search results cached up to 7 days to avoid hammering Chorus Encore.</li>
+    <li><strong>Optional email:</strong> only to notify you when a long job finishes — never for marketing and never your identity.</li>
+  </ul>
+  <h2>What we do NOT collect</h2>
+  <p>We do not store chart files, your listening history, or any data from
+     services other than Spotify. We never sell your data.</p>
+  <h2>Cookies and sessions</h2>
+  <p>We use a single signed, HttpOnly session cookie to keep you signed in.</p>
+  <h2>Your choices</h2>
+  <p>Sign out at any time. You can revoke this app's access from your Spotify
+     account settings, which deletes our ability to act for you.</p>
+
+  {% else %}
+  <h2>Copyright</h2>
+  <p>Chart files are the work of their individual authors and are available
+     through Chorus Encore (enchor.us). We do not host chart files. Song
+     metadata and track names are used solely to match your Spotify library to
+     existing charts.</p>
+  <h2>DMCA takedowns</h2>
+  <p>If you believe material available via this site or linked chart content
+     infringes your copyright, please contact the operator with:
+     identification of the work, the URL, and a statement of good-faith belief
+     that the use is unauthorized.</p>
+  <p>We will respond promptly. Our full contact and process are available on
+     request. The operator is reachable at the address listed in this product's
+     portfolio domain (ryo-nd.com).</p>
+  <p>To remove chart content you own, please also notify the host of the chart
+     files (enchor.us).</p>
+  {% endif %}
+</section>
+{% endblock %}
