@@ -5,6 +5,8 @@ import io
 import json
 import os
 import re
+import shutil
+import subprocess
 import threading
 import time
 import zipfile
@@ -26,6 +28,19 @@ def client(config):
     app.config["TESTING"] = True
     with app.test_client() as client:
         yield client
+
+
+def wait_for_soundcloud_import(client, payload, timeout=5.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        status = client.get(
+            "/api/sources/soundcloud/import/status"
+            f"?run_id={payload['run_id']}"
+        ).get_json()
+        if not status["running"]:
+            return status
+        time.sleep(0.01)
+    pytest.fail("SoundCloud import did not finish in time")
 
 
 def test_index_serves_spotify_workflow(client):
@@ -64,16 +79,44 @@ def test_index_serves_spotify_workflow(client):
     assert len(ids) == len(set(ids))
 
 
+def test_home_inline_script_parses_in_javascript_engine(client, tmp_path):
+    if shutil.which("node") is None:
+        pytest.skip("Node.js is not installed")
+
+    html = client.get("/").get_data(as_text=True)
+    scripts = re.findall(r"<script>\s*(.*?)\s*</script>", html, flags=re.DOTALL)
+    assert len(scripts) == 1
+    script_path = tmp_path / "home.js"
+    script_path.write_text(scripts[0], encoding="utf-8")
+    checked = subprocess.run(
+        ["node", "--check", str(script_path)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert checked.returncode == 0, checked.stderr
+    assert "/api/sources/soundcloud/import" in scripts[0]
+    assert "/api/sources/soundcloud/import/status" in scripts[0]
+    assert "/api/discovery/start" in scripts[0]
+
+
 def test_soundcloud_export_is_first_class_local_source_without_spotify(client):
     response = client.post(
         "/api/sources/soundcloud/import",
         data={"file": (io.BytesIO(b"Track name,Artist name,Playlist name,Type,Soundcloud - id\nArtist - Song,Lyricist,Liked Songs,Favorite,sc-1\n"), "likes.csv")},
         content_type="multipart/form-data",
     )
-    assert response.status_code == 200
+    assert response.status_code == 202
     payload = response.get_json()
-    assert payload["source"]["tracks"] == 1
-    assert payload["combined"]["tracks"] == 1
+    assert payload["status"] == "running"
+    assert payload["run_id"]
+    status = wait_for_soundcloud_import(client, payload)
+    assert status["status"] == "complete"
+    assert status["progress"]["total_tracks"] == 1
+    assert status["progress"]["persisted_tracks"] == 1
+    result = status["result"]
+    assert result["source"]["tracks"] == 1
+    assert result["combined"]["tracks"] == 1
     summary = client.get("/api/sources").get_json()
     assert summary["sources"][0]["provider"] == "soundcloud"
 
@@ -84,9 +127,11 @@ def test_soundcloud_import_persists_redacted_diagnostics(client, config):
         data={"file": (io.BytesIO(b"Track name,Artist name\nArtist - Song,\nBad row,\n"), "likes.csv")},
         content_type="multipart/form-data",
     )
-    assert response.status_code == 200
+    assert response.status_code == 202
     payload = response.get_json()
     assert payload["run_id"]
+    import_status = wait_for_soundcloud_import(client, payload)
+    assert import_status["status"] == "complete"
     status = client.get(f"/api/discovery/status?workspace_id={payload['workspace_id']}").get_json()
     assert status["diagnostics_url"].endswith(payload["run_id"])
     assert status["diagnostics"]["counters"]["accepted_input_rows"] == 1
@@ -957,7 +1002,10 @@ def test_advanced_page_serves_music_file_import_workflow(client):
         "CSV &amp; music-file import",
         "Add music exports",
         "Preview chart matches",
-        "Review choices",
+        "Review your matches",
+        "My music",
+        "Best chart",
+        "Why this match?",
         "Download selected charts",
         "iTunes/Music TXT",
         "iTunes/Music XML",

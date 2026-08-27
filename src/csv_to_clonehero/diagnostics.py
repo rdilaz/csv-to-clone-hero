@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import secrets
+import threading
 import time
 from pathlib import Path
 from typing import Any, Mapping
@@ -12,6 +13,7 @@ from typing import Any, Mapping
 
 MAX_SAMPLE = 50
 MAX_REASONS = 200
+_WRITE_LOCK = threading.RLock()
 
 
 def _safe(value: Any) -> Any:
@@ -77,9 +79,30 @@ class RunDiagnostics:
 
     def _write(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = self.path.with_suffix(".tmp")
-        temporary.write_text(json.dumps(self.data, indent=2, sort_keys=True), encoding="utf-8")
-        os.replace(temporary, self.path)
+        payload = json.dumps(self.data, indent=2, sort_keys=True)
+        # Windows can reject replacing the destination while a status request
+        # still has the previous JSON file open. A unique temp file avoids
+        # collisions between writers; retries keep that transient read lock
+        # from aborting the actual discovery job.
+        temporary = self.path.with_name(
+            f".{self.path.name}.{os.getpid()}.{threading.get_ident()}.{secrets.token_hex(4)}.tmp"
+        )
+        with _WRITE_LOCK:
+            temporary.write_text(payload, encoding="utf-8")
+            try:
+                for attempt in range(8):
+                    try:
+                        os.replace(temporary, self.path)
+                        break
+                    except PermissionError:
+                        if attempt == 7:
+                            return
+                        time.sleep(0.02 * (attempt + 1))
+            finally:
+                try:
+                    temporary.unlink()
+                except FileNotFoundError:
+                    pass
 
 
 def diagnostics_path(state_dir: Path | str, run_id: str) -> Path:

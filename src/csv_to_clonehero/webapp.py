@@ -80,6 +80,7 @@ from csv_to_clonehero.pipeline import (
     run_search,
 )
 from csv_to_clonehero.reporting import generate_reports, generate_spotify_reports
+from csv_to_clonehero.review_presentation import build_review_presentation
 from csv_to_clonehero.sources import build_sources
 from csv_to_clonehero.sources.base import ChartSource, source_catalog_available
 from csv_to_clonehero.normalization import normalize_artist, normalize_title
@@ -623,6 +624,143 @@ class _SpotifyJobState:
                 "worker_known": self.worker is not None,
                 "last_activity_at": self._last_counter_at,
             }
+
+
+class _SoundCloudImportJobState:
+    """Thread-safe state for the local SoundCloud export import."""
+
+    def __init__(self) -> None:
+        self.lock = threading.RLock()
+        self.reset()
+
+    def reset(self) -> None:
+        with getattr(self, "lock", threading.RLock()):
+            self.running = False
+            self.status = "idle"
+            self.phase = "idle"
+            self.message = ""
+            self.error = ""
+            self.workspace_id: int | None = None
+            self.workspace_key = ""
+            self.run_id = ""
+            self.filename = ""
+            self.started_at: float | None = None
+            self.finished_at: float | None = None
+            self.progress: dict[str, Any] = {
+                "total_bytes": 0,
+                "bytes_read": 0,
+                "total_rows": 0,
+                "accepted_rows": 0,
+                "skipped_rows": 0,
+                "duplicate_rows": 0,
+                "total_tracks": 0,
+                "persisted_tracks": 0,
+            }
+            self.events: deque = deque(maxlen=LOG_EVENT_LIMIT)
+            self.result: dict[str, Any] | None = None
+            self.worker: threading.Thread | None = None
+            self._last_message = ""
+
+    def begin(
+        self,
+        *,
+        workspace_id: int,
+        workspace_key: str,
+        run_id: str,
+        filename: str,
+        total_bytes: int,
+    ) -> None:
+        with self.lock:
+            self.reset()
+            self.running = True
+            self.status = "running"
+            self.phase = "queued"
+            self.message = "Upload accepted; preparing the SoundCloud import..."
+            self.workspace_id = int(workspace_id)
+            self.workspace_key = str(workspace_key)
+            self.run_id = str(run_id)
+            self.filename = str(filename)
+            self.started_at = time.time()
+            self.progress["total_bytes"] = int(total_bytes)
+            self._log_locked(self.message)
+
+    def attach_worker(self, worker: threading.Thread) -> None:
+        with self.lock:
+            self.worker = worker
+
+    def update(self, payload: Mapping[str, Any] | None = None) -> None:
+        with self.lock:
+            data = dict(payload or {})
+            self.phase = str(data.get("phase") or self.phase)
+            self.status = str(data.get("status") or self.status or "running")
+            if data.get("message"):
+                self.message = _safe_message(data["message"])
+            for key in self.progress:
+                if key not in data:
+                    continue
+                try:
+                    self.progress[key] = int(data[key] or 0)
+                except (TypeError, ValueError):
+                    self.progress[key] = data[key]
+            if data.get("error"):
+                self.error = _safe_message(data["error"])
+            if self.message and self.message != self._last_message:
+                self._log_locked(self.message)
+                self._last_message = self.message
+
+    def finish(self, result: Mapping[str, Any]) -> None:
+        with self.lock:
+            self.running = False
+            self.status = str(result.get("status") or "complete")
+            self.phase = str(result.get("phase") or "complete")
+            self.message = str(result.get("message") or "SoundCloud import complete.")
+            self.error = _safe_message(result.get("error") or "")
+            self.finished_at = time.time()
+            self.result = dict(result)
+            self._log_locked(self.message)
+
+    def fail(self, error: Any) -> None:
+        with self.lock:
+            self.running = False
+            self.status = "failed"
+            self.phase = "failed"
+            self.error = _safe_message(error)
+            self.message = f"SoundCloud import failed: {self.error}"
+            self.finished_at = time.time()
+            self._log_locked(self.message)
+
+    def snapshot(self) -> dict[str, Any]:
+        with self.lock:
+            now = time.time()
+            end = now if self.running else (self.finished_at or now)
+            elapsed = (
+                max(0.0, end - self.started_at)
+                if self.started_at is not None
+                else 0.0
+            )
+            return {
+                "running": self.running,
+                "status": self.status,
+                "phase": self.phase,
+                "message": self.message,
+                "error": self.error,
+                "workspace_id": self.workspace_id,
+                "workspace_key": self.workspace_key,
+                "run_id": self.run_id,
+                "filename": self.filename,
+                "started_at": self.started_at,
+                "finished_at": self.finished_at,
+                "elapsed_seconds": round(elapsed, 3),
+                "progress": dict(self.progress),
+                "events": list(self.events),
+                "recent_events": list(self.events)[-6:],
+                "result": self.result,
+                "worker_alive": bool(self.worker and self.worker.is_alive()),
+                "worker_known": self.worker is not None,
+            }
+
+    def _log_locked(self, message: str) -> None:
+        self.events.append({"ts": time.time(), "message": _safe_message(message)})
 
 
 class _ExportJobState:
@@ -1239,33 +1377,44 @@ def _review_payload(
                 explanation = str(breakdown.get("explanation", ""))
         except (TypeError, ValueError):
             pass
-        grouped.setdefault(row["track_id"], []).append(
-            {
-                "candidate_artist": candidate.artist,
-                "candidate_title": candidate.name,
-                "source": candidate.source,
-                "chart_id": candidate.chart_id,
-                "score": round(row["score"], 1),
-                "decision": row["decision"],
-                "automatic_decision": row["decision"],
-                "explanation": explanation,
-                "breakdown": breakdown,
-                "base_score": float(breakdown.get("base_score") or 0),
-                "bonuses": list(breakdown.get("bonuses") or []),
-                "penalties": list(breakdown.get("penalties") or []),
-                "gate_factors": dict(breakdown.get("gate_factors") or {}),
-                "quality_factors": dict(breakdown.get("quality_factors") or {}),
-                "charter": candidate.charter,
-                "instruments": candidate.instruments,
-                "diff_guitar": candidate.diff_guitar,
-                "guitar_difficulty": candidate.diff_guitar,
-                "url": candidate.url,
-                "reference": candidate.reference,
-                "chart_reference": candidate.reference,
-                "manual": manual,
-                "manual_decision": manual,
-            }
-        )
+        item = {
+            "candidate_artist": candidate.artist,
+            "candidate_title": candidate.name,
+            "source": candidate.source,
+            "chart_id": candidate.chart_id,
+            "score": round(row["score"], 1),
+            "decision": row["decision"],
+            "automatic_decision": row["decision"],
+            "explanation": explanation,
+            "breakdown": breakdown,
+            "base_score": float(breakdown.get("base_score") or 0),
+            "bonuses": list(breakdown.get("bonuses") or []),
+            "penalties": list(breakdown.get("penalties") or []),
+            "gate_factors": dict(breakdown.get("gate_factors") or {}),
+            "quality_factors": dict(breakdown.get("quality_factors") or {}),
+            "charter": candidate.charter,
+            "album": candidate.album,
+            "pack_name": candidate.pack_name,
+            "instruments": list(candidate.instruments or ()),
+            "diff_guitar": candidate.diff_guitar,
+            "guitar_difficulty": candidate.diff_guitar,
+            "url": candidate.url,
+            "reference": candidate.reference,
+            "chart_reference": candidate.reference,
+            "supports_download": bool(candidate.supports_download),
+            "manual": manual,
+            "manual_decision": manual,
+            # A local manual accept is the persisted current choice for this
+            # review surface, even before the next exact pass materializes it.
+            "selected": manual == "accept",
+        }
+        item["review"] = build_review_presentation(item)
+        item["review_state"] = item["review"]["state"]
+        item["review_label"] = item["review"]["label"]
+        item["review_summary"] = item["review"]["summary"]
+        item["selectable"] = item["review"]["selectable"]
+        item["selection_action"] = item["review"]["action"]
+        grouped.setdefault(row["track_id"], []).append(item)
 
     cards: list[dict] = []
     for track_id, candidates in grouped.items():
@@ -1280,6 +1429,14 @@ def _review_payload(
                 item["source"],
                 item["chart_id"],
             )
+        )
+        automatic_best = next(
+            (
+                candidate
+                for candidate in candidates
+                if candidate["review"]["state"] in {"strong", "needs_review"}
+            ),
+            candidates[0],
         )
         rows = all_rows.get(track_id, [])
         manual_accept = any(
@@ -1296,6 +1453,13 @@ def _review_payload(
             status = "REVIEW"
         else:
             status = "REJECT"
+        selected_candidate = next(
+            (candidate for candidate in candidates if candidate.get("selected")),
+            None,
+        )
+        for candidate in candidates:
+            candidate["best"] = candidate is automatic_best
+        primary = selected_candidate or automatic_best
         cards.append(
             {
                 "track_key": track.track_key,
@@ -1311,6 +1475,13 @@ def _review_payload(
                 "status": status,
                 "review_status": status,
                 "candidates": candidates,
+                "best_candidate_id": automatic_best["chart_id"],
+                "selected_candidate_id": selected_candidate["chart_id"] if selected_candidate else None,
+                "selected": bool(selected_candidate),
+                "review": primary["review"],
+                "review_state": primary["review"]["state"],
+                "review_label": primary["review"]["label"],
+                "review_summary": primary["review"]["summary"],
             }
         )
     cards.sort(key=lambda item: (item["artist"].casefold(), item["title"].casefold()))
@@ -1495,6 +1666,7 @@ def create_app(
         recovery_db.close()
     state = JobState()
     spotify_job = _SpotifyJobState()
+    soundcloud_import_job = _SoundCloudImportJobState()
     export_job = _ExportJobState()
     auth_lock = threading.RLock()
     auth_client: Any = None
@@ -1510,6 +1682,7 @@ def create_app(
     # Expose only injectable handles and non-secret state for application
     # integration tests.  Tokens are deliberately absent from this mapping.
     app.extensions["spotify_job"] = spotify_job
+    app.extensions["soundcloud_import_job"] = soundcloud_import_job
     app.extensions["spotify_oauth_factory"] = oauth_factory
     app.extensions["spotify_client_factory"] = spotify_factory
 
@@ -1694,6 +1867,9 @@ def create_app(
         with spotify_job.lock:
             if spotify_job.running:
                 running.append("Spotify discovery")
+        with soundcloud_import_job.lock:
+            if soundcloud_import_job.running:
+                running.append("SoundCloud import")
         with export_job.lock:
             if export_job.running:
                 running.append("chart export")
@@ -2222,6 +2398,8 @@ def create_app(
                 "candidate_id": data.get("candidate_id"),
                 "source": data.get("source", ""),
                 "chart_id": data.get("chart_id"),
+                "candidate_artist": data.get("artist", ""),
+                "candidate_title": data.get("title", ""),
                 "score": float(data.get("score") or 0),
                 "quality": float(data.get("quality") or 0),
                 "eligibility": data.get("eligibility", ""),
@@ -2248,6 +2426,8 @@ def create_app(
             "artist": str(getattr(candidate, "artist", "") or ""),
             "title": str(getattr(candidate, "name", "") or ""),
             "name": str(getattr(candidate, "name", "") or ""),
+            "candidate_artist": str(getattr(candidate, "artist", "") or ""),
+            "candidate_title": str(getattr(candidate, "name", "") or ""),
             "charter": str(getattr(candidate, "charter", "") or ""),
             "pack_name": str(getattr(candidate, "pack_name", "") or ""),
             "album": str(getattr(candidate, "album", "") or ""),
@@ -3361,6 +3541,9 @@ def create_app(
 
     # -------------------------------------------------------- Spotify discovery
     def _start_local_catalog_job(payload: Mapping[str, Any]) -> tuple[dict[str, Any], int]:
+        busy = _busy_response()
+        if busy is not None:
+            return busy
         workspace, workspace_key = _get_local_library_workspace()
         discovery_run_id = ""
         db = Database(config.database_path)
@@ -3398,6 +3581,14 @@ def create_app(
                 result = discover_combined(config, db, [LibrarySnapshot(name, tracks) for name, tracks in grouped.items()], workspace_key=workspace_key, workspace_name="Local combined library", expansion_artists=payload.get("expansion_artists", ()), diagnostics=diagnostics)
                 spotify_job.finish(result)
                 db.update_workspace(workspace, status=result.status, phase=result.phase, message="Catalog matching complete.", error=result.error)
+                db.update_workspace_progress(
+                    workspace,
+                    status=result.status,
+                    phase=result.phase,
+                    message="Catalog matching complete.",
+                    error=result.error,
+                    metadata={"run_id": run_id, "scan_key": "catalog"},
+                )
                 if diagnostics:
                     diagnostics.update("selection", counters={"selected_charts": 0})
                     diagnostics.update("export", counters={"export_attempts": 0, "exported_charts": 0})
@@ -5841,54 +6032,267 @@ def create_app(
         uploaded = request.files.get("file") or request.files.get("files")
         if uploaded is None or not uploaded.filename:
             return {"error": "upload a SoundCloud CSV or JSON export"}, 400
-        suffix = Path(uploaded.filename).suffix.casefold()
+        filename = Path(uploaded.filename).name
+        suffix = Path(filename).suffix.casefold()
         if suffix not in {".csv", ".json"}:
             return {"error": "SoundCloud imports support only CSV or JSON"}, 400
-        diagnostics = RunDiagnostics(config.state_path)
-        diagnostics.update("source_setup", workspace_key="pending", uploaded_files=[{"name": Path(uploaded.filename).name, "bytes": 0}])
+        busy = _busy_response()
+        if busy is not None:
+            return busy
         try:
             raw = uploaded.read()
-            diagnostics.update("source_setup", uploaded_files=[{"name": Path(uploaded.filename).name, "bytes": len(raw)}])
             if len(raw) > int(config.server.max_content_length):
-                diagnostics.finish("failed", error="SoundCloud export is too large")
                 return {"error": "SoundCloud export is too large"}, 413
-            from csv_to_clonehero.providers.soundcloud import SoundCloudExportProvider
-            provider = SoundCloudExportProvider.from_json(raw.decode("utf-8-sig")) if suffix == ".json" else SoundCloudExportProvider.from_csv(raw.decode("utf-8-sig"))
-            snapshot = provider.import_library()
-            report = snapshot.import_report
-            diagnostics.update("import", counters={
-                "total_input_rows": report.total_rows if report else 0,
-                "accepted_input_rows": report.accepted_rows if report else 0,
-                "skipped_input_rows": report.skipped_rows if report else 0,
-                "duplicate_input_rows": report.duplicate_rows if report else 0,
-                "unique_imported_tracks": len(snapshot.tracks),
-                "unique_imported_artists": len({track.artist_norm for track in snapshot.tracks}),
-            }, skipped_reasons=(report.skipped_reasons[:200] if report else []), samples={"tracks": [{"artist": t.artist_norm, "title": t.title_norm} for t in snapshot.tracks]})
-            if not snapshot.tracks:
-                diagnostics.finish("failed", error="SoundCloud export contained no usable tracks")
-                return {"error": "SoundCloud export contained no usable tracks", "report": report.as_dict() if report else {}}, 422
             workspace, key = _get_local_library_workspace()
-            diagnostics.update("source_setup", workspace_id=workspace, workspace_key=key)
-            db = Database(config.database_path)
+            with soundcloud_import_job.lock:
+                if soundcloud_import_job.running:
+                    return {"error": "a SoundCloud import is already running"}, 409
+                busy = _busy_response()
+                if busy is not None:
+                    return busy
+                diagnostics = RunDiagnostics(config.state_path)
+                diagnostics.update(
+                    "source_setup",
+                    workspace_id=workspace,
+                    workspace_key=key,
+                    uploaded_files=[{"name": filename, "bytes": len(raw)}],
+                )
+                soundcloud_import_job.begin(
+                    workspace_id=workspace,
+                    workspace_key=key,
+                    run_id=diagnostics.run_id,
+                    filename=filename,
+                    total_bytes=len(raw),
+                )
+                run_id = soundcloud_import_job.run_id
+
+            def worker() -> None:
+                db: Database | None = None
+                provider: Any | None = None
+                terminal: dict[str, Any] | None = None
+                try:
+                    soundcloud_import_job.update({
+                        "phase": "parse",
+                        "message": "Reading the SoundCloud export...",
+                        "bytes_read": len(raw),
+                    })
+                    from csv_to_clonehero.providers.soundcloud import SoundCloudExportProvider
+
+                    text = raw.decode("utf-8-sig")
+                    provider = (
+                        SoundCloudExportProvider.from_json(text)
+                        if suffix == ".json"
+                        else SoundCloudExportProvider.from_csv(text)
+                    )
+                    snapshot = provider.import_library()
+                    report = snapshot.import_report
+                    report_data = report.as_dict() if report else {}
+                    total_rows = int(report_data.get("total_rows", 0) or 0)
+                    accepted_rows = int(report_data.get("accepted_rows", 0) or 0)
+                    skipped_rows = int(report_data.get("skipped_rows", 0) or 0)
+                    duplicate_rows = int(report_data.get("duplicate_rows", 0) or 0)
+                    soundcloud_import_job.update({
+                        "phase": "parsed",
+                        "message": f"Read {total_rows} rows; {len(snapshot.tracks)} usable tracks found.",
+                        "total_rows": total_rows,
+                        "accepted_rows": accepted_rows,
+                        "skipped_rows": skipped_rows,
+                        "duplicate_rows": duplicate_rows,
+                        "total_tracks": len(snapshot.tracks),
+                    })
+                    diagnostics.update(
+                        "import",
+                        counters={
+                            "total_input_rows": total_rows,
+                            "accepted_input_rows": accepted_rows,
+                            "skipped_input_rows": skipped_rows,
+                            "duplicate_input_rows": duplicate_rows,
+                            "unique_imported_tracks": len(snapshot.tracks),
+                            "unique_imported_artists": len({track.artist_norm for track in snapshot.tracks}),
+                        },
+                        skipped_reasons=(report.skipped_reasons[:200] if report else []),
+                        samples={
+                            "tracks": [
+                                {"artist": track.artist_norm, "title": track.title_norm}
+                                for track in snapshot.tracks
+                            ]
+                        },
+                    )
+                    if not snapshot.tracks:
+                        error = "SoundCloud export contained no usable tracks"
+                        diagnostics.finish("failed", error=error)
+                        terminal = {
+                            "ok": False,
+                            "status": "failed",
+                            "phase": "failed",
+                            "error": error,
+                            "workspace_id": workspace,
+                            "workspace_key": key,
+                            "run_id": run_id,
+                            "diagnostics_url": f"/api/diagnostics/{run_id}",
+                            "report": report_data,
+                        }
+                        return
+
+                    db = Database(config.database_path)
+                    db.update_workspace(
+                        workspace,
+                        status="running",
+                        phase="source_import",
+                        error="",
+                    )
+
+                    def progress(payload: Mapping[str, Any]) -> None:
+                        data = dict(payload)
+                        if data.get("phase") == "import":
+                            data["phase"] = "persist"
+                            data.setdefault("message", "Preparing the imported tracks...")
+                        elif data.get("phase") == "combine":
+                            data["message"] = "Finishing the combined library summary..."
+                        soundcloud_import_job.update(data)
+
+                    from csv_to_clonehero.library_pipeline import run_library_import
+
+                    imported = run_library_import(
+                        config,
+                        db,
+                        workspace,
+                        {"soundcloud": provider},
+                        on_progress=progress,
+                    )
+                    provider = None  # run_library_import closes each provider.
+                    source_result = imported.sources.get("soundcloud")
+                    source_payload = source_result.__dict__ if source_result else {}
+                    combined = imported.combined_summary
+                    sources = [dict(row) for row in db.get_source_summary(workspace)]
+                    db.set_meta("local_current_run_id", run_id)
+                    diagnostics.update(
+                        "combine",
+                        counters={
+                            "persisted_neutral_tracks": combined.get("tracks", 0),
+                            "persisted_provenance_rows": report_data.get("unique_tracks", 0),
+                        },
+                    )
+                    diagnostics.finish(
+                        imported.status,
+                        workspace_id=workspace,
+                        workspace_key=key,
+                        counters={"combined_tracks": combined.get("tracks", 0)},
+                    )
+                    terminal = {
+                        "ok": imported.status in {"complete", "partial"},
+                        "status": imported.status,
+                        "phase": "complete",
+                        "message": f"Imported {source_result.tracks if source_result else 0} SoundCloud songs.",
+                        "workspace_id": workspace,
+                        "workspace_key": key,
+                        "run_id": run_id,
+                        "diagnostics_url": f"/api/diagnostics/{run_id}",
+                        "source": source_payload,
+                        "sources": sources,
+                        "combined": combined,
+                    }
+                except (UnicodeDecodeError, ValueError, json.JSONDecodeError) as exc:
+                    message = _safe_message(exc)
+                    diagnostics.finish("failed", error=message)
+                    terminal = {
+                        "ok": False,
+                        "status": "failed",
+                        "phase": "failed",
+                        "error": message,
+                        "workspace_id": workspace,
+                        "workspace_key": key,
+                        "run_id": run_id,
+                        "diagnostics_url": f"/api/diagnostics/{run_id}",
+                    }
+                except Exception as exc:  # noqa: BLE001
+                    message = _safe_message(exc)
+                    log.exception("SoundCloud import %s failed", run_id)
+                    try:
+                        diagnostics.finish("failed", error=message)
+                    except OSError:
+                        pass
+                    try:
+                        if db is not None:
+                            db.update_workspace(
+                                workspace,
+                                status="failed",
+                                phase="source_import",
+                                error=message,
+                            )
+                    except Exception:
+                        pass
+                    terminal = {
+                        "ok": False,
+                        "status": "failed",
+                        "phase": "failed",
+                        "error": message,
+                        "workspace_id": workspace,
+                        "workspace_key": key,
+                        "run_id": run_id,
+                        "diagnostics_url": f"/api/diagnostics/{run_id}",
+                    }
+                finally:
+                    if provider is not None:
+                        try:
+                            provider.close()
+                        except Exception:
+                            pass
+                    if db is not None:
+                        db.close()
+                    if terminal is None:
+                        terminal = {
+                            "ok": False,
+                            "status": "failed",
+                            "phase": "failed",
+                            "error": "SoundCloud import stopped unexpectedly",
+                            "workspace_id": workspace,
+                            "workspace_key": key,
+                            "run_id": run_id,
+                            "diagnostics_url": f"/api/diagnostics/{run_id}",
+                        }
+                        try:
+                            diagnostics.finish("failed", error=terminal["error"])
+                        except OSError:
+                            pass
+                    soundcloud_import_job.finish(terminal)
+
+            worker_thread = threading.Thread(
+                target=worker,
+                daemon=True,
+                name=f"soundcloud-import-{run_id}",
+            )
+            soundcloud_import_job.attach_worker(worker_thread)
+            worker_thread.start()
+            return jsonify({
+                "started": True,
+                "status": "running",
+                "workspace_id": workspace,
+                "workspace_key": key,
+                "run_id": run_id,
+                "diagnostics_url": f"/api/diagnostics/{run_id}",
+            }), 202
+        except OSError as exc:
+            return {"error": _safe_message(exc)}, 500
+
+    @app.get("/api/sources/soundcloud/import/status")
+    def soundcloud_import_status():
+        requested = str(request.args.get("run_id") or "")
+        payload = soundcloud_import_job.snapshot()
+        current = str(payload.get("run_id") or "")
+        if requested and current and requested != current:
+            return {"error": "unknown SoundCloud import run"}, 404
+        run_id = requested or current
+        if run_id:
             try:
-                from csv_to_clonehero.library_pipeline import run_library_import
-                imported = run_library_import(config, db, workspace, {"soundcloud": provider})
-                diagnostics.update("import", counters={"persisted_neutral_tracks": imported.combined_summary.get("tracks", 0), "persisted_provenance_rows": report.unique_tracks if report else 0})
-                db.set_meta("local_current_run_id", diagnostics.run_id)
-                diagnostics.finish("complete", workspace_id=workspace, workspace_key=key)
-                return jsonify({"ok": imported.status in {"complete", "partial"}, "workspace_id": workspace,
-                                "run_id": diagnostics.run_id, "diagnostics_url": f"/api/diagnostics/{diagnostics.run_id}",
-                                "workspace_key": key, "source": imported.sources["soundcloud"].__dict__,
-                                "sources": [dict(row) for row in db.get_source_summary(workspace)],
-                                "combined": imported.combined_summary})
-            finally:
-                db.close()
-        except (UnicodeDecodeError, ValueError, json.JSONDecodeError) as exc:
-            diagnostics.finish("failed", error=str(exc))
-            return {"error": str(exc)}, 422
-        except Exception as exc:  # noqa: BLE001
-            diagnostics.finish("failed", error=_safe_message(exc))
-            raise
+                artifact = diagnostics_path(config.state_path, run_id)
+                if artifact.is_file():
+                    payload["diagnostics_url"] = f"/api/diagnostics/{run_id}"
+                    if not payload["running"]:
+                        payload["diagnostics"] = json.loads(artifact.read_text(encoding="utf-8"))
+            except (OSError, ValueError, json.JSONDecodeError, TypeError):
+                pass
+        return jsonify(payload)
 
     @app.get("/api/diagnostics/<run_id>")
     def download_diagnostics(run_id: str):
@@ -6055,7 +6459,12 @@ def create_app(
     @app.get("/api/status")
     def status():
         running_jobs = _running_jobs()
-        return jsonify({**state.snapshot(), "busy": bool(running_jobs), "running_jobs": running_jobs})
+        return jsonify({
+            **state.snapshot(),
+            "busy": bool(running_jobs),
+            "running_jobs": running_jobs,
+            "soundcloud_import": soundcloud_import_job.snapshot(),
+        })
 
     @app.get("/api/estimate")
     def estimate():
@@ -6083,11 +6492,119 @@ def create_app(
                 source.close()
 
     # -------------------------------------------------------------- review
+    def _local_neutral_review_payload(
+        db: Database,
+        workspace: int | str,
+        include_rejected: bool = False,
+    ) -> dict[str, Any]:
+        """Expose source-neutral catalog candidates on the existing review page."""
+        tracks = {
+            int(track.db_id): track
+            for track in db.get_tracks(include_ignored=True)
+            if track.db_id is not None
+        }
+        grouped: dict[int, list[dict[str, Any]]] = {}
+        rows = db.get_workspace_candidates(
+            workspace,
+            kind="exact",
+            include_rejected=include_rejected,
+        )
+        for row in rows:
+            data = _row_dict(row)
+            track_id = data.get("track_id")
+            if track_id is None or int(track_id) not in tracks:
+                continue
+            candidate = _candidate_payload(row)
+            candidate["manual"] = ""
+            candidate["manual_decision"] = ""
+            candidate["review"] = build_review_presentation(candidate)
+            candidate["review_state"] = candidate["review"]["state"]
+            candidate["review_label"] = candidate["review"]["label"]
+            candidate["review_summary"] = candidate["review"]["summary"]
+            candidate["selectable"] = candidate["review"]["selectable"]
+            candidate["selection_action"] = candidate["review"]["action"]
+            grouped.setdefault(int(track_id), []).append(candidate)
+
+        cards: list[dict[str, Any]] = []
+        for track_id, candidates in grouped.items():
+            track = tracks[track_id]
+            candidates.sort(
+                key=lambda item: (
+                    -float(item.get("score") or 0),
+                    str(item.get("candidate_artist") or "").casefold(),
+                    str(item.get("candidate_title") or "").casefold(),
+                    str(item.get("source") or ""),
+                    int(item.get("chart_id") or 0),
+                )
+            )
+            best = next(
+                (item for item in candidates if item["review_state"] in {"strong", "needs_review"}),
+                candidates[0],
+            )
+            for candidate in candidates:
+                candidate["best"] = candidate is best
+            selected = next((item for item in candidates if item.get("selected")), None)
+            primary = selected or best
+            cards.append({
+                "track_key": track.track_key,
+                "spotify_id": track.spotify_id,
+                "artist": track.artist_full,
+                "title": track.title,
+                "album": track.album,
+                "playlists": list(track.playlists),
+                "spotify_artist": track.artist_full,
+                "spotify_title": track.title,
+                "status": "selected" if selected else "matched",
+                "review_status": primary["review_label"],
+                "candidates": candidates,
+                "best_candidate_id": best["chart_id"],
+                "selected_candidate_id": selected["chart_id"] if selected else None,
+                "selected": bool(selected),
+                "review": primary["review"],
+                "review_state": primary["review_state"],
+                "review_label": primary["review_label"],
+                "review_summary": primary["review_summary"],
+            })
+        cards.sort(key=lambda item: (item["artist"].casefold(), item["title"].casefold()))
+        workspace_row = db.get_workspace(workspace)
+        complete = bool(workspace_row and str(workspace_row["status"]).casefold() in {"complete", "partial"})
+        total_tracks = len(tracks)
+        candidate_count = sum(len(card["candidates"]) for card in cards)
+        return {
+            "workspace_id": int(workspace),
+            "source_neutral": True,
+            "tracks": cards,
+            "progress": {
+                "has_search_run": bool(rows),
+                "total_tracks": total_tracks,
+                "scored_tracks": total_tracks if complete else len(cards),
+                "review_track_count": len(cards),
+                "review_tracks": len(cards),
+                "review_candidate_count": candidate_count,
+                "review_candidates": candidate_count,
+                "candidate_count": candidate_count,
+                "searching": False,
+                "exact_scoring_complete": complete,
+                "exact_complete": complete,
+            },
+        }
+
     @app.get("/api/review")
     def review_items():
         include_rejected = request.args.get("include_rejected") == "1"
         db = Database(config.database_path)
         try:
+            local_key = db.get_meta("local_workspace_key")
+            local_workspace = db.get_workspace(local_key) if local_key else None
+            if local_workspace is not None:
+                neutral_rows = db.get_neutral_library_tracks(int(local_workspace["id"]))
+                neutral_candidates = db.get_workspace_candidates(
+                    int(local_workspace["id"]), kind="exact", include_rejected=True
+                )
+                if neutral_rows or neutral_candidates:
+                    return jsonify(_local_neutral_review_payload(
+                        db, int(local_workspace["id"]), include_rejected
+                    ))
             return jsonify(_review_payload(db, state.snapshot(), include_rejected))
         finally:
             db.close()
@@ -6111,6 +6628,46 @@ def create_app(
             return {"error": "invalid decision payload"}, 400
         db = Database(config.database_path)
         try:
+            if payload.get("workspace_id") not in (None, ""):
+                workspace = _workspace_id(payload.get("workspace_id"))
+                row, kind, track_value, error = _candidate_row_for_request(
+                    db,
+                    workspace,
+                    {**payload, "kind": "exact"},
+                )
+                if row is None:
+                    return {"error": error}, 404
+                data = _row_dict(row)
+                if decision == "accept":
+                    valid, validation_error = _validate_candidate_eligibility(
+                        db, workspace, row, kind
+                    )
+                    if not valid:
+                        return {"error": validation_error}, 400
+                    selection_id = db.select_workspace_candidate(
+                        workspace,
+                        track_value,
+                        data["candidate_id"],
+                        kind="exact",
+                        score=data.get("score"),
+                        explanation=data.get("breakdown_json") or "",
+                        eligibility=data.get("eligibility") or "",
+                    )
+                else:
+                    selection_id = None
+                    db.clear_workspace_selection(
+                        workspace,
+                        track_value,
+                        candidate_id=data.get("candidate_id"),
+                        kind="exact",
+                    )
+                db.set_manual_decision(track_key, source, chart_id, decision)
+                return jsonify({
+                    "ok": True,
+                    "workspace_id": workspace,
+                    "selection_id": selection_id,
+                    "decision": decision,
+                })
             db.set_manual_decision(track_key, source, chart_id, decision)
         finally:
             db.close()
@@ -6131,11 +6688,25 @@ def create_app(
         busy = _busy_response()
         if busy is not None:
             return busy
+        payload = request.get_json(silent=True) or {}
         with state.lock:
             if state.running:
                 return {"error": "wait for the current job to finish"}, 409
             db = Database(config.database_path)
             try:
+                if payload.get("workspace_id") not in (None, ""):
+                    workspace = _workspace_id(payload.get("workspace_id"))
+                    selected = _select_recommended_safe(
+                        db,
+                        workspace,
+                        kind="exact",
+                    )
+                    return jsonify({
+                        "ok": True,
+                        "accepted": len(selected),
+                        "workspace_id": workspace,
+                        **_tray_payload(db, workspace),
+                    })
                 result = db.accept_best_review_candidates()
             finally:
                 db.close()
@@ -6153,6 +6724,51 @@ def create_app(
     # ------------------------------------------------------------ reports
     @app.get("/api/summary")
     def summary():
+        db = Database(config.database_path)
+        try:
+            local_key = db.get_meta("local_workspace_key")
+            local_workspace = db.get_workspace(local_key) if local_key else None
+            if local_workspace is not None:
+                workspace = int(local_workspace["id"])
+                neutral_tracks = db.get_neutral_library_tracks(workspace)
+                if neutral_tracks:
+                    candidates = db.get_workspace_candidates(
+                        workspace, kind="exact", include_rejected=True
+                    )
+                    grouped = {
+                        int(row["track_id"])
+                        for row in candidates
+                        if row["track_id"] is not None
+                    }
+                    recommended = {
+                        int(row["track_id"])
+                        for row in candidates
+                        if row["track_id"] is not None
+                        and str(row["eligibility"] or "").upper() == RECOMMENDED
+                    }
+                    review = {
+                        int(row["track_id"])
+                        for row in candidates
+                        if row["track_id"] is not None
+                        and str(row["eligibility"] or "").upper() == ELIGIBLE_REVIEW
+                    }
+                    selections = db.list_workspace_selections(workspace)
+                    return jsonify({
+                        "csv_files": len(db.get_source_summary(workspace)),
+                        "unique_tracks": len(neutral_tracks),
+                        "primary_artists": len({row["normalized_artist"] for row in neutral_tracks}),
+                        "exact": {
+                            "auto_matches": len(recommended),
+                            "review": len(review),
+                            "no_match": max(0, len(neutral_tracks) - len(grouped)),
+                        },
+                        "expansion": {"selected": 0},
+                        "manual_decisions": {"accept": len(selections), "reject": 0},
+                        "plan": {"estimated_gib": 0},
+                        "downloads": {"completed": 0, "gib_downloaded": 0},
+                    })
+        finally:
+            db.close()
         path = config.reports_path / "summary.json"
         if not path.exists():
             return jsonify(None)
@@ -6195,12 +6811,43 @@ body{font:16px system-ui,sans-serif;max-width:980px;margin:auto;padding:24px;bac
 <!-- Compatibility controls retained for existing integrations. --><span hidden>Sign in with Spotify Connect Spotify Choose your music Find chart matches Review and export Optional: link an existing library Resume or manage saved work Preview additional songs Find charts for this preview Selected charts</span>
 <span hidden id="scopePanel"></span><span hidden id="scopeList"></span><span hidden id="expansionPreview"></span><span hidden id="expansionStart"></span><span hidden id="expansionCancel"></span><span hidden id="expansionAll"></span><span hidden id="expansionNone"></span><span hidden id="artists"></span><span hidden id="tray"></span><span hidden id="traySummary"></span><span hidden id="serverExport"></span><span hidden id="remoteExport"></span>
 <script>
-const publicMode = __PUBLIC_MODE__; const lanAccessToken = __LAN_ACCESS_TOKEN__; const $=id=>document.getElementById(id);let workspaceId=null;
+const publicMode = __PUBLIC_MODE__; const lanAccessToken = __LAN_ACCESS_TOKEN__; const $=id=>document.getElementById(id);let workspaceId=null;let importTimer=null;
 async function api(url,opt){const r=await fetch(url,opt);const d=await r.json().catch(()=>({}));if(!r.ok)throw Error(d.error||'Request failed');return d}
- function render(d){workspaceId=d.workspace_id||workspaceId;const s=d.sources||[];const c=d.combined||{};$('summary').innerHTML=(s.length?s.map(x=>`<div><b>${x.provider}</b> (${x.source_key}): ${x.tracks||0} unique songs, ${x.provenance||0} source records, ${x.skipped_rows||0} skipped, ${x.duplicate_rows||0} duplicates</div>`).join(''):'No sources imported yet.')+`<p><b>Combined:</b> ${c.tracks||0} songs, ${c.artists||0} artists</p>`;$('find').disabled=!c.tracks;if(d.run_id&&d.diagnostics_url)$('diagnostics').innerHTML=`Run <code>${d.run_id}</code> | <a href="${d.diagnostics_url}">Download diagnostics</a>`}
-async function refresh(){try{render(await api('/api/sources'))}catch(e){$('summary').textContent=e.message}}
-$('soundcloudImport').onclick=async()=>{const f=$('soundcloudFile').files[0];if(!f)return $('soundcloudMsg').textContent='Choose a CSV or JSON export first.';$('soundcloudImport').disabled=true;try{const fd=new FormData;fd.append('file',f);const d=await api('/api/sources/soundcloud/import',{method:'POST',body:fd});workspaceId=d.workspace_id;$('soundcloudMsg').textContent=`Imported ${d.source.tracks} SoundCloud songs.`;render(d)}catch(e){$('soundcloudMsg').textContent=e.message}finally{$('soundcloudImport').disabled=false}};$('spotifyConnect').onclick=async()=>{try{const d=await api('/api/auth/spotify/start');location.href=d.authorization_url}catch(e){alert(e.message)}};
- $('refresh').onclick=async()=>{try{const d=await api('/api/sources');render(d);const s=await api('/api/discovery/status?workspace_id='+workspaceId);if(s.diagnostics_url)$('diagnostics').innerHTML=`Run <code>${s.run_id}</code> | <a href="${s.diagnostics_url}">Download diagnostics</a>`}catch(e){$('summary').textContent=e.message}};$('find').onclick=async()=>{try{const d=await api('/api/discovery/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({source:'combined',workspace_id:workspaceId})});$('progress').textContent='Catalog matching started...';const timer=setInterval(async()=>{const s=await api('/api/discovery/status?workspace_id='+workspaceId);$('progress').textContent=s.message||s.phase||'Matching...';if(!s.running){clearInterval(timer);if(s.diagnostics_url)$('diagnostics').innerHTML=`Run <code>${s.run_id}</code> | <a href="${s.diagnostics_url}">Download diagnostics</a>`;if(s.result){$('review').style.display='block';const r=s.result;$('cards').textContent=r.candidates?`${r.candidates} chart candidates found; review them in Advanced.`:(!r.catalog_available?`Catalog unavailable: ${r.catalog_diagnostic}`:r.exact_hits?`All ${r.exact_hits} exact songs had candidates rejected by quality rules.`:'No exact catalog hits. Download diagnostics for lookup details.')}}</div>}},1000)}catch(e){$('progress').textContent=e.message}};refresh();
+function showDiagnostics(d){if(d&&d.run_id&&d.diagnostics_url)$('diagnostics').innerHTML=`Run <code>${d.run_id}</code> | <a href="${d.diagnostics_url}">Download diagnostics</a>`}
+function render(d){workspaceId=d.workspace_id||workspaceId;const s=d.sources||[];const c=d.combined||{};$('summary').innerHTML=(s.length?s.map(x=>`<div><b>${x.provider}</b> (${x.source_key}): ${x.tracks||0} unique songs, ${x.provenance||0} source records, ${x.skipped_rows||0} skipped, ${x.duplicate_rows||0} duplicates</div>`).join(''):'No sources imported yet.')+`<p><b>Combined:</b> ${c.tracks||0} songs, ${c.artists||0} artists</p>`;$('find').disabled=!c.tracks;showDiagnostics(d)}
+function importMessage(s){const p=s.progress||{};if(s.phase==='persist'&&p.total_tracks)return `${s.message||'Saving tracks...'} ${p.persisted_tracks||0} / ${p.total_tracks}`;return s.message||s.phase||'Importing SoundCloud export...'}
+function pollImport(runId){if(importTimer)clearTimeout(importTimer);const poll=async()=>{try{const s=await api('/api/sources/soundcloud/import/status?run_id='+encodeURIComponent(runId));workspaceId=s.workspace_id||workspaceId;$('soundcloudMsg').textContent=importMessage(s);showDiagnostics(s);if(s.running){importTimer=setTimeout(poll,500);return}importTimer=null;$('soundcloudImport').disabled=false;if(s.status==='complete'||s.status==='partial'){const d=s.result||{};render(d);$('soundcloudMsg').textContent=d.message||`Imported ${d.source?.tracks||0} SoundCloud songs.`}else $('soundcloudMsg').textContent=s.error||'SoundCloud import failed.'}catch(e){importTimer=null;$('soundcloudImport').disabled=false;$('soundcloudMsg').textContent=e.message}};poll()}
+async function refresh(){try{const d=await api('/api/sources');render(d);const s=await api('/api/sources/soundcloud/import/status');showDiagnostics(s);if(s.running&&s.run_id){workspaceId=s.workspace_id||workspaceId;$('soundcloudImport').disabled=true;$('find').disabled=true;pollImport(s.run_id)}}catch(e){$('summary').textContent=e.message}}
+$('soundcloudImport').onclick=async()=>{const f=$('soundcloudFile').files[0];if(!f)return $('soundcloudMsg').textContent='Choose a CSV or JSON export first.';$('soundcloudImport').disabled=true;$('find').disabled=true;$('soundcloudMsg').textContent='Uploading export...';try{const fd=new FormData;fd.append('file',f);const d=await api('/api/sources/soundcloud/import',{method:'POST',body:fd});workspaceId=d.workspace_id;$('soundcloudMsg').textContent='Upload accepted; importing in the background...';showDiagnostics(d);pollImport(d.run_id)}catch(e){$('soundcloudMsg').textContent=e.message;$('soundcloudImport').disabled=false}};$('spotifyConnect').onclick=async()=>{try{const d=await api('/api/auth/spotify/start');location.href=d.authorization_url}catch(e){alert(e.message)}};
+ $('refresh').onclick=refresh;
+ $('find').onclick=async()=>{
+   try {
+     const d=await api('/api/discovery/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({source:'combined',workspace_id:workspaceId})});
+     $('progress').textContent='Catalog matching started...';
+     const timer=setInterval(async()=>{
+       try {
+         const s=await api('/api/discovery/status?workspace_id='+workspaceId);
+         $('progress').textContent=s.message||s.phase||'Matching...';
+         if(!s.running){
+           clearInterval(timer);
+           showDiagnostics(s);
+           if(s.result){
+             $('review').style.display='block';
+             const r=s.result;
+             $('cards').textContent=r.candidates
+               ? `${r.candidates} chart candidates found; review them in Advanced.`
+               : (!r.catalog_available
+                 ? `Catalog unavailable: ${r.catalog_diagnostic}`
+                 : r.exact_hits
+                   ? `All ${r.exact_hits} exact songs had candidates rejected by quality rules.`
+                   : 'No exact catalog hits. Download diagnostics for lookup details.');
+           }
+         }
+       }catch(e){clearInterval(timer);$('progress').textContent=e.message}
+     },1000);
+   }catch(e){$('progress').textContent=e.message}
+ };
+ refresh();
 </script></body></html>'''
 
 
@@ -6217,10 +6864,10 @@ _ADVANCED_PAGE = """<!doctype html>
    :root { color-scheme:dark; --ink:#f4f6fa; --muted:#aab3c2; --bg:#11151c; --panel:#1a202a; --line:#354052; --accent:#7cb7ff; --success:#72d4a0; }
    * { box-sizing:border-box; }
    body { font-family:"Segoe UI",system-ui,sans-serif; background:linear-gradient(145deg,#111722,#0d1117); color:var(--ink); margin:0; }
-   main { max-width:880px; margin:0 auto; padding:32px 20px 72px; }
+   main { width:100%; max-width:880px; min-width:0; margin:0 auto; padding:32px 20px 72px; }
    h1 { font-size:clamp(2rem,5vw,3.5rem); letter-spacing:-.04em; margin:8px 0 4px; }
    h2 { font-size:1.1rem; margin:32px 0 8px; color:var(--ink); }
-   .card { background:var(--panel); border:1px solid var(--line); border-radius:14px; padding:18px; margin-top:10px; box-shadow:0 12px 30px rgba(0,0,0,.18); }
+   .card { background:var(--panel); border:1px solid var(--line); border-radius:14px; padding:18px; margin-top:10px; min-width:0; overflow-wrap:anywhere; box-shadow:0 12px 30px rgba(0,0,0,.18); }
    .muted { color:var(--muted); font-size:.9rem; }
    a { color:var(--accent); }
    button { font:inherit; border:1px solid var(--line); border-radius:8px; padding:10px 18px; cursor:pointer; background:#273143; color:var(--ink); }
@@ -6249,15 +6896,47 @@ _ADVANCED_PAGE = """<!doctype html>
   td.num { text-align: right; font-variant-numeric: tabular-nums; }
   #drop { border: 2px dashed #3a4456; border-radius: 10px; }
   #drop.over { border-color: #8fd3ff; background: #20293d; }
-  .reports a { display: inline-block; margin: 2px 10px 2px 0; font-size: .9rem; }
-  code { background: #0d1017; padding: 1px 6px; border-radius: 5px; }
+   .reports a { display: inline-block; margin: 2px 10px 2px 0; font-size: .9rem; }
+   code { background: #0d1017; padding: 1px 6px; border-radius: 5px; overflow-wrap:anywhere; word-break:break-word; }
+   .review-card { margin-top: 12px; min-width:0; overflow-wrap:anywhere; }
+   .review-card-head, .review-option-head, .review-option-actions { display: flex; align-items: center; gap: 10px; }
+   .review-card-head, .review-option-head { justify-content: space-between; }
+   .review-option-head > div { min-width:0; max-width:100%; }
+   .review-card h3, .review-card h4 { margin: 0; }
+   .review-eyebrow { color: var(--muted); font-size: .76rem; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }
+   .review-status, .review-selected { border: 1px solid var(--line); border-radius: 999px; display: inline-block; padding: 3px 9px; font-size: .82rem; font-weight: 700; }
+   .review-status-strong, .review-selected { border-color: var(--success); color: var(--success); }
+   .review-status-review { border-color: #ffd479; color: #ffd479; }
+   .review-status-blocked, .review-status-not-recommended { color: #ff7a7a; }
+   .review-option { border: 1px solid var(--line); border-radius: 8px; margin-top: 9px; padding: 12px; min-width:0; overflow-wrap:anywhere; }
+   input[type="file"] { max-width:100%; }
+   .review-option-selected { border-color: var(--success); background: #101e16; }
+   .review-option-blocked { background: #1b171a; }
+   .review-option-meta, .review-summary { color: var(--muted); font-size: .9rem; }
+   .review-option-meta { margin: 4px 0 0; }
+   .review-summary { margin: 7px 0 0; }
+   .review-option-actions { justify-content: flex-end; flex-wrap: wrap; margin-top: 10px; }
+   .review-why { margin-top: 10px; }
+   .review-why summary, .review-alternatives summary { cursor: pointer; }
+   .review-why ul { margin: 9px 0; padding-left: 20px; }
+   .review-concern { color: #ffd479; }
+   .review-why table { border-collapse: collapse; margin-top: 8px; width: 100%; }
+   .review-why th, .review-why td { border-bottom: 1px solid var(--line); padding: 5px 8px 5px 0; text-align: left; vertical-align: top; }
+   .review-why th { color: var(--muted); font-weight: 600; width: 34%; }
+   .review-alternatives { border-top: 1px solid var(--line); margin-top: 14px; padding-top: 11px; }
+   .review-selection-note { background: #102319; border-left: 3px solid var(--success); margin: 12px 0 0; padding: 8px 11px; }
+   @media (max-width: 600px) {
+     .review-card-head, .review-option-head { align-items: flex-start; flex-direction: column; }
+     .review-option-actions { justify-content: flex-start; }
+     .review-option-actions button { width: 100%; }
+   }
 </style>
 </head>
 <body>
 <main>
    <h1>CSV &amp; music-file import</h1>
    <p class="muted">Add exported music lists, preview chart matches, review choices, then download selected charts.
-      Library folder: <code>__LIBRARY_ROOT__</code>
+       Library folder: <code id="libraryRoot">__LIBRARY_ROOT__</code>
       · <a href="/">← Spotify library workflow</a></p>
 
    <h2>1 · Add music exports</h2>
@@ -6295,19 +6974,18 @@ _ADVANCED_PAGE = """<!doctype html>
     <div id="stages" style="margin-top:12px"></div>
   </div>
 
-   <h2>4 · Review choices</h2>
-  <div class="card">
-    <p class="muted">One card represents one Spotify song. The best candidate is shown first;
-        alternatives can be expanded. Choices save immediately, but affect the next download build—run it again after changing choices.</p>
-    <div id="reviewProgress" class="muted"></div>
-    <div class="review-toolbar">
-      <button id="acceptAll" class="primary">Accept all best review matches</button>
-      <span class="muted">Use this when automatic review of every found song is acceptable.</span>
-    </div>
-    <label class="muted" style="margin-left:12px">
-      <input type="checkbox" id="showRejected"> also show rejected candidates</label>
-    <input type="text" id="reviewFilter" placeholder="filter…" style="margin-left:12px; background:#0d1017; border:1px solid #2a3247; color:#e6e9ef; border-radius:6px; padding:6px 10px;">
-    <div id="review" style="margin-top:10px"></div>
+   <h2>4 · Review your matches</h2>
+   <div class="card">
+     <p class="muted">One card represents one song from your music list. Start with the best chart and its short explanation; open other versions only when you need to compare them. Choices save immediately and apply to the next download build.</p>
+     <div id="reviewProgress" class="muted"></div>
+     <div class="review-toolbar">
+       <button id="acceptAll" class="primary">Choose best review matches</button>
+       <span class="muted">Use this only when the recommended chart for every song looks right.</span>
+     </div>
+     <label class="muted" style="margin-left:12px">
+       <input type="checkbox" id="showRejected"> also show charts the app did not recommend</label>
+     <input type="text" id="reviewFilter" placeholder="Filter your music" aria-label="Filter your music" style="margin-left:12px; background:#0d1017; border:1px solid #2a3247; color:#e6e9ef; border-radius:6px; padding:6px 10px;">
+     <div id="review" style="margin-top:10px"></div>
   </div>
 
    <h2>5 · Download and reports</h2>
@@ -6419,35 +7097,97 @@ function setRunButtons(disabled) {
 }
 
 async function run(action) {
+  if (reviewData.source_neutral && action === 'exact-build') {
+    await runNeutralExport();
+    return;
+  }
   jobRunning = true;
   setRunButtons(true);
   $('stages').innerHTML = '';
   renderJobStatus({running: true, action, stage: 'Starting', activity: `Starting ${action}...`, stages: [], search_progress: {}});
-  const res = await fetch('/api/run/' + action, {method: 'POST'});
-  if (res.status === 409) { alert('A job is already running.'); }
-  poll();
+  try {
+    const res = await fetch('/api/run/' + action, {method: 'POST'});
+    if (!res.ok) throw Error((await res.json().catch(() => ({}))).error || 'Could not start this job.');
+    await poll();
+  } catch (err) {
+    jobRunning = false;
+    setRunButtons(false);
+    renderJobStatus({running: false, error: err.message, activity: err.message, stages: [], search_progress: {}});
+  }
 }
 
 async function poll() {
-  const s = await (await fetch('/api/status')).json();
-  $('stages').innerHTML = s.stages.map(st => {
-    const icon = st.status === 'done' ? '<span class="ok">✔</span>'
-               : st.status === 'failed' ? '<span class="bad">✖</span>'
-               : '<span class="spin">…</span>';
-    return `<div class="stage">${icon} ${st.label}
-      <span class="muted">${st.detail || ''}</span></div>`;
-  }).join('') + (s.error ? `<div class="stage bad" style="color:#ff7a7a">Error: ${s.error}</div>` : '');
-  jobRunning = s.running;
-  renderJobStatus(s);
-  renderReview();
-  if (s.running) {
-    await loadReview(false);
-    setTimeout(poll, 900);
-  }
-  else {
+  try {
+    const s = await (await fetch('/api/status')).json();
+    $('stages').innerHTML = (s.stages || []).map(st => {
+      const icon = st.status === 'done' ? '<span class="ok">✔</span>'
+                 : st.status === 'failed' ? '<span class="bad">✖</span>'
+                 : '<span class="spin">…</span>';
+      return `<div class="stage">${icon} ${st.label}
+        <span class="muted">${st.detail || ''}</span></div>`;
+    }).join('') + (s.error ? `<div class="stage bad" style="color:#ff7a7a">Error: ${s.error}</div>` : '');
+    jobRunning = s.running;
+    renderJobStatus(s);
+    renderReview();
+    if (s.running) {
+      await loadReview(false);
+      setTimeout(poll, 900);
+    } else {
+      setRunButtons(false);
+      await refreshSummary(); await refreshReports(); await refreshEstimate();
+      await loadReview(false);
+    }
+  } catch (err) {
+    jobRunning = false;
     setRunButtons(false);
-    refreshSummary(); refreshReports(); refreshEstimate();
-    await loadReview(false);
+    renderJobStatus({running: false, error: err.message, activity: err.message, stages: [], search_progress: {}});
+  }
+}
+
+async function runNeutralExport() {
+  jobRunning = true;
+  setRunButtons(true);
+  renderJobStatus({running: true, action: 'exact-build', activity: 'Exporting selected charts...', stages: [], search_progress: {}});
+  try {
+    const response = await fetch('/api/spotify/export/start', {method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({kind: 'folder', workspace_id: reviewData.workspace_id,
+        path: $('libraryRoot').textContent.trim()})});
+    const result = await response.json().catch(() => ({}));
+    if (!response.ok) throw Error(result.error || 'Could not start the export.');
+    await pollNeutralExport();
+  } catch (err) {
+    jobRunning = false;
+    setRunButtons(false);
+    renderJobStatus({running: false, error: err.message, activity: err.message, stages: [], search_progress: {}});
+  }
+}
+
+async function pollNeutralExport() {
+  try {
+    const response = await fetch('/api/spotify/export/status');
+    const status = await response.json();
+    renderJobStatus({
+      running: status.running,
+      action: 'exact-build',
+      activity: status.current || (status.running ? 'Exporting selected charts...' : status.error || 'Export complete.'),
+      error: status.error,
+      started_at: status.started_at,
+      elapsed_seconds: 0,
+      stages: [],
+      search_progress: {},
+    });
+    if (status.running) {
+      setTimeout(pollNeutralExport, 700);
+      return;
+    }
+    jobRunning = false;
+    setRunButtons(false);
+    await refreshSummary(); await refreshReports(); await loadReview(false);
+  } catch (err) {
+    jobRunning = false;
+    setRunButtons(false);
+    renderJobStatus({running: false, error: err.message, activity: err.message, stages: [], search_progress: {}});
   }
 }
 
@@ -6477,7 +7217,7 @@ async function refreshSummary() {
     <tr><td>Playlist CSVs</td><td class="num">${s.csv_files}</td></tr>
     <tr><td>Unique tracks</td><td class="num">${s.unique_tracks}</td></tr>
     <tr><td>Primary artists</td><td class="num">${s.primary_artists}</td></tr>
-    <tr><td>Exact: auto / review / no match</td>
+     <tr><td>Exact: strong / needs review / no suitable chart</td>
         <td class="num">${exact.auto_matches || 0} / ${exact.review || 0} / ${exact.no_match || 0}</td></tr>
     <tr><td>Expansion selected</td><td class="num">${expansion.selected || 0}</td></tr>
     <tr><td>Manual accepts / rejects</td><td class="num">${manual.accept || 0} / ${manual.reject || 0}</td></tr>
@@ -6531,33 +7271,44 @@ function renderReview() {
     });
   }
   const statusText = progress.has_search_run
-    ? `Review candidates available so far: ${progress.candidate_count || 0} · ` +
-      `${progress.scored_tracks || 0} / ${progress.total_tracks || 0} tracks scored · ` +
-      `${progress.review_track_count || 0} tracks` +
-      (progress.searching ? ' · search still in progress' :
-       progress.exact_scoring_complete ? '' : ' · scoring incomplete')
-    : 'No exact search has run yet.';
+    ? `${progress.review_track_count || 0} songs need a decision · ` +
+      `${progress.scored_tracks || 0} / ${progress.total_tracks || 0} songs checked` +
+      (progress.searching ? ' · checking is still in progress' :
+       progress.exact_scoring_complete ? '' : ' · matching is incomplete')
+    : 'Run Preview chart matches to start a review.';
   $('reviewProgress').textContent = lastSaved ? `${lastSaved} | ${statusText}` : statusText;
   if (!items.length) {
-    let empty = 'Search completed and there are no review candidates.';
-    if (!progress.has_search_run) empty = 'No exact search has run yet.';
-    else if (progress.searching) empty = 'Search is running; no scored reviews exist yet.';
-    else if (!progress.exact_scoring_complete) empty = 'Search did not complete; review state may be partial.';
-    else if (filter) empty = 'No review tracks match this filter.';
+    let empty = 'There are no songs needing review right now.';
+    if (!progress.has_search_run) empty = 'Run Preview chart matches to check your music.';
+    else if (progress.searching) empty = 'Matching is still checking your songs; no decision is ready yet.';
+    else if (!progress.exact_scoring_complete) empty = 'Matching did not finish; run the preview again before deciding.';
+    else if (filter) empty = 'No songs match this filter.';
     $('review').innerHTML = `<p class="muted">${empty}</p>`;
     return;
   }
   const cards = items.map(track => {
     const candidates = track.candidates || [];
-    const best = candidates[0];
-    const alternatives = candidates.slice(1);
-    return `<article class="card" style="margin-top:10px">
-      <div><b>${esc(track.artist)} — ${esc(track.title)}</b>
-        <span class="muted">[${esc(track.status)}]</span></div>
-      <div class="muted">${esc(track.album || '')}
-        ${(track.playlists || []).length ? ' · ' + esc(track.playlists.join(', ')) : ''}</div>
-      ${candidateHtml(track, best, true)}
-      ${alternatives.length ? `<details><summary>${alternatives.length} alternative candidate${alternatives.length === 1 ? '' : 's'}</summary>
+    const best = candidates.find(candidate => candidate.best) || candidates[0];
+    const alternatives = candidates.filter(candidate => candidate !== best);
+    const review = track.review || {state:'needs_review', label:'Needs review', summary:'Review this chart carefully.', why:[], concerns:[], details:[]};
+    const stateClass = reviewStatusClass(review);
+    const selected = candidates.find(candidate => candidate.selected || candidate.manual === 'accept');
+    const selectedNote = selected
+      ? `<p class="review-selection-note"><b>Already selected:</b> ${esc(selected.candidate_artist)} — ${esc(selected.candidate_title)}. Choosing another chart will replace this choice.</p>`
+      : '';
+    const playlists = (track.playlists || []).length ? ` · ${esc(track.playlists.join(', '))}` : '';
+    return `<article class="card review-card" data-review-state="${esc(review.state)}">
+      <header class="review-card-head">
+        <div><div class="review-eyebrow">My music</div><h3>${esc(track.artist)} — ${esc(track.title)}</h3>
+          <div class="muted">${esc(track.album || '')}${playlists}</div></div>
+        <span class="review-status ${stateClass}">${esc(review.label)}</span>
+      </header>
+      ${selectedNote}
+      <section class="review-recommendation">
+        <div class="review-eyebrow" style="margin-top:14px">Best chart</div>
+        ${best ? candidateHtml(track, best, true) : `<div class="review-option review-option-blocked"><b>${esc(review.label)}</b><p class="review-summary">${esc(review.summary)}</p></div>`}
+      </section>
+      ${alternatives.length ? `<details class="review-alternatives"><summary>Other versions (${alternatives.length})</summary>
         ${alternatives.map(candidate => candidateHtml(track, candidate, false)).join('')}</details>` : ''}
     </article>`;
   }).join('');
@@ -6569,43 +7320,67 @@ function renderReview() {
   });
 }
 
+function reviewStatusClass(review) {
+  if (review.state === 'strong') return 'review-status-strong';
+  if (review.state === 'needs_review') return 'review-status-review';
+  if (review.state === 'not_playable') return 'review-status-blocked';
+  return 'review-status-not-recommended';
+}
+
 function candidateHtml(track, candidate, best) {
   if (!candidate) return '';
+  const review = candidate.review || {state:'needs_review', label:'Needs review', summary:'Review this chart carefully.', why:[], concerns:[], details:[]};
   const manual = candidate.manual || '';
-  const state = manual === 'accept' ? 'background:#1d3a28;' : manual === 'reject' ? 'background:#3a1d24;opacity:.7;' : '';
-  const link = candidate.url ? ` <a href="${esc(candidate.url)}" target="_blank" rel="noopener">view chart</a>` : '';
+  const selectedClass = candidate.selected || manual === 'accept' ? ' review-option-selected' : '';
+  const blockedClass = review.state === 'not_playable' ? ' review-option-blocked' : '';
+  const marker = best ? '<span class="review-selected">Best match</span>' : '';
+  const selectedBadge = candidate.selected || manual === 'accept' ? '<span class="review-selected">Already selected</span>' : manual === 'reject' ? '<span class="review-status review-status-not-recommended">Skipped</span>' : '';
+  const instruments = (candidate.instruments || []).join(', ');
+  const meta = [candidate.charter ? `Charter: ${candidate.charter}` : '', instruments ? `Instruments: ${instruments}` : '', candidate.pack_name ? `Pack: ${candidate.pack_name}` : ''].filter(Boolean).join(' · ');
+  const link = candidate.url ? ` <a href="${esc(candidate.url)}" target="_blank" rel="noopener">View chart</a>` : '';
   const disabled = jobRunning ? ' disabled title="Decisions are disabled while search is running"' : '';
-  return `<div class="file-row" style="${state}margin-top:8px;padding:10px;border-radius:8px">
-    <span title="${esc(candidate.explanation)}">
-      <b>${best ? 'Best: ' : ''}${esc(candidate.candidate_artist)} — ${esc(candidate.candidate_title)}</b><br>
-      <span class="muted">Score ${candidate.score} · ${esc(candidate.charter || 'unknown charter')}
-        · ${esc((candidate.instruments || []).join(', '))} · ${esc(candidate.reference || '')}${link}</span><br>
-      <span class="muted">${esc(candidate.explanation || '')}</span>
-    </span>
-    <span style="white-space:nowrap">
-      <button data-track="${esc(track.track_key)}" data-source="${esc(candidate.source)}" data-chart="${candidate.chart_id}" data-decision="accept" style="background:#2f7d4f"${disabled}>Accept</button>
-      <button data-track="${esc(track.track_key)}" data-source="${esc(candidate.source)}" data-chart="${candidate.chart_id}" data-decision="reject" style="background:#54303a"${disabled}>Reject</button>
-      ${manual ? `<button data-track="${esc(track.track_key)}" data-source="${esc(candidate.source)}" data-chart="${candidate.chart_id}" data-decision="clear"${disabled}>Clear</button>` : ''}
-    </span>
+  let actions = '';
+  if (manual === 'accept' || candidate.selected) {
+    actions = `<button data-track="${esc(track.track_key)}" data-source="${esc(candidate.source)}" data-chart="${candidate.chart_id}" data-decision="clear"${disabled}>Clear current choice</button>`;
+  } else if (review.selectable) {
+    actions = `<button class="primary" data-track="${esc(track.track_key)}" data-source="${esc(candidate.source)}" data-chart="${candidate.chart_id}" data-decision="accept"${disabled}>${esc(review.action)}</button>
+      ${manual === 'reject' ? `<button data-track="${esc(track.track_key)}" data-source="${esc(candidate.source)}" data-chart="${candidate.chart_id}" data-decision="clear"${disabled}>Undo skip</button>` : `<button data-track="${esc(track.track_key)}" data-source="${esc(candidate.source)}" data-chart="${candidate.chart_id}" data-decision="reject"${disabled}>Skip this chart</button>`}`;
+  } else {
+    actions = `<button disabled aria-label="${esc(review.label)}: ${esc(candidate.candidate_title)}">${esc(review.label)}</button>`;
+  }
+  return `<div class="review-option${selectedClass}${blockedClass}">
+    <div class="review-option-head"><div><h4>${esc(candidate.candidate_artist)} — ${esc(candidate.candidate_title)}</h4>${meta ? `<p class="review-option-meta">${esc(meta)}${link ? ' ·' : ''}${link}</p>` : link}</div><div>${marker} ${selectedBadge} <span class="review-status ${reviewStatusClass(review)}">${esc(review.label)}</span></div></div>
+    <p class="review-summary">${esc(review.summary || review.label)}</p>
+    ${reviewDetails(candidate)}
+    <div class="review-option-actions">${actions}</div>
   </div>`;
+}
+
+function reviewDetails(candidate) {
+  const review = candidate.review || {};
+  const why = (review.why || []).map(value => `<li>${esc(value)}</li>`).join('');
+  const concerns = (review.concerns || []).map(value => `<li class="review-concern">Potential issue: ${esc(value)}</li>`).join('');
+  const rows = (review.details || []).map(row => `<tr><th scope="row">${esc(row.label)}</th><td>${esc(row.value)}</td></tr>`).join('');
+  const reference = candidate.reference ? `<p class="muted">Chart reference: ${esc(candidate.reference)}</p>` : '';
+  const heading = review.state === 'not_playable' ? 'Why this chart is unavailable' : 'Why this match?';
+  return `<details class="review-why"><summary>${heading}</summary>${why || concerns ? `<ul>${why}${concerns}</ul>` : ''}${rows ? `<table><tbody>${rows}</tbody></table>` : ''}${reference}</details>`;
 }
 
 async function decide(trackKey, source, chartId, decision) {
   const response = await fetch('/api/review/decide', {method: 'POST',
     headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({track_key: trackKey, source, chart_id: chartId, decision})});
-  if (!response.ok) return;
-  const track = reviewData.tracks.find(item => item.track_key === trackKey);
-  if (track) {
-    track.candidates.forEach(candidate => {
-      if (decision === 'accept' && candidate.manual === 'accept' &&
-          !(candidate.source === source && candidate.chart_id === chartId)) candidate.manual = '';
-      if (candidate.source === source && candidate.chart_id === chartId) candidate.manual = decision === 'clear' ? '' : decision;
-      candidate.manual_decision = candidate.manual;
-    });
+    body: JSON.stringify({track_key: trackKey, source, chart_id: chartId, decision,
+      workspace_id: reviewData.workspace_id || undefined})});
+  const result = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    lastSaved = result.error || 'Could not save that choice.';
+    renderReview();
+    return;
   }
-  lastSaved = 'Saved; applies on the next exact pass/build.';
-  renderReview();
+  lastSaved = decision === 'clear' ? 'Current choice cleared.' : 'Chart choice saved.';
+  // Reload the authoritative persisted rows instead of making the card state
+  // optimistic or allowing it to drift from SQLite.
+  await loadReview(false);
   setTimeout(() => { lastSaved = ''; renderReview(); }, 4000);
 }
 
@@ -6617,15 +7392,17 @@ async function acceptAllReview() {
     renderReview();
     return;
   }
-  if (!confirm(`Accept the best review candidate for all ${count} review tracks?`)) return;
-  const response = await fetch('/api/review/accept-all', {method: 'POST'});
+  if (!confirm(`Choose the best chart for all ${count} songs that need review?`)) return;
+  const response = await fetch('/api/review/accept-all', {method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({workspace_id: reviewData.workspace_id || undefined})});
   const result = await response.json();
   if (!response.ok) {
     lastSaved = result.error || 'Bulk accept failed.';
     renderReview();
     return;
   }
-  lastSaved = result.message || `Accepted ${result.accepted} review matches.`;
+  lastSaved = `Saved ${result.accepted || 0} chart choices.`;
   await loadReview(false);
   setTimeout(() => { lastSaved = ''; renderReview(); }, 5000);
 }

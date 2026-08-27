@@ -44,6 +44,15 @@ def test_soundcloud_csv_export_skips_incomplete_rows():
     assert tracks[0].liked is True
 
 
+def test_soundcloud_csv_file_export_preserves_csv_newlines(tmp_path):
+    path = tmp_path / "export.csv"
+    path.write_text("title,artist\nSong,DJ\n", encoding="utf-8")
+
+    provider = SoundCloudExportProvider.from_file(path)
+
+    assert provider.import_library().unique_track_count == 1
+
+
 def test_soundcloud_export_does_not_accept_unsupported_file(tmp_path):
     path = tmp_path / "export.txt"
     path.write_text("password=do-not-read", encoding="utf-8")

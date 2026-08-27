@@ -6,9 +6,90 @@ import pytest
 
 from csv_to_clonehero.database import Database
 from csv_to_clonehero.pipeline import run_plan, run_search
+from csv_to_clonehero.review_presentation import build_review_presentation
 from csv_to_clonehero.webapp import create_app
 
 from .conftest import FakeSource, make_chart, make_track
+
+
+def _presentation_candidate(*, eligibility="RECOMMENDED", decision="AUTO_ACCEPT", score=94, gates=None, quality=None, version=None):
+    return {
+        "eligibility": eligibility,
+        "decision": decision,
+        "score": score,
+        "artist": "Artist",
+        "title": "Song",
+        "instruments": ["guitar", "bass", "drums", "vocals"],
+        "diff_guitar": 3,
+        "breakdown": {
+            "factors": {
+                "match": {
+                    "title": {"similarity": 96, "exact_normalized": True},
+                    "artist": {"similarity": 94, "exact_normalized": True},
+                    "version_markers": version or {"track": [], "candidate": [], "common": []},
+                },
+                "quality": quality or {"full_band": 8, "rated_guitar": 0.5},
+                "gates": gates or {
+                    "hard_gate": False,
+                    "playable_content": True,
+                    "required_five_fret_guitar": True,
+                },
+            }
+        },
+    }
+
+
+def test_review_presentation_uses_existing_evidence_for_human_language():
+    result = build_review_presentation(_presentation_candidate())
+
+    assert result["state"] == "strong"
+    assert result["label"] == "Strong match"
+    assert "Artist and title match exactly." in result["why"]
+    assert "Guitar available." in result["why"]
+    assert result["summary"] != "RECOMMENDED"
+    assert any(row["value"] == "94/100" for row in result["details"])
+
+
+def test_review_presentation_exposes_concern_for_review_candidate():
+    result = build_review_presentation(
+        _presentation_candidate(
+            eligibility="ELIGIBLE_REVIEW",
+            decision="REVIEW",
+            score=82,
+            quality={"single_instrument": -8, "unrated_guitar": -3},
+            version={"track": [], "candidate": ["live"], "common": []},
+        ),
+        minimum_score=70,
+    )
+
+    assert result["state"] == "needs_review"
+    assert result["label"] == "Needs review"
+    assert "Possible live-version mismatch." in result["concerns"]
+    assert "Only one instrument is available." in result["concerns"]
+    assert result["selectable"] is True
+
+
+def test_review_presentation_hard_gate_is_not_playable_even_with_high_score():
+    result = build_review_presentation(
+        _presentation_candidate(
+            eligibility="INCOMPATIBLE",
+            decision="REJECT",
+            score=99,
+            gates={
+                "hard_gate": True,
+                "playable_content": False,
+                "required_five_fret_guitar": None,
+                "hard_gate_reasons": ["no playable chart content"],
+            },
+        ),
+        minimum_score=0,
+    )
+
+    assert result["state"] == "not_playable"
+    assert result["label"] == "Not playable"
+    assert result["selectable"] is False
+    assert result["action"] == "Unavailable"
+    assert result["why"] == ["This chart does not contain playable instrument data."]
 
 
 def _seed_track(config, db, track):
@@ -100,6 +181,9 @@ class TestReviewApi:
         assert item["spotify_title"] == "Low"
         assert item["candidates"][0]["candidate_title"] == "Low (Travis Barker Remix)"
         assert item["candidates"][0]["manual"] == ""
+        assert item["candidates"][0]["review"]["label"] == "Needs review"
+        assert "Guitar available." in item["candidates"][0]["review"]["why"]
+        assert "REVIEW" not in item["candidates"][0]["review"]["summary"]
         assert payload["progress"]["review_track_count"] == 1
 
         response = http.post(

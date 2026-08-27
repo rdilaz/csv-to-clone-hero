@@ -80,13 +80,13 @@ def discover_combined(
             "liked": sum(1 for track in snapshot.tracks if track.liked),
         }
     if catalog.available:
-        for track in normalized:
+        for position, track in enumerate(normalized, start=1):
             matches = catalog.candidates(track.artist_full, track.title)
             if matches:
                 result.exact_hits += 1
             else:
                 result.exact_misses += 1
-            if diagnostics:
+            if diagnostics and (position <= 50 or position % 25 == 0 or position == len(normalized)):
                 diagnostics.update("catalog_match", samples={"lookups": [{"artist": track.artist_norm, "title": track.title_norm, "candidate_count": len(matches)}]})
             for chart in matches:
                 breakdown = score_candidate(track, chart, config)

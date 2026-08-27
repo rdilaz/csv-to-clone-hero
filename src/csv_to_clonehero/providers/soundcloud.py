@@ -44,7 +44,8 @@ class SoundCloudExportProvider:
         if file_path.suffix.casefold() == ".json":
             return cls.from_json(file_path.read_text(encoding="utf-8-sig"))
         if file_path.suffix.casefold() == ".csv":
-            return cls.from_csv(file_path.read_text(encoding="utf-8-sig", newline=""))
+            with file_path.open("r", encoding="utf-8-sig", newline="") as handle:
+                return cls.from_csv(handle.read())
         raise ValueError("SoundCloud imports support only JSON or CSV exports")
 
     @classmethod

@@ -1,5 +1,65 @@
 {% extends "base.html" %}
 {% block title %}CSV to Clone Hero{% endblock %}
+{% block head %}
+<style>
+  main.wrap { min-width:0; }
+  .card { min-width:0; overflow-wrap:anywhere; }
+  input[type="file"] { max-width:100%; }
+  .review-intro { max-width: 720px; }
+  .review-feedback { min-height: 1.5em; margin: 12px 0; }
+  .review-feedback.error { color: #f85149; }
+  .review-card { margin-top: 14px; padding: 18px; min-width:0; overflow-wrap:anywhere; }
+  .match-option { min-width:0; overflow-wrap:anywhere; }
+  .review-card-header, .recommendation-header, .option-header,
+  .option-actions, .review-toolbar { display:flex; align-items:center; gap:12px; }
+  .review-card-header, .recommendation-header { justify-content:space-between; }
+  .review-card h3, .review-card h4 { margin: 0; }
+  .review-card h4 { font-size: 1.05rem; }
+  .eyebrow { color: var(--muted); font-size: .78rem; font-weight: 700;
+    letter-spacing: .08em; text-transform: uppercase; }
+  .track-album, .option-meta, .match-summary { color: var(--muted); }
+  .track-album { margin: 3px 0 0; }
+  .review-label, .selected-badge { border:1px solid var(--border); border-radius:999px;
+    display:inline-block; padding:3px 9px; font-size:.83rem; font-weight:700; }
+  .review-label--strong { border-color:var(--accent-2); color:var(--accent-2); }
+  .review-label--review { border-color:var(--warn); color:var(--warn); }
+  .review-label--blocked, .review-label--not-recommended { color:#f85149; }
+  .review-label--incomplete, .review-label--progress { color:var(--muted); }
+  .selected-badge { border-color:var(--accent-2); color:var(--accent-2); }
+  .selection-note { background:#102319; border-left:3px solid var(--accent-2);
+    margin:14px 0 0; padding:9px 12px; }
+  .review-warning { background:#2b220f; border-left:3px solid var(--warn); }
+  .recommendation { border-top:1px solid var(--border); margin-top:16px; padding-top:16px; }
+  .match-option { border:1px solid var(--border); border-radius:8px; margin-top:8px; padding:12px; }
+  .match-option--selected { border-color:var(--accent-2); background:#101e16; }
+  .match-option--blocked { background:#1b171a; }
+  .option-header { justify-content:space-between; align-items:flex-start; }
+  .option-header > div { min-width:0; max-width:100%; }
+  .option-meta { font-size:.9rem; margin:4px 0 0; }
+  .match-summary { margin:7px 0 0; }
+  .option-actions { justify-content:flex-end; flex-wrap:wrap; margin-top:12px; }
+  .why-list { margin:10px 0; padding-left:20px; }
+  .concern { color:var(--warn); }
+  .review-details { margin-top:10px; }
+  .review-details summary, .alternatives summary { cursor:pointer; }
+  .review-card button:focus-visible, .advanced-review summary:focus-visible,
+  .review-details summary:focus-visible, .alternatives summary:focus-visible,
+  .review-card a:focus-visible { outline:3px solid var(--accent); outline-offset:3px; }
+  .review-details table { border-collapse:collapse; margin-top:8px; width:100%; }
+  .review-details th, .review-details td { border-bottom:1px solid var(--border); padding:6px 8px 6px 0; text-align:left; vertical-align:top; }
+  .review-details th { color:var(--muted); font-weight:600; width:34%; }
+  .alternatives { border-top:1px solid var(--border); margin-top:16px; padding-top:13px; }
+  .alternative-option { margin-top:9px; }
+  .advanced-review { margin-top:14px; }
+  .advanced-review summary { cursor:pointer; font-weight:600; }
+  .advanced-review-body { border-left:2px solid var(--border); margin:10px 0 0 4px; padding:4px 0 4px 14px; }
+  @media (max-width: 600px) {
+    .review-card-header, .recommendation-header, .option-header { align-items:flex-start; flex-direction:column; }
+    .option-actions { justify-content:flex-start; }
+    .option-actions .btn { width:100%; }
+  }
+</style>
+{% endblock %}
 {% block content %}
 {% if not authenticated %}
 <section class="card">
@@ -75,14 +135,26 @@
   </div>
   <div id="error" class="error" style="display:none"></div>
   <div id="review" style="display:none">
-    <h2>Matches — select which to download</h2>
-    <label for="minimumScore">Minimum match score (0-100):</label>
-    <input id="minimumScore" type="number" min="0" max="100" value="50" step="1"
-           aria-label="Minimum match score" oninput="updateMinimumScore(this.value)">
-    <output id="minimumScoreValue">50</output>
-    <button class="btn ghost" onclick="saveMinimumScore()">Apply score threshold</button>
-    <button class="btn ghost" onclick="bulkSelect('select')">Select all at or above threshold</button>
-    <button class="btn ghost" onclick="bulkSelect('clear')">Deselect all</button>
+    <h2>Review your matches</h2>
+    <p class="muted review-intro">Start with the recommendation for each song. The app checks both identity and playability; open &quot;Why this match?&quot; when you want to see the evidence.</p>
+    <div id="reviewFeedback" class="review-feedback" role="status" aria-live="polite"></div>
+    <p id="reviewSummary" class="muted" role="status"></p>
+    <details class="advanced-review">
+      <summary>Advanced review settings</summary>
+      <div class="advanced-review-body">
+        <p class="muted">The safety cutoff affects which charts can be selected. Most people can leave it at the default.</p>
+        <label for="minimumScore">Selection cutoff (advanced, 0-100):</label>
+        <input id="minimumScore" type="number" min="0" max="100" value="50" step="1"
+               aria-describedby="minimumScoreHelp" oninput="updateMinimumScore(this.value)">
+        <output id="minimumScoreValue" for="minimumScore">50</output>
+        <span id="minimumScoreHelp" class="muted">Charts below this cutoff stay unavailable to select.</span>
+        <div class="review-toolbar">
+          <button class="btn ghost" onclick="saveMinimumScore()">Apply cutoff</button>
+          <button class="btn ghost" onclick="bulkSelect('select')">Select charts meeting cutoff</button>
+          <button class="btn ghost" onclick="bulkSelect('clear')">Clear all choices</button>
+        </div>
+      </div>
+    </details>
     <div id="cards"></div>
   </div>
   <div id="expansion" class="card" style="display:none">
@@ -100,6 +172,7 @@
 {% block scripts %}{% if authenticated %}
 <script>
 let jobId = null, pollTimer = null, tracks = [], scopeReady = false, preflightReady = false;
+let reviewFeedback = '';
 
 function show(msg, pct) {
   document.getElementById('status').style.display = 'block';
@@ -237,6 +310,11 @@ async function poll() {
     document.getElementById('startBtn').textContent = j.status === 'failed' ? 'Search again' : 'Search again';
     document.getElementById('startBtn').disabled = false;
     if (j.status === 'failed') { fail(j.error || 'Search failed'); }
+    if (j.status === 'partial') {
+      setReviewFeedback('Some songs could not be checked. Review the results, then run the search again for the missing checks.');
+    } else if (j.status === 'interrupted' || j.status === 'cancelled') {
+      setReviewFeedback('This search did not finish. Existing results are shown, but run it again before deciding about missing songs.');
+    }
     if (j.status !== 'failed') { await loadWorkspace(); }
   }
 }
@@ -251,19 +329,24 @@ async function loadWorkspace() {
   const cards = document.getElementById('cards');
   const host = document.getElementById('review');
   host.style.display = 'block';
-  cards.innerHTML = tracks.map(t => `
-    <div class="card" style="margin-top:10px">
-      <strong>${esc(t.artist)} — ${esc(t.title)}</strong> <span class="muted">(${esc(t.album||'')})</span>
-      <ul>
-      ${(t.candidates||[]).map(c => `
-        <li>
-          <input type="checkbox" ${c.selected?'checked':''}
-                 onchange="toggle('${t.track_key}', ${c.candidate_id}, ${c.selected?1:0})">
-          <strong>${esc(c.artist)}</strong> — ${esc(c.title)}
-          <span class="muted">score ${Math.round(c.score)} · ${esc(c.eligibility)}</span>
-        </li>`).join('')}
-      </ul>
-    </div>`).join('') || '<p class="muted">No matches yet.</p>';
+  const strong = tracks.filter(t => t.review_state === 'strong').length;
+  const needsReview = tracks.filter(t => t.review_state === 'needs_review').length;
+  const unavailable = tracks.filter(t => !['strong', 'needs_review'].includes(t.review_state)).length;
+  document.getElementById('reviewSummary').textContent = tracks.length
+    ? `${tracks.length} songs in this review: ${strong} strong matches, ${needsReview} need review, ${unavailable} without a safe recommendation.`
+    : 'No songs are ready to review yet.';
+  cards.innerHTML = tracks.length
+    ? tracks.map((track, index) => reviewCard(track, index)).join('')
+    : '<div class="card"><h3>No charts to review yet</h3><p class="muted">Run discovery after choosing some music, then return here to review the results.</p></div>';
+  cards.querySelectorAll('button[data-review-action]').forEach(button => {
+    button.addEventListener('click', () => chooseCandidate(
+      button.dataset.track,
+      Number(button.dataset.candidate),
+      button.dataset.reviewAction,
+      button,
+    ));
+  });
+  setReviewFeedback(reviewFeedback);
   loadExpansion();
 }
 async function loadExpansion() {
@@ -284,12 +367,88 @@ async function scoreExpansion() {
     await loadWorkspace();
   } catch (e) { fail(e.message); }
 }
-async function toggle(trackKey, candidateId, currentlySelected) {
-  const action = currentlySelected ? 'clear' : 'select';
-  await api('/api/selection', {method:'POST', body: JSON.stringify({
-    track_key: trackKey, candidate_id: candidateId, action, elig_ok:true
-  })});
-  await loadWorkspace();
+function setReviewFeedback(message, isError = false) {
+  reviewFeedback = String(message || '');
+  const el = document.getElementById('reviewFeedback');
+  if (!el) return;
+  el.textContent = reviewFeedback;
+  el.classList.toggle('error', Boolean(isError));
+}
+function reviewCard(track, index) {
+  const candidates = track.candidates || [];
+  const best = candidates.find(candidate => candidate.best) || candidates[0];
+  const alternatives = candidates.filter(candidate => candidate !== best);
+  const review = track.review || {label:'Needs review', state:'needs_review', summary:'Review this chart carefully.', why:[], concerns:[], details:[]};
+  const stateClass = `review-label--${review.state === 'strong' ? 'strong' : review.state === 'needs_review' ? 'review' : ['in_progress', 'incomplete', 'not_checked'].includes(review.state) ? 'progress' : review.state === 'not_playable' ? 'blocked' : 'not-recommended'}`;
+  const selected = candidates.find(candidate => candidate.selected);
+  const selectedNote = selected
+    ? `<p class="selection-note"><strong>Already selected:</strong> ${esc(selected.artist)} — ${esc(selected.title)}. Choosing another chart will replace this choice.</p>`
+    : '';
+  return `<article class="card review-card" data-review-state="${esc(review.state)}">
+    <header class="review-card-header">
+      <div>
+        <div class="eyebrow">My music</div>
+        <h3 id="review-track-${index}">${esc(track.artist)} — ${esc(track.title)}</h3>
+        ${track.album ? `<p class="track-album">${esc(track.album)}</p>` : ''}
+      </div>
+      <span class="review-label ${stateClass}">${esc(review.label)}</span>
+    </header>
+    ${selectedNote}
+    ${track.review_notice ? `<p class="selection-note review-warning" role="note">${esc(track.review_notice)}</p>` : ''}
+    <section class="recommendation" aria-labelledby="review-track-${index}">
+      <div class="recommendation-header"><span class="eyebrow">Best chart</span></div>
+      ${best ? candidateCard(track, best, true) : `<div class="match-option match-option--blocked"><strong>${esc(review.label)}</strong><p class="match-summary">${esc(review.summary)}</p></div>`}
+    </section>
+    ${alternatives.length ? `<details class="alternatives"><summary>Other versions (${alternatives.length})</summary>${alternatives.map(candidate => candidateCard(track, candidate, false)).join('')}</details>` : ''}
+  </article>`;
+}
+function candidateCard(track, candidate, best) {
+  const review = candidate.review || {state:'needs_review', label:'Needs review', summary:'Review this chart carefully.', why:[], concerns:[], details:[]};
+  const stateClass = `review-label--${review.state === 'strong' ? 'strong' : review.state === 'needs_review' ? 'review' : review.state === 'not_playable' ? 'blocked' : review.state === 'incomplete' ? 'incomplete' : 'not-recommended'}`;
+  const selectedClass = candidate.selected ? ' match-option--selected' : '';
+  const blockedClass = review.state === 'not_playable' ? ' match-option--blocked' : '';
+  const instruments = (candidate.instruments || []).join(', ');
+  const meta = [candidate.charter ? `Charter: ${candidate.charter}` : '', instruments ? `Instruments: ${instruments}` : '', candidate.pack_name ? `Pack: ${candidate.pack_name}` : ''].filter(Boolean).join(' · ');
+  const link = candidate.url ? ` <a href="${esc(candidate.url)}" target="_blank" rel="noopener">View chart</a>` : '';
+  let action = '';
+  if (candidate.selected) {
+    action = `<button class="btn ghost" data-review-action="clear" data-track="${esc(track.track_key)}" data-candidate="${candidate.candidate_id}" aria-label="Clear current choice ${esc(candidate.title)}">Clear current choice</button>`;
+  } else if (review.selectable) {
+    action = `<button class="btn" data-review-action="select" data-track="${esc(track.track_key)}" data-candidate="${candidate.candidate_id}" aria-label="${esc(review.action)} ${esc(candidate.title)} for ${esc(track.title)}">${esc(review.action)}</button>`;
+  } else {
+    action = `<button class="btn ghost" disabled aria-label="${esc(review.action || review.label)}: ${esc(candidate.title)}">${esc(review.action || review.label)}</button>`;
+  }
+  const marker = best ? '<span class="selected-badge">Best match</span>' : '';
+  const selectedBadge = candidate.selected ? '<span class="selected-badge">Already selected</span>' : '';
+  const details = reviewDetails(candidate);
+  return `<div class="match-option${selectedClass}${blockedClass}">
+    <div class="option-header"><div><h4>${esc(candidate.artist)} — ${esc(candidate.title)}</h4>${meta ? `<p class="option-meta">${esc(meta)}${link ? ' ·' : ''}${link}</p>` : link}</div><div>${marker} ${selectedBadge} <span class="review-label ${stateClass}">${esc(review.label)}</span></div></div>
+    <p class="match-summary">${esc(review.summary || review.label)}</p>
+    ${details}
+    <div class="option-actions">${action}</div>
+  </div>`;
+}
+function reviewDetails(candidate) {
+  const review = candidate.review || {};
+  const why = (review.why || []).map(value => `<li>${esc(value)}</li>`).join('');
+  const concerns = (review.concerns || []).map(value => `<li class="concern">Potential issue: ${esc(value)}</li>`).join('');
+  const rows = (review.details || []).map(row => `<tr><th scope="row">${esc(row.label)}</th><td>${esc(row.value)}</td></tr>`).join('');
+  const reference = candidate.reference ? `<p class="muted">Chart reference: ${esc(candidate.reference)}</p>` : '';
+  const heading = review.state === 'not_playable' ? 'Why this chart is unavailable' : 'Why this match?';
+  return `<details class="review-details"><summary>${heading}</summary>${why || concerns ? `<ul class="why-list">${why}${concerns}</ul>` : ''}${rows ? `<table><tbody>${rows}</tbody></table>` : ''}${reference}</details>`;
+}
+async function chooseCandidate(trackKey, candidateId, action, button) {
+  if (button) button.disabled = true;
+  setReviewFeedback(action === 'clear' ? 'Clearing the current choice...' : 'Saving your chart choice...');
+  try {
+    await api('/api/selection', {method:'POST', body: JSON.stringify({
+      track_key: trackKey, candidate_id: candidateId, action
+    })});
+    setReviewFeedback(action === 'clear' ? 'Current choice cleared.' : 'Chart choice saved.');
+    await loadWorkspace();
+  } catch (e) {
+    setReviewFeedback(e.message || 'Could not save that chart choice.', true);
+  }
 }
 async function downloadZip() {
   document.getElementById('downloadBtn').disabled = true;
@@ -310,12 +469,18 @@ async function saveMinimumScore() {
     await api('/api/workspace/settings', {method:'POST', body:JSON.stringify({
       minimum_score:Number(document.getElementById('minimumScore').value)
     })});
+    setReviewFeedback('Selection cutoff saved.');
     await loadWorkspace();
-  } catch (e) { fail(e.message); }
+  } catch (e) { setReviewFeedback(e.message || 'Could not save the selection cutoff.', true); }
 }
 async function bulkSelect(action) {
-  try { await api('/api/selection/bulk', {method:'POST', body:JSON.stringify({action})}); await loadWorkspace(); }
-  catch (e) { fail(e.message); }
+  try {
+    const result = await api('/api/selection/bulk', {method:'POST', body:JSON.stringify({action})});
+    setReviewFeedback(action === 'select'
+      ? `Saved ${result.changed || 0} chart choices meeting the cutoff.`
+      : 'All chart choices cleared.');
+    await loadWorkspace();
+  } catch (e) { setReviewFeedback(e.message || 'Could not update chart choices.', true); }
 }
 loadScope();
 loadSoundCloud();

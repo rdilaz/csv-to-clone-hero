@@ -9,7 +9,7 @@ import json
 import sqlite3
 import time
 import uuid
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import asdict, fields, is_dataclass
 from pathlib import Path
 from typing import Any
@@ -1189,6 +1189,7 @@ class Database:
         snapshot: Any,
         *,
         scope: Mapping[str, Any] | None = None,
+        on_progress: Callable[[Mapping[str, Any]], None] | None = None,
     ) -> dict[str, Any]:
         """Persist one provider snapshot without replacing other providers."""
         import time as _time
@@ -1225,7 +1226,15 @@ class Database:
             )
             import_id = int(cur.lastrowid)
             legacy_tracks = []
-            for value in snapshot.tracks:
+            total_tracks = len(snapshot.tracks)
+            if on_progress:
+                on_progress({
+                    "phase": "persist",
+                    "message": f"Saving SoundCloud tracks (0 / {total_tracks})...",
+                    "total_tracks": total_tracks,
+                    "persisted_tracks": 0,
+                })
+            for position, value in enumerate(snapshot.tracks, start=1):
                 track = provider_track_to_track(value)
                 legacy_tracks.append(track)
                 self._conn.execute(
@@ -1249,8 +1258,15 @@ class Database:
                            VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(source_id,provider_id) DO UPDATE SET
                            library_track_id=excluded.library_track_id, source_import_id=excluded.source_import_id, title=excluded.title, artist=excluded.artist,
                            album=excluded.album, isrc=excluded.isrc, url=excluded.url, liked=excluded.liked, metadata_json=excluded.metadata_json, imported_at=excluded.imported_at""",
-                        (int(row["id"]), source_id, import_id, provider_id, value.title, value.artist, value.album, value.isrc, value.url, int(value.liked), _json_text(value.metadata, {}), now),
+                         (int(row["id"]), source_id, import_id, provider_id, value.title, value.artist, value.album, value.isrc, value.url, int(value.liked), _json_text(value.metadata, {}), now),
                     )
+                if on_progress and (position == total_tracks or position % 25 == 0):
+                    on_progress({
+                        "phase": "persist",
+                        "message": f"Saving SoundCloud tracks ({position} / {total_tracks})...",
+                        "total_tracks": total_tracks,
+                        "persisted_tracks": position,
+                    })
             # Keep the existing chart engine projection usable for all callers.
             stored = self.upsert_spotify_tracks(legacy_tracks)
             for track in stored:

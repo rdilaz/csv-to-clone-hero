@@ -45,7 +45,17 @@ def run_library_import(
             on_progress({"phase": "import", "provider": provider_name})
         try:
             snapshot = provider.import_library(scope=scopes.get(provider_name) or {})
-            persisted = db.upsert_library_snapshot(workspace_id, snapshot, scope=scopes.get(provider_name))
+
+            def persistence_progress(payload: Mapping[str, Any]) -> None:
+                if on_progress:
+                    on_progress({"provider": provider_name, **dict(payload)})
+
+            persisted = db.upsert_library_snapshot(
+                workspace_id,
+                snapshot,
+                scope=scopes.get(provider_name),
+                on_progress=persistence_progress if on_progress else None,
+            )
             report = dict(persisted.get("report") or {})
             result.sources[provider_name] = SourceImportResult(provider_name, "complete", len(snapshot.tracks), report=report)
         except Exception as exc:  # one provider must not erase another

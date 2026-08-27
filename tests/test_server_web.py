@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import time
 import io
+import json
 
 import pytest
 
@@ -87,6 +88,18 @@ def test_landing_is_public(client):
     assert b"Get every song" not in r.data
     assert b"score the best match" not in r.data
     assert b"Enchor" in r.data
+
+
+def test_authenticated_review_shell_prioritizes_human_decisions(client):
+    _sign_in(client)
+    html = client.get("/").get_data(as_text=True)
+
+    assert "Review your matches" in html
+    assert "Advanced review settings" in html
+    assert '<details class="advanced-review">' in html
+    assert 'role="status" aria-live="polite"' in html
+    assert "Minimum match score" not in html
+    assert "eligibility" not in html
 
 
 def test_anonymous_soundcloud_export_import_is_available_without_spotify_login(client):
@@ -417,6 +430,118 @@ def test_workspace_empty_before_run(client, config):
     _sign_in(client)
     data = client.get("/api/workspace").get_json()
     assert data["tracks"] == []
+
+
+def test_workspace_review_payload_uses_human_states_and_current_selection(client, config):
+    from csv_to_clonehero.database import Database
+    from tests.conftest import make_chart, make_track
+    from csv_to_clonehero.server.auth import user_workspace_key
+
+    _sign_in(client)
+    assert client.post("/api/spotify/scope", json={"include_liked": True}).status_code == 200
+    db = Database(config.database_path)
+    try:
+        workspace = db.get_workspace(user_workspace_key("user-1"))
+        track = make_track("Song", "Artist", spotify_id="review-track", album="Album")
+        stored = db.upsert_spotify_tracks([track])[0]
+        db.replace_workspace_library_tracks(workspace["id"], [stored])
+
+        strong = make_chart("Song", "Artist", chart_id=701)
+        review = make_chart("Song (Live)", "Artist", chart_id=702)
+        hard = make_chart("Song", "Artist", chart_id=703, instruments=[], diff_guitar=None)
+        db.upsert_workspace_candidate(
+            workspace["id"], stored.track_key, strong, score=94,
+            eligibility="RECOMMENDED", decision="AUTO_ACCEPT",
+            breakdown_json=json.dumps({
+                "factors": {
+                    "match": {
+                        "title": {"similarity": 100, "exact_normalized": True},
+                        "artist": {"similarity": 100, "exact_normalized": True},
+                    },
+                    "quality": {"full_band": 8},
+                    "gates": {"hard_gate": False, "playable_content": True, "required_five_fret_guitar": True},
+                }
+            }),
+        )
+        db.upsert_workspace_candidate(
+            workspace["id"], stored.track_key, review, score=82,
+            eligibility="ELIGIBLE_REVIEW", decision="REVIEW",
+            breakdown_json=json.dumps({
+                "factors": {
+                    "match": {
+                        "title": {"similarity": 92},
+                        "artist": {"similarity": 94},
+                        "version_markers": {"track": [], "candidate": ["live"], "common": []},
+                    },
+                    "quality": {"unrated_guitar": -3},
+                    "gates": {"hard_gate": False, "playable_content": True, "required_five_fret_guitar": True},
+                }
+            }),
+        )
+        db.upsert_workspace_candidate(
+            workspace["id"], stored.track_key, hard, score=99,
+            eligibility="INCOMPATIBLE", decision="REJECT",
+            breakdown_json=json.dumps({
+                "reasons": ["no playable chart content"],
+                "factors": {
+                    "gates": {
+                        "hard_gate": True,
+                        "playable_content": False,
+                        "hard_gate_reasons": ["no playable chart content"],
+                    }
+                },
+            }),
+        )
+        db.select_workspace_candidate(
+            workspace["id"], stored.track_key, strong,
+            kind="exact", eligibility="RECOMMENDED",
+        )
+    finally:
+        db.close()
+
+    payload = client.get("/api/workspace").get_json()
+    item = payload["tracks"][0]
+    candidates = {candidate["chart_id"]: candidate for candidate in item["candidates"]}
+    assert item["review_label"] == "Strong match"
+    assert item["best_candidate_id"] == candidates[701]["candidate_id"]
+    assert item["selected_candidate_id"] == candidates[701]["candidate_id"]
+    assert candidates[701]["selected"] is True
+    assert candidates[701]["review"]["summary"]
+    assert candidates[702]["review_label"] == "Needs review"
+    assert "live-version mismatch" in candidates[702]["review"]["summary"]
+    assert candidates[703]["review_label"] == "Not playable"
+    assert candidates[703]["selectable"] is False
+    assert "RECOMMENDED" not in item["review_summary"]
+
+
+def test_workspace_review_payload_is_honest_when_matching_is_incomplete(client, config):
+    from csv_to_clonehero.database import Database
+    from csv_to_clonehero.server.auth import user_workspace_key
+    from tests.conftest import make_track
+
+    _sign_in(client)
+    assert client.post("/api/spotify/scope", json={"include_liked": True}).status_code == 200
+    db = Database(config.database_path)
+    try:
+        workspace = db.get_workspace(user_workspace_key("user-1"))
+        track = db.upsert_spotify_tracks([make_track("Unmatched", "Artist", "unmatched")])[0]
+        db.replace_workspace_library_tracks(workspace["id"], [track])
+        db.update_workspace(workspace["id"], status="complete", phase="complete")
+    finally:
+        db.close()
+
+    complete = client.get("/api/workspace").get_json()["tracks"][0]
+    assert complete["review_label"] == "No suitable chart found"
+    assert "completed search" in complete["review_summary"]
+
+    db = Database(config.database_path)
+    try:
+        db.update_workspace(workspace["id"], status="partial", phase="complete")
+    finally:
+        db.close()
+    partial = client.get("/api/workspace").get_json()["tracks"][0]
+    assert partial["review_label"] == "Matching incomplete"
+    assert "run the search again" in partial["review_summary"]
 
 
 def test_download_requires_selection(client, config):

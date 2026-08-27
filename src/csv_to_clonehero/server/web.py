@@ -39,6 +39,7 @@ from csv_to_clonehero.server.safeguards import (
     validate_discovery_start,
 )
 from csv_to_clonehero.server.security import resolve_session_key, resolve_token_cipher
+from csv_to_clonehero.review_presentation import build_review_presentation
 from csv_to_clonehero.sources.base import source_catalog_available
 
 log = logging.getLogger(__name__)
@@ -582,8 +583,8 @@ def create_app(
         db = _user_db()
         try:
             workspace = _ensure_workspace(db, user)
-            cards = _review_cards(db, workspace)
             minimum_score = db.get_workspace_minimum_score(workspace) if workspace else 50.0
+            cards = _review_cards(db, workspace, minimum_score)
             return jsonify({"workspace": workspace, "minimum_score": minimum_score, "tracks": cards})
         finally:
             db.close()
@@ -1000,7 +1001,11 @@ def _ensure_workspace(db: Database, user: Any) -> int:
     return 0
 
 
-def _review_cards(db: Database, workspace: int) -> list[dict[str, Any]]:
+def _review_cards(
+    db: Database,
+    workspace: int,
+    minimum_score: float = 50.0,
+) -> list[dict[str, Any]]:
     if not workspace:
         return []
     rows = db.get_workspace_candidates(workspace, kind="exact", include_rejected=True)
@@ -1018,27 +1023,165 @@ def _review_cards(db: Database, workspace: int) -> list[dict[str, Any]]:
             breakdown = json.loads(data.get("breakdown_json") or "{}")
         except (TypeError, ValueError):
             breakdown = {}
-        by_track.setdefault(int(tid), []).append(
-            {
-                "candidate_id": data.get("candidate_id"),
-                "source": candidate.source,
-                "chart_id": candidate.chart_id,
-                "artist": candidate.artist,
-                "title": candidate.name,
-                "score": round(float(data.get("score") or 0), 1),
-                "quality": round(float(data.get("quality") or 0), 1),
-                "eligibility": data.get("eligibility") or breakdown.get("eligibility") or "",
-                "explanation": breakdown.get("explanation") or "",
-                "selected": bool(data.get("selected")),
-            }
+        item = {
+            "candidate_id": data.get("candidate_id"),
+            "source": candidate.source,
+            "chart_id": candidate.chart_id,
+            "artist": candidate.artist,
+            "title": candidate.name,
+            "charter": candidate.charter,
+            "album": candidate.album,
+            "pack_name": candidate.pack_name,
+            "instruments": list(candidate.instruments or ()),
+            "diff_guitar": candidate.diff_guitar,
+            "url": candidate.url,
+            "reference": candidate.reference,
+            "supports_download": bool(candidate.supports_download),
+            "score": round(float(data.get("score") or 0), 1),
+            "quality": round(float(data.get("quality") or 0), 1),
+            # Raw fields remain available to existing API consumers. The
+            # ``review`` object is the only shape the human-facing UI needs.
+            "eligibility": data.get("eligibility") or breakdown.get("eligibility") or "",
+            "explanation": breakdown.get("explanation") or "",
+            "selected": bool(data.get("selected")),
+        }
+        item["review"] = build_review_presentation(
+            {**item, "breakdown": breakdown},
+            minimum_score=minimum_score,
         )
-    tracks = db.get_spotify_tracks(True)
+        item["review_state"] = item["review"]["state"]
+        item["review_label"] = item["review"]["label"]
+        item["review_summary"] = item["review"]["summary"]
+        item["selectable"] = item["review"]["selectable"]
+        item["selection_action"] = item["review"]["action"]
+        by_track.setdefault(int(tid), []).append(item)
+
+    workspace_track_ids = db.get_workspace_library_track_ids(workspace)
+    if not workspace_track_ids:
+        # Legacy workspaces may predate the workspace-library projection. The
+        # candidate rows are still workspace-scoped, so this fallback preserves
+        # their review cards without broadening visibility across users.
+        workspace_track_ids = set(by_track)
+    tracks = [
+        track
+        for track in db.get_spotify_tracks(True)
+        if int(track.db_id or 0) in workspace_track_ids
+    ]
+    workspace_row = db.get_workspace(workspace)
+    workspace_status = str(workspace_row["status"] or "") if workspace_row is not None else ""
+    progress_row = db.get_workspace_progress(workspace)
+    progress_status = str(progress_row["status"] or "") if progress_row is not None else ""
+    metadata = _json_object(workspace_row["metadata_json"] if workspace_row is not None else "{}")
+    stats = _json_object(metadata.get("stats"))
+    if not isinstance(stats, dict):
+        stats = {}
+    has_catalog_gaps = bool(stats.get("catalog_unavailable_tracks"))
+    active_statuses = {"pending", "running"}
+    incomplete_statuses = {"failed", "partial", "interrupted", "cancelled"}
+    matching_partial = bool(
+        workspace_status in incomplete_statuses
+        or progress_status in incomplete_statuses
+        or (workspace_row is not None and int(workspace_row["error_count"] or 0) > 0)
+        or metadata.get("partial")
+        or stats.get("partial")
+        or stats.get("query_errors")
+    )
+
+    def empty_review() -> dict[str, Any]:
+        if workspace_status in active_statuses or progress_status in active_statuses:
+            return {
+                "state": "in_progress",
+                "label": "Checking",
+                "summary": "The chart search is still checking this song.",
+                "why": ["The search has not finished for this song."],
+                "concerns": [],
+                "details": [],
+                "score": None,
+                "hard_gate": False,
+                "selectable": False,
+                "action": "Unavailable",
+                "selected": False,
+                "selected_label": "",
+            }
+        if workspace_status in {"created", "ready_for_scope"} or not workspace_status:
+            return {
+                "state": "not_checked",
+                "label": "Not checked",
+                "summary": "Run discovery to check this song for a playable chart.",
+                "why": ["Matching has not started for this song."],
+                "concerns": [],
+                "details": [],
+                "score": None,
+                "hard_gate": False,
+                "selectable": False,
+                "action": "Unavailable",
+                "selected": False,
+                "selected_label": "",
+            }
+        if matching_partial:
+            return {
+                "state": "incomplete",
+                "label": "Matching incomplete",
+                "summary": "Matching did not finish; run the search again before deciding.",
+                "why": ["The chart search did not finish for this song."],
+                "concerns": [],
+                "details": [],
+                "score": None,
+                "hard_gate": False,
+                "selectable": False,
+                "action": "Unavailable",
+                "selected": False,
+                "selected_label": "",
+            }
+        return {
+            "state": "no_match",
+            "label": "No suitable chart found",
+            "summary": (
+                "No suitable chart was found, or this song was not covered by the available catalog."
+                if has_catalog_gaps
+                else "No suitable chart was found in the completed search."
+            ),
+            "why": ["There is no chart result to review for this song."],
+            "concerns": [],
+            "details": [],
+            "score": None,
+            "hard_gate": False,
+            "selectable": False,
+            "action": "Unavailable",
+            "selected": False,
+            "selected_label": "",
+        }
+
     cards: list[dict[str, Any]] = []
     for track in tracks:
         candidates = by_track.get(int(track.db_id or 0))
-        if not candidates:
-            continue
+        candidates = candidates or []
         candidates.sort(key=lambda item: (-item["score"], item["source"], str(item["chart_id"])))
+        if candidates:
+            # A hard-gated high score is never presented as the best safe
+            # recommendation when another usable version exists.
+            best = next(
+                (
+                    item
+                    for item in candidates
+                    if item["review"]["state"] in {"strong", "needs_review"}
+                ),
+                candidates[0],
+            )
+            for item in candidates:
+                item["best"] = item is best
+            selected = next((item for item in candidates if item["selected"]), None)
+            review = best["review"]
+            review_notice = (
+                "Some chart checks were incomplete; run discovery again before relying on missing alternatives."
+                if matching_partial
+                else ""
+            )
+        else:
+            best = None
+            selected = None
+            review = empty_review()
+            review_notice = ""
         cards.append(
             {
                 "track_key": track.track_key,
@@ -1047,6 +1190,14 @@ def _review_cards(db: Database, workspace: int) -> list[dict[str, Any]]:
                 "title": track.title,
                 "album": track.album,
                 "candidates": candidates,
+                "best_candidate_id": best["candidate_id"] if best else None,
+                "selected_candidate_id": selected["candidate_id"] if selected else None,
+                "selected": bool(selected),
+                "review": review,
+                "review_state": review["state"],
+                "review_label": review["label"],
+                "review_summary": review["summary"],
+                "review_notice": review_notice,
             }
         )
     cards.sort(key=lambda item: (item["artist"].casefold(), item["title"].casefold()))
