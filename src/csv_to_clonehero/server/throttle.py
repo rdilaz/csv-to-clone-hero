@@ -17,9 +17,10 @@ Design:
 
 from __future__ import annotations
 
+from collections import deque
+from contextlib import contextmanager
 import threading
 import time
-from contextlib import contextmanager
 
 
 class GlobalGate:
@@ -34,9 +35,11 @@ class GlobalGate:
         if max_concurrent < 1:
             raise ValueError("max_concurrent must be >= 1")
         self.max_concurrent = max_concurrent
+        self.fair = bool(fair)
         self._lock = threading.Lock()
         self._available = max_concurrent
-        self._waiters = 0
+        self._waiters: deque[int] = deque()
+        self._next_ticket = 0
         self._cv = threading.Condition(self._lock)
 
     @contextmanager
@@ -51,25 +54,35 @@ class GlobalGate:
     def _acquire(self, timeout: float | None, tag: str) -> bool:
         deadline = None if timeout is None else time.monotonic() + timeout
         with self._cv:
-            self._waiters += 1
+            ticket = self._next_ticket
+            self._next_ticket += 1
+            self._waiters.append(ticket)
             try:
-                while self._available <= 0:
+                while self._available <= 0 or (
+                    self.fair and self._waiters[0] != ticket
+                ):
                     if deadline is not None:
                         remaining = deadline - time.monotonic()
                         if remaining <= 0:
+                            self._waiters.remove(ticket)
+                            self._cv.notify_all()
                             return False
                         self._cv.wait(remaining)
                     else:
                         self._cv.wait()
+                self._waiters.remove(ticket)
                 self._available -= 1
                 return True
-            finally:
-                self._waiters -= 1
+            except BaseException:
+                if ticket in self._waiters:
+                    self._waiters.remove(ticket)
+                self._cv.notify_all()
+                raise
 
     def _release(self, tag: str) -> None:
         with self._cv:
             self._available += 1
-            self._cv.notify(self._waiters)
+            self._cv.notify_all()
 
     @property
     def in_use(self) -> int:

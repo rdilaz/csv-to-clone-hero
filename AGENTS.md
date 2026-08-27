@@ -13,7 +13,7 @@
   Keep `network.concurrency` low (default 2). Query errors are never cached
   so transient failures retry on the next run; successes cache 7 days.
 - Never commit `input_playlists/*.csv`, `state/`, `output_library/`,
-  `reports/` (see .gitignore).
+  `reports/`, `overrides.yaml`, or `catalog/*.jsonl` (see .gitignore).
 - All source-specific logic must stay behind `sources/base.py:ChartSource`.
   Multi-source works structurally (query keys are per-source, candidates are
   keyed by `(source, chart_id)`, and a quality tie-break makes the
@@ -67,12 +67,11 @@
   apply it. Web endpoints: `/api/files` returns `enabled`; `/api/files/toggle`
   persists. CLI and web share the same set.
 - Web UI: `webapp.py` (Flask, 127.0.0.1-only), `python -m csv_to_clonehero
-  web`, launcher `WEB_INTERFACE.bat`. Simple mode is `/` (service picker,
-  drop zone, file enable/disable checkboxes, validated output path, Start,
-  progress + live log, Open folder); the full interface (review cards,
-  estimates, dry runs) is `/advanced`. Simple runs auto-accept best review
-  candidates between search and plan. `JobState` exposes a capped live-log
-  ring buffer in `/api/status`. Source factory is injectable for tests.
+  web`, launcher `WEB_INTERFACE.bat`. The active home page is source-neutral
+  (`_UNIFIED_PAGE`): SoundCloud export import plus optional Spotify and local
+  catalog matching. `/advanced` is the full CSV/iTunes review and build UI.
+  The local API exposes a capped live-log ring buffer in `/api/status`, and
+  source factories are injectable for tests.
 - Linked Clone Hero library (`webapp.py`): the Songs folder linked via
   `/api/spotify/library/link` (alias of `library-import`) persists in DB meta
   `spotify_inventory_root`; `scan_library` indexes it so discovery marks
@@ -90,9 +89,10 @@
 
 # Multi-user cloud product (the public `server/` package)
 
-- `src/csv_to_clonehero/server/` is the NEW public product (`web.py:create_app`,
+- `src/csv_to_clonehero/server/` is the public product (`web.py:create_app`,
   a WSGI app factory; run via `wsgi.py`/waitress/gunicorn). Migrations are
-  additive (`SCHEMA_VERSION` bumped to 5) and the 244-test suite covers both
+  additive (`database.py:SCHEMA_VERSION` is the source of truth) and the
+  offline suite covers both
   the legacy `webapp.py` engine and the new `server/` modules.
 - Secrets are NEVER in `config.yaml` (now untracked/gitignored). They come from
   env/secret-manager: `SECRET_KEY` (session), `TOKEN_ENCRYPTION_KEY` (Fernet),
@@ -113,16 +113,21 @@
   `server/throttle.GlobalGate`, so a single shared IP never exceeds Enchor's
   rate cap. Email-on-completion is optional/best-effort
   (`server/notifications`, resend|smtp|log).
-- Chart downloads are browser-only: `server/downloads.build_archive` assembles a
-  ZIP from workspace selections into a per-user staging dir, and
+- Public chart downloads are browser-only: `server/downloads.build_archive`
+  assembles a ZIP from workspace selections into transient staging, and
   `server/downloads.BrowserDownloads` hands it over via a short-lived, signed,
-  single-use URL (revoke + sweeper). Nothing chart-shaped is persisted.
-- Legacy single-user CSV/`webapp.py` `/advanced` flow stays intact but is off
-  the public surface; reachable only when `admin.enable_legacy_csv` is true AND
-  the signed-in user is in `admin.admins`.
+  single-use URL (revoke + sweeper). The local folder exporter may persist
+  verified artifacts under `state/export-artifacts` for idempotent rebuilds.
+- The local CSV/`webapp.py` `/advanced` flow stays separate from the public WSGI
+  product. It is protected by local loopback/LAN-token access, not the public
+  multi-user session model.
 - Ops: `Dockerfile` + `docker-compose.yml` (single host, SQLite `/data`
   volume), `.github/workflows/ci.yml` (offline on push, live Enchor on a
   schedule), `requirements.txt` runtime lock, `docs/ARCHITECTURE.md` and
   `docs/runbook.md` (Cloudflare DNS/Tunnel + single container host, backups,
   rollback). Consolidate ALL operator backends on that one host; never split
   the Enchor-facing worker across hosts.
+- The local `catalog/enchor.jsonl` snapshot is generated metadata, not source
+  code. It is intentionally ignored because a full snapshot is too large for
+  ordinary GitHub storage; `catalog-export` is the reproducible acquisition
+  utility and the loader refuses incomplete or checksum-invalid snapshots.

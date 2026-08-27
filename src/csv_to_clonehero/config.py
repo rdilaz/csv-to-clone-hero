@@ -63,6 +63,7 @@ class PathsConfig(BaseModel):
     # Base-dir-relative on purpose: state must never live inside the output
     # folder, so per-run output overrides never carry the DB with them.
     database: str = "state/csv_to_clonehero.db"
+    catalog: str = "catalog/enchor.jsonl"
     artifact_cache_dir: str = "state/export-artifacts"
     manifest_dir: str = "state/export-manifests"
 
@@ -118,6 +119,7 @@ class InstrumentsConfig(BaseModel):
 
 class ExpansionConfig(BaseModel):
     enabled: bool = True
+    max_artists_per_batch: int = Field(default=25, ge=1, le=25)
     cap_many_songs: int = 50
     min_songs_many: int = 5
     cap_some_songs: int = 25
@@ -182,7 +184,7 @@ class SearchConfig(BaseModel):
     max_search_pages: int = 20
     # Full source responses stay cached, but only the strongest local matches
     # receive expensive scoring and workspace rows.
-    candidate_shortlist_size: int = 12
+    candidate_shortlist_size: int = 50
 
     @property
     def search_result_cap(self) -> int:
@@ -195,6 +197,42 @@ class SearchConfig(BaseModel):
 
 class SourcesConfig(BaseModel):
     enabled: list[str] = Field(default_factory=lambda: ["enchor"])
+
+
+class SoundCloudConfig(BaseModel):
+    """Optional approved SoundCloud integration coordinates.
+
+    The public product may use an official OAuth client when configured. User
+    exports remain available without storing SoundCloud credentials.
+    """
+
+    enabled: bool = False
+    client_id_env: str = "SOUNDCLOUD_CLIENT_ID"
+    client_secret_env: str = "SOUNDCLOUD_CLIENT_SECRET"
+    redirect_uri: str = ""
+    redirect_path: str = "/api/auth/soundcloud/callback"
+    allow_user_exports: bool = True
+    allow_public_playlists: bool = True
+    scopes: list[str] = Field(default_factory=lambda: ["non-expiring"])
+
+    @property
+    def effective_client_id(self) -> str:
+        return os.environ.get(self.client_id_env.strip() or "SOUNDCLOUD_CLIENT_ID", "").strip()
+
+    @property
+    def effective_client_secret(self) -> str:
+        return os.environ.get(self.client_secret_env.strip() or "SOUNDCLOUD_CLIENT_SECRET", "").strip()
+
+    @property
+    def oauth_configured(self) -> bool:
+        return bool(self.effective_client_id and self.effective_client_secret and self.redirect_uri_value)
+
+    @property
+    def redirect_uri_value(self) -> str:
+        configured = self.redirect_uri.strip()
+        if configured:
+            return configured
+        return f"http://127.0.0.1:8765{self.redirect_path}"
 
 
 class KeyringConfig(BaseModel):
@@ -495,6 +533,10 @@ class ServerConfig(BaseModel):
     database_url_env: str = DATABASE_URL_ENV
     database_url: str = ""
     max_content_length: int = 50 * 1024 * 1024
+    enchor_preflight_ttl_seconds: int = 3600
+    max_scope_playlists: int = 200
+    max_scope_tracks: int = 10000
+    enable_expansion: bool = False
     session: SessionsConfig = Field(default_factory=SessionsConfig)
 
     @property
@@ -578,6 +620,7 @@ class AppConfig(BaseModel):
     storage: StorageConfig = Field(default_factory=StorageConfig)
     network: NetworkConfig = Field(default_factory=NetworkConfig)
     sources: SourcesConfig = Field(default_factory=SourcesConfig)
+    soundcloud: SoundCloudConfig = Field(default_factory=SoundCloudConfig)
     search: SearchConfig = Field(default_factory=SearchConfig)
     scan: ScanConfig = Field(default_factory=ScanConfig)
     cache: CacheConfig = Field(default_factory=CacheConfig)
@@ -636,6 +679,11 @@ class AppConfig(BaseModel):
             if url:
                 return self.resolve(url)
         return self.resolve(self.paths.database)
+
+    @property
+    def catalog_path(self) -> Path:
+        """Location of the optional generated Enchor metadata snapshot."""
+        return self._resolve_expanded(self.paths.catalog)
 
     @property
     def public_base_url(self) -> str:

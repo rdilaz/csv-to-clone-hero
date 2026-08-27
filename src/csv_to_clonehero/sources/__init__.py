@@ -30,6 +30,7 @@ def build_sources(config) -> list[ChartSource]:
                     timeout=config.network.timeout_seconds,
                     head_size_enabled=getattr(config.network, "head_size_enabled", False),
                     download_request_delay=getattr(config.network, "download_request_delay", 0.1),
+                    catalog_path=getattr(config, "catalog_path", None),
                 )
             )
         else:

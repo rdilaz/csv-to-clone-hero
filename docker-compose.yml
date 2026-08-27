@@ -4,7 +4,7 @@
 #
 #   docker compose up -d --build
 #   docker compose down           # stop
-#   docker compose run --rm backupper-backup      # documented in docs/runbook.md
+#   docker compose --profile backup run --rm backupper  # documented in docs/runbook.md
 #
 # Secrets come from the environment / .env (gitignored). See .env.example.
 services:
@@ -40,12 +40,14 @@ services:
     profiles: ["backup"]
     restart: "no"
     volumes:
-      - clonehero-data:/data:ro
+      # The backup command only reads /data; rw is needed by the documented
+      # restore command below when this profile is used intentionally.
+      - clonehero-data:/data
       - ${PWD}/backups:/backups
     entrypoint: >
-      /bin/sh -c "apk add --no-cache sqlite >/dev/null 2>&1;
-      mkdir -p /backups &&
-      . /etc/alpine-release && \
+      /bin/sh -c "set -eu;
+      apk add --no-cache sqlite >/dev/null 2>&1;
+      mkdir -p /backups;
       sqlite3 /data/csv_to_clonehero.db '.backup /backups/csv_to_clonehero_$$(date +%Y%m%d_%H%M%S).db'"
 
 volumes:

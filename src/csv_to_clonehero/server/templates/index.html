@@ -3,37 +3,95 @@
 {% block content %}
 {% if not authenticated %}
 <section class="card">
-  <h1>Get every song that already has a Chart</h1>
-  <p>Sign in with Spotify. We find every song in your library that already has a
-     playable chart on <strong>Chorus Encore</strong>, score the best match, and hand
-     you a ZIP to drop into your Clone Hero / YARG <code>Songs</code> folder.</p>
+  <h1>Bring your music list to Clone Hero and YARG</h1>
+  <p>Import a music list from Spotify or SoundCloud, then explore community-built
+     charts on <strong>Enchor</strong>.</p>
+  <h2>Start with SoundCloud</h2>
+   <p class="muted">CSV/JSON imports work without Spotify authentication. Upload a
+      TuneMyMusic export to create an anonymous workspace, then sign in to
+      continue discovery.</p>
+  <input id="guestSoundcloudFile" type="file" accept=".csv,.json">
+  <button class="btn" id="guestSoundcloudImport">Import SoundCloud export</button>
+  <p id="guestSoundcloudMessage" class="muted"></p>
+  <div id="guestSoundcloudSummary" class="muted"></div>
   <ul>
-    <li>No account, no password — just your real Spotify login.</li>
-    <li>Charts stream to <strong>your</strong> computer; we never store them.</li>
+    <li>SoundCloud CSV/JSON imports work without Spotify authentication.</li>
+      <li>Charts stream to <strong>your</strong> computer; temporary delivery
+          files are removed after download or expiry.</li>
     <li>Your Spotify refresh token is encrypted at rest; we hold only query cache and job state.</li>
   </ul>
   <p><a class="btn" href="/login">Continue with Spotify</a></p>
+  <p class="muted">Spotify is optional for the local app. SoundCloud exports can be
+     created with the <a href="/browser-exporter.js">optional browser exporter</a>
+     and uploaded in the local workflow.</p>
   <p class="muted">By continuing you agree to our <a href="/terms">Terms</a> and
      <a href="/privacy">Privacy Policy</a>.</p>
-</section>
+ </section>
+ <script>
+ (function(){const file=document.getElementById('guestSoundcloudFile');const button=document.getElementById('guestSoundcloudImport');const msg=document.getElementById('guestSoundcloudMessage');button.onclick=async()=>{if(!file.files[0]){msg.textContent='Choose a CSV or JSON export first.';return}button.disabled=true;try{const body=new FormData();body.append('file',file.files[0]);const r=await fetch('/api/sources/soundcloud/import',{method:'POST',body});const d=await r.json();if(!r.ok)throw Error(d.error||'Import failed');msg.textContent=`Imported ${d.source.tracks} SoundCloud songs.`;document.getElementById('guestSoundcloudSummary').textContent=`Combined library: ${d.combined.tracks} songs from ${d.combined.artists} artists.`}catch(e){msg.textContent=e.message}finally{button.disabled=false}}})()
+ </script>
 {% else %}
 <section class="card">
-  <h1>Welcome, {{ user.display_name }}</h1>
-  <p class="muted">Scanning may take a while — Enchor rate-limits us, so we go
-     slowly and safely. You'll stay on this page and watch progress; you can
-     optionally be emailed when it finishes.</p>
+  <h1>Build your combined music library</h1>
+  <p class="muted">Choose the music you want to check. Scanning may take a while because Enchor rate-limits requests, so we go
+      slowly and safely. You'll stay on this page and watch progress; you can
+      optionally be emailed when it finishes.</p>
+  <div id="soundcloudUploadPanel">
+    <h2>1. Import SoundCloud</h2>
+    <p class="muted">Upload a TuneMyMusic CSV or SoundCloud JSON export. This source does not require OAuth.</p>
+    <input id="soundcloudFile" type="file" accept=".csv,.json">
+    <button class="btn ghost" id="soundcloudImportBtn">Import SoundCloud export</button>
+    <span id="soundcloudImportMessage" class="muted"></span>
+    <div id="sourceSummary" class="muted"></div>
+    <p><a href="/browser-exporter.js">Download the optional browser exporter</a></p>
+  </div>
+  <div id="scopePanel">
+    <h2>2. Add Spotify (optional)</h2>
+    <div id="scopeChoices" class="muted">Loading Spotify playlists...</div>
+    <button class="btn ghost" id="saveScopeBtn" onclick="saveScope()">Save library selection</button>
+  </div>
+   <div id="soundcloudPanel">
+     <h2>SoundCloud OAuth (optional)</h2>
+    <p id="soundcloudStatus" class="muted">Checking SoundCloud availability...</p>
+    <p><a class="btn ghost" id="soundcloudLogin" href="/api/auth/soundcloud/start" style="display:none">Sign in with SoundCloud</a></p>
+    <p class="muted">CSV/JSON export support is available in the local workflow; the
+       <a href="/browser-exporter.js">browser exporter</a> reads rendered metadata only.</p>
+    <div id="soundcloudChoices" class="muted"></div>
+    <button class="btn ghost" id="saveSoundcloudBtn" onclick="saveSoundcloudScope()" style="display:none">Save SoundCloud selection</button>
+  </div>
+  <div id="preflightPanel">
+     <h2>3. Check Enchor locally</h2>
+    <p id="preflightMsg" class="muted">No catalog check loaded.</p>
+    <button class="btn ghost" id="preflightBtn" onclick="refreshPreflight(true)">Check Enchor now</button>
+  </div>
   <div class="field">
-    <button class="btn" id="startBtn" onclick="startJob()">Find my songs' charts</button>
+     <button class="btn" id="startBtn" disabled onclick="startJob()">4. Discover community charts</button>
     <button class="btn ghost" id="downloadBtn" style="display:none" onclick="downloadZip()">Download selected (.zip)</button>
   </div>
   <div id="status" style="display:none">
     <div id="statusMsg"></div>
     <div class="bar"><span id="bar"></span></div>
+    <button class="btn ghost" id="cancelBtn" onclick="cancelJob()" style="display:none">Cancel scan</button>
   </div>
   <div id="error" class="error" style="display:none"></div>
   <div id="review" style="display:none">
     <h2>Matches — select which to download</h2>
+    <label for="minimumScore">Minimum match score (0-100):</label>
+    <input id="minimumScore" type="number" min="0" max="100" value="50" step="1"
+           aria-label="Minimum match score" oninput="updateMinimumScore(this.value)">
+    <output id="minimumScoreValue">50</output>
+    <button class="btn ghost" onclick="saveMinimumScore()">Apply score threshold</button>
+    <button class="btn ghost" onclick="bulkSelect('select')">Select all at or above threshold</button>
+    <button class="btn ghost" onclick="bulkSelect('clear')">Deselect all</button>
     <div id="cards"></div>
+  </div>
+  <div id="expansion" class="card" style="display:none">
+    <h2>Catalog-ranked artist expansion</h2>
+    <p class="muted">Expansion is local: only artists already present in your imported library are offered.</p>
+    <div id="expansionArtists"></div>
+    <button class="btn ghost" onclick="selectExpansionAll()">Select all</button>
+    <button class="btn" onclick="scoreExpansion()">Score selected catalog songs</button>
+    <span id="expansionStatus" class="muted"></span>
   </div>
 </section>
 {% endif %}
@@ -41,7 +99,7 @@
 
 {% block scripts %}{% if authenticated %}
 <script>
-let jobId = null, pollTimer = null, tracks = [];
+let jobId = null, pollTimer = null, tracks = [], scopeReady = false, preflightReady = false;
 
 function show(msg, pct) {
   document.getElementById('status').style.display = 'block';
@@ -52,13 +110,117 @@ function fail(msg) {
   const el = document.getElementById('error');
   el.textContent = msg; el.style.display = 'block';
 }
+function renderSourceSummary(data) {
+  const host = document.getElementById('sourceSummary'); if (!host) return;
+  const sources = data.sources || []; const combined = data.combined || {};
+  host.innerHTML = (sources.length ? sources.map(s => `<div><b>${esc(s.provider)}</b>: ${s.tracks||0} unique songs, ${s.provenance||0} source records, ${s.skipped_rows||0} skipped, ${s.duplicate_rows||0} duplicates</div>`).join('') : 'No imported sources yet.') + `<div><b>Combined:</b> ${combined.tracks||0} songs from ${combined.artists||0} artists</div>`;
+  scopeReady = Boolean(combined.tracks) || scopeReady; updateStartState();
+}
+async function importSoundcloudExport() {
+  const input = document.getElementById('soundcloudFile'); const message = document.getElementById('soundcloudImportMessage');
+  if (!input || !input.files[0]) { message.textContent = 'Choose a CSV or JSON export first.'; return; }
+  try { const body = new FormData(); body.append('file', input.files[0]); const response = await fetch('/api/sources/soundcloud/import', {method:'POST', body}); const data = await response.json(); if (!response.ok) throw Error(data.error || 'SoundCloud import failed'); message.textContent = `Imported ${data.source.tracks} SoundCloud songs.`; renderSourceSummary(data); } catch (error) { message.textContent = error.message; }
+}
+
+function updateStartState() {
+  document.getElementById('startBtn').disabled = !(scopeReady && preflightReady);
+}
+async function loadSoundCloud() {
+  try {
+    const status = await api('/api/auth/soundcloud/status');
+    const msg = document.getElementById('soundcloudStatus');
+    if (!status.configured) { msg.textContent = 'SoundCloud OAuth is not configured. Spotify-only discovery remains available.'; return; }
+    if (!status.authenticated) { msg.textContent = 'Connect SoundCloud to include Likes and playlists.'; document.getElementById('soundcloudLogin').style.display = ''; return; }
+    const d = await api('/api/soundcloud/scope');
+    const choices = [`<label><input id="soundcloudLiked" type="checkbox"> Liked Tracks (${Number(d.liked_count||0).toLocaleString()})</label>`];
+    for (const p of (d.playlists || [])) choices.push(`<label style="display:block"><input class="soundcloudPlaylist" type="checkbox" value="${esc(p.id)}"> ${esc(p.title||p.name||p.id)}</label>`);
+    document.getElementById('soundcloudChoices').innerHTML = choices.join('');
+    document.getElementById('saveSoundcloudBtn').style.display = '';
+    msg.textContent = 'SoundCloud connected. Selection is optional.';
+  } catch (e) { document.getElementById('soundcloudStatus').textContent = 'SoundCloud is unavailable; continue with Spotify.'; }
+}
+async function saveSoundcloudScope() {
+  try {
+    await api('/api/soundcloud/scope', {method:'POST', body:JSON.stringify({
+      playlist_ids:[...document.querySelectorAll('.soundcloudPlaylist:checked')].map(el=>el.value),
+      include_liked:Boolean(document.getElementById('soundcloudLiked')?.checked)
+    })});
+    document.getElementById('soundcloudStatus').textContent = 'SoundCloud selection saved.';
+  } catch (e) { fail(e.message); }
+}
+async function loadScope() {
+  try {
+    const d = await api('/api/spotify/scope');
+    const saved = (d.workspace && d.workspace.scope) || {};
+    const savedIds = new Set(saved.playlist_ids || []);
+    const choices = [];
+    choices.push(`<label><input id="includeLiked" type="checkbox" ${saved.include_liked?'checked':''}> Liked Songs (${Number(d.liked_count||0).toLocaleString()})</label>`);
+    for (const p of (d.playlists || [])) {
+      choices.push(`<label style="display:block"><input class="scopePlaylist" type="checkbox" value="${esc(p.id)}" ${savedIds.has(p.id)?'checked':''}> ${esc(p.name)} <span class="muted">(${Number(p.track_count||0).toLocaleString()} tracks)</span></label>`);
+    }
+    document.getElementById('scopeChoices').innerHTML = choices.join('') || '<p>No Spotify library choices were returned.</p>';
+    scopeReady = Boolean(saved.include_liked || (saved.playlist_ids||[]).length || (saved.track_ids||[]).length);
+    updateStartState();
+  } catch (e) { fail(e.message); }
+}
+async function saveScope() {
+  const playlist_ids = [...document.querySelectorAll('.scopePlaylist:checked')].map(el => el.value);
+  const include_liked = Boolean(document.getElementById('includeLiked')?.checked);
+  try {
+    await api('/api/spotify/scope', {method:'POST', body:JSON.stringify({playlist_ids, include_liked})});
+    scopeReady = true; updateStartState();
+  } catch (e) { scopeReady = false; updateStartState(); fail(e.message); }
+}
+async function loadPreflight() {
+  try {
+    const d = await api('/api/preflight'); renderPreflight(d.preflight || {});
+  } catch (e) { fail(e.message); }
+}
+async function refreshPreflight(force) {
+  const btn = document.getElementById('preflightBtn'); btn.disabled = true;
+  try {
+    const d = await api('/api/preflight', {method:'POST', body:JSON.stringify({force:Boolean(force)})});
+    renderPreflight(d.preflight || {});
+  } catch (e) { preflightReady = false; updateStartState(); fail(e.message); }
+  finally { btn.disabled = false; }
+}
+function renderPreflight(p) {
+  preflightReady = Boolean(p.usable);
+  document.getElementById('preflightMsg').textContent = p.message || 'Enchor catalog check unavailable.';
+  updateStartState();
+}
 
 async function startJob() {
   document.getElementById('startBtn').disabled = true;
   try {
     const d = await api('/api/jobs', {method:'POST', body: JSON.stringify({kind:'discovery'})});
     jobId = d.job.id; pollTimer = setInterval(poll, 1500); poll();
-  } catch (e) { fail(e.message); document.getElementById('startBtn').disabled = false; }
+  } catch (e) {
+    if (e.data && e.data.job) {
+      attachJob(e.data.job);
+    } else {
+      fail(e.message); document.getElementById('startBtn').disabled = false;
+    }
+  }
+}
+function attachJob(job) {
+  jobId = job.id;
+  if (pollTimer) clearInterval(pollTimer);
+  pollTimer = setInterval(poll, 1500);
+  document.getElementById('cancelBtn').style.display = '';
+  poll();
+}
+async function cancelJob() {
+  if (!jobId || !confirm('Cancel this scan? Completed cached work will remain resumable.')) return;
+  try { await api('/api/jobs/' + jobId + '/cancel', {method:'POST'}); }
+  catch (e) { fail(e.message); }
+}
+async function resumeActiveJob() {
+  try {
+    const d = await api('/api/jobs');
+    const active = (d.jobs || []).find(job => ['queued','running'].includes(job.status));
+    if (active) attachJob(active);
+  } catch (e) { fail(e.message); }
 }
 async function poll() {
   const d = await api('/api/jobs/' + jobId);
@@ -69,8 +231,9 @@ async function poll() {
   const pct = Math.min(100, Math.round(done/total*100));
   show(j.message || j.phase, pct);
   document.getElementById('startBtn').textContent = 'Searching… ' + pct + '%';
-  if (['complete','partial','failed'].includes(j.status)) {
+  if (['complete','partial','failed','cancelled','interrupted'].includes(j.status)) {
     clearInterval(pollTimer);
+    document.getElementById('cancelBtn').style.display = 'none';
     document.getElementById('startBtn').textContent = j.status === 'failed' ? 'Search again' : 'Search again';
     document.getElementById('startBtn').disabled = false;
     if (j.status === 'failed') { fail(j.error || 'Search failed'); }
@@ -80,6 +243,9 @@ async function poll() {
 async function loadWorkspace() {
   const d = await api('/api/workspace');
   tracks = d.tracks || [];
+  const threshold = Number(d.minimum_score ?? 50);
+  document.getElementById('minimumScore').value = threshold;
+  updateMinimumScore(threshold);
   document.getElementById('startBtn').style.display = 'none';
   document.getElementById('downloadBtn').style.display = '';
   const cards = document.getElementById('cards');
@@ -98,6 +264,25 @@ async function loadWorkspace() {
         </li>`).join('')}
       </ul>
     </div>`).join('') || '<p class="muted">No matches yet.</p>';
+  loadExpansion();
+}
+async function loadExpansion() {
+  try {
+    const data = await api('/api/expansion/artists');
+    const host = document.getElementById('expansionArtists');
+    document.getElementById('expansion').style.display = data.artists?.length ? '' : 'none';
+    host.innerHTML = (data.artists || []).map(a => `<label style="display:block"><input class="expansionArtist" type="checkbox" value="${esc(a.artist)}"> ${esc(a.artist)} <span class="muted">${a.catalog_songs} songs · ${a.catalog_charts} charts</span></label>`).join('');
+  } catch (e) { /* expansion is optional */ }
+}
+function selectExpansionAll() { document.querySelectorAll('.expansionArtist').forEach(el => el.checked = true); }
+async function scoreExpansion() {
+  const artists = [...document.querySelectorAll('.expansionArtist:checked')].map(el => el.value);
+  try {
+    await api('/api/expansion/artists/select', {method:'POST', body:JSON.stringify({artists})});
+    const result = await api('/api/expansion/score', {method:'POST', body:JSON.stringify({})});
+    document.getElementById('expansionStatus').textContent = `${result.result?.candidates || 0} local expansion candidates scored.`;
+    await loadWorkspace();
+  } catch (e) { fail(e.message); }
 }
 async function toggle(trackKey, candidateId, currentlySelected) {
   const action = currentlySelected ? 'clear' : 'select';
@@ -117,5 +302,26 @@ async function downloadZip() {
 function esc(v) {
   return String(v ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
+function updateMinimumScore(value) {
+  document.getElementById('minimumScoreValue').textContent = value;
+}
+async function saveMinimumScore() {
+  try {
+    await api('/api/workspace/settings', {method:'POST', body:JSON.stringify({
+      minimum_score:Number(document.getElementById('minimumScore').value)
+    })});
+    await loadWorkspace();
+  } catch (e) { fail(e.message); }
+}
+async function bulkSelect(action) {
+  try { await api('/api/selection/bulk', {method:'POST', body:JSON.stringify({action})}); await loadWorkspace(); }
+  catch (e) { fail(e.message); }
+}
+loadScope();
+loadSoundCloud();
+loadPreflight();
+resumeActiveJob();
+document.getElementById('soundcloudImportBtn')?.addEventListener('click', importSoundcloudExport);
+api('/api/sources').then(renderSourceSummary).catch(() => {});
 </script>
 {% endif %}{% endblock %}

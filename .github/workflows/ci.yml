@@ -30,8 +30,34 @@ jobs:
       - name: Lint compile (syntax/import sanity)
         run: |
           python -m compileall -q src tests
+      - name: Build wheel and verify package assets
+        run: |
+          python -m pip wheel --no-deps . --wheel-dir wheelhouse
+          python - <<'PY'
+          import pathlib
+          import zipfile
+
+          wheel = next(pathlib.Path("wheelhouse").glob("*.whl"))
+          names = set(zipfile.ZipFile(wheel).namelist())
+          required = {
+              "csv_to_clonehero/default_config.yaml",
+              "csv_to_clonehero/server/templates/base.html",
+              "csv_to_clonehero/server/templates/index.html",
+          }
+          missing = required - names
+          if missing:
+              raise SystemExit(f"wheel is missing package assets: {sorted(missing)}")
+          PY
       - name: Offline tests (no live network)
         run: python -m pytest -m "not integration" -q
+
+  container:
+    name: Docker build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build production image
+        run: docker build --tag csv-to-clonehero:ci .
 
   integration:
     name: Live Enchor integration

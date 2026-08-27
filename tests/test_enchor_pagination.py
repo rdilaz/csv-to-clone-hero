@@ -3,6 +3,7 @@
 import httpx
 import pytest
 
+from csv_to_clonehero.normalization import sanitize_query_for_enchor
 from csv_to_clonehero.sources.enchor import EnchorSource
 
 
@@ -11,7 +12,7 @@ def _chart(chart_id: int, name: str = "Song", artist: str = "Artist") -> dict:
 
 
 def test_search_artist_paginates_until_empty(monkeypatch):
-    source = EnchorSource()
+    source = EnchorSource(catalog_path="nonexistent_catalog.jsonl")
     calls = []
 
     def fake_post(path, payload):
@@ -33,7 +34,7 @@ def test_search_artist_paginates_until_empty(monkeypatch):
 
 
 def test_search_artist_stops_when_accumulated_reaches_found(monkeypatch):
-    source = EnchorSource()
+    source = EnchorSource(catalog_path="nonexistent_catalog.jsonl")
     calls = []
 
     def fake_post(path, payload):
@@ -56,7 +57,7 @@ def test_search_artist_stops_when_accumulated_reaches_found(monkeypatch):
 
 
 def test_search_artist_deduplicates_overlapping_pages(monkeypatch):
-    source = EnchorSource()
+    source = EnchorSource(catalog_path="nonexistent_catalog.jsonl")
 
     def fake_post(path, payload):
         page = payload["page"]
@@ -75,7 +76,7 @@ def test_search_artist_deduplicates_overlapping_pages(monkeypatch):
 
 
 def test_search_artist_enforces_sanity_cap(monkeypatch):
-    source = EnchorSource()
+    source = EnchorSource(catalog_path="nonexistent_catalog.jsonl")
     calls = []
 
     def fake_post(path, payload):
@@ -104,7 +105,7 @@ def test_song_http_500_falls_back_without_retrying_same_query():
         )
 
     client = httpx.Client(transport=httpx.MockTransport(handler))
-    source = EnchorSource(client=client, request_delay=0, retries=3)
+    source = EnchorSource(client=client, request_delay=0, retries=3, catalog_path="nonexistent_catalog.jsonl")
     try:
         results = source.search_song("Artist", "Song")
     finally:
@@ -112,3 +113,85 @@ def test_song_http_500_falls_back_without_retrying_same_query():
 
     assert len(results) == 1
     assert len(calls) == 2
+
+
+def test_song_query_sanitizer_removes_spotify_version_noise():
+    artist, title = sanitize_query_for_enchor(
+        'Artist “Name” (feat. Guest)',
+        'Song (feat. Singer [Remix]) (2011 Remaster) - Live Version /',
+    )
+
+    assert artist == "Artist Name"
+    assert title == "Song"
+
+
+def test_search_song_sends_sanitized_query(monkeypatch):
+    source = EnchorSource(request_delay=0, catalog_path="nonexistent_catalog.jsonl")
+    queries = []
+    monkeypatch.setattr(source, "_search", lambda query: queries.append(query) or [])
+    try:
+        source.search_song("Artist (with Guest)", "Song (Deluxe Version)")
+    finally:
+        source.close()
+
+    assert queries == ["Artist Song"]
+
+
+def test_catalog_preflight_uses_one_bounded_authoritative_probe(monkeypatch):
+    source = EnchorSource(request_delay=0, catalog_path="nonexistent_catalog.jsonl")
+    calls = []
+    monkeypatch.setattr(
+        source,
+        "_post",
+        lambda path, payload: calls.append((path, payload)) or {
+            "found": 1234,
+            "out_of": 1234,
+            "page": 1,
+            "data": [_chart(1)],
+        },
+    )
+    try:
+        result = source.preflight_catalog()
+    finally:
+        source.close()
+
+    assert result.success is True
+    assert result.supported is True
+    assert result.authoritative is True
+    assert result.out_of == 1234
+    assert len(calls) == 1
+    assert calls[0][0] == "/search"
+    assert calls[0][1]["search"] == ""
+    assert calls[0][1]["per_page"] == 1
+
+
+def test_catalog_preflight_rejects_filtered_or_incomplete_total(monkeypatch):
+    source = EnchorSource(request_delay=0, catalog_path="nonexistent_catalog.jsonl")
+    monkeypatch.setattr(
+        source,
+        "_post",
+        lambda path, payload: {"found": 12, "out_of": 1234, "page": 1, "data": []},
+    )
+    try:
+        result = source.preflight_catalog()
+    finally:
+        source.close()
+
+    assert result.success is True
+    assert result.supported is True
+    assert result.authoritative is False
+    assert "not authoritative" in result.error
+
+
+def test_catalog_preflight_rejects_empty_page_for_positive_total(monkeypatch):
+    source = EnchorSource(request_delay=0, catalog_path="nonexistent_catalog.jsonl")
+    monkeypatch.setattr(
+        source,
+        "_post",
+        lambda path, payload: {"found": 100, "out_of": 100, "page": 1, "data": []},
+    )
+    try:
+        result = source.preflight_catalog()
+    finally:
+        source.close()
+    assert result.authoritative is False

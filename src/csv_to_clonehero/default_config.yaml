@@ -24,6 +24,10 @@ paths:
   # the output folder on purpose: per-run output overrides never move state.
   database: state/csv_to_clonehero.db
 
+  # Optional generated Enchor metadata snapshot used by the source-neutral
+  # local workflow. It is intentionally not committed to Git.
+  catalog: catalog/enchor.jsonl
+
   # Verified export artifacts and ownership manifests stay in app state, never
   # in the Songs folder. One manifest is kept per destination.
   state_dir: state
@@ -52,6 +56,7 @@ spotify:
     service: csv-to-clonehero.spotify
     # Blank uses a stable client-specific fallback; it is not a secret.
     user: ""
+    username: ""
 
 build:
   # Dry run: search, score and plan, but download nothing.
@@ -91,6 +96,8 @@ instruments:
 
 expansion:
   enabled: true
+  # Hard safety boundary for one resumable artist-expansion batch.
+  max_artists_per_batch: 25
   # Additional charts downloaded per artist, based on how many unique playlist
   # songs the artist has as PRIMARY artist.
   cap_many_songs: 50      # artist has >= min_songs_many unique songs
@@ -149,12 +156,23 @@ search:
   result_cap: 250
   max_search_pages: 20
   # Full source responses remain cached; score only the strongest local matches.
-  candidate_shortlist_size: 12
+  candidate_shortlist_size: 50
 
 sources:
   # Currently only the Enchor (Chorus Encore) source is built in. It exposes
   # legitimate direct downloads, so it supports automated downloading.
   enabled: [enchor]
+
+soundcloud:
+  # Official API/OAuth is opt-in. Exports/public playlists do not require a secret.
+  enabled: false
+  client_id_env: SOUNDCLOUD_CLIENT_ID
+  client_secret_env: SOUNDCLOUD_CLIENT_SECRET
+  redirect_uri: ""
+  redirect_path: /api/auth/soundcloud/callback
+  scopes: [non-expiring]
+  allow_user_exports: true
+  allow_public_playlists: true
 
 export:
   # Managed sync removes only files listed in an app-owned manifest.
@@ -222,6 +240,14 @@ server:
   # Spotify OAuth redirect origin. You can also set APP_BASE_URL in the env.
   base_url: ""
   base_url_env: APP_BASE_URL
+  # Reuse one global bounded Enchor catalog check across all users.
+  enchor_preflight_ttl_seconds: 3600
+  max_scope_playlists: 200
+  max_scope_tracks: 10000
+  max_content_length: 52428800
+  trusted_hops: 1
+  # Public discovery is exact imported-library matching only.
+  enable_expansion: false
   # Session signing key. ALWAYS from the environment (SECRET_KEY), never here.
   secret_key_env: SECRET_KEY
   # When true, the multi-user server refuses to start without SECRET_KEY set.
@@ -229,6 +255,13 @@ server:
   # Optional absolute sqlite path override via DATABASE_URL env.
   database_url: ""
   database_url_env: DATABASE_URL
+  session:
+    # Compatibility only. The public app reads the top-level sessions block.
+    cookie_name: c2ch_session
+    cookie_same_site: Lax
+    cookie_secure: null
+    max_age_seconds: 2592000
+    domain: ""
 
 crypto:
   # Fernet key used to encrypt each user's Spotify refresh token at rest.

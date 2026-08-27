@@ -10,6 +10,7 @@ from csv_to_clonehero.config import AppConfig
 from csv_to_clonehero.server.downloads import (
     BrowserDownloads,
     DownloadError,
+    _validated_selections,
     build_archive,
 )
 
@@ -74,10 +75,52 @@ def test_stream_invalid_raises(downloads):
         list(downloads.stream("not.a.token"))
 
 
+def test_revoke_workspace_removes_all_transient_archives(downloads):
+    first = downloads.root / "workspace-a.zip"
+    second = downloads.root / "workspace-b.zip"
+    first.write_bytes(b"a")
+    second.write_bytes(b"b")
+    downloads.create(1, 10, first)
+    downloads.create(1, 10, second)
+    assert downloads.revoke_workspace(10) == 2
+    assert not first.exists()
+    assert not second.exists()
+
+
 def test_build_archive_requires_selections(config, db_workspace):
     db, _workspace = db_workspace
     with pytest.raises(DownloadError):
         build_archive(config, db, _workspace, [], config.state_path / "dl")
+
+
+def test_public_download_ignores_stale_expansion_selection(config):
+    from csv_to_clonehero.database import Database
+    from tests.conftest import make_chart as chart_fixture
+
+    db = Database(config.database_path)
+    try:
+        workspace = db.create_workspace(workspace_key="exact-only")
+        chart = chart_fixture("Other", "Artist", chart_id=200)
+        db.upsert_workspace_candidate(
+            workspace,
+            None,
+            chart,
+            kind="expansion",
+            artist_norm="artist",
+            score=90,
+            eligibility="EXPANSION_CONFIRMED",
+        )
+        db.select_workspace_candidate(
+            workspace,
+            None,
+            chart,
+            kind="expansion",
+            artist_norm="artist",
+        )
+        with pytest.raises(DownloadError, match="No downloadable charts"):
+            _validated_selections(db, workspace)
+    finally:
+        db.close()
 
 
 @pytest.fixture

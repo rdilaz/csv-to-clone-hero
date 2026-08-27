@@ -30,6 +30,8 @@ from urllib.parse import quote, urlencode, urljoin, urlsplit
 
 import httpx
 
+from csv_to_clonehero.normalization import normalize_artist, normalize_title
+
 
 ACCOUNTS_BASE_URL = "https://accounts.spotify.com"
 API_BASE_URL = "https://api.spotify.com/v1"
@@ -162,6 +164,10 @@ class SpotifyPermissionError(SpotifyAPIError):
 
 class SpotifyRateLimitError(SpotifyAPIError):
     """Spotify continued to rate-limit a request after the retry budget."""
+
+
+class SpotifyCancellationError(Exception):
+    """A caller cancelled Spotify work between bounded network requests."""
 
 
 # Alternative spelling used by some callers.
@@ -1605,6 +1611,29 @@ class SpotifyClient:
         parsed = urlsplit(url)
         return f"{method.upper()} {parsed.path or '/'}"
 
+    @staticmethod
+    def _check_cancelled(cancellation_event: Any | None) -> None:
+        if cancellation_event is not None and cancellation_event.is_set():
+            raise SpotifyCancellationError("Spotify operation cancelled")
+
+    def _wait_for_retry(self, delay: float, cancellation_event: Any | None) -> None:
+        self._check_cancelled(cancellation_event)
+        if cancellation_event is None:
+            self._sleep(delay)
+            return
+        wait = getattr(cancellation_event, "wait", None)
+        if callable(wait):
+            if wait(delay):
+                raise SpotifyCancellationError("Spotify operation cancelled")
+            self._check_cancelled(cancellation_event)
+            return
+        remaining = max(0.0, delay)
+        while remaining > 0:
+            interval = min(remaining, 0.1)
+            self._sleep(interval)
+            remaining -= interval
+            self._check_cancelled(cancellation_event)
+
     def _permission_error(self, status: int) -> SpotifyPermissionError:
         scopes = ", ".join(self.config.scopes) or "the configured Spotify scopes"
         return SpotifyPermissionError(
@@ -1653,11 +1682,13 @@ class SpotifyClient:
         path_or_url: str,
         *,
         params: Mapping[str, Any] | None = None,
+        cancellation_event: Any | None = None,
     ) -> Any:
         url = self._api_url(path_or_url)
         refreshed_after_401 = False
         rate_attempt = 0
         while True:
+            self._check_cancelled(cancellation_event)
             token = self._oauth.access_token()
             headers = {
                 "Accept": "application/json",
@@ -1679,6 +1710,7 @@ class SpotifyClient:
                 ) from exc
             status = _response_status(response)
             if status == 401 and not refreshed_after_401:
+                self._check_cancelled(cancellation_event)
                 refreshed_after_401 = True
                 try:
                     self._oauth.access_token(force_refresh=True)
@@ -1690,7 +1722,10 @@ class SpotifyClient:
                     _header_value(response, "Retry-After"),
                     now=self._oauth._clock(),
                 )
-                self._sleep(retry_after if retry_after is not None else min(2.0**rate_attempt, 30.0))
+                self._wait_for_retry(
+                    retry_after if retry_after is not None else min(2.0**rate_attempt, 30.0),
+                    cancellation_event,
+                )
                 rate_attempt += 1
                 continue
             if not 200 <= status < 300:
@@ -1714,18 +1749,32 @@ class SpotifyClient:
                     status_code=status,
                 ) from exc
 
-    def _paginate(self, path: str, *, limit: int | None = None) -> list[Any]:
+    def _paginate(
+        self,
+        path: str,
+        *,
+        limit: int | None = None,
+        query: Mapping[str, Any] | None = None,
+        cancellation_event: Any | None = None,
+    ) -> list[Any]:
         page_limit = self.page_size if limit is None else limit
         if page_limit < 1 or page_limit > MAX_PAGE_SIZE:
             raise ValueError(f"limit must be from 1 through {MAX_PAGE_SIZE}")
         url = self._api_url(path)
         offset = 0
-        params: Mapping[str, Any] | None = {"limit": page_limit, "offset": offset}
+        base_query = dict(query or {})
+        params: Mapping[str, Any] | None = {**base_query, "limit": page_limit, "offset": offset}
         items: list[Any] = []
         seen_urls: set[str] = set()
         followed_next = False
         for _ in range(1000):
-            payload = self._request_json("GET", url, params=params)
+            self._check_cancelled(cancellation_event)
+            payload = self._request_json(
+                "GET",
+                url,
+                params=params,
+                cancellation_event=cancellation_event,
+            )
             if not isinstance(payload, Mapping):
                 raise SpotifyAPIError("Spotify pagination response was not an object")
             page = payload.get("items")
@@ -1748,7 +1797,7 @@ class SpotifyClient:
             if not followed_next and total is not None and offset + len(page) < int(total) and page:
                 offset += len(page)
                 url = self._api_url(path)
-                params = {"limit": page_limit, "offset": offset}
+                params = {**base_query, "limit": page_limit, "offset": offset}
                 continue
             return items
         raise SpotifyAPIError("Spotify pagination exceeded the safety limit")
@@ -1781,6 +1830,106 @@ class SpotifyClient:
     def get_liked_tracks(self, *, limit: int | None = None) -> list[Any]:
         """Fetch all saved tracks from ``/v1/me/tracks``."""
         return self._paginate("/me/tracks", limit=limit)
+
+    def get_saved_tracks_count(self) -> int:
+        """Fetch the saved-track total without downloading the library."""
+        payload = self._request_json(
+            "GET",
+            self._api_url("/me/tracks"),
+            params={"limit": 1, "offset": 0},
+        )
+        if not isinstance(payload, Mapping):
+            raise SpotifyAPIError("Spotify saved tracks response was not an object")
+        try:
+            return max(0, int(payload.get("total", 0)))
+        except (TypeError, ValueError) as exc:
+            raise SpotifyAPIError("Spotify saved tracks response had an invalid total") from exc
+
+    saved_tracks_count = get_saved_tracks_count
+
+    def search_artist(
+        self,
+        artist_name: str,
+        *,
+        cancellation_event: Any | None = None,
+    ) -> Mapping[str, Any] | None:
+        name = str(artist_name or "").strip()
+        if not name:
+            raise ValueError("artist_name is required")
+        self._check_cancelled(cancellation_event)
+        payload = self._request_json(
+            "GET",
+            self._api_url("/search"),
+            params={"q": name, "type": "artist", "limit": 10},
+            cancellation_event=cancellation_event,
+        )
+        artists = payload.get("artists", {}) if isinstance(payload, Mapping) else {}
+        items = artists.get("items", []) if isinstance(artists, Mapping) else []
+        valid = [item for item in items if isinstance(item, Mapping) and item.get("id")]
+        folded = name.casefold()
+        return next(
+            (
+                item
+                for item in valid
+                if str(item.get("name") or "").strip().casefold() == folded
+            ),
+            valid[0] if valid else None,
+        )
+
+    def get_artist_discography(
+        self,
+        artist_name: str,
+        *,
+        cancellation_event: Any | None = None,
+    ) -> dict[str, Any]:
+        self._check_cancelled(cancellation_event)
+        artist = self.search_artist(artist_name, cancellation_event=cancellation_event)
+        if artist is None:
+            return {"artist_name": artist_name, "artist_id": "", "albums": 0, "tracks": []}
+        artist_id = str(artist.get("id") or "")
+        encoded_artist = quote(artist_id, safe="")
+        albums = self._paginate(
+            f"/artists/{encoded_artist}/albums",
+            query={"include_groups": "album,single"},
+            cancellation_event=cancellation_event,
+        )
+        album_rows = {str(album.get("id")): album for album in albums if isinstance(album, Mapping) and album.get("id")}
+        tracks: dict[tuple[str, str], dict[str, Any]] = {}
+        for album_id, album in album_rows.items():
+            self._check_cancelled(cancellation_event)
+            encoded_album = quote(album_id, safe="")
+            for track in self._paginate(
+                f"/albums/{encoded_album}/tracks",
+                cancellation_event=cancellation_event,
+            ):
+                if not isinstance(track, Mapping):
+                    continue
+                artists = [value for value in track.get("artists", []) if isinstance(value, Mapping)]
+                if not artists or str(artists[0].get("id") or "") != artist_id:
+                    continue
+                title = str(track.get("name") or "").strip()
+                if not title:
+                    continue
+                display_artist = str(artist.get("name") or artist_name)
+                key = (normalize_artist(display_artist), normalize_title(title))
+                tracks.setdefault(
+                    key,
+                    {
+                        "spotify_id": str(track.get("id") or ""),
+                        "title": title,
+                        "artist": display_artist,
+                        "artist_id": artist_id,
+                        "album": str(album.get("name") or ""),
+                        "album_id": album_id,
+                        "duration_ms": track.get("duration_ms"),
+                    },
+                )
+        return {
+            "artist_name": str(artist.get("name") or artist_name),
+            "artist_id": artist_id,
+            "albums": len(album_rows),
+            "tracks": list(tracks.values()),
+        }
 
     liked_tracks = get_liked_tracks
     fetch_liked_tracks = get_liked_tracks

@@ -16,7 +16,6 @@ import json
 import logging
 import re
 import secrets
-import shutil
 import threading
 import time
 from pathlib import Path
@@ -30,7 +29,6 @@ from csv_to_clonehero.sources.base import ChartSource
 
 log = logging.getLogger(__name__)
 
-_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 _DEFAULT_TTL_SECONDS = 15 * 60
 
 
@@ -188,6 +186,18 @@ class BrowserDownloads:
             meta = self._index.pop(key, None)
         self._revoke_meta(meta)
 
+    def revoke_workspace(self, workspace_id: int) -> int:
+        """Revoke all transient archives belonging to one workspace."""
+        with self._lock:
+            keys = [
+                key for key, meta in self._index.items()
+                if int(meta.get("workspace_id", -1)) == int(workspace_id)
+            ]
+            metas = [self._index.pop(key) for key in keys]
+        for meta in metas:
+            self._revoke_meta(meta)
+        return len(metas)
+
 
 def _safe_basename(value: str) -> str:
     name = re.sub(r"[^A-Za-z0-9_-]", "", value)
@@ -245,7 +255,6 @@ def build_archive(
     service = ExportService(
         config,
         source_map,
-        artifact_cache_dir=getattr(config, "artifact_cache_path", None),
         track_resolver=track_map,
     )
     try:
@@ -286,6 +295,10 @@ def _validated_selections(db: Database, workspace_id: int) -> list[dict[str, Any
 
         data = dict(row) if hasattr(row, "keys") else {}
         kind = str(data.get("kind") or "exact").casefold()
+        if kind != "exact":
+            # Public discovery is exact-only. Retain legacy expansion state in
+            # SQLite, but never let stale expansion choices enter an archive.
+            continue
         candidate = db.get_candidate(int(data.get("candidate_id") or 0))
         if candidate is None:
             continue

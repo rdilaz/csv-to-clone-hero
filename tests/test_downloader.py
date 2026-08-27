@@ -31,7 +31,7 @@ def test_download_completes_and_records(config):
     md5 = hashlib.md5(content).hexdigest()
     chart = make_chart("Song", "Artist", chart_id=1, md5=md5)
     source = FakeSource(files={md5: content})
-    selection_id = _make_selection(db, chart)
+    _make_selection(db, chart)
 
     manager = DownloadManager(config, db)
     success, message, size = manager.download_selection(chart, source, "00 - His Music/Exact Playlist Songs/Artist/Artist - Song.sng"
@@ -50,7 +50,7 @@ def test_second_run_does_not_redownload(config):
     md5 = hashlib.md5(content).hexdigest()
     chart = make_chart("Song", "Artist", chart_id=1, md5=md5)
     source = FakeSource(files={md5: content})
-    selection_id = _make_selection(db, chart)
+    _make_selection(db, chart)
     relpath = "00 - His Music/Exact Playlist Songs/Artist/Artist - Song.sng"
 
     manager = DownloadManager(config, db)
@@ -69,7 +69,7 @@ def test_checksum_mismatch_rejected(config):
     db = Database(config.database_path)
     chart = make_chart("Song", "Artist", chart_id=1, md5="0" * 32)  # wrong md5
     source = FakeSource(files={"0" * 32: b"tampered"})
-    selection_id = _make_selection(db, chart)
+    _make_selection(db, chart)
 
     manager = DownloadManager(config, db)
     success, message, _ = manager.download_selection(chart, source,
@@ -88,7 +88,7 @@ def test_path_escape_refused(config):
     md5 = hashlib.md5(content).hexdigest()
     chart = make_chart("Song", "Artist", chart_id=1, md5=md5)
     source = FakeSource(files={md5: content})
-    selection_id = _make_selection(db, chart)
+    _make_selection(db, chart)
 
     manager = DownloadManager(config, db)
     success, message, _ = manager.download_selection(chart, source, "..\\..\\evil.sng"

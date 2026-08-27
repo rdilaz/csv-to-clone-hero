@@ -186,6 +186,22 @@ def source_is_exportable(source: object) -> bool:
     return capabilities.exportable
 
 
+def source_catalog_available(source: object, artist: str, title: str = "") -> bool | None:
+    """Return authoritative local catalog membership when a source exposes it.
+
+    ``None`` means the source has no complete local snapshot, so callers must
+    preserve the existing network behavior rather than treating it as absent.
+    """
+    method = getattr(source, "catalog_available", None)
+    if not callable(method):
+        return None
+    try:
+        result = method(artist, title)
+    except Exception:
+        return None
+    return result if isinstance(result, bool) else None
+
+
 # Short aliases keep integrations from having to depend on a particular
 # helper naming convention while the optional capability surface evolves.
 get_source_cap = get_source_capabilities

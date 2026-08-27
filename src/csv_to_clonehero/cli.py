@@ -1,6 +1,6 @@
 """Command-line interface.
 
-Commands: scan, search, expand, plan, build, report, doctor, reset-cache.
+Commands: scan, search, expand, plan, build, report, doctor, reset-cache, catalog-export.
 """
 
 from __future__ import annotations
@@ -17,6 +17,29 @@ from pathlib import Path
 from rich.console import Console
 
 console = Console()
+
+
+def cmd_catalog_export(config, args) -> int:
+    """Acquire the operator-managed, metadata-only Enchor snapshot."""
+    from csv_to_clonehero.catalog import export_catalog
+    from csv_to_clonehero.sources import build_sources
+
+    sources = build_sources(config)
+    try:
+        source = next((item for item in sources if getattr(item, "name", "") == "enchor"), None)
+        if source is None:
+            console.print("[red]Enchor is not enabled.[/red]")
+            return 2
+        output = args.output or config.catalog_path
+        result = export_catalog(source, output, checkpoint=args.checkpoint)
+    except Exception as exc:
+        console.print(f"[red]Catalog export failed: {exc}[/red]")
+        return 2
+    finally:
+        for item in sources:
+            item.close()
+    console.print(f"[green]Wrote {result['chart_count']:,} charts to {result['path']}[/green]")
+    return 0
 
 
 def _setup_logging(level: str) -> None:
@@ -353,8 +376,8 @@ def cmd_web(config, args) -> int:
 
     from csv_to_clonehero.webapp import create_app
 
-    if not _ensure_spotify_client_id(config):
-        return 2
+    # Source-neutral mode can start with SoundCloud exports and does not need
+    # Spotify credentials. Spotify validates its configuration when selected.
     public_url = str(getattr(args, "public_url", "") or "").strip().rstrip("/")
     if public_url:
         config.spotify.public_base_url = public_url
@@ -415,39 +438,10 @@ def cmd_web(config, args) -> int:
     return 0
 
 
-def _ensure_spotify_client_id(config) -> bool:
-    """Prompt for a session-only Spotify client ID when none is configured."""
-    if getattr(config, "spotify_client_id", ""):
-        return True
-
-    console.print(
-        "[yellow]Spotify client ID is not configured.[/yellow]\n"
-        "Create one at https://developer.spotify.com/dashboard and add the "
-        "redirect URI shown below."
-    )
-    console.print(f"Redirect URI: {getattr(config, 'spotify_redirect_uri', '')}")
-    try:
-        client_id = console.input("Spotify client ID (input is not saved): ").strip()
-    except (EOFError, KeyboardInterrupt):
-        console.print("\n[yellow]No Spotify client ID entered; web server not started.[/yellow]")
-        return False
-    if not client_id:
-        console.print("[red]A Spotify client ID is required to start the web interface.[/red]")
-        return False
-
-    # Keep the value in this process only. Config resolution reads the
-    # environment fallback, while refresh tokens remain in the OS keyring.
-    import os
-
-    variable = getattr(getattr(config, "spotify", None), "client_id_env", "SPOTIFY_CLIENT_ID")
-    os.environ[str(variable or "SPOTIFY_CLIENT_ID")] = client_id
-    return True
-
-
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="csv_to_clonehero",
-        description="Build a Clone Hero library from Spotify playlist CSVs.",
+        description="Build a Clone Hero or YARG library from music metadata.",
     )
     parser.add_argument("--config", help="path to config.yaml", default=None)
     parser.add_argument("--verbose", action="store_true", help="debug logging")
@@ -479,6 +473,10 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("report", help="regenerate reports from stored state")
     sub.add_parser("doctor", help="check setup and connectivity")
     sub.add_parser("reset-cache", help="clear search cache (keeps downloads)")
+
+    catalog = sub.add_parser("catalog-export", help="crawl and write the complete Enchor metadata snapshot")
+    catalog.add_argument("--output", type=Path, default=None)
+    catalog.add_argument("--checkpoint", type=Path, default=None)
 
     web = sub.add_parser("web", help="start the web interface")
     web.add_argument("--port", type=int, default=8765)
@@ -529,6 +527,7 @@ def main(argv: list[str] | None = None) -> int:
         "report": cmd_report,
         "doctor": cmd_doctor,
         "reset-cache": cmd_reset_cache,
+        "catalog-export": cmd_catalog_export,
         "web": cmd_web,
         "keys": cmd_keys,
         "serve": cmd_serve,

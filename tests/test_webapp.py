@@ -5,12 +5,14 @@ import io
 import json
 import os
 import re
+import threading
 import time
 import zipfile
 
 import pytest
 
 from csv_to_clonehero.webapp import _SpotifyJobState, create_app
+from csv_to_clonehero.diagnostics import RunDiagnostics
 from csv_to_clonehero.database import Database
 from csv_to_clonehero.cli import build_parser
 
@@ -26,28 +28,508 @@ def client(config):
         yield client
 
 
-def test_index_serves_simple_page(client):
+def test_index_serves_spotify_workflow(client):
     response = client.get("/")
     assert response.status_code == 200
     html = response.get_data(as_text=True)
-    # Simple mode: service dropdown, output path, expansion checkbox, log view.
-    assert "Where does your music live?" in html
-    assert "iTunes / Apple Music" in html
-    assert "outPath" in html
-    assert "Also find more songs by my artists" in html
-    assert "/advanced" in html
-    assert "showInaccessible" in html
-    assert "Show inaccessible playlists" in html
-    assert "created_by" in html
-    assert html.index('id="scopeList"') < html.index('id="saveScope"')
-    assert "scanRecent" in html
-    assert "scanEta" in html
-    assert html.index('id="inventoryPath"') < html.index('id="signIn"')
-    assert "pickInventoryPath" in html
-    assert "workspacePicker" in html
-    assert "loadWorkspaceButton" in html
-    ids = re.findall(r'id="([^"]+)"', html)
+    for text in (
+        "Sign in with Spotify",
+        "Connect Spotify",
+        "Choose your music",
+        "Find chart matches",
+        "Review and export",
+        "Optional: link an existing library",
+        "Resume or manage saved work",
+        "Preview additional songs",
+        "Find charts for this preview",
+        "Selected charts",
+    ):
+        assert text in html
+    for element_id in (
+        "scopePanel",
+        "scopeList",
+        "expansionPreview",
+        "expansionStart",
+        "expansionCancel",
+        "expansionAll",
+        "expansionNone",
+        "artists",
+        "tray",
+        "traySummary",
+        "serverExport",
+        "remoteExport",
+    ):
+        assert f'id="{element_id}"' in html
+    ids = re.findall(r'id="([^\"]+)"', html)
     assert len(ids) == len(set(ids))
+
+
+def test_soundcloud_export_is_first_class_local_source_without_spotify(client):
+    response = client.post(
+        "/api/sources/soundcloud/import",
+        data={"file": (io.BytesIO(b"Track name,Artist name,Playlist name,Type,Soundcloud - id\nArtist - Song,Lyricist,Liked Songs,Favorite,sc-1\n"), "likes.csv")},
+        content_type="multipart/form-data",
+    )
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload["source"]["tracks"] == 1
+    assert payload["combined"]["tracks"] == 1
+    summary = client.get("/api/sources").get_json()
+    assert summary["sources"][0]["provider"] == "soundcloud"
+
+
+def test_soundcloud_import_persists_redacted_diagnostics(client, config):
+    response = client.post(
+        "/api/sources/soundcloud/import",
+        data={"file": (io.BytesIO(b"Track name,Artist name\nArtist - Song,\nBad row,\n"), "likes.csv")},
+        content_type="multipart/form-data",
+    )
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload["run_id"]
+    status = client.get(f"/api/discovery/status?workspace_id={payload['workspace_id']}").get_json()
+    assert status["diagnostics_url"].endswith(payload["run_id"])
+    assert status["diagnostics"]["counters"]["accepted_input_rows"] == 1
+    downloaded = client.get(status["diagnostics_url"])
+    assert downloaded.status_code == 200
+    assert b"access_token" not in downloaded.data
+
+
+def test_run_diagnostics_redacts_secrets_and_bounds_samples(tmp_path):
+    run = RunDiagnostics(tmp_path)
+    run.update("import", token="secret", samples={"tracks": [{"artist": str(i), "title": "song"} for i in range(100)]})
+    data = json.loads(run.path.read_text(encoding="utf-8"))
+    assert "token" not in data["events"][0]["data"]
+    assert len(data["samples"]["tracks"]) == 50
+
+
+def test_spotify_scoring_sandbox_uses_production_matcher(client):
+    response = client.post(
+        "/api/spotify/score-preview",
+        json={
+            "track": {"artist": "Artist", "title": "Song", "album": "Album"},
+            "chart": {
+                "artist": "Artist",
+                "title": "Song",
+                "album": "Album",
+                "icon": "gh3",
+                "instruments": "guitar,bass,drums,vocals",
+                "difficulty": 3,
+            },
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload["final_score"] >= 90
+    assert payload["eligibility"] == "RECOMMENDED"
+    assert payload["bonuses"]
+    assert "gate_factors" in payload
+
+
+def test_spotify_callback_binds_exchanged_token_for_background_clients(config):
+    class Token:
+        access_token = "access-token"
+        refresh_token = "refresh-token"
+        scope = ("user-library-read",)
+
+        def is_expired(self, _now):
+            return False
+
+    class OAuth:
+        def __init__(self):
+            self.token = None
+
+        def begin_authorization(self, *, state, **_kwargs):
+            return {
+                "url": f"http://example.test/authorize?state={state}",
+                "state": state,
+                "redirect_uri": "http://127.0.0.1:8765/callback",
+            }
+
+        def exchange_code(self, _code, **_kwargs):
+            return Token()
+
+        def save_token(self, token):
+            self.token = token
+            return token
+
+        def access_token(self):
+            if self.token is None:
+                raise RuntimeError("Spotify sign-in is required")
+            return self.token
+
+    class SpotifyClient:
+        def __init__(self, oauth):
+            self.oauth = oauth
+            self.fetch_calls = 0
+
+        def get_current_user(self):
+            self.oauth.access_token()
+            return {"id": "test-user", "display_name": "Test user"}
+
+        def fetch_library(self, **_kwargs):
+            self.oauth.access_token()
+            self.fetch_calls += 1
+            return []
+
+    oauth = OAuth()
+    app = create_app(
+        config,
+        source_factory=lambda _config: [FakeSource()],
+        oauth_factory=lambda **_kwargs: oauth,
+        spotify_factory=lambda oauth, **_kwargs: SpotifyClient(oauth),
+    )
+    app.config["TESTING"] = True
+    db = Database(config.database_path)
+    try:
+        workspace = db.create_workspace(
+            workspace_key="spotify-auth-test",
+            name="Authenticated scan",
+            kind="exact",
+        )
+        db.set_workspace_scope(workspace, [], include_liked=True)
+    finally:
+        db.close()
+    with app.test_client() as http:
+        started = http.get("/api/auth/spotify/start").get_json()
+        callback = http.get(
+            f"/api/auth/spotify/callback?state={started['state']}&code=valid-code&format=json"
+        )
+        scan = http.post("/api/spotify/scan", json={"workspace_id": workspace})
+        for _ in range(100):
+            status = http.get(
+                f"/api/spotify/status?workspace_id={workspace}"
+            ).get_json()
+            if not status["running"]:
+                break
+            time.sleep(0.01)
+
+    assert callback.status_code == 200
+    assert scan.status_code == 202
+    assert status["status"] == "complete"
+    assert oauth.access_token().refresh_token == "refresh-token"
+    assert oauth.token is not None
+
+
+def test_expansion_state_and_saved_results_are_separate_from_exact(config):
+    db = Database(config.database_path)
+    workspace = db.create_workspace(
+        workspace_key="spotify",
+        name="Expansion workspace",
+        kind="exact",
+        status="complete",
+        phase="complete",
+    )
+    track = make_track("Known Song", "Artist", "spotify-known")
+    db.replace_spotify_library(records=[track], workspace_id=workspace)
+    chart = make_chart("Deep Cut", "Artist", chart_id=42)
+    db.upsert_workspace_candidate(
+        workspace,
+        None,
+        chart,
+        kind="expansion",
+        artist_norm="artist",
+        score=91.5,
+        quality=4.0,
+        decision="ACCEPT",
+        eligibility="RECOMMENDED",
+        breakdown_json=json.dumps({"eligibility": "RECOMMENDED", "explanation": "artist expansion"}),
+        metadata={"cap_rank": 1, "artist_cap": 3, "within_artist_cap": True},
+    )
+    db.replace_workspace_expansion_artists(
+        workspace,
+        [{
+            "artist_name": "Artist",
+            "artist_norm": "artist",
+            "track_count": 1,
+            "cap": 3,
+            "selected": True,
+        }],
+    )
+    db.create_discovery_scan(
+        workspace,
+        scan_key="exact",
+        kind="exact",
+        status="complete",
+        metadata={"stats": {"exact_candidates": 1, "exact_recommended": 1}},
+    )
+    db.create_discovery_scan(
+        workspace,
+        scan_key="expansion",
+        kind="expansion",
+        status="complete",
+        metadata={
+            "stats": {
+                "expansion_artists_requested": 1,
+                "expansion_artists_scanned": 1,
+                "expansion_candidates": 1,
+                "expansion_eligible": 1,
+            }
+        },
+    )
+    db.close()
+    app = create_app(config, source_factory=lambda cfg: [FakeSource()])
+
+    state = app.extensions["spotify_job"]
+    state.begin(workspace, scan_key="expansion")
+    assert state.snapshot()["scan_key"] == "expansion"
+    state.reset()
+
+    with app.test_client() as http:
+        response = http.get(f"/api/spotify/library?workspace_id={workspace}&view=all")
+        status = http.get(f"/api/spotify/status?workspace_id={workspace}")
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload["expansion_groups"][0]["artist_name"] == "Artist"
+    assert payload["expansion_groups"][0]["candidates"][0]["kind"] == "expansion"
+    assert payload["expansion_groups"][0]["candidates"][0]["artist_norm"] == "artist"
+    assert payload["expansion_summary"]["unique_songs"] == 1
+    assert payload["expansion_summary"]["new_songs"] == 1
+    assert {scan["kind"] for scan in payload["scan_history"]} == {"exact", "expansion"}
+    assert status.status_code == 200
+    assert status.get_json()["scan_key"] == "expansion"
+
+    candidate_id = payload["expansion_groups"][0]["candidates"][0]["candidate_id"]
+    with app.test_client() as http:
+        selected = http.post(
+            "/api/spotify/select",
+            json={
+                "workspace_id": workspace,
+                "kind": "expansion",
+                "artist_norm": "artist",
+                "candidate_id": candidate_id,
+                "action": "select",
+            },
+        )
+        tray = http.get(f"/api/spotify/selections?workspace_id={workspace}")
+
+    assert selected.status_code == 200
+    assert tray.get_json()["count"] == 1
+    assert tray.get_json()["items"][0]["kind"] == "expansion"
+
+
+def test_expansion_preview_requires_confirmation_and_drives_artist_catalog_search(config):
+    class Keyring:
+        def __init__(self):
+            self.values = {}
+
+        def get_password(self, service, username):
+            return self.values.get((service, username))
+
+        def set_password(self, service, username, password):
+            self.values[(service, username)] = password
+
+        def delete_password(self, service, username):
+            self.values.pop((service, username), None)
+
+    class SpotifyCatalog:
+        def get_artist_discography(self, artist):
+            assert artist == "Artist"
+            return {
+                "artist_id": "spotify-artist",
+                "albums": 2,
+                "tracks": [
+                    {"spotify_id": "known", "artist": "Artist", "title": "Known", "album": "Album"},
+                    {"spotify_id": "deep", "artist": "Artist", "title": "Deep Cut", "album": "Album"},
+                ],
+            }
+
+    source = FakeSource(artist_results={"Artist": [make_chart("Deep Cut", "Artist", chart_id=88)]})
+    keyring = Keyring()
+    config.spotify.keyring.service = "test-service"
+    config.spotify.keyring.user = "test-user"
+    config.spotify.keyring.username = "test-user"
+    keyring.set_password(config.keyring_service, config.keyring_user, "refresh-token")
+    db = Database(config.database_path)
+    db.upsert_spotify_account({"spotify_user_id": "spotify-user", "display_name": "Test User"})
+    workspace = db.create_workspace(
+        workspace_key="spotify",
+        name="Spotify workspace",
+        kind="exact",
+        status="complete",
+        phase="complete",
+    )
+    db.replace_spotify_library(
+        records=[make_track("Known", "Artist", "known")],
+        workspace_id=workspace,
+    )
+    db.replace_workspace_expansion_artists(
+        workspace,
+        [{"artist_name": "Artist", "artist_norm": "artist", "track_count": 1, "cap": 10, "selected": True}],
+    )
+    db.close()
+    app = create_app(
+        config,
+        source_factory=lambda _config: [source],
+        spotify_factory=lambda: SpotifyCatalog(),
+        keyring=keyring,
+    )
+    app.config["TESTING"] = True
+
+    with app.test_client() as http:
+        blocked = http.post(
+            "/api/spotify/expansion/start",
+            json={"workspace_id": workspace, "artist_norms": ["artist"]},
+        )
+        assert blocked.status_code == 409
+        assert "preview" in blocked.get_json()["error"]
+
+        preview = http.post(
+            "/api/spotify/expansion/preview",
+            json={"workspace_id": workspace, "artist_norms": ["artist"]},
+        )
+        assert preview.status_code == 202
+        for _ in range(100):
+            status = http.get(f"/api/spotify/status?workspace_id={workspace}").get_json()
+            if not status["running"]:
+                break
+            time.sleep(0.01)
+        else:
+            pytest.fail("Spotify preview worker did not finish")
+
+        preview_data = http.get(
+            f"/api/spotify/expansion/preview?workspace_id={workspace}"
+        ).get_json()
+        assert preview_data["ready"] is True
+        assert preview_data["full_discography_count"] == 2
+        assert preview_data["already_in_library_count"] == 1
+        assert preview_data["song_count"] == 1
+        assert preview_data["expected_queries"] == 1
+
+        expansion = http.post(
+            "/api/spotify/expansion/start",
+            json={"workspace_id": workspace, "artist_norms": ["artist"]},
+        )
+        assert expansion.status_code == 202
+        for _ in range(100):
+            status = http.get(f"/api/spotify/status?workspace_id={workspace}").get_json()
+            if not status["running"]:
+                break
+            time.sleep(0.01)
+        else:
+            pytest.fail("expansion worker did not finish")
+        assert status["scan_key"] == "expansion"
+
+        workspace_data = http.get(
+            f"/api/spotify/library?workspace_id={workspace}&view=all"
+        ).get_json()
+        assert workspace_data["expansion_summary"]["new_songs"] == 1
+        assert workspace_data["expansion_groups"][0]["song_title"] == "Deep Cut"
+
+
+def test_expansion_artist_api_enforces_hard_batch_limit(client, config):
+    db = Database(config.database_path)
+    try:
+        workspace = db.create_workspace(
+            workspace_key="spotify",
+            name="Spotify workspace",
+            kind="exact",
+            status="complete",
+            phase="complete",
+        )
+        records = [
+            make_track("Song", f"Artist {index}", f"spotify-{index}")
+            for index in range(26)
+        ]
+        db.replace_spotify_library(records=records, workspace_id=workspace)
+    finally:
+        db.close()
+
+    artists = client.get(f"/api/spotify/expansion/artists?workspace_id={workspace}")
+    assert artists.status_code == 200
+    payload = artists.get_json()
+    assert payload["max_artists_per_batch"] == 25
+    artist_norms = [item["artist_norm"] for item in payload["artists"]]
+    assert len(artist_norms) == 26
+
+    rejected = client.post(
+        "/api/spotify/expansion/artists/select",
+        json={
+            "workspace_id": workspace,
+            "artists": [{"artist_norm": norm, "selected": True} for norm in artist_norms],
+        },
+    )
+    assert rejected.status_code == 400
+    assert "limited to 25 primary artists; received 26" in rejected.get_json()["error"]
+
+
+def test_expansion_preview_cancel_is_durable_and_preserves_completed_artists(config):
+    class Keyring:
+        def __init__(self):
+            self.values = {}
+
+        def get_password(self, service, username):
+            return self.values.get((service, username))
+
+        def set_password(self, service, username, password):
+            self.values[(service, username)] = password
+
+        def delete_password(self, service, username):
+            self.values.pop((service, username), None)
+
+    entered_second = threading.Event()
+    release_second = threading.Event()
+
+    class SpotifyCatalog:
+        def get_artist_discography(self, artist, cancellation_event=None):
+            if artist == "Artist Two":
+                entered_second.set()
+                release_second.wait(2)
+                if cancellation_event is not None and cancellation_event.is_set():
+                    from csv_to_clonehero.spotify import SpotifyCancellationError
+
+                    raise SpotifyCancellationError("cancelled")
+            return {"artist_id": artist, "albums": 1, "tracks": []}
+
+    keyring = Keyring()
+    config.spotify.keyring.service = "test-service"
+    config.spotify.keyring.user = "test-user"
+    config.spotify.keyring.username = "test-user"
+    keyring.set_password(config.keyring_service, config.keyring_user, "refresh-token")
+    db = Database(config.database_path)
+    try:
+        db.upsert_spotify_account({"spotify_user_id": "spotify-user", "display_name": "Test User"})
+        workspace = db.create_workspace(workspace_key="spotify", name="Spotify", kind="exact")
+        db.replace_spotify_library(
+            records=[make_track("One", "Artist One", "one"), make_track("Two", "Artist Two", "two")],
+            workspace_id=workspace,
+        )
+    finally:
+        db.close()
+    app = create_app(
+        config,
+        source_factory=lambda _config: [FakeSource()],
+        spotify_factory=lambda: SpotifyCatalog(),
+        keyring=keyring,
+    )
+    app.config["TESTING"] = True
+
+    with app.test_client() as http:
+        artists = http.get(f"/api/spotify/expansion/artists?workspace_id={workspace}").get_json()["artists"]
+        norms = [item["artist_norm"] for item in artists]
+        started = http.post(
+            "/api/spotify/expansion/preview",
+            json={"workspace_id": workspace, "artist_norms": norms},
+        )
+        assert started.status_code == 202
+        assert entered_second.wait(2)
+        cancelled = http.post("/api/spotify/scan/cancel")
+        assert cancelled.status_code == 200
+        release_second.set()
+        for _ in range(100):
+            status = http.get(f"/api/spotify/status?workspace_id={workspace}").get_json()
+            if not status["running"]:
+                break
+            time.sleep(0.01)
+        else:
+            pytest.fail("preview cancellation did not finish")
+        assert status["status"] == "cancelled"
+        batch = status["expansion_batch"]
+        assert batch["status"] == "cancelled"
+        assert any(item["preview_status"] == "complete" for item in batch["artists"])
+        assert any(item["preview_status"] in {"running", "interrupted", "pending"} for item in batch["artists"])
 
 
 @pytest.mark.parametrize("remaining", [1, 5, 10, 25])
@@ -106,6 +588,26 @@ def test_spotify_status_eta_ignores_cached_query_burst(monkeypatch):
     assert status["eta_seconds"] == 20.0
 
 
+def test_spotify_status_eta_shrinks_when_remaining_queries_are_cached(monkeypatch):
+    clock = [300.0]
+    monkeypatch.setattr("csv_to_clonehero.webapp.time.time", lambda: clock[0])
+    state = _SpotifyJobState()
+    state.begin(1)
+    state.progress_update({"total_tasks": 10, "total_work": 10, "estimated_cached_queries": 10})
+    clock[0] += 4
+    state.progress_update({"completed_tasks": 2, "completed_work": 2, "cached_queries": 2})
+    clock[0] += 0.08
+    state.progress_update({"completed_tasks": 3, "completed_work": 3, "cached_queries": 3})
+    clock[0] += 0.08
+    state.progress_update({"completed_tasks": 4, "completed_work": 4, "cached_queries": 4})
+
+    status = state.snapshot()
+
+    assert status["cached_seconds_per_item"] == 0.08
+    assert status["eta_seconds"] < 4 * 6
+    assert status["eta_seconds"] == round(6 * 0.08, 1)
+
+
 def test_spotify_status_eta_expands_when_fallback_queries_are_added(monkeypatch):
     clock = [400.0]
     monkeypatch.setattr("csv_to_clonehero.webapp.time.time", lambda: clock[0])
@@ -161,6 +663,96 @@ def test_running_spotify_status_does_not_replay_stale_persisted_error(config):
 
     assert status["running"] is True
     assert status["error"] == ""
+
+
+def test_spotify_status_does_not_apply_a_new_run_to_another_workspace(config):
+    db = Database(config.database_path)
+    old_workspace = db.create_workspace(
+        workspace_key="old", name="Old scan", kind="exact", status="complete", phase="complete",
+        metadata={"scan_key": "exact", "run_id": "old-run"},
+    )
+    active_workspace = db.create_workspace(
+        workspace_key="active", name="Active scan", kind="exact", status="running", phase="starting",
+        metadata={"scan_key": "exact", "run_id": "new-run"},
+    )
+    db.close()
+    app = create_app(config, source_factory=lambda cfg: [FakeSource()])
+    app.extensions["spotify_job"].begin(active_workspace, scan_key="exact", run_id="new-run")
+
+    with app.test_client() as http:
+        old_status = http.get(f"/api/spotify/status?workspace_id={old_workspace}").get_json()
+        active_status = http.get(f"/api/spotify/status?workspace_id={active_workspace}").get_json()
+
+    assert old_status["running"] is False
+    assert old_status["status"] == "complete"
+    assert old_status["run_id"] == "old-run"
+    assert active_status["running"] is True
+    assert active_status["run_id"] == "new-run"
+
+
+def test_dead_spotify_worker_is_recovered_and_retry_status_is_exposed(config):
+    app = create_app(config, source_factory=lambda _config: [FakeSource()])
+    db = Database(config.database_path)
+    workspace = db.create_workspace(
+        workspace_key="spotify-stale",
+        name="Stale Spotify scan",
+        kind="exact",
+        status="running",
+        phase="starting",
+        metadata={"scan_key": "exact", "run_id": "stale-run"},
+    )
+    db.close()
+    state = app.extensions["spotify_job"]
+    state.begin(workspace, run_id="stale-run")
+    dead_worker = threading.Thread(target=lambda: None)
+    state.attach_worker("stale-run", dead_worker)
+    dead_worker.start()
+    dead_worker.join()
+
+    with app.test_client() as http:
+        status = http.get(f"/api/spotify/status?workspace_id={workspace}").get_json()
+
+    assert status["running"] is False
+    assert status["status"] == "interrupted"
+    assert status["run_id"] == "stale-run"
+    assert status["recovered"] is True
+    assert status["heartbeat_at"] is not None
+    db = Database(config.database_path)
+    try:
+        assert db.get_workspace(workspace)["status"] == "interrupted"
+    finally:
+        db.close()
+
+
+def test_old_spotify_worker_cannot_clear_new_run():
+    state = _SpotifyJobState()
+    state.begin(1, run_id="old-run")
+    old_worker = threading.Thread(target=lambda: None)
+    state.attach_worker("old-run", old_worker)
+    state.begin(1, run_id="new-run")
+    new_worker = threading.Thread(target=lambda: None)
+    state.attach_worker("new-run", new_worker)
+
+    assert state.cleanup("old-run", old_worker) is False
+    assert state.snapshot()["running"] is True
+    assert state.snapshot()["run_id"] == "new-run"
+
+
+def test_active_spotify_worker_remains_owned():
+    state = _SpotifyJobState()
+    release = threading.Event()
+    active_worker = threading.Thread(target=lambda: release.wait(2))
+    state.begin(1, run_id="active-run")
+    state.attach_worker("active-run", active_worker)
+    active_worker.start()
+    try:
+        snapshot = state.snapshot()
+        assert snapshot["running"] is True
+        assert snapshot["worker_alive"] is True
+        assert snapshot["worker_known"] is True
+    finally:
+        release.set()
+        active_worker.join()
 
 
 def test_spotify_workspace_save_checkpoints_durable_database(config):
@@ -300,15 +892,81 @@ def test_spotify_saved_workspace_tracks_are_server_paged(config):
     assert first["tracks"][0]["spotify_id"] != second["tracks"][0]["spotify_id"]
 
 
-def test_advanced_page_keeps_full_interface(client):
+def test_spotify_workspace_reset_endpoint(client, config):
+    db = Database(config.database_path)
+    try:
+        workspace_id = db.create_workspace(
+            workspace_key="spotify-reset-test",
+            name="Reset test",
+            kind="exact",
+            status="complete",
+            phase="complete",
+        )
+        db.replace_spotify_library(
+            records=[make_track("Personal Song", "Personal Artist", "personal-song")],
+            workspace_id=workspace_id,
+        )
+        db.set_workspace_scope(workspace_id, [], include_liked=True)
+    finally:
+        db.close()
+
+    reset_res = client.post("/api/spotify/workspace/reset", json={"workspace_id": workspace_id})
+    assert reset_res.status_code == 200
+    assert reset_res.get_json()["ok"] is True
+    assert reset_res.get_json()["status"] == "reset"
+
+    db = Database(config.database_path)
+    try:
+        row = db.get_workspace(workspace_id)
+        assert row["status"] == "created"
+        assert row["phase"] == "idle"
+        candidates = db.get_workspace_candidates(workspace_id)
+        assert len(candidates) == 0
+        assert db.get_workspace_expansion_artists(workspace_id) == []
+        assert db.get_library_tracks(workspace_id=workspace_id) == []
+        assert db.get_workspace_scope_data(workspace_id)["playlist_ids"] == []
+    finally:
+        db.close()
+
+
+def test_app_startup_removes_legacy_demo_workspace(config):
+    db = Database(config.database_path)
+    try:
+        db.create_workspace(
+            workspace_key="spotify-demo",
+            name="Legacy demo",
+            kind="exact",
+        )
+    finally:
+        db.close()
+
+    create_app(config, source_factory=lambda _config: [FakeSource()])
+
+    db = Database(config.database_path)
+    try:
+        assert db.get_workspace("spotify-demo") is None
+    finally:
+        db.close()
+
+
+def test_advanced_page_serves_music_file_import_workflow(client):
     response = client.get("/advanced")
     assert response.status_code == 200
     html = response.get_data(as_text=True)
-    assert "chosic.com/spotify-playlist-exporter" in html
-    assert "exportify.net" in html
-    assert "Accept all best review matches" in html
-    assert "jobStatus" in html
-    assert 'href="/"' in html  # cross-link back to simple mode
+    for text in (
+        "CSV &amp; music-file import",
+        "Add music exports",
+        "Preview chart matches",
+        "Review choices",
+        "Download selected charts",
+        "iTunes/Music TXT",
+        "iTunes/Music XML",
+    ):
+        assert text in html
+    assert 'id="picker" accept=".csv,.txt,.xml"' in html
+    assert 'id="review"' in html
+    assert 'id="jobStatus"' in html
+    assert 'href="/"' in html
 
 
 def test_upload_list_delete_csv(client, config):

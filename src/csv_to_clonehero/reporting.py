@@ -8,7 +8,7 @@ import logging
 from pathlib import Path
 
 from csv_to_clonehero.config import AppConfig
-from csv_to_clonehero.database import Database
+from csv_to_clonehero.database import Database, _candidate_from_json
 
 log = logging.getLogger(__name__)
 
@@ -41,6 +41,11 @@ def _candidate_fields(candidate) -> dict:
 
 
 def generate_reports(config: AppConfig, db: Database) -> list[Path]:
+    """Write the legacy build reports from the current database snapshot.
+
+    Reports are derived output: regenerating them never changes matching or
+    download state, and the destination remains separate from the Songs folder.
+    """
     reports_dir = config.reports_path
     reports_dir.mkdir(parents=True, exist_ok=True)
     written: list[Path] = []
@@ -391,9 +396,10 @@ def generate_spotify_reports(
 ) -> list[Path]:
     """Write a compact, export-safe report for a Spotify discovery workspace.
 
-    Spotify navigation artwork and URLs are intentionally omitted from the CSV
-    files.  The report contains the library identity, source-owned candidate
-    metadata, terminal import statuses, and export ownership records only.
+    Spotify artwork is omitted from the CSV files. Explicit Spotify/source
+    reference URLs may be included for navigation, but tokens, audio URLs, and
+    credentials are not. The report contains library identity, source-owned
+    candidate metadata, terminal import statuses, and export ownership records.
     """
     reports_dir = config.reports_path
     reports_dir.mkdir(parents=True, exist_ok=True)
@@ -441,7 +447,14 @@ def generate_spotify_reports(
     candidate_rows: list[dict] = []
     if workspace_id is not None:
         for row in db.get_workspace_candidates(workspace_id, include_rejected=True):
-            candidate = db.get_candidate(row["candidate_id"])
+            candidate_json = row["candidate_json"] if "candidate_json" in row.keys() else None
+            if candidate_json:
+                try:
+                    candidate = _candidate_from_json(row["candidate_id"], candidate_json)
+                except Exception:
+                    candidate = db.get_candidate(row["candidate_id"])
+            else:
+                candidate = db.get_candidate(row["candidate_id"])
             track = track_by_id.get(row["track_id"])
             if candidate is None:
                 continue

@@ -26,6 +26,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Application. src-layout package; wsgi.py is the entry point.
 COPY pyproject.toml README.md ./
 COPY src ./src
+COPY browser_export ./browser_export
 COPY wsgi.py ./
 
 # Python needs rapidfuzz/hatch-free install of the src package into the image.
@@ -39,8 +40,7 @@ USER appuser
 
 # SQLite state + transient downloads live on this volume.
 VOLUME ["/data"]
-ENV DATABASE_URL=sqlite:////data/csv_to_clonehero.db \
-    PATH=/data
+ENV DATABASE_URL=sqlite:////data/csv_to_clonehero.db
 
 EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \

@@ -17,7 +17,7 @@ from typing import Any
 from csv_to_clonehero.config import AppConfig
 from csv_to_clonehero.database import Database
 from csv_to_clonehero.spotify import SpotifyClient, SpotifyOAuth, SpotifyOAuthConfig
-from csv_to_clonehero.server.security import TokenCipher
+from csv_to_clonehero.server.security import TokenCipher, resolve_token_cipher
 
 
 class EncryptedCredentialStore:
@@ -32,10 +32,12 @@ class EncryptedCredentialStore:
         database_path: Path | str,
         cipher: TokenCipher,
         user_id: int,
+        provider: str = "spotify",
     ) -> None:
         self.database_path = Path(database_path)
         self.cipher = cipher
         self.user_id = user_id
+        self.provider = str(provider or "spotify")
 
     def _db(self) -> Database:
         return Database(self.database_path)
@@ -43,7 +45,8 @@ class EncryptedCredentialStore:
     def get_password(self, service_name: str, username: str) -> str | None:
         db = self._db()
         try:
-            row = db.get_user_token(self.user_id)
+            row = (db.get_user_token(self.user_id) if self.provider == "spotify"
+                   else db.get_provider_token(self.user_id, self.provider))
             if row is None or not row["encrypted_refresh_token"]:
                 return None
             return self.cipher.decrypt(row["encrypted_refresh_token"])
@@ -57,14 +60,21 @@ class EncryptedCredentialStore:
             return
         db = self._db()
         try:
-            db.set_user_token(self.user_id, self.cipher.encrypt(str(password)))
+            encrypted = self.cipher.encrypt(str(password))
+            if self.provider == "spotify":
+                db.set_user_token(self.user_id, encrypted)
+            else:
+                db.set_provider_token(self.user_id, self.provider, encrypted)
         finally:
             db.close()
 
     def delete_password(self, service_name: str, username: str) -> None:
         db = self._db()
         try:
-            db.clear_user_token(self.user_id)
+            if self.provider == "spotify":
+                db.clear_user_token(self.user_id)
+            else:
+                db.clear_provider_token(self.user_id, self.provider)
         finally:
             db.close()
 
@@ -100,6 +110,29 @@ def build_oauth(
 
 def build_spotify_client(config: AppConfig, oauth: SpotifyOAuth | Any) -> SpotifyClient:
     return SpotifyClient(oauth=oauth, timeout=float(config.network.timeout_seconds or 20.0))
+
+
+def build_soundcloud_oauth(config: AppConfig, user_id: int):
+    """Build the optional SoundCloud OAuth client for one signed-in user."""
+    from csv_to_clonehero.providers.soundcloud_api import SoundCloudOAuth
+
+    redirect = config.soundcloud.redirect_uri.strip()
+    if not redirect:
+        public = config.public_base_url.rstrip("/")
+        redirect = (
+            f"{public}{config.soundcloud.redirect_path}"
+            if public
+            else config.soundcloud.redirect_uri_value
+        )
+    store = EncryptedCredentialStore(config.database_path, resolve_token_cipher(config), user_id, "soundcloud")
+    return SoundCloudOAuth(
+        config.soundcloud.effective_client_id,
+        config.soundcloud.effective_client_secret,
+        redirect,
+        scopes=tuple(config.soundcloud.scopes),
+        store=store,
+        timeout=float(config.network.timeout_seconds or 20.0),
+    )
 
 
 USER_WORKSPACE_BASE = "spotify"

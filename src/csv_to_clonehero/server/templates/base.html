@@ -97,7 +97,10 @@ async function api(path, opts) {
   const r = await fetch(path, Object.assign({headers:{'Content-Type':'application/json'}}, opts));
   if (r.status === 401) { window.location.href='/'; throw new Error('login'); }
   const data = await r.json().catch(() => ({}));
-  if (!r.ok && data.error) throw new Error(data.error);
+  if (!r.ok) {
+    const error = new Error(data.error || `Request failed (${r.status})`);
+    error.data = data; error.status = r.status; throw error;
+  }
   return data;
 }
 async function doLogout() {

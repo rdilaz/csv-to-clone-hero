@@ -7,9 +7,10 @@
   {% if page == "Terms of Service" %}
   <p class="muted">Last updated: {{ now_year }}. This is a plain-English summary; legally binding terms follow the same intent.</p>
   <h2>1. What this service does</h2>
-  <p>CSV to Clone Hero connects your Spotify library to chart files hosted by
-     independent chart authors (via Chorus Encore). We help you find and
-     download those chart files.</p>
+   <p>CSV to Clone Hero connects your Spotify library to chart files hosted by
+      independent chart authors (via Chorus Encore). We help you find and
+      download those chart files. Public ZIPs are staged only for delivery and
+      are removed after download or expiry.</p>
   <h2>2. Your account</h2>
   <p>There is no separate account or password. You sign in with your own Spotify
      account (PKCE OAuth). We store minimal account data — your Spotify user id,
@@ -33,8 +34,10 @@
     <li><strong>Optional email:</strong> only to notify you when a long job finishes — never for marketing and never your identity.</li>
   </ul>
   <h2>What we do NOT collect</h2>
-  <p>We do not store chart files, your listening history, or any data from
-     services other than Spotify. We never sell your data.</p>
+   <p>We do not retain public chart files after their short-lived delivery
+      window, and we do not collect your listening history. If you choose a
+      SoundCloud integration or upload a SoundCloud export, we process only the
+      library metadata needed for matching. We never sell your data.</p>
   <h2>Cookies and sessions</h2>
   <p>We use a single signed, HttpOnly session cookie to keep you signed in.</p>
   <h2>Your choices</h2>
@@ -44,7 +47,8 @@
   {% else %}
   <h2>Copyright</h2>
   <p>Chart files are the work of their individual authors and are available
-     through Chorus Encore (enchor.us). We do not host chart files. Song
+      through Chorus Encore (enchor.us). We do not retain chart files as a
+      hosted library. Song
      metadata and track names are used solely to match your Spotify library to
      existing charts.</p>
   <h2>DMCA takedowns</h2>

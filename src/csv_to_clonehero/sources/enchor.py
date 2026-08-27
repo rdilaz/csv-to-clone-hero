@@ -23,6 +23,7 @@ import logging
 import threading
 import time
 from collections.abc import Mapping
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -38,9 +39,10 @@ from csv_to_clonehero.models import ChartCandidate, DownloadInfo
 from csv_to_clonehero.normalization import (
     normalize_artist,
     normalize_title,
-    strip_version_noise,
+    sanitize_query_for_enchor,
 )
 from csv_to_clonehero.sources.base import SourceCapabilities, SourceError
+from csv_to_clonehero.catalog import DEFAULT_CATALOG_PATH, load_enchor_catalog
 
 log = logging.getLogger(__name__)
 
@@ -53,13 +55,26 @@ DEFAULT_GENERAL_MAX_PAGES = 20
 DEFAULT_ARTIST_MAX_PAGES = 20
 DEFAULT_ARTIST_PAGE_SIZE = 250
 DEFAULT_ARTIST_RESULT_CAP = DEFAULT_ARTIST_MAX_PAGES * DEFAULT_ARTIST_PAGE_SIZE
+PREFLIGHT_VERSION = "enchor-catalog-v1"
 
 
-def _safe_retry_after(value: Any) -> float | None:
-    try:
-        return min(float(value), 60.0)
-    except (TypeError, ValueError):
-        return None
+@dataclass(frozen=True)
+class EnchorCatalogPreflight:
+    """One bounded probe of Enchor's broad-search response shape."""
+
+    source_name: str = "enchor"
+    endpoint: str = "/search"
+    request_version: str = PREFLIGHT_VERSION
+    checked_at: float = 0.0
+    success: bool = False
+    supported: bool = False
+    authoritative: bool = False
+    found: int | None = None
+    out_of: int | None = None
+    returned_count: int = 0
+    page: int | None = None
+    error: str = ""
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 def _looks_like_sng(path: Any) -> bool:
@@ -170,6 +185,7 @@ class EnchorSource:
         max_search_pages: int = DEFAULT_GENERAL_MAX_PAGES,
         head_size_enabled: bool = False,
         download_request_delay: float = 0.1,
+        catalog_path: Path | str | None = None,
     ) -> None:
         self.request_delay = request_delay
         self.retries = max(1, retries)
@@ -224,6 +240,13 @@ class EnchorSource:
             discovery_only=False,
             supports_direct_download=True,
         )
+        self.catalog = load_enchor_catalog(catalog_path or DEFAULT_CATALOG_PATH)
+
+    def catalog_available(self, artist: str, title: str = "") -> bool | None:
+        """Return membership, or ``None`` when no safe snapshot is loaded."""
+        if not self.catalog.available:
+            return None
+        return self.catalog.has_song(artist, title) if title else self.catalog.has_artist(artist)
 
     @staticmethod
     def _as_int(value: Any, default: int = 0) -> int:
@@ -313,12 +336,81 @@ class EnchorSource:
             raise SourceError(f"Enchor request failed after retries: {exc}") from exc
 
     # ---------------------------------------------------------------- search
+    def preflight_catalog(self) -> EnchorCatalogPreflight:
+        """Probe broad search once; never turn preflight into a catalog crawl.
+
+        Bridge sends the normal search request with an empty search string when
+        browsing the unfiltered catalog.  The result is authoritative only when
+        Enchor explicitly reports the filtered count as the global ``out_of``
+        count.  Any other response is useful health evidence but cannot justify
+        claiming that a complete online catalog is available.
+        """
+        checked_at = time.time()
+        payload = {
+            "search": "",
+            "per_page": 1,
+            "page": 1,
+            "instrument": None,
+            "difficulty": None,
+            "drumType": None,
+            "drumsReviewed": False,
+            "sort": None,
+            "source": "bridge",
+        }
+        try:
+            response = self._post("/search", payload)
+        except SourceError as exc:
+            return EnchorCatalogPreflight(
+                checked_at=checked_at,
+                error=str(exc),
+                metadata={
+                    "http_status": exc.status,
+                    "rate_limited": bool(exc.rate_limited),
+                    "query": "",
+                },
+            )
+
+        rows = response.get("data")
+        rows_are_valid = isinstance(rows, list)
+        returned_count = len(rows) if rows_are_valid else 0
+        found = self._optional_nonnegative_int(response.get("found"))
+        out_of = self._optional_nonnegative_int(response.get("out_of"))
+        page = self._optional_nonnegative_int(response.get("page"))
+        supported = rows_are_valid and found is not None and out_of is not None and page == 1
+        authoritative = bool(
+            supported
+            and found == out_of
+            and found > 0
+            and returned_count == 1
+        )
+        error = ""
+        if not supported:
+            error = "Enchor did not return supported broad-search totals."
+        elif not authoritative:
+            error = "Enchor's broad-search total is not authoritative."
+        return EnchorCatalogPreflight(
+            checked_at=checked_at,
+            success=True,
+            supported=supported,
+            authoritative=authoritative,
+            found=found,
+            out_of=out_of,
+            returned_count=returned_count,
+            page=page,
+            error=error,
+            metadata={"query": "", "response_keys": sorted(response.keys())},
+        )
+
+    @classmethod
+    def _optional_nonnegative_int(cls, value: Any) -> int | None:
+        parsed = cls._as_int(value, -1)
+        return parsed if parsed >= 0 else None
+
     def search_song(self, artist: str, title: str) -> list[ChartCandidate]:
-        # The general search endpoint occasionally 500s on long queries with
-        # version-noise words; search with the noise-stripped title and fall
-        # back to a title-only query if the server still errors.
-        clean_title = strip_version_noise(title)
-        query = f"{artist} {clean_title}".strip()
+        clean_artist, clean_title = sanitize_query_for_enchor(artist, title)
+        if self.catalog_available(artist, title) is False:
+            return []
+        query = f"{clean_artist} {clean_title}".strip()
         try:
             return self._search(query)
         except SourceError as exc:
@@ -328,7 +420,7 @@ class EnchorSource:
                 exc.status == 500
                 and not getattr(exc, "rate_limited", False)
                 and clean_title
-                and artist.strip()
+                and clean_artist
             ):
                 log.debug("retrying search with title only: %s", clean_title)
                 return self._search(clean_title)
@@ -466,6 +558,8 @@ class EnchorSource:
         )
 
     def search_artist(self, artist: str) -> list[ChartCandidate]:  # noqa: E501
+        if self.catalog_available(artist) is False:
+            return []
         # Paginate through the artist catalog. The API returns `found` (total
         # hits) and `data` (this page). We stop when a page is empty or we have
         # accumulated at least `found` rows, with a hard cap to keep mistagged

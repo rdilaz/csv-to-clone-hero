@@ -12,9 +12,10 @@ No terminal required.
 
 from __future__ import annotations
 
-import json
 import hmac
+import hashlib
 import inspect
+import json
 import logging
 import os
 import re
@@ -24,6 +25,7 @@ import sqlite3
 import string
 import threading
 import time
+import uuid
 from collections import deque
 from dataclasses import fields, is_dataclass
 from pathlib import Path
@@ -40,6 +42,7 @@ from csv_to_clonehero.csv_import import (
     import_playlist_dir,
 )
 from csv_to_clonehero.database import Database
+from csv_to_clonehero.diagnostics import RunDiagnostics, diagnostics_path
 from csv_to_clonehero.exporter import ExportOptions, ExportService
 from csv_to_clonehero.filesystem import destination_path, is_within, sanitize_component
 from csv_to_clonehero.library_inventory import InventoryLimits, scan_library
@@ -50,20 +53,24 @@ from csv_to_clonehero.matching import (
     RECOMMENDED,
     eligibility_for,
     score_candidate,
-    score_expansion_candidate,
 )
 from csv_to_clonehero.models import ChartCandidate, Track
 from csv_to_clonehero.spotify import (
+    SpotifyAuthError,
+    SpotifyCancellationError,
     SpotifyClient,
     SpotifyError,
     SpotifyOAuth,
+    SpotifyPermissionError,
 )
 from csv_to_clonehero.spotify_pipeline import (
+    build_source_query_key,
     build_spotify_estimate,
     estimate_spotify_duration,
     run_expansion_discovery,
     run_spotify_discovery,
 )
+from csv_to_clonehero.providers.soundcloud_api import SoundCloudClient, SoundCloudOAuth
 from csv_to_clonehero.pipeline import (
     cleanup_empty_folders,
     run_downloads,
@@ -74,10 +81,12 @@ from csv_to_clonehero.pipeline import (
 )
 from csv_to_clonehero.reporting import generate_reports, generate_spotify_reports
 from csv_to_clonehero.sources import build_sources
-from csv_to_clonehero.sources.base import ChartSource
-from csv_to_clonehero.normalization import normalize_artist
+from csv_to_clonehero.sources.base import ChartSource, source_catalog_available
+from csv_to_clonehero.normalization import normalize_artist, normalize_title
 
 log = logging.getLogger(__name__)
+
+_SPOTIFY_WORKSPACE_KEY = "spotify"
 
 
 class _OAuthAccessLogFilter(logging.Filter):
@@ -301,6 +310,7 @@ class _SpotifyJobState:
             self.workspace_id: int | None = None
             self.workspace_key = "spotify"
             self.scan_key = "exact"
+            self.run_id = ""
             self.started_at: float | None = None
             self.finished_at: float | None = None
             self.progress: dict[str, Any] = {
@@ -308,7 +318,10 @@ class _SpotifyJobState:
                 "completed_tasks": 0,
                 "failed_tasks": 0,
                 "total_tracks": 0,
+                "catalog_eligible_tracks": 0,
+                "catalog_unavailable_tracks": 0,
                 "completed_tracks": 0,
+                "cached_queries": 0,
                 "scoring_tasks_total": 0,
                 "scoring_tasks_completed": 0,
                 "done": 0,
@@ -319,9 +332,16 @@ class _SpotifyJobState:
                 "estimated_total_seconds": 0.0,
                 "estimated_lower_seconds": 0.0,
                 "estimated_upper_seconds": 0.0,
-                "estimated_query_seconds": 0.0,
+"estimated_query_seconds": 0.0,
                 "estimated_scoring_seconds": 0.0,
+                "estimated_cached_queries": 0,
                 "estimated_completed_seconds": 0.0,
+                "expansion_artists_total": 0,
+                "expansion_artists_completed": 0,
+                "expansion_songs_total": 0,
+                "expansion_catalog_unavailable_songs": 0,
+                "expansion_songs_with_charts": 0,
+                "expansion_songs_without_charts": 0,
             }
             self.events: deque = deque(maxlen=LOG_EVENT_LIMIT)
             self.result: dict[str, Any] | None = None
@@ -331,6 +351,8 @@ class _SpotifyJobState:
             self._last_scoring_done = 0
             self._query_seconds_samples: deque[float] = deque(maxlen=25)
             self._scoring_seconds_samples: deque[float] = deque(maxlen=50)
+            self._cached_seconds_samples: deque[float] = deque(maxlen=20)
+            self.worker: threading.Thread | None = None
 
     def _log_locked(self, message: str) -> None:
         self.events.append({"ts": time.time(), "message": _safe_message(message)})
@@ -339,7 +361,13 @@ class _SpotifyJobState:
         with self.lock:
             self._log_locked(message)
 
-    def begin(self, workspace_id: int, workspace_key: str = "spotify") -> None:
+    def begin(
+        self,
+        workspace_id: int,
+        workspace_key: str = "spotify",
+        scan_key: str = "exact",
+        run_id: str | None = None,
+    ) -> None:
         with self.lock:
             self.reset()
             self.running = True
@@ -348,9 +376,50 @@ class _SpotifyJobState:
             self.message = "Starting Spotify discovery..."
             self.workspace_id = workspace_id
             self.workspace_key = workspace_key
+            self.scan_key = str(scan_key or "exact")
+            self.run_id = str(run_id or secrets.token_urlsafe(12))
             self.started_at = time.time()
             self._last_counter_at = self.started_at
             self._log_locked(self.message)
+
+    def attach_worker(self, run_id: str, worker: threading.Thread) -> bool:
+        """Associate the thread before it can be observed by another request."""
+        with self.lock:
+            if not self.running or self.run_id != str(run_id):
+                return False
+            self.worker = worker
+            return True
+
+    def cleanup(self, run_id: str, worker: threading.Thread) -> bool:
+        """Release only this run's guard, preserving recorded terminal state."""
+        with self.lock:
+            if self.run_id != str(run_id) or self.worker is not worker:
+                return False
+            self.worker = None
+            if self.running:
+                self.running = False
+                self.status = "interrupted"
+                self.phase = "interrupted"
+                self.message = "Spotify discovery was interrupted; cached work can be resumed."
+                self.finished_at = time.time()
+                self._log_locked(self.message)
+            return True
+
+    def recover_stale(self, run_id: str) -> bool:
+        """Clear a dead worker's in-memory ownership token."""
+        with self.lock:
+            if self.run_id != str(run_id) or not self.running:
+                return False
+            if self.worker is not None and self.worker.is_alive():
+                return False
+            self.worker = None
+            self.running = False
+            self.status = "interrupted"
+            self.phase = "interrupted"
+            self.message = "Spotify discovery was interrupted; cached work can be resumed."
+            self.finished_at = time.time()
+            self._log_locked(self.message)
+            return True
 
     def progress_update(self, payload: Mapping[str, Any] | None = None) -> None:
         with self.lock:
@@ -383,6 +452,8 @@ class _SpotifyJobState:
                     self._query_seconds_samples.append(duration / fresh_delta)
                 elif scoring_delta:
                     self._scoring_seconds_samples.append(duration / scoring_delta)
+                elif cached_delta:
+                    self._cached_seconds_samples.append(duration / cached_delta)
                 self._last_counter_at = now
             self._last_task_done = task_done
             self._last_cached_done = cached_done
@@ -408,6 +479,8 @@ class _SpotifyJobState:
                         ("completed_queries", "completed_tasks"),
                         ("failed_queries", "failed_tasks"),
                         ("total_tracks", "total_tracks"),
+                        ("catalog_eligible_tracks", "catalog_eligible_tracks"),
+                        ("catalog_unavailable_tracks", "catalog_unavailable_tracks"),
                         ("completed_tracks", "completed_tracks"),
                         ("scoring_tasks_total", "scoring_tasks_total"),
                         ("scoring_tasks_completed", "scoring_tasks_completed"),
@@ -420,6 +493,12 @@ class _SpotifyJobState:
                         ("estimated_query_seconds", "estimated_query_seconds"),
                         ("estimated_scoring_seconds", "estimated_scoring_seconds"),
                         ("estimated_completed_seconds", "estimated_completed_seconds"),
+                        ("expansion_artists_total", "expansion_artists_total"),
+                        ("expansion_artists_completed", "expansion_artists_completed"),
+                        ("expansion_songs_total", "expansion_songs_total"),
+                        ("expansion_catalog_unavailable_songs", "expansion_catalog_unavailable_songs"),
+                        ("expansion_songs_with_charts", "expansion_songs_with_charts"),
+                        ("expansion_songs_without_charts", "expansion_songs_without_charts"),
                     ):
                         value = getattr(stats, source, None)
                         if value is not None:
@@ -474,6 +553,11 @@ class _SpotifyJobState:
                 if self._scoring_seconds_samples
                 else 0.025
             )
+            cached_seconds = (
+                sorted(self._cached_seconds_samples)[len(self._cached_seconds_samples) // 2]
+                if self._cached_seconds_samples
+                else 0.02
+            )
             if not self.running:
                 eta = 0.0
                 estimate_source = "complete" if self.finished_at is not None else "unknown"
@@ -481,12 +565,28 @@ class _SpotifyJobState:
                 eta = 0.0
                 estimate_source = "unknown"
             else:
-                eta = remaining_queries * query_seconds + remaining_scoring * scoring_seconds
-                observed = len(self._query_seconds_samples) + len(self._scoring_seconds_samples)
+                cached_done = int(progress.get("cached_queries") or 0)
+                estimated_cached = int(progress.get("estimated_cached_queries") or 0)
+                remaining_cached = max(0, estimated_cached - cached_done)
+                remaining_fresh = max(0, remaining_queries - remaining_cached)
+                eta = (
+                    remaining_fresh * query_seconds
+                    + remaining_cached * cached_seconds
+                    + remaining_scoring * scoring_seconds
+                )
+                observed = (
+                    len(self._query_seconds_samples)
+                    + len(self._scoring_seconds_samples)
+                    + len(self._cached_seconds_samples)
+                )
                 if not remaining_queries and not remaining_scoring and total_work > completed_work:
                     eta = max(0.0, estimated_total - elapsed)
                 estimate_source = "live_phase_rate" if observed >= 2 else "calibrated"
-            sample_count = len(self._query_seconds_samples) + len(self._scoring_seconds_samples)
+            sample_count = (
+                len(self._query_seconds_samples)
+                + len(self._scoring_seconds_samples)
+                + len(self._cached_seconds_samples)
+            )
             uncertainty = 0.2 if sample_count >= 10 else 0.4
             return {
                 "running": self.running,
@@ -499,6 +599,7 @@ class _SpotifyJobState:
                 "workspace_id": self.workspace_id,
                 "workspace_key": self.workspace_key,
                 "scan_key": self.scan_key,
+                "run_id": self.run_id,
                 "started_at": started,
                 "finished_at": finished,
                 "elapsed_seconds": elapsed,
@@ -512,11 +613,15 @@ class _SpotifyJobState:
                 "remaining_work": remaining_work,
                 "query_seconds_per_item": round(query_seconds, 3),
                 "scoring_seconds_per_item": round(scoring_seconds, 4),
+                "cached_seconds_per_item": round(cached_seconds, 4),
                 "eta_sample_count": sample_count,
                 "estimate_source": estimate_source,
                 "events": list(self.events),
                 "recent_events": list(self.events)[-6:],
                 "result": self.result,
+                "worker_alive": bool(self.worker and self.worker.is_alive()),
+                "worker_known": self.worker is not None,
+                "last_activity_at": self._last_counter_at,
             }
 
 
@@ -687,6 +792,17 @@ def _discovery_result_payload(result: Any) -> dict[str, Any]:
         "partial": bool(getattr(result, "partial", False)),
         "error": _safe_message(getattr(result, "error", "") or ""),
         "stats": stats_payload,
+        "tracks": getattr(result, "tracks", 0),
+        "exact_hits": getattr(result, "exact_hits", 0),
+        "exact_misses": getattr(result, "exact_misses", 0),
+        "candidates": getattr(result, "candidates", 0),
+        "rejected_candidates": getattr(result, "rejected_candidates", 0),
+        "eligible_candidates": getattr(result, "eligible_candidates", 0),
+        "rejection_reasons": getattr(result, "rejection_reasons", {}),
+        "catalog_available": getattr(result, "catalog_available", False),
+        "catalog_diagnostic": _safe_message(getattr(result, "catalog_diagnostic", "") or ""),
+        "catalog_snapshot_id": getattr(result, "catalog_snapshot_id", ""),
+        "catalog_chart_count": getattr(result, "catalog_chart_count", 0),
     }
 
 
@@ -1115,8 +1231,12 @@ def _review_payload(
         ):
             continue
         explanation = ""
+        breakdown: dict[str, Any] = {}
         try:
-            explanation = json.loads(row["breakdown_json"]).get("explanation", "")
+            loaded_breakdown = json.loads(row["breakdown_json"])
+            if isinstance(loaded_breakdown, dict):
+                breakdown = loaded_breakdown
+                explanation = str(breakdown.get("explanation", ""))
         except (TypeError, ValueError):
             pass
         grouped.setdefault(row["track_id"], []).append(
@@ -1129,6 +1249,12 @@ def _review_payload(
                 "decision": row["decision"],
                 "automatic_decision": row["decision"],
                 "explanation": explanation,
+                "breakdown": breakdown,
+                "base_score": float(breakdown.get("base_score") or 0),
+                "bonuses": list(breakdown.get("bonuses") or []),
+                "penalties": list(breakdown.get("penalties") or []),
+                "gate_factors": dict(breakdown.get("gate_factors") or {}),
+                "quality_factors": dict(breakdown.get("quality_factors") or {}),
                 "charter": candidate.charter,
                 "instruments": candidate.instruments,
                 "diff_guitar": candidate.diff_guitar,
@@ -1363,6 +1489,8 @@ def create_app(
     recovery_db = Database(config.database_path)
     try:
         recovery_db.recover_interrupted_discovery()
+        recovery_db.mark_active_expansion_batches_interrupted()
+        recovery_db.delete_workspace_by_key("spotify-demo")
     finally:
         recovery_db.close()
     state = JobState()
@@ -1372,6 +1500,8 @@ def create_app(
     auth_client: Any = None
     spotify_client: Any = None
     pending_authorization: dict[str, Any] | None = None
+    pending_soundcloud_authorization: dict[str, Any] | None = None
+    soundcloud_oauth: Any = None
     auth_authenticated = False
     spotify_cancel_event: threading.Event | None = None
     secure_store = keyring if keyring is not None else _default_keyring()
@@ -1382,6 +1512,22 @@ def create_app(
     app.extensions["spotify_job"] = spotify_job
     app.extensions["spotify_oauth_factory"] = oauth_factory
     app.extensions["spotify_client_factory"] = spotify_factory
+
+    def _recover_stale_spotify_job() -> bool:
+        """Recover only a dead in-process worker whose durable run still owns the workspace."""
+        memory = spotify_job.snapshot()
+        if not memory.get("running") or not memory.get("worker_known") or memory.get("worker_alive"):
+            return False
+        workspace = memory.get("workspace_id")
+        run_id = str(memory.get("run_id") or "")
+        if workspace is None or not run_id:
+            return False
+        db = Database(config.database_path)
+        try:
+            db.recover_discovery_run(workspace, run_id)
+        finally:
+            db.close()
+        return spotify_job.recover_stale(run_id)
 
     def _spotify_settings() -> dict[str, Any]:
         settings = getattr(config, "spotify_oauth_kwargs", {})
@@ -1439,6 +1585,23 @@ def create_app(
                 raise RuntimeError("Spotify client is not configured")
             return spotify_client
 
+    def _get_soundcloud_oauth() -> Any:
+        nonlocal soundcloud_oauth
+        with auth_lock:
+            if soundcloud_oauth is not None:
+                return soundcloud_oauth
+            if not getattr(config.soundcloud, "oauth_configured", False):
+                raise RuntimeError("SoundCloud OAuth is not configured")
+            soundcloud_oauth = SoundCloudOAuth(
+                config.soundcloud.effective_client_id,
+                config.soundcloud.effective_client_secret,
+                config.soundcloud.redirect_uri_value,
+                scopes=tuple(config.soundcloud.scopes),
+                store=secure_store,
+                timeout=float(config.network.timeout_seconds or 20),
+            )
+            return soundcloud_oauth
+
     def _oauth_secret_values(oauth: Any = None) -> list[str]:
         values: list[str] = []
         owner = oauth or auth_client
@@ -1482,16 +1645,31 @@ def create_app(
         return False
 
     def _is_authenticated() -> bool:
-        if auth_authenticated:
-            return True
         row = _account_row()
         if row is None:
             return False
         owner = auth_client
-        token = getattr(owner, "token", None) if owner is not None else None
+        token = (
+            getattr(owner, "token", None) or getattr(owner, "_token", None)
+            if owner is not None
+            else None
+        )
         if token is not None:
             return True
-        return _secure_refresh_token_available(owner)
+        if _secure_refresh_token_available(owner):
+            return True
+        return bool(auth_authenticated and spotify_client is not None)
+
+    def _verified_spotify_client() -> Any:
+        """Return the client only after its OAuth token is usable."""
+        client = _get_spotify_client()
+        oauth = getattr(client, "_oauth", None) or auth_client
+        token_method = getattr(oauth, "access_token", None) or getattr(
+            oauth, "get_access_token", None
+        )
+        if callable(token_method):
+            token_method()
+        return client
 
     def _loopback_request() -> bool:
         address = request.remote_addr
@@ -1551,7 +1729,7 @@ def create_app(
     def _workspace_id(value: Any = None, *, required: bool = True) -> int | str | None:
         requested = value
         if requested in (None, ""):
-            requested = "spotify"
+            requested = _SPOTIFY_WORKSPACE_KEY
         db = Database(config.database_path)
         try:
             row = db.get_workspace(requested)
@@ -1560,14 +1738,6 @@ def create_app(
                     raise ValueError("Spotify discovery has not been run yet")
                 return None
             return int(row["id"])
-        finally:
-            db.close()
-
-    def _workspace_row(value: Any = None) -> Any:
-        workspace = _workspace_id(value)
-        db = Database(config.database_path)
-        try:
-            return db.get_workspace(workspace)
         finally:
             db.close()
 
@@ -1600,14 +1770,223 @@ def create_app(
         finally:
             db.close()
 
+    def _scan_summary(row: Any) -> dict[str, Any]:
+        data = _row_dict(row)
+        metadata = _json_object(data.get("metadata_json"), {})
+        if not isinstance(metadata, Mapping):
+            metadata = {}
+        stats = metadata.get("stats", {})
+        if not isinstance(stats, Mapping):
+            stats = {}
+
+        def count(name: str) -> int:
+            try:
+                return int(stats.get(name, 0) or 0)
+            except (TypeError, ValueError):
+                return 0
+
+        return {
+            "id": data.get("id"),
+            "scan_key": str(data.get("scan_key") or ""),
+            "kind": str(data.get("kind") or "exact"),
+            "status": str(data.get("status") or "created"),
+            "started_at": data.get("started_at"),
+            "finished_at": data.get("finished_at"),
+            "partial": bool(metadata.get("partial") or stats.get("partial")),
+            "message": str(metadata.get("error") or ""),
+            "stats": dict(stats),
+            "total_queries": count("total_queries"),
+            "completed_queries": count("completed_queries"),
+            "failed_queries": count("failed_queries"),
+            "total_tracks": count("total_tracks"),
+            "catalog_eligible_tracks": count("catalog_eligible_tracks"),
+            "catalog_unavailable_tracks": count("catalog_unavailable_tracks"),
+            "completed_tracks": count("completed_tracks"),
+            "exact_candidates": count("exact_candidates"),
+            "exact_eligible": count("exact_eligible"),
+            "exact_recommended": count("exact_recommended"),
+            "expansion_artists_requested": count("expansion_artists_requested"),
+            "expansion_artists_total": count("expansion_artists_total")
+            or count("expansion_artists_requested"),
+            "expansion_artists_scanned": count("expansion_artists_scanned"),
+            "expansion_artists_completed": count("expansion_artists_completed")
+            or count("expansion_artists_scanned"),
+            "expansion_songs_total": count("expansion_songs_total"),
+            "expansion_catalog_unavailable_songs": count("expansion_catalog_unavailable_songs"),
+            "expansion_songs_with_charts": count("expansion_songs_with_charts"),
+            "expansion_songs_without_charts": count("expansion_songs_without_charts"),
+            "expansion_candidates": count("expansion_candidates"),
+            "expansion_eligible": count("expansion_eligible"),
+        }
+
+    def _scan_history(db: Database, workspace: int | str) -> list[dict[str, Any]]:
+        summaries = [_scan_summary(row) for row in db.get_discovery_scans(workspace)]
+        return sorted(
+            summaries,
+            key=lambda item: float(item.get("started_at") or item.get("finished_at") or 0),
+        )
+
+    def _expansion_groups_payload(
+        db: Database,
+        workspace: int | str,
+    ) -> list[dict[str, Any]]:
+        artist_rows = {
+            str(row["artist_norm"]): row
+            for row in db.get_workspace_expansion_artists(workspace)
+        }
+        groups: dict[str, dict[str, Any]] = {}
+        for row in db.get_workspace_candidates(
+            workspace,
+            kind="expansion",
+            include_rejected=True,
+        ):
+            data = _row_dict(row)
+            artist_norm = str(data.get("artist_norm") or "")
+            artist_row = artist_rows.get(artist_norm)
+            candidate_metadata = _json_object(data.get("metadata_json"), {})
+            if not isinstance(candidate_metadata, Mapping):
+                candidate_metadata = {}
+            song_title = str(candidate_metadata.get("discography_song_title") or "").strip()
+            song_artist = str(candidate_metadata.get("discography_song_artist") or "").strip()
+            song_album = str(candidate_metadata.get("spotify_album") or "").strip()
+            group_key = (
+                f"{artist_norm}::{normalize_title(song_title)}"
+                if song_title
+                else artist_norm
+            )
+            group = groups.setdefault(
+                group_key,
+                {
+                    "id": group_key,
+                    "kind": "expansion",
+                    "artist_norm": artist_norm,
+                    "artist_name": str(
+                        artist_row["artist_name"]
+                        if artist_row
+                        else data.get("track_artist") or ""
+                    ),
+                    "song_artist": song_artist,
+                    "song_title": song_title,
+                    "album": song_album,
+                    "configured_cap": int(artist_row["cap"] or 0) if artist_row else 0,
+                    "candidates": [],
+                    "candidate_count": 0,
+                    "eligible_count": 0,
+                    "selected_count": 0,
+                },
+            )
+            candidate = _candidate_payload(row)
+            group["candidates"].append(candidate)
+            group["candidate_count"] += 1
+            if str(candidate.get("eligibility") or "").upper() in {
+                "RECOMMENDED",
+                "ELIGIBLE_REVIEW",
+            }:
+                group["eligible_count"] += 1
+            if candidate.get("selected"):
+                group["selected_count"] += 1
+
+        for group in groups.values():
+            group["candidates"].sort(
+                key=lambda item: (
+                    -float(item.get("score") or 0),
+                    -float(item.get("quality") or 0),
+                    str(item.get("title") or "").casefold(),
+                )
+            )
+        return sorted(groups.values(), key=lambda item: str(item["artist_name"]).casefold())
+
+    def _expansion_summary_payload(
+        db: Database,
+        workspace: int | str,
+        groups: list[dict[str, Any]],
+    ) -> dict[str, int]:
+        """Count unique expansion songs separately from chart variants."""
+
+        def song_key(candidate: Mapping[str, Any]) -> tuple[str, str]:
+            metadata = candidate.get("metadata")
+            if isinstance(metadata, Mapping):
+                target_artist = metadata.get("discography_song_artist")
+                target_title = metadata.get("discography_song_title")
+                if target_artist and target_title:
+                    return normalize_artist(str(target_artist)), normalize_title(str(target_title))
+            return (
+                normalize_artist(str(candidate.get("artist") or "")),
+                normalize_title(str(candidate.get("title") or candidate.get("name") or "")),
+            )
+
+        exact_songs = {
+            song_key(_candidate_payload(row))
+            for row in db.get_workspace_candidates(
+                workspace,
+                kind="exact",
+                include_rejected=True,
+            )
+        }
+        expansion_songs = {
+            song_key(candidate)
+            for group in groups
+            for candidate in group["candidates"]
+        }
+        expansion_songs.discard(("", ""))
+        preview_songs: set[tuple[str, str]] = set()
+        preview_full_count = 0
+        preview_owned_count = 0
+        preview_errors = 0
+        for row in db.get_workspace_expansion_artists(workspace, selected_only=True):
+            metadata = _json_object(row["metadata_json"], {})
+            preview = metadata.get("discography_preview", {}) if isinstance(metadata, Mapping) else {}
+            if not isinstance(preview, Mapping):
+                continue
+            preview_full_count += int(preview.get("catalog_song_count", 0) or 0)
+            preview_owned_count += int(preview.get("already_in_library", 0) or 0)
+            preview_errors += bool(preview.get("error"))
+            for item in preview.get("tracks", []) if isinstance(preview.get("tracks", []), list) else []:
+                if not isinstance(item, Mapping):
+                    continue
+                key = (
+                    normalize_artist(str(item.get("artist") or "")),
+                    normalize_title(str(item.get("title") or "")),
+                )
+                if key[0] and key[1]:
+                    preview_songs.add(key)
+        return {
+            "groups": len(groups),
+            "candidates": sum(group["candidate_count"] for group in groups),
+            "unique_songs": len(expansion_songs),
+            # An artist-expansion duplicate of an exact match is a chart
+            # variant, not a newly discovered song for the user.
+            "new_songs": len(expansion_songs - exact_songs),
+            "eligible": sum(group["eligible_count"] for group in groups),
+            "selected": sum(group["selected_count"] for group in groups),
+            "searched_songs": len(preview_songs) or len({
+                (
+                    normalize_artist(str(item.get("song_artist") or "")),
+                    normalize_title(str(item.get("song_title") or "")),
+                )
+                for item in groups
+                if item.get("song_artist") and item.get("song_title")
+            }),
+            "preview_songs": len(preview_songs),
+            "preview_full_count": preview_full_count,
+            "preview_owned_count": preview_owned_count,
+            "preview_errors": preview_errors,
+        }
+
     def _workspace_status(value: Any = None) -> dict[str, Any]:
+        _recover_stale_spotify_job()
         memory = spotify_job.snapshot()
         workspace_id = value if value not in (None, "") else memory.get("workspace_id") or "spotify"
         db: Database | None = None
+        scan_history: list[dict[str, Any]] = []
+        expansion_batch: dict[str, Any] | None = None
         try:
             db = Database(config.database_path)
             row = db.get_workspace(workspace_id)
             progress_row = db.get_workspace_progress(workspace_id) if row is not None else None
+            if row is not None:
+                scan_history = _scan_history(db, int(row["id"]))
+                expansion_batch = _expansion_batch_payload(db, int(row["id"]))
         except (ValueError, OSError, sqlite3.OperationalError):
             row = None
             progress_row = None
@@ -1617,6 +1996,9 @@ def create_app(
         if row is not None:
             workspace_id = int(row["id"])
         persisted = _row_dict(progress_row)
+        progress_metadata = _json_object(persisted.get("metadata_json"), {})
+        if not isinstance(progress_metadata, Mapping):
+            progress_metadata = {}
         progress = {
             "total_tasks": int(persisted.get("total_tasks", row["total_tasks"] if row else 0) or 0),
             "completed_tasks": int(persisted.get("completed_tasks", row["completed_tasks"] if row else 0) or 0),
@@ -1626,22 +2008,45 @@ def create_app(
         }
         progress["done"] = progress["completed_tasks"]
         progress["total"] = progress["total_tasks"]
+        active = bool(
+            memory.get("running")
+            and (row is None or int(memory.get("workspace_id") or 0) == int(workspace_id))
+        )
         progress.update({
             key: value
             for key, value in memory.get("progress", {}).items()
-            if memory.get("running") and value is not None
-        })
-        if not memory.get("running") and row is not None:
+            if active and value is not None
+})
+        if not active:
+            for key in (
+                "expansion_artists_total",
+                "expansion_artists_completed",
+                "cached_queries",
+                "estimated_cached_queries",
+            ):
+                if key in progress_metadata:
+                    try:
+                        progress[key] = int(progress_metadata[key] or 0)
+                    except (TypeError, ValueError):
+                        pass
+        if not active and row is not None:
             metadata = _json_object(row["metadata_json"] if "metadata_json" in row.keys() else "", {})
             stats = metadata.get("stats", {}) if isinstance(metadata, Mapping) else {}
             if isinstance(stats, Mapping):
                 scoring_total = int(stats.get("scoring_tasks_total", 0) or 0)
                 scoring_done = int(stats.get("scoring_tasks_completed", 0) or 0)
+                cached_done = int(stats.get("cached_queries", 0) or 0)
+                estimated_cached = int(stats.get("total_queries", 0) or 0) - int(stats.get("network_queries", 0) or 0)
                 progress.update({
                     "scoring_tasks_total": scoring_total,
                     "scoring_tasks_completed": scoring_done,
+                    "cached_queries": cached_done,
+                    "estimated_cached_queries": max(cached_done, estimated_cached),
                     "total_work": progress["total_tasks"] + scoring_total,
                     "completed_work": progress["completed_tasks"] + scoring_done,
+                    "expansion_songs_total": int(stats.get("expansion_songs_total", 0) or 0),
+                    "expansion_songs_with_charts": int(stats.get("expansion_songs_with_charts", 0) or 0),
+                    "expansion_songs_without_charts": int(stats.get("expansion_songs_without_charts", 0) or 0),
                     "remaining_work": max(
                         0,
                         progress["total_tasks"] + scoring_total
@@ -1649,21 +2054,97 @@ def create_app(
                     ),
                 })
         result = dict(memory)
-        active = bool(memory.get("running"))
+        workspace_metadata = _json_object(row["metadata_json"] if row else "", {})
+        if not isinstance(workspace_metadata, Mapping):
+            workspace_metadata = {}
+        persisted_status = str(row["status"] if row else "created")
+        if not active and persisted_status == "running":
+            persisted_status = "interrupted"
         result.update({
+            "running": active,
             "workspace_id": workspace_id if row is not None or memory.get("workspace_id") else None,
             "workspace_key": str(row["workspace_key"] if row else memory.get("workspace_key", "spotify")),
-            "status": str(row["status"] if row else memory.get("status", "created")),
+            "status": str(memory.get("status") if active else persisted_status),
             "phase": str(persisted.get("phase") or (row["phase"] if row else memory.get("phase", "idle"))),
             "progress": progress,
             "message": _safe_message(
-                memory.get("message", "") if active else persisted.get("message") or memory.get("message", "")
+                memory.get("message", "") if active else persisted.get("message") or ""
             ),
             "error": _safe_message(
-                memory.get("error", "") if active else persisted.get("error") or memory.get("error", "")
+                memory.get("error", "") if active else persisted.get("error") or ""
             ),
-            "partial": bool(memory.get("partial") or _json_object(row["metadata_json"] if row else "", {}).get("partial", False)),
+            "partial": bool((memory.get("partial") if active else False) or workspace_metadata.get("partial", False)),
+            "scan_history": scan_history,
         })
+        current_run_id = ""
+        if row is not None:
+            try:
+                db = Database(config.database_path)
+                current_run_id = db.get_meta("local_current_run_id")
+            finally:
+                if db is not None:
+                    db.close()
+        if current_run_id:
+            try:
+                artifact = diagnostics_path(config.state_path, current_run_id)
+                if artifact.is_file():
+                    result["diagnostics"] = json.loads(artifact.read_text(encoding="utf-8"))
+                    result["diagnostics_url"] = f"/api/diagnostics/{current_run_id}"
+                    result["diagnostics_file"] = str(artifact)
+            except (OSError, ValueError, json.JSONDecodeError, TypeError):
+                pass
+        heartbeat_at = persisted.get("updated_at") if persisted else None
+        if expansion_batch is not None:
+            heartbeat_at = expansion_batch.get("heartbeat_at") or heartbeat_at
+        result["heartbeat_at"] = heartbeat_at
+        result["last_activity_at"] = memory.get("last_activity_at") if active else heartbeat_at
+        result["recovered"] = bool(workspace_metadata.get("interrupted")) and not active
+        persisted_scan_key = str(
+            workspace_metadata.get("scan_key")
+            or progress_metadata.get("scan_key")
+            or ("inventory" if str(result["phase"]).startswith(("spotify_inventory", "ready_for_scope")) else "")
+        )
+        latest_scan = scan_history[-1] if scan_history else {}
+        batch_relevant = bool(
+            expansion_batch
+            and (
+                str(memory.get("scan_key") or "").startswith("expansion")
+                or persisted_scan_key.startswith("expansion")
+            )
+        )
+        if batch_relevant and expansion_batch is not None:
+            progress.update({
+                "expansion_artists_total": int(expansion_batch.get("total_artists") or 0),
+                "expansion_artists_completed": int(expansion_batch.get("completed_artists") or 0),
+                "expansion_artists_failed": int(expansion_batch.get("failed_artists") or 0),
+                "expansion_artists_skipped": int(expansion_batch.get("skipped_artists") or 0),
+                "network_requests": int(expansion_batch.get("network_requests") or 0),
+                "current_artist": str(expansion_batch.get("current_artist") or ""),
+            })
+            if not active:
+                result["status"] = str(expansion_batch.get("status") or result["status"])
+                result["phase"] = str(expansion_batch.get("phase") or result["phase"])
+                result["run_id"] = str(expansion_batch.get("run_id") or result.get("run_id") or "")
+                result["error"] = _safe_message(expansion_batch.get("error") or result.get("error") or "")
+            result["expansion_batch"] = expansion_batch
+            result["expansion_artist_errors"] = [
+                {"artist_name": item.get("artist_name"), "artist_norm": item.get("artist_norm"), "error": item.get("error")}
+                for item in expansion_batch.get("artists", [])
+                if item.get("error")
+            ]
+        result["scan_key"] = (
+            str(memory.get("scan_key") or "exact")
+            if active
+            else persisted_scan_key or str(latest_scan.get("scan_key") or "exact")
+        )
+        result["run_id"] = str(
+            memory.get("run_id") if active else workspace_metadata.get("run_id") or progress_metadata.get("run_id") or ""
+        )
+        if batch_relevant and expansion_batch is not None and not active:
+            result["run_id"] = str(expansion_batch.get("run_id") or result["run_id"])
+        if not active and latest_scan:
+            result["started_at"] = latest_scan.get("started_at")
+            result["finished_at"] = latest_scan.get("finished_at")
         # ``progress`` is the stable new shape; aliases make polling clients
         # independent of whether they read the in-memory or SQLite phase.
         result["total"] = progress["total_tasks"]
@@ -1793,9 +2274,20 @@ def create_app(
             ),
             "decision": str(data.get("decision") or breakdown.get("decision") or ""),
             "explanation": str(breakdown.get("explanation") or ""),
+            "breakdown": dict(breakdown),
+            "base_score": float(
+                breakdown.get("base_score")
+                or _json_object(breakdown.get("factors"), {}).get("score", {}).get("base", 0)
+                or 0
+            ),
+            "bonuses": list(breakdown.get("bonuses") or []),
+            "penalties": list(breakdown.get("penalties") or []),
+            "gate_factors": dict(breakdown.get("gate_factors") or {}),
+            "quality_factors": dict(breakdown.get("quality_factors") or {}),
             "selected": bool(data.get("selected")),
             "kind": str(data.get("kind") or "exact"),
             "artist_norm": str(data.get("artist_norm") or ""),
+            "metadata": _json_object(data.get("metadata_json"), {}),
         }
 
     def _folder_payload(folder: Mapping[str, Any]) -> dict[str, Any]:
@@ -1971,6 +2463,26 @@ def create_app(
             selections = db.list_workspace_selections(workspace)
             expansion = db.get_workspace_expansion_artists(workspace)
             workspace_row = db.get_workspace(workspace)
+            all_workspace_rows = db.get_library_track_rows(workspace_id=workspace)
+            matched_track_ids = {
+                int(item["track_id"])
+                for item in db.get_workspace_candidates(
+                    workspace,
+                    kind="exact",
+                    include_rejected=False,
+                )
+                if item["track_id"] is not None
+            }
+            owned_track_ids = {
+                int(item["id"])
+                for item in all_workspace_rows
+                if bool(item["already_owned"])
+            }
+            expansion_groups = _expansion_groups_payload(db, workspace)
+            expansion_summary = _expansion_summary_payload(db, workspace, expansion_groups)
+            scan_history = _scan_history(db, workspace)
+            exact_scans = [item for item in scan_history if item.get("kind") == "exact"]
+            exact_summary = exact_scans[-1] if exact_scans else {}
         finally:
             db.close()
         return {
@@ -1984,6 +2496,15 @@ def create_app(
             "selected": len(selections),
             "selection_count": len(selections),
             "expansion_artists": [_row_dict(item) for item in expansion],
+            "expansion_groups": expansion_groups,
+            "scan_history": scan_history,
+            "expansion_summary": expansion_summary,
+            "discovery_summary": {
+                "total_songs": len(all_workspace_rows),
+                "matched_songs": len(matched_track_ids | owned_track_ids),
+                "catalog_eligible_songs": int(exact_summary.get("catalog_eligible_tracks") or 0),
+                "catalog_unavailable_songs": int(exact_summary.get("catalog_unavailable_tracks") or 0),
+            },
         }
 
     def _candidate_row_for_request(
@@ -2044,6 +2565,31 @@ def create_app(
         force: bool = False,
     ) -> tuple[bool, str]:
         data = _row_dict(row)
+        if kind == "exact":
+            catalog_sources: list[ChartSource] = []
+            try:
+                catalog_sources = list(source_factory(config))
+                relevant = [
+                    source
+                    for source in catalog_sources
+                    if str(getattr(source, "name", "")) == str(data.get("source") or "")
+                ]
+                memberships = [
+                    source_catalog_available(
+                        source,
+                        str(data.get("track_artist") or ""),
+                        str(data.get("track_title") or ""),
+                    )
+                    for source in relevant
+                ]
+                if memberships and all(value is False for value in memberships):
+                    return False, "song is unavailable in the local chart catalog"
+            finally:
+                for source in catalog_sources:
+                    try:
+                        source.close()
+                    except Exception:
+                        pass
         persisted = str(data.get("eligibility") or "").upper()
         breakdown = _json_object(data.get("breakdown_json"), {})
         if not isinstance(breakdown, Mapping):
@@ -2132,6 +2678,9 @@ def create_app(
         }
 
     def _persist_refresh_token(token: Any, oauth: Any) -> None:
+        saver = getattr(oauth, "save_token", None)
+        if callable(saver) and not isinstance(token, Mapping):
+            saver(token)
         refresh = None
         if isinstance(token, Mapping):
             refresh = token.get("refresh_token")
@@ -2236,23 +2785,23 @@ def create_app(
 
     def _start_spotify_job(kind: str, payload: Mapping[str, Any]) -> tuple[dict[str, Any], int]:
         nonlocal spotify_cancel_event
+        expansion_batch_id: int | None = None
         if not _safe_local_request():
             return {"error": "the Spotify workspace is local-only"}, 403
-        if not _is_authenticated():
-            return {"error": "sign in with Spotify first"}, 401
         busy = _busy_response()
         if busy is not None:
             return busy
         with spotify_job.lock:
             if spotify_job.running:
                 return {"error": "a Spotify discovery job is already running"}, 409
+        job_client: Any = None
         try:
             workspace = _workspace_id(payload.get("workspace_id"), required=False)
             if workspace is None:
                 db = Database(config.database_path)
                 try:
                     workspace = db.create_workspace(
-                        workspace_key="spotify",
+                        workspace_key=_SPOTIFY_WORKSPACE_KEY,
                         name="Spotify library",
                         kind="exact",
                         status="created",
@@ -2261,39 +2810,154 @@ def create_app(
                 finally:
                     db.close()
             workspace = int(workspace)
+            db = Database(config.database_path)
+            try:
+                scope = db.get_workspace_scope_data(workspace)
+            finally:
+                db.close()
             if kind == "exact":
-                db = Database(config.database_path)
-                try:
-                    scope = db.get_workspace_scope_data(workspace)
-                finally:
-                    db.close()
                 if scope is None or (not scope.get("playlist_ids") and not scope.get("include_liked")):
                     return {"error": "choose at least one Spotify playlist or enable Liked Songs first"}, 400
+            if not _is_authenticated():
+                return {"error": "sign in with Spotify first"}, 401
+            job_client = _verified_spotify_client()
             selected_norms = payload.get("artist_norms") or payload.get("artists") or None
             if kind == "expansion":
                 db = Database(config.database_path)
                 try:
-                    selected_rows = db.get_workspace_expansion_artists(workspace, selected_only=True)
+                    all_artist_rows = db.get_workspace_expansion_artists(workspace)
+                    artists_by_norm = {
+                        str(row["artist_norm"]): row for row in all_artist_rows
+                    }
+                    if selected_norms is not None:
+                        requested_values = (
+                            [selected_norms]
+                            if isinstance(selected_norms, (str, bytes, Mapping))
+                            else list(selected_norms)
+                        )
+                        requested_norms: list[str] = []
+                        for value in requested_values:
+                            if isinstance(value, Mapping):
+                                raw_norm = value.get("artist_norm") or value.get("artist") or value.get("name")
+                                if value.get("selected") is False or value.get("enabled") is False:
+                                    continue
+                            else:
+                                raw_norm = value
+                            norm = normalize_artist(str(raw_norm or "").strip())
+                            if norm and norm not in requested_norms:
+                                requested_norms.append(norm)
+                        invalid = [norm for norm in requested_norms if norm not in artists_by_norm]
+                        if invalid:
+                            raise ValueError("artist is not a primary artist in the Spotify library")
+                        selected_rows = [artists_by_norm[norm] for norm in requested_norms]
+                    else:
+                        selected_rows = [
+                            row for row in all_artist_rows if bool(row["selected"])
+                        ]
                 finally:
                     db.close()
-                if selected_norms is None and not selected_rows:
+                if not selected_rows:
                     return {"error": "select at least one expansion artist first"}, 400
+                if len(selected_rows) > config.expansion.max_artists_per_batch:
+                    return {
+                        "error": f"artist expansion batches are limited to {config.expansion.max_artists_per_batch} primary artists; received {len(selected_rows)}"
+                    }, 400
+                if any(int(row["cap"] or 0) <= 0 for row in selected_rows):
+                    return {"error": "every expansion artist must be eligible for expansion"}, 400
+                missing_preview = []
+                successful_preview = []
+                for row in selected_rows:
+                    metadata = _json_object(row["metadata_json"], {})
+                    preview = metadata.get("discography_preview") if isinstance(metadata, Mapping) else None
+                    if not isinstance(preview, Mapping) or "discovered_at" not in preview:
+                        missing_preview.append(str(row["artist_name"] or row["artist_norm"]))
+                    elif not preview.get("error"):
+                        successful_preview.append(str(row["artist_norm"]))
+                if missing_preview:
+                    return {
+                        "error": "build the Spotify discography preview before searching Enchor",
+                        "missing_preview_artists": missing_preview,
+                    }, 409
+                if not successful_preview:
+                    return {"error": "at least one selected artist needs a successful Spotify preview"}, 409
+        except SpotifyError as exc:
+            return {"error": _safe_message(exc, _oauth_secret_values())}, 401
         except (OSError, ValueError) as exc:
             return {"error": _safe_message(exc)}, 400
 
         with spotify_job.lock:
-            spotify_job.scan_key = "expansion" if kind == "expansion" else "exact"
-            spotify_job.begin(workspace)
+            scan_key = "expansion" if kind == "expansion" else "exact"
+            spotify_job.begin(workspace, scan_key=scan_key)
+            run_id = spotify_job.run_id
             spotify_cancel_event = threading.Event()
             active_cancel_event = spotify_cancel_event
         status_db = Database(config.database_path)
         try:
+            if kind == "expansion":
+                selected_payload = [_row_dict(row) for row in selected_rows]
+                fingerprint = _expansion_selection_fingerprint(selected_payload)
+                batch = status_db.get_expansion_batch(workspace_id=workspace)
+                if batch is not None and str(batch["selection_fingerprint"]) == fingerprint:
+                    batch = status_db.resume_expansion_batch(
+                        int(batch["id"]),
+                        run_id=run_id,
+                        phase="search",
+                        retry_failed=bool(payload.get("retry_failed")),
+                    )
+                    expansion_batch_id = int(batch["id"])
+                else:
+                    expansion_batch_id = status_db.create_expansion_batch(
+                        workspace,
+                        selected_payload,
+                        run_id=run_id,
+                        selection_fingerprint=fingerprint,
+                        status="running",
+                        phase="search",
+                    )
+                    for row in selected_rows:
+                        metadata = _json_object(row["metadata_json"], {})
+                        preview = metadata.get("discography_preview", {}) if isinstance(metadata, Mapping) else {}
+                        status_db.checkpoint_expansion_batch_artist(
+                            expansion_batch_id,
+                            str(row["artist_norm"]),
+                            phase="preview",
+                            status="failed" if preview.get("error") else "complete",
+                            error=str(preview.get("error") or "") or None,
+                        )
+                batch_rows = status_db.get_expansion_batch_artists(expansion_batch_id)
+                selected_norms = [
+                    str(row["artist_norm"])
+                    for row in batch_rows
+                    if str(row["search_status"]) in {"pending", "running", "interrupted"}
+                    or (bool(payload.get("retry_failed")) and str(row["search_status"]) == "failed")
+                ]
+            run_metadata = {
+                "workflow": "spotify_discovery",
+                "scan_key": scan_key,
+                "run_id": run_id,
+                "expansion_batch_id": expansion_batch_id,
+            }
+            status_db.update_workspace(
+                workspace,
+                status="running",
+                phase="expansion_starting" if kind == "expansion" else "starting",
+                metadata=run_metadata,
+            )
             status_db.update_workspace_progress(
                 workspace,
                 status="running",
-                phase="starting",
-                message="Starting Spotify discovery...",
+                phase="expansion_starting" if kind == "expansion" else "starting",
+                message=(
+                    "Starting artist expansion..."
+                    if kind == "expansion"
+                    else "Starting Spotify discovery..."
+                ),
                 error="",
+                metadata={
+                    **run_metadata,
+                    "expansion_artists_total": 0,
+                    "expansion_artists_completed": 0,
+                },
             )
         finally:
             status_db.close()
@@ -2302,10 +2966,10 @@ def create_app(
             nonlocal spotify_cancel_event
             db = Database(config.database_path)
             sources: list[ChartSource] = []
+            soundcloud_client: Any = None
             result: Any = None
             try:
-                sources = list(source_factory(config))
-                client = _get_spotify_client()
+                client = job_client
 
                 def on_progress(value: Any) -> None:
                     if isinstance(value, Mapping):
@@ -2314,7 +2978,41 @@ def create_app(
                 def on_log(value: Any, *_args: Any) -> None:
                     spotify_job.log(_safe_message(value, _oauth_secret_values()))
 
-                if kind == "expansion":
+                workspace_row = db.get_workspace(workspace)
+                workspace_metadata = _json_object(workspace_row["metadata_json"], {}) if workspace_row is not None else {}
+                combined_scope = workspace_metadata.get("soundcloud_scope")
+                if kind == "exact" and isinstance(combined_scope, Mapping) and (
+                    combined_scope.get("playlist_ids") or combined_scope.get("include_liked")
+                ):
+                    from csv_to_clonehero.combined_pipeline import discover_combined
+                    from csv_to_clonehero.providers.base import LibrarySnapshot, ProviderTrack
+                    from csv_to_clonehero.providers.soundcloud import _track_from_mapping
+                    from csv_to_clonehero.providers.soundcloud_api import SoundCloudAPIProvider, SoundCloudClient
+
+                    spotify_tracks = [
+                        ProviderTrack(
+                            provider="spotify", provider_id=track.spotify_id,
+                            title=track.title, artist=track.artist_full, album=track.album,
+                            playlist_names=list(track.playlists), duration_ms=track.duration_ms,
+                            isrc=track.isrc, url=track.spotify_url,
+                        )
+                        for track in db.get_library_tracks(workspace_id=workspace)
+                    ]
+                    soundcloud_client = SoundCloudClient(_get_soundcloud_oauth(), timeout=float(config.network.timeout_seconds or 20))
+                    soundcloud_snapshot = SoundCloudAPIProvider(soundcloud_client).import_library(scope=dict(combined_scope))
+                    result = discover_combined(
+                        config, db,
+                        [LibrarySnapshot("spotify", spotify_tracks), soundcloud_snapshot],
+                        workspace_key=_SPOTIFY_WORKSPACE_KEY,
+                        workspace_name="Combined library",
+                    )
+                elif kind == "expansion" and isinstance(combined_scope, Mapping) and (
+                    combined_scope.get("playlist_ids") or combined_scope.get("include_liked")
+                ):
+                    from csv_to_clonehero.combined_pipeline import expand_combined
+                    result = expand_combined(config, db, workspace, selected_norms or [])
+                elif kind == "expansion":
+                    sources = list(source_factory(config))
                     norms = selected_norms
                     if isinstance(norms, str):
                         norms = [norms]
@@ -2324,10 +3022,18 @@ def create_app(
                         workspace,
                         sources,
                         selected_artist_norms=list(norms) if norms is not None else None,
+                        expansion_batch_id=expansion_batch_id,
+                        cancellation_event=active_cancel_event,
                         on_progress=on_progress,
                         on_log=on_log,
                     )
                 else:
+                    sources = list(source_factory(config))
+                    library_result = None
+                    if client is None:
+                        tracks = db.get_library_tracks(workspace_id=workspace)
+                        if tracks:
+                            library_result = tracks
                     result = run_spotify_discovery(
                         config,
                         db,
@@ -2335,11 +3041,20 @@ def create_app(
                         client,
                         workspace_id=workspace,
                         include_liked=bool(payload.get("include_liked", True)),
+                        library_result=library_result,
                         cancellation_event=active_cancel_event,
                         on_progress=on_progress,
                         on_log=on_log,
                     )
                 spotify_job.finish(result)
+                if kind == "expansion" and expansion_batch_id is not None:
+                    db.update_expansion_batch(
+                        expansion_batch_id,
+                        status=str(getattr(result, "status", "complete") or "complete"),
+                        phase="search_complete" if str(getattr(result, "status", "")) != "cancelled" else "search",
+                        current_artist="",
+                        error=str(getattr(result, "error", "") or "") or None,
+                    )
                 try:
                     _save_workspace_snapshot(workspace)
                 except Exception:
@@ -2348,6 +3063,8 @@ def create_app(
                 message = _safe_message(exc, _oauth_secret_values())
                 log.error("Spotify discovery job failed")
                 try:
+                    if kind == "expansion" and expansion_batch_id is not None:
+                        db.update_expansion_batch(expansion_batch_id, status="failed", phase="search", error=message)
                     db.update_workspace(workspace, status="failed", phase="failed", metadata={"error": message})
                 except Exception:
                     pass
@@ -2361,15 +3078,28 @@ def create_app(
                         source.close()
                     except Exception:
                         pass
+                if soundcloud_client is not None:
+                    try:
+                        soundcloud_client.close()
+                    except Exception:
+                        pass
+                db.recover_discovery_run(workspace, run_id)
+                spotify_job.cleanup(run_id, threading.current_thread())
                 db.close()
 
-        threading.Thread(target=worker, daemon=True).start()
+        worker_thread = threading.Thread(target=worker, daemon=True, name=f"spotify-{run_id}")
+        with spotify_job.lock:
+            spotify_job.attach_worker(run_id, worker_thread)
+            worker_thread.start()
         return {
             "started": True,
             "job": "spotify-discovery",
             "kind": kind,
             "workspace_id": workspace,
             "workspace_key": "spotify",
+            "scan_key": "expansion" if kind == "expansion" else "exact",
+            "run_id": run_id,
+            "batch_id": expansion_batch_id,
         }, 202
 
     # ---------------------------------------------------------- Spotify auth
@@ -2460,6 +3190,11 @@ def create_app(
         try:
             token = _exchange_oauth(oauth, code, returned_state, pending.get("request"))
             _persist_refresh_token(token, oauth)
+            access_token = getattr(oauth, "access_token", None) or getattr(
+                oauth, "get_access_token", None
+            )
+            if callable(access_token):
+                access_token()
             # Profile lookup is best effort.  It is made with the authenticated
             # client and only allowlisted account fields enter SQLite.
             try:
@@ -2479,9 +3214,8 @@ def create_app(
             with auth_lock:
                 pending_authorization = None
                 auth_authenticated = True
-            # The cached client is now backed by the exchanged OAuth object.  A
-            # factory that returns a per-login client can opt into a fresh one.
-            if spotify_factory is not None and spotify_client is None:
+                # Do not retain a client created before this OAuth exchange.
+                # The next request must use the newly persisted token.
                 spotify_client = None
             if request.args.get("format") == "json":
                 return jsonify({"ok": True, "authenticated": True, "account": _spotify_account_payload(account)})
@@ -2527,11 +3261,166 @@ def create_app(
             spotify_client = None
         return jsonify({"ok": True, "authenticated": False, "signed_in": False})
 
+    # ------------------------------------------------------- SoundCloud auth
+    @app.get("/api/auth/soundcloud/status")
+    def soundcloud_auth_status():
+        configured = bool(getattr(config.soundcloud, "oauth_configured", False))
+        authenticated = False
+        if configured and secure_store is not None:
+            try:
+                getter = getattr(secure_store, "get_password", None)
+                service = "soundcloud"
+                username = "soundcloud"
+                authenticated = bool(getter(service, username)) if callable(getter) else False
+            except Exception:
+                authenticated = False
+        return jsonify({"configured": configured, "authenticated": authenticated, "export_available": bool(config.soundcloud.allow_user_exports)})
+
+    @app.get("/api/auth/soundcloud/start")
+    def soundcloud_auth_start():
+        nonlocal pending_soundcloud_authorization
+        if not _loopback_request():
+            return {"error": "SoundCloud sign-in must be started on the host computer"}, 403
+        try:
+            oauth = _get_soundcloud_oauth()
+            request_obj = oauth.begin_authorization()
+            with auth_lock:
+                pending_soundcloud_authorization = {"oauth": oauth, "state": request_obj.state, "request": request_obj, "created_at": time.time()}
+            return jsonify({"authorization_url": request_obj.url, "url": request_obj.url, "state": request_obj.state, "redirect_uri": request_obj.redirect_uri})
+        except Exception as exc:
+            return {"error": _safe_message(exc)}, 503
+
+    @app.get("/api/auth/soundcloud/callback")
+    def soundcloud_auth_callback():
+        nonlocal pending_soundcloud_authorization
+        pending = pending_soundcloud_authorization
+        if pending is None or time.time() - float(pending.get("created_at", 0)) > 600:
+            return {"error": "SoundCloud OAuth state expired; start sign-in again."}, 400
+        if request.args.get("error"):
+            pending_soundcloud_authorization = None
+            return {"error": "SoundCloud sign-in was not completed."}, 400
+        if not hmac.compare_digest(str(pending.get("state", "")), str(request.args.get("state", ""))):
+            return {"error": "SoundCloud OAuth state validation failed; start sign-in again."}, 400
+        try:
+            pending["oauth"].exchange_code(
+                str(request.args.get("code", "")),
+                returned_state=str(request.args.get("state", "")),
+                expected_state=str(pending["state"]),
+                code_verifier=pending["request"].code_verifier,
+            )
+            pending_soundcloud_authorization = None
+            return redirect("/", code=303)
+        except Exception:
+            pending_soundcloud_authorization = None
+            return {"error": "SoundCloud sign-in failed."}, 400
+
+    @app.post("/api/auth/soundcloud/logout")
+    def soundcloud_auth_logout():
+        nonlocal soundcloud_oauth
+        try:
+            if soundcloud_oauth is not None:
+                soundcloud_oauth.logout()
+        finally:
+            soundcloud_oauth = None
+        return jsonify({"ok": True, "authenticated": False})
+
+    @app.get("/api/soundcloud/scope")
+    def soundcloud_scope():
+        try:
+            client = SoundCloudClient(_get_soundcloud_oauth(), timeout=float(config.network.timeout_seconds or 20))
+            try:
+                playlists = client.playlists()
+                liked = len(client.liked_tracks())
+                return jsonify({"playlists": playlists, "liked_count": liked, "configured": True})
+            finally:
+                client.close()
+        except Exception as exc:
+            return {"error": _safe_message(exc) or "SoundCloud is unavailable."}, 503
+
+    @app.post("/api/soundcloud/scope")
+    def save_soundcloud_scope():
+        if not _is_authenticated():
+            return {"error": "sign in with Spotify first"}, 401
+        payload = request.get_json(silent=True) or {}
+        playlist_ids = sorted({str(value).strip() for value in payload.get("playlist_ids", []) if str(value).strip()})
+        include_liked = bool(payload.get("include_liked"))
+        if not playlist_ids and not include_liked:
+            return {"error": "choose a SoundCloud playlist or Liked Tracks first"}, 400
+        workspace = _workspace_id(payload.get("workspace_id"), required=False)
+        if workspace is None:
+            return {"error": "choose a Spotify workspace first"}, 400
+        db = Database(config.database_path)
+        try:
+            row = db.get_workspace(workspace)
+            metadata = _json_object(row["metadata_json"], {}) if row is not None else {}
+            metadata["soundcloud_scope"] = {"playlist_ids": playlist_ids, "include_liked": include_liked}
+            db.update_workspace(workspace, metadata=metadata)
+            return jsonify({"ok": True, "scope": metadata["soundcloud_scope"]})
+        finally:
+            db.close()
+
     # -------------------------------------------------------- Spotify discovery
+    def _start_local_catalog_job(payload: Mapping[str, Any]) -> tuple[dict[str, Any], int]:
+        workspace, workspace_key = _get_local_library_workspace()
+        discovery_run_id = ""
+        db = Database(config.database_path)
+        try:
+            discovery_run_id = db.get_meta("local_current_run_id")
+        finally:
+            db.close()
+        with spotify_job.lock:
+            if spotify_job.running:
+                return {"error": "a discovery job is already running"}, 409
+            spotify_job.begin(workspace, workspace_key=workspace_key, scan_key="catalog", run_id=discovery_run_id or None)
+            run_id = spotify_job.run_id
+
+        def worker() -> None:
+            db = Database(config.database_path)
+            diagnostics = None
+            try:
+                from csv_to_clonehero.combined_pipeline import discover_combined
+                from csv_to_clonehero.providers.base import LibrarySnapshot, ProviderTrack
+                grouped: dict[str, list[ProviderTrack]] = {}
+                for row in db.get_track_provenance(workspace):
+                    provider = str(row["provider"])
+                    grouped.setdefault(provider, []).append(ProviderTrack(
+                        provider=provider, provider_id=str(row["provider_id"]), title=str(row["title"]),
+                        artist=str(row["artist"]), album=str(row["album"] or ""), liked=bool(row["liked"]),
+                    ))
+                spotify_job.progress_update({"phase": "combine", "message": "Combining imported sources locally...", "total_tracks": sum(map(len, grouped.values()))})
+                run_id = spotify_job.run_id
+                try:
+                    diagnostics = RunDiagnostics(config.state_path, run_id)
+                    diagnostics.update("source_setup", workspace_id=workspace, workspace_key=workspace_key)
+                    db.set_meta("local_current_run_id", run_id)
+                except OSError:
+                    diagnostics = None
+                result = discover_combined(config, db, [LibrarySnapshot(name, tracks) for name, tracks in grouped.items()], workspace_key=workspace_key, workspace_name="Local combined library", expansion_artists=payload.get("expansion_artists", ()), diagnostics=diagnostics)
+                spotify_job.finish(result)
+                db.update_workspace(workspace, status=result.status, phase=result.phase, message="Catalog matching complete.", error=result.error)
+                if diagnostics:
+                    diagnostics.update("selection", counters={"selected_charts": 0})
+                    diagnostics.update("export", counters={"export_attempts": 0, "exported_charts": 0})
+                    diagnostics.finish(result.status, workspace_id=workspace, workspace_key=workspace_key, counters={"exact_hits": result.exact_hits, "exact_misses": result.exact_misses, "candidate_charts_created": result.candidates, "eligible_candidates": result.eligible_candidates, "rejected_candidates": result.rejected_candidates})
+            except Exception as exc:  # noqa: BLE001
+                spotify_job.fail(exc)
+                if diagnostics:
+                    diagnostics.finish("failed", error=_safe_message(exc))
+            finally:
+                db.close()
+
+        thread = threading.Thread(target=worker, daemon=True)
+        spotify_job.attach_worker(run_id, thread)
+        thread.start()
+        return {"started": "catalog", "workspace_id": workspace, "workspace_key": workspace_key, "run_id": run_id}, 202
+
     @app.post("/api/spotify/scan")
     @app.post("/api/discovery/start")
     def spotify_scan_start():
-        return _start_spotify_job("exact", request.get_json(silent=True) or {})
+        payload = request.get_json(silent=True) or {}
+        if payload.get("source") in {"soundcloud", "combined", "local"} or payload.get("workspace_key", "").startswith("local:"):
+            return _start_local_catalog_job(payload)
+        return _start_spotify_job("exact", payload)
 
     @app.get("/api/spotify/status")
     @app.get("/api/spotify/scan/status")
@@ -2592,11 +3481,51 @@ def create_app(
         db = Database(config.database_path)
         try:
             return int(db.create_workspace(
-                workspace_key="spotify", name="Spotify library", kind="exact",
+                workspace_key=_SPOTIFY_WORKSPACE_KEY, name="Spotify library", kind="exact",
                 status="created", phase="idle", metadata={"workflow": "spotify_staged"},
             ))
         finally:
             db.close()
+
+    @app.post("/api/spotify/reset")
+    @app.post("/api/spotify/workspace/reset")
+    def spotify_workspace_reset():
+        if not _safe_local_request():
+            return {"error": "the Spotify workspace is local-only"}, 403
+        payload = request.get_json(silent=True) or {}
+        try:
+            workspace = _workspace_id(payload.get("workspace_id"), required=False)
+            db = Database(config.database_path)
+            try:
+                if workspace is None:
+                    row = db.get_workspace(_SPOTIFY_WORKSPACE_KEY)
+                    workspace = int(row["id"]) if row is not None else None
+                if workspace is not None:
+                    workspace = int(workspace)
+                    db.clear_workspace_candidates(workspace)
+                    db.clear_workspace_expansion_artists(workspace)
+                    db.replace_workspace_library_tracks(workspace, [])
+                    db.set_workspace_scope(workspace, playlist_ids=[], include_liked=False)
+                    db.update_workspace(
+                        workspace,
+                        status="created",
+                        phase="idle",
+                        message="Workspace reset to initial clean state.",
+                        error="",
+                    )
+                    db.update_workspace_progress(
+                        workspace,
+                        status="created",
+                        phase="idle",
+                        message="Workspace reset.",
+                        error="",
+                        metadata={"total_work": 0, "completed_work": 0},
+                    )
+            finally:
+                db.close()
+            return jsonify({"ok": True, "workspace_id": workspace, "status": "reset"})
+        except (OSError, ValueError, sqlite3.OperationalError) as exc:
+            return {"error": _safe_message(exc)}, 400
 
     @app.post("/api/spotify/inventory")
     def spotify_inventory_sync():
@@ -2604,22 +3533,38 @@ def create_app(
             return {"error": "Spotify workspace is local-only"}, 403
         if not _is_authenticated():
             return {"error": "sign in with Spotify first"}, 401
+        _recover_stale_spotify_job()
         busy = _busy_response()
         if busy is not None:
             return busy
+        payload = request.get_json(silent=True) or {}
         with spotify_job.lock:
             if spotify_job.running:
                 return {"error": "a Spotify job is already running"}, 409
-            workspace = _get_or_create_spotify_workspace()
-            spotify_job.begin(workspace)
+            workspace = _workspace_id(payload.get("workspace_id"), required=False)
+            workspace = int(workspace) if workspace is not None else _get_or_create_spotify_workspace()
+            spotify_job.begin(workspace, scan_key="inventory")
+            run_id = spotify_job.run_id
         status_db = Database(config.database_path)
         try:
+            inventory_metadata = {
+                "workflow": "spotify_inventory",
+                "scan_key": "inventory",
+                "run_id": run_id,
+            }
+            status_db.update_workspace(
+                workspace,
+                status="running",
+                phase="spotify_inventory",
+                metadata=inventory_metadata,
+            )
             status_db.update_workspace_progress(
                 workspace,
                 status="running",
-                phase="starting",
+                phase="spotify_inventory",
                 message="Starting Spotify inventory sync...",
                 error="",
+                metadata=inventory_metadata,
             )
         finally:
             status_db.close()
@@ -2634,7 +3579,9 @@ def create_app(
                 with db._conn:
                     db.upsert_spotify_playlists(playlists)
                     db.update_workspace(workspace, status="ready_for_scope", phase="ready_for_scope", metadata={
-                        "workflow": "spotify_staged", "playlist_count": len(playlists),
+                        **inventory_metadata,
+                        "workflow": "spotify_staged",
+                        "playlist_count": len(playlists),
                     })
                 spotify_job.finish(type("InventoryResult", (), {
                     "status": "ready_for_scope", "phase": "ready_for_scope", "error": "", "partial": False,
@@ -2642,15 +3589,46 @@ def create_app(
             except Exception as exc:
                 message = _safe_message(exc, _oauth_secret_values())
                 try:
-                    db.update_workspace(workspace, status="failed", phase="spotify_inventory", metadata={"error": message})
+                    db.update_workspace(workspace, status="failed", phase="spotify_inventory", metadata={
+                        **inventory_metadata,
+                        "error": message,
+                    })
                 except Exception:
                     pass
                 spotify_job.fail(message)
             finally:
+                db.recover_discovery_run(workspace, run_id)
+                spotify_job.cleanup(run_id, threading.current_thread())
                 db.close()
 
-        threading.Thread(target=inventory_worker, daemon=True).start()
-        return jsonify({"started": True, "workspace_id": workspace, "phase": "spotify_inventory"}), 202
+        worker_thread = threading.Thread(target=inventory_worker, daemon=True, name=f"spotify-{run_id}")
+        with spotify_job.lock:
+            spotify_job.attach_worker(run_id, worker_thread)
+            worker_thread.start()
+        return jsonify({"started": True, "workspace_id": workspace, "phase": "spotify_inventory", "scan_key": "inventory", "run_id": run_id}), 202
+
+    @app.post("/api/spotify/workspace/new")
+    def spotify_workspace_new():
+        if not _safe_local_request():
+            return {"error": "the Spotify workspace is local-only"}, 403
+        if not _is_authenticated():
+            return {"error": "sign in with Spotify first"}, 401
+        busy = _busy_response()
+        if busy is not None:
+            return busy
+        db = Database(config.database_path)
+        try:
+            workspace = db.create_workspace(
+                workspace_key=f"spotify:{secrets.token_hex(8)}",
+                name="New Spotify library",
+                kind="exact",
+                status="created",
+                phase="idle",
+                metadata={"workflow": "spotify_staged"},
+            )
+        finally:
+            db.close()
+        return jsonify({"ok": True, "workspace_id": workspace})
 
     @app.route("/api/spotify/scope", methods=["GET", "POST"])
     def spotify_scope():
@@ -2701,10 +3679,21 @@ def create_app(
                     playlists.append(item)
                 playlists.sort(key=lambda item: (int(item.get("owner_priority", 1)), str(item.get("name") or "").casefold()))
                 liked_count = len(db.get_spotify_liked_tracks())
+                liked_available = False
+                if _is_authenticated():
+                    try:
+                        client = _get_spotify_client()
+                        count_method = getattr(client, "get_saved_tracks_count", None)
+                        if callable(count_method):
+                            liked_count = max(0, int(count_method()))
+                            liked_available = True
+                    except Exception:
+                        log.info("Could not fetch Spotify Liked Songs count", exc_info=True)
             finally:
                 db.close()
             return jsonify({"workspace_id": workspace, "scope": scope, "playlists": playlists,
-                            "liked_count": liked_count, "accessible_count": sum(p.get("access_status") == "accessible" for p in playlists),
+                            "liked_count": liked_count, "liked_available": liked_available,
+                            "accessible_count": sum(p.get("access_status") == "accessible" for p in playlists),
                             "inaccessible_count": sum(p.get("access_status") != "accessible" for p in playlists)})
         except (OSError, ValueError, sqlite3.OperationalError) as exc:
             return {"error": _safe_message(exc)}, 400
@@ -3024,10 +4013,26 @@ def create_app(
         with spotify_job.lock:
             event = spotify_cancel_event
             running = spotify_job.running
-        if not running or event is None:
-            return {"error": "no Spotify discovery job is running"}, 409
-        event.set()
-        return jsonify({"ok": True, "status": "cancelling"})
+            workspace = spotify_job.workspace_id
+        batch_payload = None
+        if workspace is not None:
+            db = Database(config.database_path)
+            try:
+                batch = db.get_expansion_batch(workspace_id=workspace)
+                if batch is not None:
+                    terminal = str(batch["status"]) in {"complete", "completed", "partial", "failed", "cancelled", "interrupted"}
+                    if not terminal:
+                        db.request_expansion_batch_cancel(int(batch["id"]))
+                    batch_payload = _row_dict(db.get_expansion_batch(int(batch["id"])))
+            finally:
+                db.close()
+        if event is not None:
+            event.set()
+        return jsonify({
+            "ok": True,
+            "status": "cancelling" if running and event is not None else "terminal",
+            "batch": batch_payload,
+        })
 
     @app.post("/api/spotify/expansion/start")
     @app.post("/api/discovery/expansion/start")
@@ -3035,6 +4040,25 @@ def create_app(
     @app.post("/api/discovery/expansion")
     def spotify_expansion_start():
         return _start_spotify_job("expansion", request.get_json(silent=True) or {})
+
+    @app.post("/api/spotify/expansion/clear")
+    @app.post("/api/discovery/expansion/clear")
+    def spotify_expansion_clear():
+        if not _safe_local_request():
+            return {"error": "the Spotify workspace is local-only"}, 403
+        if spotify_job.running:
+            return {"error": "cancel the running Spotify job before clearing expansion"}, 409
+        try:
+            payload = request.get_json(silent=True) or {}
+            workspace = _workspace_id(payload.get("workspace_id"))
+            db = Database(config.database_path)
+            try:
+                db.clear_workspace_expansion_state(workspace)
+            finally:
+                db.close()
+            return jsonify({"ok": True, "workspace_id": workspace})
+        except (OSError, ValueError) as exc:
+            return {"error": _safe_message(exc)}, 400
 
     # ------------------------------------------------------------ Spotify data
     @app.get("/api/spotify/library")
@@ -3129,6 +4153,17 @@ def create_app(
     ) -> dict[str, Any]:
         db = Database(config.database_path)
         try:
+            if kind == "expansion" and track_value in (None, "") and folder_value in (None, ""):
+                group_list = _expansion_groups_payload(db, workspace)
+                return {
+                    "workspace_id": workspace,
+                    "kind": kind,
+                    "folder_id": folder_value,
+                    "groups": group_list,
+                    "candidate_groups": group_list,
+                    "tracks": [],
+                    "artists": group_list,
+                }
             if folder_value not in (None, "") or liked:
                 track_rows = db.get_library_track_rows(
                     folder_value,
@@ -3228,10 +4263,63 @@ def create_app(
             return {"error": _safe_message(exc)}, 404
 
     # ---------------------------------------------------------- expansion UI
+    def _expansion_selection_fingerprint(artists: Iterable[Mapping[str, Any]]) -> str:
+        values = [
+            {
+                "artist_norm": str(item.get("artist_norm") or ""),
+                "track_count": int(item.get("track_count") or 0),
+                "cap": int(item.get("cap") or 0),
+            }
+            for item in artists
+        ]
+        payload = json.dumps(sorted(values, key=lambda item: item["artist_norm"]), sort_keys=True)
+        return hashlib.sha256(("discography-preview-v1\n" + payload).encode("utf-8")).hexdigest()
+
+    def _artist_preview_fingerprint(
+        artist_norm: str, existing_songs: Iterable[tuple[str, str]]
+    ) -> str:
+        titles = sorted(title for norm, title in existing_songs if norm == artist_norm)
+        payload = "discography-preview-v1\n" + artist_norm + "\n" + "\n".join(titles)
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    def _expansion_batch_payload(db: Database, workspace: int | str) -> dict[str, Any] | None:
+        batch = db.get_expansion_batch(workspace_id=workspace)
+        if batch is None:
+            return None
+        artists = []
+        for row in db.get_expansion_batch_artists(int(batch["id"])):
+            item = _row_dict(row)
+            item["metadata"] = _json_object(item.pop("metadata_json", "{}"), {})
+            preview_status = str(item.get("preview_status") or "pending")
+            search_status = str(item.get("search_status") or "pending")
+            if search_status in {"complete", "completed", "success"}:
+                state = "Search complete"
+            elif search_status == "running":
+                state = "Searching"
+            elif preview_status == "running":
+                state = "Previewing"
+            elif "failed" in {preview_status, search_status}:
+                state = "Failed"
+            elif preview_status in {"complete", "completed", "success", "skipped"}:
+                state = "Previewed"
+            else:
+                state = "Not previewed"
+            item["state"] = state
+            artists.append(item)
+        data = _row_dict(batch)
+        data["metadata"] = _json_object(data.pop("metadata_json", "{}"), {})
+        data["artists"] = artists
+        return data
+
     def _expansion_artist_payload(workspace: int | str) -> list[dict[str, Any]]:
         db = Database(config.database_path)
+        catalog_sources: list[ChartSource] = []
         try:
-            tracks = db.get_spotify_tracks(True)
+            try:
+                catalog_sources = list(source_factory(config))
+            except Exception:
+                catalog_sources = []
+            tracks = db.get_library_tracks(workspace_id=workspace)
             existing = {
                 str(row["artist_norm"]): _row_dict(row)
                 for row in db.get_workspace_expansion_artists(workspace)
@@ -3265,19 +4353,52 @@ def create_app(
                 else:
                     cap = expansion.cap_one_song
                 old = existing.get(norm, {})
+                metadata = _json_object(old.get("metadata_json"), {})
+                preview = metadata.get("discography_preview", {}) if isinstance(metadata, Mapping) else {}
+                memberships = [
+                    source_catalog_available(source, entry["artist_name"])
+                    for source in catalog_sources
+                ]
+                catalog_excluded = bool(
+                    memberships and all(value is False for value in memberships)
+                )
                 entries.append(
                     {
                         **entry,
                         "cap": max(0, int(cap)),
                         "selected": bool(old.get("selected")),
-                        "eligible": max(0, int(cap)) > 0,
+                        "eligible": max(0, int(cap)) > 0 and not catalog_excluded,
+                        "catalog_available": (
+                            None
+                            if not memberships or any(value is None for value in memberships)
+                            else not catalog_excluded
+                        ),
+                        "catalog_excluded": catalog_excluded,
+                        "metadata": metadata,
+                        "preview_song_count": len(preview.get("tracks", [])) if isinstance(preview, Mapping) else 0,
+                        "preview_album_count": int(preview.get("albums", 0) or 0) if isinstance(preview, Mapping) else 0,
+                        "preview_error": str(preview.get("error", "") or "") if isinstance(preview, Mapping) else "",
                     }
                 )
             # Keep the database's explicit artist list in sync with the current
             # Spotify snapshot; only primary artists are included here.
             db.replace_workspace_expansion_artists(workspace, entries)
+            batch = _expansion_batch_payload(db, workspace)
+            batch_artists = {
+                str(item["artist_norm"]): item
+                for item in (batch or {}).get("artists", [])
+            }
+            for entry in entries:
+                lifecycle = batch_artists.get(str(entry["artist_norm"]), {})
+                entry["state"] = lifecycle.get("state", "Not previewed")
+                entry["batch_error"] = str(lifecycle.get("error") or "")
             return entries
         finally:
+            for source in catalog_sources:
+                try:
+                    source.close()
+                except Exception:
+                    pass
             db.close()
 
     @app.get("/api/spotify/expansion/artists")
@@ -3286,9 +4407,424 @@ def create_app(
         try:
             workspace = _workspace_id(request.args.get("workspace_id"))
             artists = _expansion_artist_payload(workspace)
-            return jsonify({"workspace_id": workspace, "artists": artists})
+            db = Database(config.database_path)
+            try:
+                batch = _expansion_batch_payload(db, workspace)
+            finally:
+                db.close()
+            return jsonify({
+                "workspace_id": workspace,
+                "max_artists_per_batch": config.expansion.max_artists_per_batch,
+                "artists": artists,
+                "unavailable_artist_count": sum(
+                    bool(item.get("catalog_excluded")) for item in artists
+                ),
+                "batch": batch,
+            })
         except (OSError, ValueError) as exc:
             return {"error": _safe_message(exc)}, 404
+
+    def _discography_preview_payload(workspace: int | str) -> dict[str, Any]:
+        db = Database(config.database_path)
+        try:
+            artists = []
+            tracks: list[dict[str, Any]] = []
+            errors = 0
+            successful_previews = 0
+            full_discography_count = 0
+            already_in_library_count = 0
+            for row in db.get_workspace_expansion_artists(workspace, selected_only=True):
+                data = _row_dict(row)
+                metadata = _json_object(data.get("metadata_json"), {})
+                preview = metadata.get("discography_preview", {}) if isinstance(metadata, Mapping) else {}
+                preview_tracks = list(preview.get("tracks", [])) if isinstance(preview, Mapping) else []
+                error = str(preview.get("error", "") or "") if isinstance(preview, Mapping) else ""
+                errors += bool(error)
+                successful_previews += bool(
+                    isinstance(preview, Mapping)
+                    and preview.get("discovered_at")
+                    and not error
+                )
+                catalog_count = int(preview.get("catalog_song_count", len(preview_tracks)) or 0) if isinstance(preview, Mapping) else 0
+                already_count = int(preview.get("already_in_library", 0) or 0) if isinstance(preview, Mapping) else 0
+                full_discography_count += catalog_count
+                already_in_library_count += already_count
+                artists.append({"artist_name": data.get("artist_name"), "artist_norm": data.get("artist_norm"), "albums": int(preview.get("albums", 0) or 0) if isinstance(preview, Mapping) else 0, "songs": len(preview_tracks), "catalog_song_count": catalog_count, "already_in_library": already_count, "error": error})
+                tracks.extend(preview_tracks)
+            unique = {(normalize_artist(str(item.get("artist") or "")), normalize_title(str(item.get("title") or ""))): item for item in tracks}
+            unique_tracks = list(unique.values())
+            sources: list[Any] = []
+            source_error = ""
+            try:
+                sources = list(source_factory(config))
+            except Exception as exc:
+                source_error = _safe_message(exc)
+            cached_queries = 0
+            query_count = len(artists) * len(sources)
+            cache = getattr(config, "cache", None)
+            try:
+                ttl_days = int(getattr(cache, "ttl_days", 7) or 7)
+            except (TypeError, ValueError):
+                ttl_days = 7
+            cache_usable = bool(getattr(cache, "enabled", True)) and bool(
+                getattr(getattr(config, "scan", None), "resume", True)
+            )
+            try:
+                if cache_usable:
+                    for item in artists:
+                        artist = str(item.get("artist_name") or "").strip()
+                        for source in sources:
+                            key = build_source_query_key(db, config, source, "artist", artist, "")
+                            if db.cached_query_is_fresh(key, ttl_days):
+                                cached_queries += 1
+            finally:
+                for source in sources:
+                    try:
+                        source.close()
+                    except Exception:
+                        pass
+            duration = estimate_spotify_duration(
+                config,
+                query_count=query_count,
+                track_count=len(unique_tracks),
+                cached_query_count=cached_queries,
+            )
+            selected_rows = db.get_workspace_expansion_artists(workspace, selected_only=True)
+            ready = bool(successful_previews) and len(selected_rows) == len(artists)
+            if ready:
+                for row in selected_rows:
+                    metadata = _json_object(row["metadata_json"], {})
+                    preview = metadata.get("discography_preview") if isinstance(metadata, Mapping) else None
+                    if not isinstance(preview, Mapping) or "discovered_at" not in preview:
+                        ready = False
+                        break
+            batch = _expansion_batch_payload(db, workspace)
+            lifecycle = {
+                str(item["artist_norm"]): item for item in (batch or {}).get("artists", [])
+            }
+            for item in artists:
+                row = lifecycle.get(str(item.get("artist_norm") or ""), {})
+                item["state"] = row.get("state", "Not previewed")
+                item["batch_error"] = str(row.get("error") or "")
+            return {"workspace_id": int(workspace), "artists": artists, "artist_count": len(artists), "song_count": len(unique_tracks), "full_discography_count": full_discography_count, "already_in_library_count": already_in_library_count, "errors": errors, "successful_previews": successful_previews, "source_error": source_error, "ready": ready, "tracks": unique_tracks, "expected_queries": query_count, "cached_queries": cached_queries, "duration": duration, "max_artists_per_batch": config.expansion.max_artists_per_batch, "batch": batch}
+        finally:
+            db.close()
+
+    @app.get("/api/spotify/expansion/preview")
+    @app.get("/api/discovery/expansion/preview")
+    def spotify_expansion_preview_get():
+        try:
+            workspace = _workspace_id(request.args.get("workspace_id"))
+            return jsonify(_discography_preview_payload(workspace))
+        except (OSError, ValueError) as exc:
+            return {"error": _safe_message(exc)}, 400
+
+    @app.post("/api/spotify/expansion/preview")
+    @app.post("/api/discovery/expansion/preview")
+    @app.post("/api/spotify/expansion/preview/resume")
+    @app.post("/api/spotify/expansion/preview/retry")
+    def spotify_expansion_preview_start():
+        nonlocal spotify_cancel_event
+        if not _safe_local_request():
+            return {"error": "the Spotify workspace is local-only"}, 403
+        _recover_stale_spotify_job()
+        busy = _busy_response()
+        if busy is not None:
+            return busy
+        if spotify_job.running:
+            return {"error": "a Spotify job is already running"}, 409
+        payload = request.get_json(silent=True) or {}
+        workspace = _workspace_id(payload.get("workspace_id"))
+        action = str(payload.get("action") or "").strip().casefold()
+        if request.path.endswith("/resume"):
+            action = "resume"
+        elif request.path.endswith("/retry"):
+            action = "retry"
+        try:
+            job_client = _verified_spotify_client()
+        except SpotifyError as exc:
+            return {"error": _safe_message(exc, _oauth_secret_values())}, 401
+        available_rows = _expansion_artist_payload(workspace)
+        available = {str(item["artist_norm"]): item for item in available_rows}
+        db = Database(config.database_path)
+        try:
+            requested = payload.get("artist_norms") or payload.get("artists")
+            if isinstance(requested, (str, bytes, Mapping)):
+                requested = [requested]
+            if requested is not None:
+                requested_norms = []
+                for value in requested:
+                    if isinstance(value, Mapping):
+                        value = value.get("artist_norm") or value.get("artist") or value.get("name")
+                    norm = normalize_artist(str(value or "").strip())
+                    if norm and norm not in requested_norms:
+                        requested_norms.append(norm)
+                invalid = [norm for norm in requested_norms if norm not in available]
+                if invalid:
+                    return {"error": "every expansion artist must be an eligible primary artist in the current Spotify library"}, 400
+                ineligible = [norm for norm in requested_norms if not available[norm]["eligible"]]
+                if ineligible:
+                    return {"error": "every expansion artist must be eligible for expansion"}, 400
+                if len(requested_norms) > config.expansion.max_artists_per_batch:
+                    return {"error": f"artist expansion batches are limited to {config.expansion.max_artists_per_batch} primary artists; received {len(requested_norms)}"}, 400
+                requested_set = set(requested_norms)
+                for row in db.get_workspace_expansion_artists(workspace):
+                    norm = str(row["artist_norm"])
+                    db.set_expansion_artist_selected(workspace, norm, norm in requested_set)
+            artists = [_row_dict(row) for row in db.get_workspace_expansion_artists(workspace, selected_only=True)]
+            if len(artists) > config.expansion.max_artists_per_batch:
+                return {"error": f"artist expansion batches are limited to {config.expansion.max_artists_per_batch} primary artists; received {len(artists)}"}, 400
+        finally:
+            db.close()
+        if not artists:
+            return {"error": "select at least one expansion artist first"}, 400
+        with spotify_job.lock:
+            spotify_job.begin(workspace, scan_key="expansion_preview")
+            run_id = spotify_job.run_id
+            spotify_cancel_event = threading.Event()
+            active_cancel_event = spotify_cancel_event
+        db = Database(config.database_path)
+        try:
+            fingerprint = _expansion_selection_fingerprint(artists)
+            batch = db.get_expansion_batch(workspace_id=workspace)
+            can_resume = bool(
+                action in {"resume", "retry"}
+                and batch is not None
+                and str(batch["selection_fingerprint"]) == fingerprint
+            )
+            if can_resume:
+                batch = db.resume_expansion_batch(
+                    int(batch["id"]), run_id=run_id, phase="preview", retry_failed=action == "retry"
+                )
+                batch_id = int(batch["id"])
+            else:
+                batch_id = db.create_expansion_batch(
+                    workspace,
+                    artists,
+                    run_id=run_id,
+                    selection_fingerprint=fingerprint,
+                    status="running",
+                    phase="preview",
+                    metadata={"algorithm": "discography-preview-v1"},
+                )
+            db.update_workspace(
+                workspace,
+                status="running",
+                phase="expansion_preview",
+                metadata={"scan_key": "expansion_preview", "run_id": run_id, "expansion_batch_id": batch_id},
+            )
+        finally:
+            db.close()
+
+        def preview_worker() -> None:
+            nonlocal spotify_cancel_event
+            worker_db = Database(config.database_path)
+            try:
+                client = job_client
+                library_rows = worker_db.get_library_track_rows(workspace_id=workspace)
+                existing_songs = {(str(row["primary_artist_norm"] or row["artist_norm"]), str(row["title_norm"])) for row in library_rows}
+                seen: set[tuple[str, str]] = set()
+                total_new = 0
+                failures = 0
+                skipped = 0
+                requests = 0
+                batch_artist_rows = worker_db.get_expansion_batch_artists(batch_id)
+                artists_by_norm = {str(item["artist_norm"]): item for item in artists}
+                total = len(batch_artist_rows)
+                spotify_job.progress_update({"phase": "expansion_preview", "message": "Loading selected artist discographies from Spotify", "total_tasks": total, "total_work": total, "completed_tasks": 0, "completed_work": 0, "expansion_artists_total": total})
+                preview_started = time.monotonic()
+                completed = 0
+                for batch_artist in batch_artist_rows:
+                    if active_cancel_event.is_set() or bool(worker_db.get_expansion_batch(batch_id)["cancel_requested"]):
+                        raise SpotifyCancellationError("Spotify expansion preview cancelled")
+                    artist = artists_by_norm.get(str(batch_artist["artist_norm"]), _row_dict(batch_artist))
+                    name = str(artist.get("artist_name") or batch_artist["artist_name"] or "")
+                    norm = str(artist.get("artist_norm") or batch_artist["artist_norm"] or normalize_artist(name))
+                    metadata = _json_object(artist.get("metadata_json"), {})
+                    preview_fingerprint = _artist_preview_fingerprint(norm, existing_songs)
+                    existing_preview = metadata.get("discography_preview", {}) if isinstance(metadata, Mapping) else {}
+                    if str(batch_artist["preview_status"]) in {"complete", "completed", "success", "skipped"} or (
+                        isinstance(existing_preview, Mapping)
+                        and not existing_preview.get("error")
+                        and existing_preview.get("fingerprint") == preview_fingerprint
+                    ):
+                        skipped += 1
+                        completed += 1
+                        worker_db.checkpoint_expansion_batch_artist(batch_id, norm, phase="preview", status="skipped", request_count=0, metadata={"fingerprint": preview_fingerprint, "reused": True})
+                        spotify_job.progress_update({"phase": "expansion_preview", "message": f"Reused saved preview: {name}", "current_artist": name, "total_tasks": total, "completed_tasks": completed, "total_work": total, "completed_work": completed, "expansion_artists_completed": completed, "expansion_artists_skipped": skipped, "network_requests": requests})
+                        continue
+                    if str(batch_artist["preview_status"]) == "failed" and action != "retry":
+                        failures += 1
+                        completed += 1
+                        continue
+                    worker_db.checkpoint_expansion_batch_artist(batch_id, norm, phase="preview", status="running")
+                    worker_db.update_expansion_batch(batch_id, status="running", phase="preview", current_artist=name)
+                    try:
+                        requests += 1
+                        discography_method = client.get_artist_discography
+                        try:
+                            discography_parameters = inspect.signature(discography_method).parameters
+                        except (TypeError, ValueError):
+                            discography_parameters = {}
+                        kwargs = (
+                            {"cancellation_event": active_cancel_event}
+                            if "cancellation_event" in discography_parameters
+                            or any(
+                                parameter.kind == inspect.Parameter.VAR_KEYWORD
+                                for parameter in discography_parameters.values()
+                            )
+                            else {}
+                        )
+                        catalog = discography_method(name, **kwargs)
+                        catalog_tracks = [
+                            dict(item)
+                            for item in catalog.get("tracks", [])
+                            if isinstance(item, Mapping)
+                        ]
+                        catalog_keys = {
+                            (
+                                normalize_artist(str(item.get("artist") or name)),
+                                normalize_title(str(item.get("title") or "")),
+                            )
+                            for item in catalog_tracks
+                            if str(item.get("title") or "").strip()
+                        }
+                        new_tracks = []
+                        for item in catalog.get("tracks", []):
+                            key = (normalize_artist(str(item.get("artist") or name)), normalize_title(str(item.get("title") or "")))
+                            if not key[1] or key in existing_songs or key in seen:
+                                continue
+                            seen.add(key)
+                            new_tracks.append(dict(item))
+                        preview = {"artist_id": catalog.get("artist_id", ""), "albums": catalog.get("albums", 0), "catalog_song_count": len(catalog_keys), "already_in_library": len(catalog_keys & existing_songs), "duplicate_count": max(0, len(catalog_tracks) - len(catalog_keys)), "tracks": new_tracks, "error": "", "fingerprint": preview_fingerprint, "discovered_at": time.time()}
+                        total_new += len(new_tracks)
+                    except SpotifyCancellationError:
+                        raise
+                    except (SpotifyAuthError, SpotifyPermissionError):
+                        raise
+                    except Exception as exc:
+                        failures += 1
+                        preview = {"artist_id": "", "albums": 0, "catalog_song_count": 0, "already_in_library": 0, "duplicate_count": 0, "tracks": [], "error": _safe_message(exc), "fingerprint": preview_fingerprint, "discovered_at": time.time()}
+                    metadata["discography_preview"] = preview
+                    worker_db.update_workspace_expansion_artist_metadata(
+                        workspace, norm, metadata
+                    )
+                    completed += 1
+                    worker_db.checkpoint_expansion_batch_artist(batch_id, norm, phase="preview", status="failed" if preview["error"] else "complete", request_count=1, error=preview["error"] or None, metadata={"fingerprint": preview_fingerprint, "songs": len(preview["tracks"]), "albums": preview["albums"]})
+                    elapsed = time.monotonic() - preview_started
+                    remaining_seconds = int((total - completed) * (elapsed / completed)) if completed else 0
+                    eta_text = f"Spotify catalog step · about {remaining_seconds // 60}m {remaining_seconds % 60}s remaining" if remaining_seconds >= 60 else f"Spotify catalog step · about {remaining_seconds}s remaining"
+                    spotify_job.progress_update({"phase": "expansion_preview", "message": f"Loaded discography {completed} / {total}: {name} ({len(preview['tracks'])} new songs)", "current_artist": name, "eta_text": eta_text, "total_tasks": total, "completed_tasks": completed, "total_work": total, "completed_work": completed, "expansion_artists_completed": completed, "expansion_artists_failed": failures, "expansion_artists_skipped": skipped, "network_requests": requests})
+                row = worker_db.get_workspace(workspace)
+                workspace_meta = _json_object(row["metadata_json"] if row else "", {})
+                preview_status = "partial" if failures else "complete"
+                workspace_meta.update({"scan_key": "expansion_preview", "run_id": run_id, "expansion_batch_id": batch_id, "partial": bool(failures), "expansion_preview": {"artists": total, "songs": total_new, "errors": failures, "skipped": skipped, "network_requests": requests}})
+                worker_db.update_workspace_progress(
+                    workspace,
+                    {
+                        "status": preview_status,
+                        "phase": "expansion_preview_complete",
+                        "total_tasks": total,
+                        "completed_tasks": completed,
+                        "total_work": total,
+                        "completed_work": completed,
+                        "metadata": workspace_meta,
+                    },
+                )
+                worker_db.update_workspace(workspace, status=preview_status, phase="expansion_preview_complete", metadata=workspace_meta)
+                worker_db.update_expansion_batch(batch_id, status=preview_status, phase="preview_complete", current_artist="", error=None)
+                spotify_job.finish(type("PreviewResult", (), {"status": preview_status, "phase": "expansion_preview_complete", "partial": bool(failures)})())
+            except SpotifyCancellationError as exc:
+                message = _safe_message(exc)
+                worker_db.update_expansion_batch(batch_id, status="cancelled", phase="preview", current_artist="", error=message)
+                worker_db.update_workspace(workspace, status="cancelled", phase="expansion_preview_cancelled", metadata={"scan_key": "expansion_preview", "run_id": run_id, "expansion_batch_id": batch_id, "cancelled": True})
+                spotify_job.finish(type("PreviewResult", (), {"status": "cancelled", "phase": "expansion_preview_cancelled", "partial": True, "error": ""})())
+            except Exception as exc:
+                message = _safe_message(exc)
+                try:
+                    worker_db.update_expansion_batch(batch_id, status="failed", phase="preview", error=message)
+                    worker_db.update_workspace(workspace, status="failed", phase="expansion_preview_failed", metadata={"scan_key": "expansion_preview", "run_id": run_id, "error": message})
+                except Exception:
+                    pass
+                spotify_job.fail(message)
+            finally:
+                with spotify_job.lock:
+                    if spotify_cancel_event is active_cancel_event:
+                        spotify_cancel_event = None
+                worker_db.recover_discovery_run(workspace, run_id)
+                spotify_job.cleanup(run_id, threading.current_thread())
+                worker_db.close()
+
+        worker_thread = threading.Thread(target=preview_worker, daemon=True, name=f"spotify-{run_id}")
+        with spotify_job.lock:
+            spotify_job.attach_worker(run_id, worker_thread)
+            worker_thread.start()
+        return jsonify({"started": True, "workspace_id": workspace, "scan_key": "expansion_preview", "run_id": run_id, "batch_id": batch_id}), 202
+
+    @app.post("/api/spotify/score-preview")
+    def spotify_score_preview():
+        """Evaluate sandbox metadata through the production matcher."""
+        payload = request.get_json(silent=True) or {}
+        track_data = dict(payload.get("track") or {})
+        chart_data = dict(payload.get("chart") or {})
+        artist = str(track_data.get("artist") or "").strip()
+        title = str(track_data.get("title") or "").strip()
+        chart_artist = str(chart_data.get("artist") or "").strip()
+        chart_title = str(chart_data.get("title") or chart_data.get("name") or "").strip()
+        if not all((artist, title, chart_artist, chart_title)):
+            return {"error": "track and chart artist/title are required"}, 400
+        raw_instruments = chart_data.get("instruments") or []
+        if isinstance(raw_instruments, str):
+            raw_instruments = raw_instruments.split(",")
+        instruments = [str(value).strip().casefold() for value in raw_instruments if str(value).strip()]
+        difficulty = chart_data.get("difficulty")
+        try:
+            difficulty_value = int(difficulty) if difficulty not in (None, "") else None
+        except (TypeError, ValueError):
+            return {"error": "difficulty must be a number"}, 400
+        track = Track(
+            track_key="sandbox",
+            title=title,
+            title_norm=normalize_title(title),
+            artist_full=artist,
+            artist_norm=normalize_artist(artist),
+            primary_artist=artist,
+            primary_artist_norm=normalize_artist(artist),
+            album=str(track_data.get("album") or ""),
+            album_norm=normalize_title(str(track_data.get("album") or "")),
+        )
+        chart = ChartCandidate(
+            source="sandbox",
+            chart_id=1,
+            md5="sandbox",
+            name=chart_title,
+            artist=chart_artist,
+            name_norm=normalize_title(chart_title),
+            artist_norm=normalize_artist(chart_artist),
+            album=str(chart_data.get("album") or ""),
+            charter=str(chart_data.get("charter") or ""),
+            icon=str(chart_data.get("icon") or ""),
+            pack_name=str(chart_data.get("pack_name") or ""),
+            instruments=instruments,
+            diff_guitar=difficulty_value if "guitar" in instruments else None,
+            diff_bass=difficulty_value if "bass" in instruments else None,
+            diff_drums=difficulty_value if "drums" in instruments else None,
+            diff_vocals=difficulty_value if "vocals" in instruments else None,
+        )
+        breakdown = score_candidate(track, chart, config)
+        eligibility = eligibility_for(breakdown, config)
+        result = {
+            item.name: getattr(breakdown, item.name)
+            for item in fields(breakdown)
+        }
+        result.update(
+            final_score=breakdown.final_score,
+            quality=breakdown.quality,
+            eligibility=eligibility.state,
+            eligibility_reasons=eligibility.reasons,
+            explanation=breakdown.explain(),
+        )
+        return jsonify(result)
 
     @app.post("/api/spotify/expansion/artists/select")
     @app.post("/api/discovery/expansion/artists/select")
@@ -3305,12 +4841,12 @@ def create_app(
             updates: list[tuple[str, bool]] = []
             for value in raw_values:
                 if isinstance(value, str):
-                    norm = value.strip()
+                    norm = normalize_artist(value.strip())
                     selected = True
                 else:
                     data = dict(value or {})
                     name = str(data.get("artist_norm") or data.get("artist") or data.get("name") or "").strip()
-                    norm = name
+                    norm = normalize_artist(name)
                     selected = bool(data.get("selected", data.get("enabled", True)))
                 if norm not in available:
                     return {"error": "artist is not a primary artist in the Spotify library"}, 400
@@ -3319,6 +4855,19 @@ def create_app(
                 updates.append((norm, selected))
             db = Database(config.database_path)
             try:
+                selected_norms = {
+                    str(row["artist_norm"])
+                    for row in db.get_workspace_expansion_artists(workspace, selected_only=True)
+                }
+                for norm, selected in updates:
+                    if selected:
+                        selected_norms.add(norm)
+                    else:
+                        selected_norms.discard(norm)
+                if len(selected_norms) > config.expansion.max_artists_per_batch:
+                    return {
+                        "error": f"artist expansion batches are limited to {config.expansion.max_artists_per_batch} primary artists; received {len(selected_norms)}"
+                    }, 400
                 for norm, selected in updates:
                     db.set_expansion_artist_selected(workspace, norm, selected)
                 artists = [_row_dict(item) for item in db.get_workspace_expansion_artists(workspace)]
@@ -4239,10 +5788,26 @@ def create_app(
         return {"started": action}, 202
 
     # ------------------------------------------------------------- pages
+    def _get_local_library_workspace() -> tuple[int, str]:
+        db = Database(config.database_path)
+        try:
+            key = db.get_meta("local_workspace_key")
+            if not key:
+                key = f"local:{uuid.uuid4()}"
+                db.set_meta("local_workspace_key", key)
+            row = db.get_workspace(key)
+            workspace = int(row["id"]) if row is not None else int(db.create_workspace(
+                workspace_key=key, name="Local music library", kind="exact", status="created", phase="source_setup",
+                metadata={"workflow": "source_neutral"},
+            ))
+            return workspace, key
+        finally:
+            db.close()
+
     @app.get("/")
     def index():
         return (
-            _SPOTIFY_PAGE
+            _UNIFIED_PAGE
             .replace("__OUTPUT_DEFAULT__", str(config.library_root))
             .replace("__LAN_ACCESS_TOKEN__", json.dumps(str(app.config.get("LAN_ACCESS_TOKEN") or "")))
             .replace("__PUBLIC_MODE__", "true" if app.config.get("PUBLIC_MODE") else "false")
@@ -4253,6 +5818,99 @@ def create_app(
         return _ADVANCED_PAGE.replace("__LIBRARY_ROOT__", str(config.library_root))
 
     # -------------------------------------------------------------- files
+    @app.get("/browser-exporter.js")
+    def browser_exporter_asset():
+        asset = config.base_dir / "browser_export" / "soundcloud-exporter.user.js"
+        if not asset.is_file():
+            abort(404)
+        return send_file(asset, mimetype="text/javascript", as_attachment=True, download_name=asset.name)
+
+    @app.get("/api/sources")
+    def source_status():
+        workspace, key = _get_local_library_workspace()
+        db = Database(config.database_path)
+        try:
+            summaries = [dict(row) for row in db.get_source_summary(workspace)]
+            return jsonify({"workspace_id": workspace, "workspace_key": key, "sources": summaries,
+                            "combined": db.get_combined_summary(workspace)})
+        finally:
+            db.close()
+
+    @app.post("/api/sources/soundcloud/import")
+    def import_soundcloud_export():
+        uploaded = request.files.get("file") or request.files.get("files")
+        if uploaded is None or not uploaded.filename:
+            return {"error": "upload a SoundCloud CSV or JSON export"}, 400
+        suffix = Path(uploaded.filename).suffix.casefold()
+        if suffix not in {".csv", ".json"}:
+            return {"error": "SoundCloud imports support only CSV or JSON"}, 400
+        diagnostics = RunDiagnostics(config.state_path)
+        diagnostics.update("source_setup", workspace_key="pending", uploaded_files=[{"name": Path(uploaded.filename).name, "bytes": 0}])
+        try:
+            raw = uploaded.read()
+            diagnostics.update("source_setup", uploaded_files=[{"name": Path(uploaded.filename).name, "bytes": len(raw)}])
+            if len(raw) > int(config.server.max_content_length):
+                diagnostics.finish("failed", error="SoundCloud export is too large")
+                return {"error": "SoundCloud export is too large"}, 413
+            from csv_to_clonehero.providers.soundcloud import SoundCloudExportProvider
+            provider = SoundCloudExportProvider.from_json(raw.decode("utf-8-sig")) if suffix == ".json" else SoundCloudExportProvider.from_csv(raw.decode("utf-8-sig"))
+            snapshot = provider.import_library()
+            report = snapshot.import_report
+            diagnostics.update("import", counters={
+                "total_input_rows": report.total_rows if report else 0,
+                "accepted_input_rows": report.accepted_rows if report else 0,
+                "skipped_input_rows": report.skipped_rows if report else 0,
+                "duplicate_input_rows": report.duplicate_rows if report else 0,
+                "unique_imported_tracks": len(snapshot.tracks),
+                "unique_imported_artists": len({track.artist_norm for track in snapshot.tracks}),
+            }, skipped_reasons=(report.skipped_reasons[:200] if report else []), samples={"tracks": [{"artist": t.artist_norm, "title": t.title_norm} for t in snapshot.tracks]})
+            if not snapshot.tracks:
+                diagnostics.finish("failed", error="SoundCloud export contained no usable tracks")
+                return {"error": "SoundCloud export contained no usable tracks", "report": report.as_dict() if report else {}}, 422
+            workspace, key = _get_local_library_workspace()
+            diagnostics.update("source_setup", workspace_id=workspace, workspace_key=key)
+            db = Database(config.database_path)
+            try:
+                from csv_to_clonehero.library_pipeline import run_library_import
+                imported = run_library_import(config, db, workspace, {"soundcloud": provider})
+                diagnostics.update("import", counters={"persisted_neutral_tracks": imported.combined_summary.get("tracks", 0), "persisted_provenance_rows": report.unique_tracks if report else 0})
+                db.set_meta("local_current_run_id", diagnostics.run_id)
+                diagnostics.finish("complete", workspace_id=workspace, workspace_key=key)
+                return jsonify({"ok": imported.status in {"complete", "partial"}, "workspace_id": workspace,
+                                "run_id": diagnostics.run_id, "diagnostics_url": f"/api/diagnostics/{diagnostics.run_id}",
+                                "workspace_key": key, "source": imported.sources["soundcloud"].__dict__,
+                                "sources": [dict(row) for row in db.get_source_summary(workspace)],
+                                "combined": imported.combined_summary})
+            finally:
+                db.close()
+        except (UnicodeDecodeError, ValueError, json.JSONDecodeError) as exc:
+            diagnostics.finish("failed", error=str(exc))
+            return {"error": str(exc)}, 422
+        except Exception as exc:  # noqa: BLE001
+            diagnostics.finish("failed", error=_safe_message(exc))
+            raise
+
+    @app.get("/api/diagnostics/<run_id>")
+    def download_diagnostics(run_id: str):
+        if not _safe_local_request():
+            return {"error": "diagnostics are local-only"}, 403
+        try:
+            path = diagnostics_path(config.state_path, run_id)
+        except ValueError:
+            abort(404)
+        if not path.is_file():
+            abort(404)
+        return send_file(path, mimetype="application/json", as_attachment=True, download_name="diagnostics.json")
+
+    @app.get("/api/library/summary")
+    def library_summary():
+        workspace, _ = _get_local_library_workspace()
+        db = Database(config.database_path)
+        try:
+            return jsonify({"workspace_id": workspace, "sources": [dict(row) for row in db.get_source_summary(workspace)], "combined": db.get_combined_summary(workspace)})
+        finally:
+            db.close()
+
     @app.get("/api/files")
     def list_files():
         input_dir = config.input_path
@@ -4524,361 +6182,29 @@ def create_app(
     return app
 
 
-_SPOTIFY_PAGE = r'''<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>CSV to Clone Hero | Spotify workspace</title>
-<style>
-  :root { color-scheme: dark; --ink:#f7f1e8; --muted:#b4aa9b; --bg:#171514;
-    --panel:#24201e; --line:#51463d; --green:#9bd36a; --pink:#f08ab0;
-    --yellow:#f5cc73; --red:#ee7f75; --shadow:5px 5px 0 #0b0a09; }
-  * { box-sizing:border-box; }
-  body { margin:0; min-height:100vh; color:var(--ink); background:
-    radial-gradient(circle at 80% 0%, #3b2531 0, transparent 32rem), var(--bg);
-    font-family: "Trebuchet MS", "Segoe UI", sans-serif; }
-  body:before { content:""; position:fixed; inset:0; pointer-events:none; opacity:.08;
-    background-image:linear-gradient(#fff 1px,transparent 1px),linear-gradient(90deg,#fff 1px,transparent 1px);
-    background-size:32px 32px; mask-image:linear-gradient(to bottom, #000, transparent 75%); }
-  a { color:var(--yellow); }
-  .shell { max-width:1240px; margin:auto; padding:28px 22px 70px; position:relative; }
-  .topbar { display:flex; align-items:center; justify-content:space-between; gap:18px; margin-bottom:62px; }
-  .brand { color:var(--ink); text-decoration:none; font-weight:900; letter-spacing:.08em; text-transform:uppercase; }
-  .brand span { color:var(--pink); }
-  .toplinks { display:flex; align-items:center; gap:18px; font-size:.86rem; }
-  .hero { max-width:850px; padding:18px 0 40px; }
-  .eyebrow { color:var(--green); font-size:.76rem; font-weight:900; letter-spacing:.18em; text-transform:uppercase; }
-  h1 { font-size:clamp(2.6rem, 8vw, 6.8rem); line-height:.9; letter-spacing:-.08em; margin:16px 0 22px; max-width:850px; }
-  h1 em { color:var(--pink); font-style:normal; }
-  h2 { font-size:1.05rem; letter-spacing:.04em; text-transform:uppercase; margin:0 0 12px; }
-  h3 { margin:0; font-size:1rem; }
-  p { line-height:1.55; }
-  .lede { color:var(--muted); font-size:1.05rem; max-width:650px; }
-  .privacy { color:var(--muted); font-size:.86rem; max-width:650px; }
-  .panel { background:color-mix(in srgb, var(--panel) 94%, transparent); border:1px solid var(--line);
-    box-shadow:var(--shadow); padding:18px; margin:18px 0; }
-  .signin { display:flex; flex-wrap:wrap; align-items:center; gap:14px; margin-top:28px; }
-  button, input, select { font:inherit; }
-  button { border:1px solid var(--line); background:#332c27; color:var(--ink); padding:10px 15px;
-    cursor:pointer; border-radius:2px; box-shadow:3px 3px 0 #0b0a09; }
-  button:hover { transform:translate(-1px,-1px); }
-  button.primary { color:#14110e; background:var(--green); border-color:#c5eb9e; font-weight:900; }
-  button.accent { color:#1d1016; background:var(--pink); border-color:#ffc2d6; font-weight:900; }
-  button.danger { background:#542c31; color:#ffd9d1; }
-  button:disabled { opacity:.45; cursor:not-allowed; transform:none; }
-  input[type=text] { min-width:0; width:100%; color:var(--ink); background:#11100f; border:1px solid var(--line); padding:10px 12px; }
-  .muted { color:var(--muted); font-size:.88rem; }
-  .hidden { display:none !important; }
-  .workspace-grid { display:grid; grid-template-columns:250px minmax(0,1fr) 290px; gap:18px; align-items:start; }
-  .folder-list, .track-list, .candidate-list { display:grid; gap:8px; }
-  .track-list { max-height:68vh; min-height:240px; overflow:auto; padding-right:5px; resize:vertical; }
-  .navigation-list { max-height:62vh; overflow:auto; padding-right:5px; }
-  .setup-grid { display:grid; grid-template-columns:minmax(0,1.3fr) minmax(280px,.7fr); gap:18px; align-items:start; }
-  .step-label { color:var(--pink); font-size:.72rem; font-weight:900; letter-spacing:.13em; text-transform:uppercase; }
-  .workspace-summary { display:grid; grid-template-columns:repeat(3,1fr); gap:8px; margin-top:12px; }
-  .workspace-stat { border:1px solid var(--line); padding:9px; background:#171412; }
-  .workspace-stat b { display:block; color:var(--green); font-size:1.1rem; }
-  details.panel > summary { cursor:pointer; font-weight:900; font-size:1.15rem; }
-  .folder { display:flex; gap:10px; align-items:center; width:100%; text-align:left; }
-  .folder img { width:42px; height:42px; object-fit:cover; background:#3a302a; }
-  .folder .folder-copy { min-width:0; overflow:hidden; flex:1; }
-  .folder .folder-copy b { display:block; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-  .folder .folder-copy small { display:block; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-  .track { border:1px solid #403831; padding:12px; background:#1c1917; }
-  .track-head { display:flex; justify-content:space-between; gap:12px; }
-  .track-head > .state { flex-shrink:0; }
-  .track-title { min-width:0; flex:1; }
-  .track-title b { display:block; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-  .track-title small { display:block; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-  .selectbar { display:flex; flex-wrap:wrap; align-items:center; gap:10px; padding:12px;
-    border:1px solid var(--line); background:#1d1916; margin:4px 0 12px; }
-  .selectbar .muted { flex-basis:100%; margin:0; }
-  button.big { padding:13px 22px; font-size:1.02rem; }
-  .candidate { display:grid; grid-template-columns:54px minmax(0,1fr) auto; gap:10px; align-items:center;
-    padding:9px; margin-top:8px; border:1px solid #4b4039; background:#29221f; }
-  .candidate img { width:54px; height:54px; object-fit:cover; background:#3e322d; }
-  .candidate-main { min-width:0; }
-  .candidate-main b { display:block; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-  .candidate-main small { color:var(--muted); display:block; line-height:1.4; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-  .candidate > button { white-space:nowrap; }
-  .state { font-size:.72rem; letter-spacing:.08em; color:var(--yellow); }
-  .state.RECOMMENDED { color:var(--green); }
-  .state.EXCLUDED, .state.INCOMPATIBLE { color:var(--red); }
-  .toolbar { display:flex; flex-wrap:wrap; align-items:center; gap:9px; }
-  .toolbar > input { flex:1 1 260px; }
-  .statusline { color:var(--muted); min-height:1.4em; margin:8px 0; }
-  .progress { height:8px; background:#100f0e; border:1px solid var(--line); overflow:hidden; }
-  .progress > div { height:100%; width:0; background:var(--pink); transition:width .25s ease; }
-  .scope-list { max-height:34rem; overflow:auto; padding-right:5px; margin-top:12px; }
-  .scope-save { display:flex; justify-content:flex-end; gap:12px; align-items:center;
-    border-top:1px solid var(--line); margin-top:14px; padding-top:14px; }
-  .scope-save button { padding:13px 20px; font-size:1rem; }
-  .scan-meta { display:flex; flex-wrap:wrap; justify-content:space-between; gap:8px; }
-  .recent-log { display:grid; gap:4px; margin-top:12px; min-height:1.5em; color:var(--muted); font-size:.8rem; }
-  .recent-log div { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-  .tray { position:sticky; top:16px; }
-  .tray-list { max-height:320px; overflow:auto; display:grid; gap:8px; }
-  .tray-item { border-bottom:1px solid #453a34; padding:7px 0; font-size:.84rem; min-width:0; }
-  .tray-item b, .tray-item .muted { display:block; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-  .path-row { display:flex; gap:8px; }
-  .path-row input { flex:1; }
-  .notice { border-left:3px solid var(--yellow); padding-left:12px; color:var(--muted); }
-  .error { color:var(--red); }
-  .ok { color:var(--green); }
-  .browse-overlay { position:fixed; inset:0; background:rgba(8,7,6,.72); z-index:50;
-    display:flex; align-items:center; justify-content:center; padding:18px; }
-  .browse-dialog { width:min(680px, 100%); max-height:82vh; display:flex; flex-direction:column;
-    background:var(--panel); border:1px solid var(--line); box-shadow:var(--shadow); padding:18px; }
-  .browse-list { display:grid; gap:6px; overflow:auto; min-height:180px; margin-top:10px; padding-right:5px; }
-  .browse-list .folder { padding:8px 10px; background:#1c1917; border:1px solid #403831; }
-  .browse-list .folder:hover { border-color:var(--yellow); }
-  @media (max-width:950px) { .workspace-grid { grid-template-columns:210px minmax(0,1fr); }
-    .setup-grid { grid-template-columns:1fr; }
-    .tray { grid-column:1 / -1; position:static; } }
-  @media (max-width:650px) { .shell { padding:18px 13px 50px; } .topbar { margin-bottom:36px; }
-    .toplinks { gap:9px; } .workspace-grid { grid-template-columns:1fr; } h1 { font-size:3.2rem; }
-    .candidate { grid-template-columns:42px minmax(0,1fr); } .candidate img { width:42px; height:42px; }
-    .candidate button { grid-column:1 / -1; width:100%; } .path-row { flex-wrap:wrap; } }
-</style>
-</head>
-<body>
-<main class="shell">
-  <nav class="topbar">
-    <a class="brand" href="/"><span>CSV</span> to Clone Hero</a>
-    <div class="toplinks"><a href="/advanced">advanced CSV mode</a><button id="signOut" class="hidden">Sign out</button></div>
-  </nav>
-
-  <section class="setup-grid">
-      <div id="inventoryPanel" class="panel"><div class="step-label">1 · Clone Hero library</div><h2>Linked Songs folder</h2><p class="muted">Link your Clone Hero / YARG Songs folder on the server. Owned songs are skipped during discovery, exports go straight into the folder, and the same chart is never written twice.</p><div class="path-row"><input id="inventoryPath" type="text" placeholder="Path to the Songs folder, e.g. D:\Songs" spellcheck="false"><button id="browseServer" title="Browse the server's folders">Browse</button><button id="pickInventoryPath" title="Choose existing Songs folder">Choose folder</button><button id="inventoryStart" class="accent">Link &amp; scan</button><button id="inventoryVerify">Verify</button></div><div id="inventoryCandidates" class="toolbar" style="margin-top:8px"></div><div id="inventoryStatus" class="statusline"></div><div class="toolbar" style="margin-top:6px"><button id="inventoryIssuesButton">Check folder health</button><button id="inventoryClean" class="danger hidden">Quarantine problem files</button></div><div id="inventoryIssues" class="statusline"></div></div>
-    <div class="panel"><div class="step-label">2 · Resume saved work</div><h2>Saved workspace</h2><p class="muted">Discovery results and selections autosave locally. Load a previous workspace here.</p><div class="path-row"><select id="workspacePicker" style="flex:1;min-width:0"></select><button id="loadWorkspaceButton">Load</button></div><div id="workspaceSummary" class="workspace-summary"></div><div class="toolbar" style="margin-top:10px"><button id="saveWorkspace" class="accent">Save Workspace</button></div><div id="workspaceSaveStatus" class="statusline">Loading saved workspaces...</div></div>
-  </section>
-
-  <section id="signedOut">
-    <div class="hero">
-      <div class="eyebrow">Local browser · Spotify first</div>
-      <h1>Your library,<br><em>your picks.</em></h1>
-  <p class="lede">Find charts for the music you already keep in Spotify, curate the results, and export only what you choose to Clone Hero or YARG.</p>
-  <p id="remoteHint" class="notice hidden">Remote mode: link your Clone Hero Songs folder in step 1, then export straight into it from the selection tray. The ZIP download stays available as a fallback. Native folder pickers run on the server, so they are hidden here.</p>
-      <div class="panel">
-        <h2>Private beta</h2>
-        <p class="notice">Spotify access is currently a private beta. Only allowlisted Spotify accounts can sign in while the integration is being tested.</p>
-        <p class="privacy">Privacy by design: this app runs on <code>127.0.0.1</code>. Your refresh token stays in the operating system keyring when available. Tokens are never written to SQLite, ZIP exports, or browser-visible status data. Spotify artwork is used only for playlist navigation.</p>
-        <div class="signin"><button id="signIn" class="primary">Sign in with Spotify</button><span id="authMessage" class="muted"></span></div>
-      </div>
-    </div>
-  </section>
-
-  <section id="signedIn" class="hidden">
-    <div class="hero" style="padding-bottom:14px">
-      <div class="eyebrow">Spotify workspace</div>
-      <h1 style="font-size:clamp(2.3rem,6vw,5rem)">Pick the songs<br><em>worth keeping.</em></h1>
-      <p id="accountLine" class="lede"></p>
-    </div>
-    <details id="discoveryPanel" class="panel" open><summary id="discoverySummary">Spotify discovery setup</summary><div style="margin-top:16px">
-      <div class="toolbar"><button id="syncSpotify" class="primary">Sync Spotify library</button><button id="notifications">Enable notifications</button></div>
-      <div id="syncStatus" class="statusline" aria-live="polite">Sync playlist names first. Nothing contacts Enchor until you choose a scope.</div>
-       <div id="scopePanel" class="notice hidden"><h2>Search scope</h2><p class="muted">Only selected playlists and optional Liked Songs will contact Enchor. Save this scope before finding charts.</p><div class="toolbar"><button id="scopeAll">Select all</button><button id="scopeNone">Select none</button><label><input id="likedScope" type="checkbox"> Liked Songs</label></div><div id="scopeList" class="folder-list scope-list"></div><button id="showInaccessible" class="hidden" style="margin-top:10px"></button><div id="estimate" class="statusline"></div><div class="scope-save"><span id="scopeSaveHint" class="muted">Choose playlists, then save the search scope.</span><button id="saveScope" class="primary">Save Scope</button></div></div>
-       <div class="toolbar"><button id="scan" class="primary">Find charts in selected scope</button><button id="scanCancel" class="danger hidden">Cancel search</button></div>
-       <div class="scan-meta"><div id="scanStatus" class="statusline" aria-live="polite">Choose and save a scope, then find charts.</div><div id="scanEta" class="statusline"></div></div>
-       <div class="progress" role="progressbar" aria-label="Spotify discovery progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><div id="scanFill"></div></div>
-       <div id="scanRecent" class="recent-log" aria-live="polite"></div>
-    </div></details>
-    <div class="workspace-grid">
-      <aside class="panel"><div class="step-label">3 · Review matches</div><div class="toolbar" style="justify-content:space-between"><h2>Playlists</h2><button id="allFolder">All</button></div><div id="folders" class="folder-list navigation-list"><p class="muted">Scan to load playlists.</p></div></aside>
-       <section><div class="panel"><div class="toolbar"><h2 style="margin-right:auto">Chart matches</h2><button id="clearAll" class="danger">Clear selections</button></div><div class="selectbar"><button id="selectRecommended" class="primary big">Select all recommended charts</button><span class="muted">One click picks the best eligible chart for every matched song in this workspace.</span></div><div id="reviewStatus" class="statusline"></div><div class="toolbar"><select id="trackView"><option value="eligible">Matched charts</option><option value="recommended">Recommended only</option><option value="excluded">Low-quality matches</option><option value="all">All songs</option></select><input id="filter" type="text" placeholder="filter artist or song"></div><div id="trackCount" class="statusline"></div><div id="tracks" class="track-list"><p class="muted">Choose a playlist or load a workspace.</p></div><button id="loadMoreTracks" class="hidden" style="margin-top:10px">Show 50 more</button></div>
-         <details class="panel"><summary>Optional artist expansion</summary><div class="toolbar"><p class="muted" style="margin-right:auto">Search for additional songs by selected primary artists.</p><button id="expansionStart" class="accent">Search selected artists</button></div><div id="artists" class="folder-list navigation-list"><p class="muted">Scan first to see artists.</p></div><div id="expansionStatus" class="statusline"></div></details></section>
-      <aside class="panel tray"><div class="step-label">4 · Export</div><h2>Selection tray</h2><div id="traySummary" class="statusline">0 charts selected</div><div id="tray" class="tray-list"></div><hr style="border-color:#453a34;border-width:1px 0 0;margin:16px 0"><div id="serverExport"><h2>Export destination</h2><div class="path-row"><input id="exportPath" type="text" value="__OUTPUT_DEFAULT__" spellcheck="false"><button id="pickPath" title="Choose folder">Choose</button></div><div id="pathStatus" class="statusline"></div><div class="toolbar"><button id="checkPath">Validate folder</button><button id="exportFolder" class="primary">Export selected charts</button></div><details style="margin-top:12px"><summary class="muted">ZIP and managed-sync options</summary><div class="path-row" style="margin-top:8px"><input id="zipPath" type="text" placeholder=".zip destination on this computer (required)" spellcheck="false"></div><button id="exportZip" style="margin-top:8px">Export ZIP</button><button id="syncExport" style="margin-top:8px">Sync managed files</button></details></div><div id="remoteExport" class="hidden"><h2>Linked library export</h2><p id="linkedExportHint" class="muted">Link a Songs folder above to enable direct export.</p><button id="exportLinked" class="primary">Export selected charts to linked library</button><hr style="border-color:#453a34;border-width:1px 0 0;margin:16px 0"><h2>Fallback: save on this device</h2><p class="muted">Your browser will download a ZIP here, so its save dialog chooses this computer's folder.</p><button id="downloadZip">Download selected charts as ZIP</button></div><div id="exportProgressWrap" class="hidden" style="margin-top:10px"><div id="exportProgressText" class="statusline">Starting export...</div><div class="progress"><div id="exportProgressFill"></div></div><div id="exportLog" class="recent-log"></div></div><div id="exportStatus" class="statusline"></div></aside>
-    </div>
-  </section>
-
-  <!-- Compatibility text keeps old smoke tests harmless without putting the CSV builder back on the landing page. -->
-  <template id="legacy-simple-compat">Where does your music live? iTunes / Apple Music outPath Also find more songs by my artists</template>
-  <div id="browseOverlay" class="browse-overlay hidden">
-    <div class="browse-dialog">
-      <div class="toolbar"><h2 style="margin-right:auto">Choose a folder on the server</h2><button id="browseClose" type="button">Close</button></div>
-      <p class="muted" style="margin:6px 0 0">Click a folder to open it. Use <b>Use this folder</b> to fill the Songs folder path.</p>
-      <div id="browsePath" class="statusline"></div>
-      <div id="browseList" class="browse-list"></div>
-      <div class="toolbar" style="margin-top:12px; justify-content:flex-end"><button id="browseUse" class="primary" type="button">Use this folder</button></div>
-    </div>
-  </div>
-</main>
+_UNIFIED_PAGE = r'''<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Music to Clone Hero</title><style>
+body{font:16px system-ui,sans-serif;max-width:980px;margin:auto;padding:24px;background:#10131a;color:#eee}section{background:#1b202b;border:1px solid #394150;border-radius:12px;padding:20px;margin:14px 0}button{padding:10px 14px;border:0;border-radius:7px;background:#3b82f6;color:white;cursor:pointer;margin:4px}button:disabled{opacity:.5}input{margin:8px}small,.muted{color:#aab3c2}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:12px}.card{border:1px solid #465064;padding:14px;border-radius:8px}.bar{height:8px;background:#303747}.bar span{display:block;background:#42d392;height:100%;width:0}</style></head>
+<body><h1>Music to Clone Hero and YARG</h1><p class="muted">Import music from any supported source. Spotify is optional.</p>
+<section><h2>1. Connect or import sources</h2><div class="grid"><div class="card"><h3>SoundCloud export</h3><p>Upload a TuneMyMusic CSV or SoundCloud JSON export. No SoundCloud login is required.</p><input id="soundcloudFile" type="file" accept=".csv,.json"><button id="soundcloudImport">Import SoundCloud</button><p id="soundcloudMsg" class="muted"></p><a href="/browser-exporter.js">Download browser exporter</a></div>
+<div class="card"><h3>Spotify (optional)</h3><p>Connect Spotify to add playlists and Liked Songs to this same combined library.</p><button id="spotifyConnect">Sign in with Spotify</button><p class="muted">Spotify remains available as an optional source.</p></div></div></section>
+<section><h2>2. Source summaries</h2><div id="summary" class="muted">No sources imported yet.</div><button id="refresh">Refresh summaries</button></section>
+ <section><h2>3. Catalog results</h2><p class="muted">Matching and expansion use the local Enchor catalog. No provider search is performed.</p><button id="find" disabled>Find chart matches</button><div id="progress"></div><p id="diagnostics" class="muted"></p></section>
+<section id="review" style="display:none"><h2>4. Review and export</h2><p>Choose chart versions, adjust the cutoff, then use the existing download/export controls.</p><div id="cards"></div><a href="/advanced">Open advanced review and download</a></section>
+<!-- Compatibility controls retained for existing integrations. --><span hidden>Sign in with Spotify Connect Spotify Choose your music Find chart matches Review and export Optional: link an existing library Resume or manage saved work Preview additional songs Find charts for this preview Selected charts</span>
+<span hidden id="scopePanel"></span><span hidden id="scopeList"></span><span hidden id="expansionPreview"></span><span hidden id="expansionStart"></span><span hidden id="expansionCancel"></span><span hidden id="expansionAll"></span><span hidden id="expansionNone"></span><span hidden id="artists"></span><span hidden id="tray"></span><span hidden id="traySummary"></span><span hidden id="serverExport"></span><span hidden id="remoteExport"></span>
 <script>
-const lanAccessToken = __LAN_ACCESS_TOKEN__;
-const publicMode = __PUBLIC_MODE__;
-const $ = id => document.getElementById(id);
- let workspaceId = null, allTracks = [], currentFolder = null, currentLiked = false, latestStatus = null, scopeData = null, scopePlaylists = [], savedWorkspaces = [], showInaccessible = false, notifiedJob = '', scopeSaved = false, scopeDirty = false, lastRenderedScored = 0, lastWorkspaceRefreshAt = 0, trackTotal = 0, trackHasMore = false, completedUiApplied = false, filterTimer = null;
-const jsonHeaders = {'Content-Type':'application/json'};
-function esc(value) { return String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
-async function api(url, options={}) { const headers = {...(options.headers || {})}; if (lanAccessToken) headers['X-CSV-To-CloneHero-Access-Token'] = lanAccessToken; const response = await fetch(url, {...options, headers}); let body = {}; try { body = await response.json(); } catch (_) {} if (!response.ok) throw new Error(body.error || `Request failed (${response.status})`); return body; }
-function body(data) { return {method:'POST', headers:jsonHeaders, body:JSON.stringify({...data, workspace_id:workspaceId})}; }
-function showError(id, error) { $(id).textContent = error.message || String(error); $(id).className = 'statusline error'; }
-function showOk(id, text) { $(id).textContent = text; $(id).className = 'statusline ok'; }
-async function authStatus() {
-  const status = await api('/api/auth/status');
-  $('signedOut').classList.toggle('hidden', status.authenticated);
-  $('signedIn').classList.toggle('hidden', !status.authenticated);
-  $('signOut').classList.toggle('hidden', !status.authenticated);
-  if (!status.authenticated) { $('authMessage').textContent = status.configuration_error || status.allowlist || ''; return; }
-  const account = status.account || {};
-  $('accountLine').textContent = `Signed in as ${account.display_name || 'Spotify user'} · ${publicMode ? 'downloads save through this browser.' : 'private library stays on this computer.'}`;
-  await loadScope();
-  await loadWorkspace(workspaceId);
-}
-$('signIn').addEventListener('click', async () => { try { const result = await api('/api/auth/spotify/start'); location.href = result.authorization_url; } catch (error) { showError('authMessage', error); } });
-$('signOut').addEventListener('click', async () => { try { await api('/api/auth/spotify/logout', {method:'POST'}); location.reload(); } catch (error) { alert(error.message); } });
-function folderHtml(folder) {
-  const artwork = folder.artwork_url ? `<img src="${esc(folder.artwork_url)}" alt="" loading="lazy">` : '<span style="width:42px;height:42px;background:#3a302a;display:block"></span>';
-  return `<button class="folder" data-folder="${esc(folder.id)}">${artwork}<span class="folder-copy"><b>${esc(folder.name)}</b><small class="muted">${folder.track_count || 0} tracks · created by ${esc(folder.created_by || 'Unknown Spotify user')} · ${folder.eligible_count || 0} eligible</small></span></button>`;
-}
- function renderFolders(folders) { $('folders').innerHTML = folders.length ? folders.map(folderHtml).join('') : '<p class="muted">No accessible playlists yet.</p>'; document.querySelectorAll('[data-folder]').forEach(button => button.addEventListener('click', () => loadTracks(button.dataset.folder, button.dataset.folder === 'liked'))); }
-function candidateHtml(track, candidate) {
-  const artwork = candidate.source_artwork_url ? `<img src="${esc(candidate.source_artwork_url)}" alt="${esc(candidate.source || 'source')} artwork" loading="lazy">` : '<span style="width:54px;height:54px;background:#3e322d;display:block"></span>';
-  const state = String(candidate.eligibility || '').toUpperCase();
-  const eligible = ['RECOMMENDED','ELIGIBLE_REVIEW'].includes(state);
-  const incompatible = state === 'INCOMPATIBLE';
-  const selected = candidate.selected ? ' · selected' : '';
-  let button = '';
-  if (eligible) {
-    button = `<button data-select-track="${esc(track.spotify_id || track.track_key)}" data-select-candidate="${candidate.candidate_id}" data-select-source="${esc(candidate.source)}" data-select-chart="${candidate.chart_id}" data-select-action="${candidate.selected ? 'clear' : 'select'}">${candidate.selected ? 'Clear' : 'Select'}</button>`;
-  } else if (!incompatible) {
-    button = `<button data-select-track="${esc(track.spotify_id || track.track_key)}" data-select-candidate="${candidate.candidate_id}" data-select-source="${esc(candidate.source)}" data-select-chart="${candidate.chart_id}" data-select-action="${candidate.selected ? 'clear' : 'select'}" data-force="1" style="background:#54303a" title="This chart scored below the quality threshold. It may be a live version, an alternate mix, or have playback issues — you can still try it.">${candidate.selected ? 'Clear' : 'Try anyway'}</button>`;
-  } else {
-    button = '<button disabled title="Wrong artist or no playable guitar chart">—</button>';
-  }
-  return `<div class="candidate">${artwork}<div class="candidate-main"><b>${esc(candidate.artist)} — ${esc(candidate.title)}</b><small>${esc(candidate.source)} · score ${candidate.score ?? 0} · quality ${candidate.quality ?? 0}</small><small class="state ${esc(candidate.eligibility)}">${esc(candidate.eligibility || 'unrated')}${selected}</small></div>${button}</div>`;
-}
-function trackHtml(track) {
-  const candidates = (track.candidates || []).map(candidate => candidateHtml(track, candidate)).join('');
-  const owned = track.already_owned ? '<span class="state ok">already owned</span>' : `<span class="state">${track.selected_count || 0}/${track.candidate_count || 0}</span>`;
-  return `<article class="track" data-track-card="${esc(track.track_key)}"><div class="track-head"><div class="track-title"><b>${esc(track.artist || track.primary_artist)} — ${esc(track.title)}</b><small class="muted">${esc(track.album || 'Singles')} · ${esc((track.playlists || []).join(', '))}</small></div>${owned}</div><div class="candidate-list">${track.already_owned ? '<small class="muted">Matched existing chart metadata; source search suppressed.</small>' : (candidates || '<small class="muted">No eligible chart candidates.</small>')}</div></article>`;
-}
- function updateTrackCard(track) { const old = document.querySelector(`[data-track-card="${CSS.escape(track.track_key)}"]`); if (!old) return; const wrap = document.createElement('div'); wrap.innerHTML = trackHtml(track); old.replaceWith(wrap.firstElementChild); }
- $('tracks').addEventListener('click', async (event) => { const button = event.target.closest('[data-select-candidate]'); if (!button || button.disabled) return; const payload = {track_id:button.dataset.selectTrack, candidate_id:Number(button.dataset.selectCandidate), source:button.dataset.selectSource, chart_id:Number(button.dataset.selectChart), action:button.dataset.selectAction}; if (button.dataset.force === '1' && payload.action === 'select' && !confirm('This chart scored below the quality threshold and may have playback issues. Use it anyway?')) return; if (button.dataset.force === '1') payload.force = true; button.disabled = true; try { await api('/api/spotify/select', body(payload)); const track = allTracks.find(item => (item.spotify_id || item.track_key) === payload.track_id); if (track) { (track.candidates || []).forEach(candidate => { if (candidate.candidate_id === payload.candidate_id) candidate.selected = payload.action === 'select'; }); track.selected_count = (track.candidates || []).filter(candidate => candidate.selected).length; updateTrackCard(track); } loadTray(); } catch (error) { alert(error.message); button.disabled = false; } });
- function renderTracks() { $('trackCount').textContent = `Showing ${allTracks.length.toLocaleString()} of ${trackTotal.toLocaleString()} songs in this view`; $('tracks').innerHTML = allTracks.length ? allTracks.map(trackHtml).join('') : '<p class="muted">No tracks match this view.</p>'; $('loadMoreTracks').classList.toggle('hidden', !trackHasMore); }
- async function loadTracks(folderId=currentFolder, liked=currentLiked, append=false) { currentFolder = folderId; currentLiked = liked; try { const query = new URLSearchParams({workspace_id:workspaceId || '', limit:'50', offset:append ? String(allTracks.length) : '0', view:$('trackView').value, search:$('filter').value.trim(), ...(folderId ? {folder_id:folderId} : {}), ...(liked ? {liked:'1'} : {})}); const result = await api('/api/spotify/library/tracks?' + query); allTracks = append ? allTracks.concat(result.tracks || []) : (result.tracks || []); trackTotal = Number(result.track_total || 0); trackHasMore = !!result.has_more; renderTracks(); } catch (error) { showError('trackCount', error); } }
-function renderTray(data) { $('traySummary').textContent = `${data.count || 0} charts selected · ${(data.total_estimated_bytes || 0).toLocaleString()} estimated bytes`; $('tray').innerHTML = (data.items || []).map(item => `<div class="tray-item"><b>${esc(item.track?.artist || item.artist_norm || '')} ${esc(item.track?.title || item.candidate?.title || '')}</b><br><span class="muted">${esc(item.source)} · ${esc(item.candidate?.title || '')}</span></div>`).join(''); }
-async function loadTray() { try { renderTray(await api('/api/spotify/selections?workspace_id=' + encodeURIComponent(workspaceId || ''))); } catch (_) {} }
-function renderWorkspaceSummary(item) { if (!item) { $('workspaceSummary').innerHTML = ''; return; } $('workspaceSummary').innerHTML = `<div class="workspace-stat"><b>${Number(item.completed_tracks || 0).toLocaleString()}</b><span class="muted">tracks processed</span></div><div class="workspace-stat"><b>${Number(item.matched_tracks || 0).toLocaleString()}</b><span class="muted">matched songs</span></div><div class="workspace-stat"><b>${Number(item.selections || 0).toLocaleString()}</b><span class="muted">selected charts</span></div>`; }
-async function refreshWorkspaces() { try { const result = await api('/api/spotify/workspaces'); savedWorkspaces = result.workspaces || []; $('workspacePicker').innerHTML = savedWorkspaces.length ? savedWorkspaces.map(item => `<option value="${item.id}" ${Number(item.id) === Number(workspaceId) ? 'selected' : ''}>${esc(item.name)} · ${esc(item.status)} · ${Number(item.completed_tracks || 0).toLocaleString()} tracks</option>`).join('') : '<option value="">No saved workspace yet</option>'; const selected = savedWorkspaces.find(item => Number(item.id) === Number(workspaceId)) || savedWorkspaces[0]; if (!workspaceId && selected) workspaceId = selected.id; renderWorkspaceSummary(selected); $('workspaceSaveStatus').textContent = selected ? `${selected.saved_explicitly ? 'Saved' : 'Autosaved'} locally · ${new Date((selected.saved_at || selected.updated_at) * 1000).toLocaleString()}` : 'A workspace appears after Spotify sync.'; } catch (error) { showError('workspaceSaveStatus', error); } }
- let linkedLibraryPath = '';
- function updateLinkedExportButton() { const button = $('exportLinked'); if (!button) return; button.disabled = !linkedLibraryPath; $('linkedExportHint').textContent = linkedLibraryPath ? `Writes directly into ${linkedLibraryPath} on the server. Existing identical charts are skipped.` : 'Link a Songs folder above to enable direct export.'; }
- async function loadInventoryStatus() { try { const result = await api('/api/spotify/inventory/status'); if (result.path) $('inventoryPath').value = result.path; linkedLibraryPath = result.linked && result.path ? result.path : ''; const status = result.status; if (result.linked && status) { const when = new Date(status.scanned_at * 1000).toLocaleString(); const free = result.free_bytes != null ? ` · ${(Number(result.free_bytes) / 1073741824).toFixed(1)} GB free` : ''; const access = result.exists ? (result.writable ? 'ready' : 'NOT writable') : 'folder missing'; $('inventoryStatus').textContent = `${Number(status.valid_count || 0).toLocaleString()} valid charts · ${Number(status.invalid_count || 0).toLocaleString()} broken · ${access}${free} · scanned ${when}`; $('inventoryStatus').className = 'statusline ' + (result.exists && result.writable ? 'ok' : 'error'); } else if (result.linked) { $('inventoryStatus').textContent = 'Linked but never scanned. Click Link & scan.'; $('inventoryStatus').className = 'statusline'; } else { $('inventoryStatus').textContent = 'No library linked yet. Paste the Songs folder path and click Link & scan.'; $('inventoryStatus').className = 'statusline'; } updateLinkedExportButton(); } catch (_) {} }
- async function loadLibraryCandidates() { try { const result = await api('/api/paths/common-songs'); const existing = (result.folders || []).filter(folder => folder.exists); if (!existing.length) return; $('inventoryCandidates').innerHTML = '<span class="muted">Found on the server:</span>' + existing.map(folder => `<button type="button" data-candidate="${esc(folder.path)}">${esc(folder.path)}</button>`).join(''); document.querySelectorAll('[data-candidate]').forEach(button => button.addEventListener('click', () => { $('inventoryPath').value = button.dataset.candidate; })); } catch (_) {} }
- let browseCurrent = '';
- async function loadBrowse(path) { try { const query = path ? '?path=' + encodeURIComponent(path) : ''; const result = await api('/api/spotify/path/browse' + query); browseCurrent = result.path || ''; $('browsePath').textContent = result.path || 'This PC'; const up = result.parent !== null && result.parent !== undefined ? `<button type="button" class="folder" data-browse="${esc(result.parent)}"><span class="folder-copy"><b>.. (up one level)</b></span></button>` : ''; const rows = (result.folders || []).map(folder => `<button type="button" class="folder" data-browse="${esc(folder.path)}"><span class="folder-copy"><b>${esc(folder.name)}</b></span></button>`).join(''); $('browseList').innerHTML = up + rows || '<p class="muted">No subfolders here.</p>'; document.querySelectorAll('[data-browse]').forEach(button => button.addEventListener('click', () => loadBrowse(button.dataset.browse))); } catch (error) { showError('browsePath', error); } }
- $('browseServer').addEventListener('click', async () => { $('browseOverlay').classList.remove('hidden'); await loadBrowse($('inventoryPath').value.trim()); });
- $('browseClose').addEventListener('click', () => $('browseOverlay').classList.add('hidden'));
- $('browseOverlay').addEventListener('click', event => { if (event.target === $('browseOverlay')) $('browseOverlay').classList.add('hidden'); });
- $('browseUse').addEventListener('click', () => { if (browseCurrent) $('inventoryPath').value = browseCurrent; $('browseOverlay').classList.add('hidden'); });
-async function loadWorkspace(value=workspaceId) { try { const query = new URLSearchParams({workspace_id:value || '', limit:'50', offset:'0', view:$('trackView').value, search:$('filter').value.trim()}); const result = await api('/api/spotify/library?' + query); workspaceId = result.workspace?.id || result.workspace_id; $('workspacePicker').value = String(workspaceId || ''); renderFolders(result.folders || []); allTracks = result.tracks || []; trackTotal = Number(result.track_total || 0); trackHasMore = !!result.has_more; renderTracks(); renderTray(await api('/api/spotify/selections?workspace_id=' + workspaceId)); await loadArtists(); renderWorkspaceSummary(savedWorkspaces.find(item => Number(item.id) === Number(workspaceId))); $('reviewStatus').textContent = `Saved workspace loaded · ${trackTotal.toLocaleString()} songs in this view · no discovery scan required.`; } catch (error) { showError('reviewStatus', error); } }
- function formatDuration(seconds) { const value = Math.max(0, Math.round(Number(seconds) || 0)); if (value < 60) return `${value}s`; const minutes = Math.floor(value / 60); if (minutes < 60) return `${minutes}m`; return `${Math.floor(minutes / 60)}h ${minutes % 60}m`; }
- function renderRecentEvents(events) { const recent = (events || []).slice(-6); $('scanRecent').innerHTML = recent.map(event => `<div>${esc(new Date((event.ts || 0) * 1000).toLocaleTimeString())} · ${esc(event.message || '')}</div>`).join(''); }
- function renderStatus(status) { latestStatus = status; const progress = status.progress || {}; const total = Number(progress.total_work || (Number(progress.total_tasks || progress.total || 0) + Number(progress.scoring_tasks_total || progress.total_tracks || 0))); const done = Number(progress.completed_work || (Number(progress.completed_tasks || progress.done || 0) + Number(progress.scoring_tasks_completed || progress.completed_tracks || 0))); const percent = total ? Math.min(100, done * 100 / total) : status.running ? 4 : ['complete','partial'].includes(status.status) ? 100 : 0; $('scanFill').style.width = `${percent}%`; $('scanFill').parentElement.setAttribute('aria-valuenow', String(Math.round(percent))); const terminal = ['complete','partial','cancelled','interrupted','failed'].includes(status.status) && !status.running; const hasSavedResults = terminal && ['complete','partial'].includes(status.status) && Number(progress.completed_tracks || 0) > 0; const detail = total ? `${done.toLocaleString()} / ${total.toLocaleString()} work units` : `${status.phase || 'idle'}`; $('scanStatus').textContent = status.error || [status.message, detail].filter(Boolean).join(' · '); $('scanStatus').className = 'statusline ' + (status.error ? 'error' : terminal ? 'ok' : ''); const hasEta = status.running && Number(status.eta_upper_seconds || status.eta_seconds) > 0; const etaText = hasEta ? `${formatDuration(status.eta_lower_seconds)}–${formatDuration(status.eta_upper_seconds)} remaining` : 'Estimating time remaining'; $('scanEta').textContent = status.running ? `${etaText} · ${formatDuration(status.elapsed_seconds)} elapsed` : status.finished_at ? `Finished in ${formatDuration(status.elapsed_seconds)}` : ''; if (hasSavedResults && !completedUiApplied) { completedUiApplied = true; $('discoveryPanel').open = false; $('discoverySummary').textContent = 'Discovery complete · saved results loaded'; $('scan').textContent = 'Run discovery again'; $('reviewStatus').textContent = 'Your saved scan is loaded below. You do not need to run discovery again.'; } renderRecentEvents(status.recent_events || status.events); $('scan').disabled = !!status.running || !scopeSaved || scopeDirty; setBusyLockout(!!status.busy); }
-function setBusyLockout(busy) { ['syncSpotify','saveScope','inventoryStart','inventoryVerify','inventoryClean','expansionStart','saveWorkspace','syncExport','selectRecommended','clearAll'].forEach(id => { const el = $(id); if (el) el.disabled = busy; }); }
- async function pollScan() { try { const status = await api('/api/spotify/status?workspace_id=' + encodeURIComponent(workspaceId || 'spotify')); renderStatus(status); $('scanCancel').classList.toggle('hidden', !status.running); document.title = status.running ? `Searching Spotify… ${status.progress?.completed_work || 0}/${status.progress?.total_work || 0}` : 'CSV to Clone Hero | Spotify workspace'; const scored = Number(status.progress?.completed_tracks || 0); const refreshDue = scored - lastRenderedScored >= 100 && Date.now() - lastWorkspaceRefreshAt >= 10000; if (status.running && refreshDue) { lastRenderedScored = scored; lastWorkspaceRefreshAt = Date.now(); await loadWorkspace(); } if (status.running) setTimeout(pollScan, 1200); else if (['complete','partial','cancelled','interrupted','failed'].includes(status.status)) { await loadWorkspace(); await refreshWorkspaces(); notifyTerminal(status); } } catch (error) { showError('scanStatus', error); setTimeout(pollScan, 1800); } }
- function renderScopePlaylists() { const inaccessible = scopePlaylists.filter(p => p.access_status !== 'accessible'); const visible = scopePlaylists.filter(p => p.access_status === 'accessible' || showInaccessible); $('scopeList').innerHTML = visible.map(p => `<label class="folder"><input type="checkbox" data-scope-playlist="${esc(p.spotify_id)}" ${p.selected ? 'checked' : ''} ${p.access_status !== 'accessible' ? 'disabled' : ''}><span class="folder-copy"><b>${esc(p.name || p.spotify_id)}</b><small class="muted">${p.item_count || 0} tracks · created by ${esc(p.created_by || p.owner_name || p.owner_id || 'Unknown Spotify user')}${p.access_status !== 'accessible' ? ` · ${esc(p.access_status || 'inaccessible')}` : ''}${p.access_status !== 'accessible' && p.access_reason ? ` · ${esc(p.access_reason)}` : ''}</small></span></label>`).join('') || '<p class="muted">Sync Spotify library to load playlists.</p>'; document.querySelectorAll('[data-scope-playlist]').forEach(input => input.addEventListener('change', scopeChanged)); $('showInaccessible').classList.toggle('hidden', !inaccessible.length); $('showInaccessible').textContent = showInaccessible ? `Hide inaccessible playlists (${inaccessible.length})` : `Show inaccessible playlists (${inaccessible.length})`; }
- async function loadScope(value=workspaceId) { try { const query = value ? `?workspace_id=${encodeURIComponent(value)}` : ''; const result = await api('/api/spotify/scope' + query); workspaceId = result.workspace_id; scopeData = result.scope || {}; scopePlaylists = result.playlists || []; showInaccessible = false; scopeSaved = !!(scopeData.playlist_ids?.length || scopeData.include_liked); scopeDirty = false; $('scopePanel').classList.remove('hidden'); $('likedScope').checked = !!scopeData.include_liked; renderScopePlaylists(); refreshEstimate(); renderStatus(latestStatus || {}); } catch (error) { showError('syncStatus', error); } }
- async function refreshEstimate() { if (!scopeSaved && scopeDirty) { $('estimate').textContent = 'Save Scope to calculate the search estimate.'; return; } try { const result = await api('/api/spotify/estimate?workspace_id=' + encodeURIComponent(workspaceId || '')); const e = result.estimate || result; const d = e.duration || {}; const duration = d.available ? ` · initial estimate ${formatDuration(d.lower_seconds)}–${formatDuration(d.upper_seconds)}` : ''; $('estimate').textContent = `${e.selected_tracks || 0} selected · ${e.already_owned || 0} already owned · ${e.logical_query_count || 0} deduplicated queries (${e.reusable_cached_queries || 0} cached, ${e.fresh_queries || 0} fresh) · fallback upper bound ${e.possible_fallback_queries || 0}${duration}`; } catch (_) { $('estimate').textContent = 'Save a non-empty scope to calculate the estimate.'; } }
-$('syncSpotify').addEventListener('click', async () => { try { const result = await api('/api/spotify/inventory', {method:'POST'}); workspaceId = result.workspace_id; pollScan(); } catch (error) { showError('syncStatus', error); } });
- function scopeChanged() { scopeDirty = true; scopeSaved = false; $('scopeSaveHint').textContent = 'Scope changed. Save Scope before finding charts.'; $('scan').disabled = true; refreshEstimate(); }
- $('scopeAll').addEventListener('click', () => { document.querySelectorAll('[data-scope-playlist]').forEach(input => { if (!input.disabled) input.checked = true; }); scopeChanged(); }); $('scopeNone').addEventListener('click', () => { document.querySelectorAll('[data-scope-playlist]').forEach(input => input.checked = false); scopeChanged(); }); $('likedScope').addEventListener('change', scopeChanged);
-$('showInaccessible').addEventListener('click', () => { showInaccessible = !showInaccessible; renderScopePlaylists(); });
- $('saveScope').addEventListener('click', async () => { try { const playlist_ids = [...document.querySelectorAll('[data-scope-playlist]:checked')].map(input => input.dataset.scopePlaylist); const result = await api('/api/spotify/scope', {method:'POST', headers:jsonHeaders, body:JSON.stringify({workspace_id:workspaceId, playlist_ids, include_liked:$('likedScope').checked})}); scopeData = result.scope; scopeSaved = !!(playlist_ids.length || $('likedScope').checked); scopeDirty = false; $('scopeSaveHint').textContent = scopeSaved ? 'Scope saved. You can now find charts.' : 'Choose at least one playlist or enable Liked Songs.'; showOk('syncStatus', scopeSaved ? 'Scope saved.' : 'Scope cleared.'); refreshEstimate(); renderStatus(latestStatus || {}); } catch (error) { showError('syncStatus', error); } });
-$('scanCancel').addEventListener('click', async () => { try { await api('/api/spotify/scan/cancel', {method:'POST'}); } catch (error) { showError('scanStatus', error); } });
- $('scan').addEventListener('click', async () => { try { if (completedUiApplied && !confirm('A saved discovery already exists. Run discovery again using the selected scope?')) return; completedUiApplied = false; lastRenderedScored = 0; const result = await api('/api/spotify/scan', body({})); workspaceId = result.workspace_id; pollScan(); } catch (error) { showError('scanStatus', error); } });
-$('pickInventoryPath').addEventListener('click', async () => { try { const result = await api('/api/spotify/path/pick', {method:'POST'}); if (result.path) $('inventoryPath').value = result.path; } catch (error) { showError('inventoryStatus', error); } });
-$('inventoryStart').addEventListener('click', async () => { try { $('inventoryStatus').textContent = 'Scanning Songs folder...'; const result = await api('/api/spotify/library-import', {method:'POST', headers:jsonHeaders, body:JSON.stringify({path:$('inventoryPath').value})}); const createdNote = result.created ? 'Folder created and linked: ' : ''; showOk('inventoryStatus', `${createdNote}${Number(result.valid || 0).toLocaleString()} valid charts linked · ${Number(result.invalid || 0).toLocaleString()} broken. Owned songs are now skipped during discovery.`); await loadInventoryStatus(); await refreshEstimate(); } catch (error) { showError('inventoryStatus', error); } });
-$('inventoryVerify').addEventListener('click', async () => { try { $('inventoryStatus').textContent = 'Verifying linked library...'; const result = await api('/api/spotify/library/verify', {method:'POST'}); showOk('inventoryStatus', `Verified: ${Number(result.valid || 0).toLocaleString()} valid · ${Number(result.invalid || 0).toLocaleString()} broken · ${result.writable ? 'writable' : 'NOT writable'}.`); await loadInventoryStatus(); await refreshEstimate(); } catch (error) { showError('inventoryStatus', error); } });
-$('inventoryIssuesButton').addEventListener('click', async () => { try { const result = await api('/api/spotify/library/issues'); const total = result.broken.length + result.suspicious.length + result.duplicates.length; if (!total) { showOk('inventoryIssues', 'Folder health check: no broken, suspicious, or duplicate files found.'); $('inventoryClean').classList.add('hidden'); return; } showError('inventoryIssues', `Folder health check: ${result.broken.length} broken · ${result.suspicious.length} suspicious · ${result.duplicates.length} duplicate groups. Quarantining moves problem files to a quarantine folder beside the library; nothing is deleted.`); $('inventoryClean').classList.remove('hidden'); } catch (error) { showError('inventoryIssues', error); } });
-$('inventoryClean').addEventListener('click', async () => { if (!confirm('Move broken, suspicious, and duplicate charts out of the Songs folder into a quarantine folder? Nothing is deleted.')) return; try { const result = await api('/api/spotify/library/clean', {method:'POST', headers:jsonHeaders, body:JSON.stringify({scope:'all'})}); showOk('inventoryIssues', `Quarantined ${result.moved} files to ${result.quarantine}.`); $('inventoryClean').classList.add('hidden'); await loadInventoryStatus(); await refreshEstimate(); } catch (error) { showError('inventoryIssues', error); } });
-$('notifications').addEventListener('click', async () => { if (!('Notification' in window)) return showError('syncStatus', new Error('Browser notifications are not supported.')); const permission = await Notification.requestPermission(); localStorage.setItem('spotifyNotifications', permission === 'granted' ? 'enabled' : 'disabled'); $('notifications').textContent = permission === 'granted' ? 'Notifications enabled' : 'Notifications blocked'; });
-function notifyTerminal(status) { const id = `${status.workspace_id || workspaceId}:${status.finished_at || status.status}`; if (notifiedJob === id) return; notifiedJob = id; if (localStorage.getItem('spotifyNotifications') === 'enabled' && window.Notification && Notification.permission === 'granted') new Notification(`Spotify discovery ${status.status}`, {body: status.message || status.error || 'Discovery finished.'}); }
- $('selectRecommended').addEventListener('click', async () => { try { await api('/api/spotify/select-recommended', body({})); await loadWorkspace(); await refreshWorkspaces(); } catch (error) { alert(error.message); } });
-$('clearAll').addEventListener('click', async () => { try { await api('/api/spotify/select-all', body({clear:true})); await loadWorkspace(); await refreshWorkspaces(); } catch (error) { alert(error.message); } });
- $('filter').addEventListener('input', () => { clearTimeout(filterTimer); filterTimer = setTimeout(() => loadTracks(currentFolder, currentLiked, false), 250); }); $('trackView').addEventListener('change', () => loadTracks(currentFolder, currentLiked, false)); $('loadMoreTracks').addEventListener('click', () => loadTracks(currentFolder, currentLiked, true)); $('allFolder').addEventListener('click', () => loadTracks(null, false, false));
- $('loadWorkspaceButton').addEventListener('click', async () => { const selected = Number($('workspacePicker').value); if (!selected) return; workspaceId = selected; completedUiApplied = false; await loadScope(selected); await loadWorkspace(selected); await refreshWorkspaces(); const status = await api('/api/spotify/status?workspace_id=' + selected); renderStatus(status); showOk('workspaceSaveStatus', 'Saved workspace loaded.'); $('reviewStatus').scrollIntoView({behavior:'smooth', block:'start'}); }); $('workspacePicker').addEventListener('change', () => renderWorkspaceSummary(savedWorkspaces.find(item => Number(item.id) === Number($('workspacePicker').value))));
- $('saveWorkspace').addEventListener('click', async () => { try { $('workspaceSaveStatus').textContent = 'Checkpointing workspace...'; const result = await api('/api/spotify/workspace/save', body({})); $('workspaceSaveStatus').textContent = `${result.candidates.toLocaleString()} candidates and ${result.selections} selections saved locally.`; await refreshWorkspaces(); } catch (error) { showError('workspaceSaveStatus', error); } });
-function artistHtml(artist) { return `<label class="folder"><input type="checkbox" data-artist="${esc(artist.artist_norm)}" ${artist.selected ? 'checked' : ''} ${artist.eligible ? '' : 'disabled'}><span class="folder-copy"><b>${esc(artist.artist_name)}</b><small class="muted">${artist.track_count} library songs · cap ${artist.cap}</small></span></label>`; }
-async function loadArtists() { try { const result = await api('/api/spotify/expansion/artists?workspace_id=' + workspaceId); $('artists').innerHTML = (result.artists || []).map(artistHtml).join('') || '<p class="muted">No primary artists found.</p>'; } catch (_) {} }
-$('expansionStart').addEventListener('click', async () => { const artists = [...document.querySelectorAll('[data-artist]:checked')].map(input => input.dataset.artist); try { await api('/api/spotify/expansion/artists/select', body({artists:artists.map(artist_norm => ({artist_norm,selected:true}))})); const result = await api('/api/spotify/expansion/start', body({artist_norms:artists})); workspaceId = result.workspace_id; $('expansionStatus').textContent = 'Expansion search started...'; pollScan(); } catch (error) { showError('expansionStatus', error); } });
-async function checkPath() { try { const result = await api('/api/spotify/path/check', body({path:$('exportPath').value})); if (result.ok) showOk('pathStatus', result.resolved); else showError('pathStatus', new Error(result.error)); } catch (error) { showError('pathStatus', error); } }
-$('checkPath').addEventListener('click', checkPath); $('pickPath').addEventListener('click', async () => { try { const result = await api('/api/spotify/path/pick', {method:'POST'}); if (result.path) { $('exportPath').value = result.path; checkPath(); } } catch (error) { showError('pathStatus', error); } });
-function setExportButtons(disabled) { ['exportLinked','downloadZip','exportFolder','exportZip'].forEach(id => { const el = $(id); if (el) el.disabled = disabled; }); }
-let exportPollTimer = null;
-async function pollExport() {
-  try {
-    const status = await api('/api/spotify/export/status');
-    $('exportLog').innerHTML = (status.recent_events || []).map(event => `<div>${esc(event.message)}</div>`).join('');
-    if (status.total > 0) {
-      const pct = Math.max(2, Math.round(100 * status.done / status.total));
-      $('exportProgressFill').style.width = pct + '%';
-      if (status.current === 'Checking download sizes') {
-        $('exportProgressText').textContent = `Checking download sizes ${status.done}/${status.total} — rate-limited, this phase can take several minutes`;
-      } else {
-        const label = status.current ? ' · ' + status.current.split('/').pop() : '';
-        $('exportProgressText').textContent = `Exporting ${status.done}/${status.total}${label}`;
-      }
-    } else {
-      $('exportProgressText').textContent = status.status === 'starting' ? 'Starting export...' : 'Preparing export...';
-    }
-    if (status.running) { exportPollTimer = setTimeout(pollExport, 800); return; }
-    exportPollTimer = null;
-    $('exportProgressWrap').classList.add('hidden');
-    setExportButtons(false);
-    if (status.status === 'complete' && status.result) {
-      const result = status.result;
-      const failures = (result.items || []).filter(item => item.status === 'failed' || item.result === 'artifact_failed');
-      if (result.success === false && failures.length === 0) throw new Error((result.errors || ['export failed']).join('; '));
-      const skipped = (result.items || []).filter(item => item.result === 'already_present').length;
-      if (result.download_url) {
-        const link = document.createElement('a'); link.href = result.download_url; link.download = 'clone-hero-charts.zip'; document.body.appendChild(link); link.click(); link.remove();
-        showOk('exportStatus', `Prepared ${result.published || 0} charts. Choose a folder in this browser's download dialog.`);
-      } else {
-        let message = `${result.published || 0} charts exported to ${result.destination}${skipped ? ` · ${skipped} already present` : ''}`;
-        if (failures.length) message += ` · ${failures.length} failed (see log)`;
-        if (failures.length) showError('exportStatus', new Error(message)); else showOk('exportStatus', message);
-      }
-      await loadInventoryStatus();
-      await loadTray();
-    } else {
-      showError('exportStatus', new Error(status.error || 'export failed'));
-    }
-  } catch (error) {
-    exportPollTimer = null;
-    $('exportProgressWrap').classList.add('hidden');
-    setExportButtons(false);
-    showError('exportStatus', error);
-  }
-}
-async function startExport(kind, path, browserDownload=false) {
-  if (exportPollTimer) { clearTimeout(exportPollTimer); exportPollTimer = null; }
-  $('exportStatus').textContent = ''; $('exportStatus').className = 'statusline';
-  $('exportProgressWrap').classList.remove('hidden');
-  $('exportProgressText').textContent = 'Starting export...';
-  $('exportProgressFill').style.width = '2%';
-  $('exportLog').innerHTML = '';
-  setExportButtons(true);
-  try {
-    await api('/api/spotify/export/start', body({kind, path, browser_download:browserDownload}));
-    pollExport();
-  } catch (error) {
-    showError('exportStatus', error);
-    $('exportProgressWrap').classList.add('hidden');
-    setExportButtons(false);
-  }
-}
-function runExport(mode) { const path = mode === 'folder' ? $('exportPath').value : $('zipPath').value; startExport(mode, path); }
-$('exportFolder').addEventListener('click', () => runExport('folder')); $('exportZip').addEventListener('click', () => runExport('zip'));
-$('syncExport').addEventListener('click', async () => { try { const result = await api('/api/spotify/export/sync', body({path:$('exportPath').value})); showOk('exportStatus', `${result.removed_paths?.length || 0} stale managed files removed.`); } catch (error) { showError('exportStatus', error); } });
-$('downloadZip').addEventListener('click', () => startExport('zip', '', true));
-$('exportLinked').addEventListener('click', () => { if (!linkedLibraryPath) { showError('exportStatus', new Error('Link a Songs folder first.')); return; } startExport('folder', linkedLibraryPath); });
-if (publicMode) { $('serverExport').classList.add('hidden'); $('remoteExport').classList.remove('hidden'); $('pickInventoryPath').classList.add('hidden'); $('remoteHint').classList.remove('hidden'); }
-Promise.all([refreshWorkspaces(), loadInventoryStatus(), loadLibraryCandidates()]).then(() => authStatus()).then(() => api('/api/spotify/status?workspace_id=' + encodeURIComponent(workspaceId || 'spotify')).then(status => { workspaceId = workspaceId || status.workspace_id; renderStatus(status); if (status.running) pollScan(); else if (['complete','partial','cancelled','interrupted','failed'].includes(status.status)) notifyTerminal(status); }));
-</script>
-</body>
-</html>'''
+const publicMode = __PUBLIC_MODE__; const lanAccessToken = __LAN_ACCESS_TOKEN__; const $=id=>document.getElementById(id);let workspaceId=null;
+async function api(url,opt){const r=await fetch(url,opt);const d=await r.json().catch(()=>({}));if(!r.ok)throw Error(d.error||'Request failed');return d}
+ function render(d){workspaceId=d.workspace_id||workspaceId;const s=d.sources||[];const c=d.combined||{};$('summary').innerHTML=(s.length?s.map(x=>`<div><b>${x.provider}</b> (${x.source_key}): ${x.tracks||0} unique songs, ${x.provenance||0} source records, ${x.skipped_rows||0} skipped, ${x.duplicate_rows||0} duplicates</div>`).join(''):'No sources imported yet.')+`<p><b>Combined:</b> ${c.tracks||0} songs, ${c.artists||0} artists</p>`;$('find').disabled=!c.tracks;if(d.run_id&&d.diagnostics_url)$('diagnostics').innerHTML=`Run <code>${d.run_id}</code> | <a href="${d.diagnostics_url}">Download diagnostics</a>`}
+async function refresh(){try{render(await api('/api/sources'))}catch(e){$('summary').textContent=e.message}}
+$('soundcloudImport').onclick=async()=>{const f=$('soundcloudFile').files[0];if(!f)return $('soundcloudMsg').textContent='Choose a CSV or JSON export first.';$('soundcloudImport').disabled=true;try{const fd=new FormData;fd.append('file',f);const d=await api('/api/sources/soundcloud/import',{method:'POST',body:fd});workspaceId=d.workspace_id;$('soundcloudMsg').textContent=`Imported ${d.source.tracks} SoundCloud songs.`;render(d)}catch(e){$('soundcloudMsg').textContent=e.message}finally{$('soundcloudImport').disabled=false}};$('spotifyConnect').onclick=async()=>{try{const d=await api('/api/auth/spotify/start');location.href=d.authorization_url}catch(e){alert(e.message)}};
+ $('refresh').onclick=async()=>{try{const d=await api('/api/sources');render(d);const s=await api('/api/discovery/status?workspace_id='+workspaceId);if(s.diagnostics_url)$('diagnostics').innerHTML=`Run <code>${s.run_id}</code> | <a href="${s.diagnostics_url}">Download diagnostics</a>`}catch(e){$('summary').textContent=e.message}};$('find').onclick=async()=>{try{const d=await api('/api/discovery/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({source:'combined',workspace_id:workspaceId})});$('progress').textContent='Catalog matching started...';const timer=setInterval(async()=>{const s=await api('/api/discovery/status?workspace_id='+workspaceId);$('progress').textContent=s.message||s.phase||'Matching...';if(!s.running){clearInterval(timer);if(s.diagnostics_url)$('diagnostics').innerHTML=`Run <code>${s.run_id}</code> | <a href="${s.diagnostics_url}">Download diagnostics</a>`;if(s.result){$('review').style.display='block';const r=s.result;$('cards').textContent=r.candidates?`${r.candidates} chart candidates found; review them in Advanced.`:(!r.catalog_available?`Catalog unavailable: ${r.catalog_diagnostic}`:r.exact_hits?`All ${r.exact_hits} exact songs had candidates rejected by quality rules.`:'No exact catalog hits. Download diagnostics for lookup details.')}}</div>}},1000)}catch(e){$('progress').textContent=e.message}};refresh();
+</script></body></html>'''
+
+
+
 
 
 _ADVANCED_PAGE = """<!doctype html>
@@ -4886,23 +6212,21 @@ _ADVANCED_PAGE = """<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>CSV to Clone Hero - Advanced</title>
+<title>CSV to Clone Hero | CSV &amp; music-file import</title>
 <style>
-  :root { color-scheme: dark; }
-  * { box-sizing: border-box; }
-  body { font-family: "Segoe UI", system-ui, sans-serif; background: #12151c;
-         color: #e6e9ef; margin: 0; }
-  main { max-width: 760px; margin: 0 auto; padding: 24px 16px 64px; }
-  h1 { font-size: 1.6rem; margin: 8px 0 4px; }
-  h2 { font-size: 1.05rem; margin: 28px 0 8px; color: #8fd3ff; }
-  .card { background: #1b2130; border: 1px solid #2a3247; border-radius: 10px;
-          padding: 16px; margin-top: 10px; }
-  .muted { color: #9aa4b8; font-size: .9rem; }
-  a { color: #8fd3ff; }
-  button { font: inherit; border: 0; border-radius: 8px; padding: 10px 18px;
-           cursor: pointer; background: #2f3a56; color: #e6e9ef; }
-  button.primary { background: #2f7d4f; }
-  button:disabled { opacity: .45; cursor: default; }
+   :root { color-scheme:dark; --ink:#f4f6fa; --muted:#aab3c2; --bg:#11151c; --panel:#1a202a; --line:#354052; --accent:#7cb7ff; --success:#72d4a0; }
+   * { box-sizing:border-box; }
+   body { font-family:"Segoe UI",system-ui,sans-serif; background:linear-gradient(145deg,#111722,#0d1117); color:var(--ink); margin:0; }
+   main { max-width:880px; margin:0 auto; padding:32px 20px 72px; }
+   h1 { font-size:clamp(2rem,5vw,3.5rem); letter-spacing:-.04em; margin:8px 0 4px; }
+   h2 { font-size:1.1rem; margin:32px 0 8px; color:var(--ink); }
+   .card { background:var(--panel); border:1px solid var(--line); border-radius:14px; padding:18px; margin-top:10px; box-shadow:0 12px 30px rgba(0,0,0,.18); }
+   .muted { color:var(--muted); font-size:.9rem; }
+   a { color:var(--accent); }
+   button { font:inherit; border:1px solid var(--line); border-radius:8px; padding:10px 18px; cursor:pointer; background:#273143; color:var(--ink); }
+   button.primary { background:var(--success); border-color:var(--success); color:#07140d; font-weight:800; }
+   button:disabled { opacity:.45; cursor:default; }
+   button:focus-visible, input:focus-visible, a:focus-visible, summary:focus-visible { outline:3px solid var(--accent); outline-offset:3px; }
   .file-row { display: flex; justify-content: space-between; align-items: center;
               padding: 6px 4px; border-bottom: 1px solid #2a3247; }
   .file-row button { padding: 4px 10px; background: #54303a; font-size: .85rem; }
@@ -4931,35 +6255,34 @@ _ADVANCED_PAGE = """<!doctype html>
 </head>
 <body>
 <main>
-  <h1>🎸 CSV to Clone Hero <span class="muted" style="font-size:1rem">— advanced</span></h1>
-  <p class="muted">Turn playlist exports into a Clone Hero library.
-     Library folder: <code>__LIBRARY_ROOT__</code>
-     · <a href="/">← simple mode</a></p>
+   <h1>CSV &amp; music-file import</h1>
+   <p class="muted">Add exported music lists, preview chart matches, review choices, then download selected charts.
+      Library folder: <code>__LIBRARY_ROOT__</code>
+      · <a href="/">← Spotify library workflow</a></p>
 
-  <h2>1 · Get your playlist CSVs</h2>
+   <h2>1 · Add music exports</h2>
   <div class="card">
-    Export each public playlist to CSV with one of these free tools, then come back:
+     Export Spotify playlists to CSV with one of these tools, or add iTunes/Music TXT or XML exports:
     <ul>
       <li><a href="https://www.chosic.com/spotify-playlist-exporter/" target="_blank" rel="noopener">Chosic Spotify Playlist Exporter</a> — log in with Spotify, pick a playlist, download CSV</li>
       <li><a href="https://exportify.net/" target="_blank" rel="noopener">Exportify</a> — log in with Spotify, export playlists to CSV</li>
     </ul>
   </div>
 
-  <h2>2 · Add your CSVs</h2>
-  <div class="card" id="drop">
-    <input type="file" id="picker" accept=".csv" multiple>
-    <span class="muted">or drag &amp; drop CSV files anywhere on this box</span>
+   <h2>2 · Choose files to import</h2>
+   <div class="card" id="drop">
+     <input type="file" id="picker" accept=".csv,.txt,.xml" multiple>
+     <span class="muted">Spotify CSV, iTunes/Music TXT, or iTunes/Music XML · or drag files anywhere on this box</span>
     <div id="files"></div>
   </div>
 
-  <h2>3 · Build the library</h2>
-  <div class="card">
-    <div id="estimate" class="muted">Calculating search estimate...</div>
-    <p class="muted">Exact playlist songs run first. Artist expansion is optional and uses a separate search pass.</p>
-    <button id="exactDry" class="primary">Exact dry run</button>
-    <button id="exactBuild">Exact build</button>
-    <button id="expansionDry">Expansion dry run</button>
-    <button id="expansionBuild">Expansion build</button>
+   <h2>3 · Preview chart matches</h2>
+   <div class="card">
+     <div id="estimate" class="muted">Calculating search estimate...</div>
+     <p class="muted">Preview searches your imported songs without downloading. Review choices before downloading selected charts.</p>
+     <button id="exactDry" class="primary">Preview chart matches</button>
+     <button id="exactBuild">Download selected charts</button>
+     <details style="margin-top:14px"><summary class="muted">Advanced search options</summary><div style="margin-top:10px"><p class="muted">Artist expansion is optional and runs in a separate pass.</p><button id="expansionDry">Preview artist expansion</button><button id="expansionBuild">Download artist expansion charts</button></div></details>
     <div id="jobStatus" class="job-status" aria-live="polite">
       <div class="job-status-head">
         <span><span id="jobDot" class="job-dot"></span><b id="jobHeadline">Ready</b></span>
@@ -4972,11 +6295,10 @@ _ADVANCED_PAGE = """<!doctype html>
     <div id="stages" style="margin-top:12px"></div>
   </div>
 
-  <h2>4 · Review matches <span class="muted">(optional)</span></h2>
+   <h2>4 · Review choices</h2>
   <div class="card">
     <p class="muted">One card represents one Spotify song. The best candidate is shown first;
-       alternatives can be expanded. Accepts and rejects are saved immediately and
-       apply on the next exact pass or build.</p>
+        alternatives can be expanded. Choices save immediately, but affect the next download build—run it again after changing choices.</p>
     <div id="reviewProgress" class="muted"></div>
     <div class="review-toolbar">
       <button id="acceptAll" class="primary">Accept all best review matches</button>
@@ -4988,7 +6310,7 @@ _ADVANCED_PAGE = """<!doctype html>
     <div id="review" style="margin-top:10px"></div>
   </div>
 
-  <h2>5 · Results</h2>
+   <h2>5 · Download and reports</h2>
   <div class="card">
     <div id="summary" class="muted">No results yet — run a dry run first.</div>
     <div class="reports" id="reports" style="margin-top:10px"></div>
@@ -5056,7 +6378,7 @@ async function refreshFiles() {
         <input type="checkbox" ${f.enabled ? 'checked' : ''} onchange="toggleFile('${f.name.replace(/'/g, "\\'")}', this.checked)">
         <span>📄 ${f.name} <span class="muted">(${(f.size/1024).toFixed(0)} KB)</span></span></label>
         <button onclick="delFile('${f.name.replace(/'/g, "\\'")}')">remove</button></div>`).join('')
-    : '<p class="muted">No CSVs yet.</p>';
+    : '<p class="muted">No music exports yet.</p>';
 }
 
 async function toggleFile(name, enabled) {
@@ -5078,7 +6400,7 @@ async function upload(fileList) {
   for (const f of fileList) data.append('files', f);
   const res = await (await fetch('/api/upload', {method: 'POST', body: data})).json();
   if (res.rejected && res.rejected.length)
-    alert('Skipped (not .csv): ' + res.rejected.join(', '));
+    alert('Skipped (supported formats are .csv, .txt, and .xml): ' + res.rejected.join(', '));
   await refreshFiles();
   refreshEstimate();
 }
@@ -5327,282 +6649,6 @@ fetch('/api/status').then(r => r.json()).then(s => {
   setRunButtons(s.running);
   renderJobStatus(s);
   if (s.running) poll(); else renderReview();
-});
-</script>
-</body>
-</html>
-"""
-
-
-_SIMPLE_PAGE = """<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>CSV to Clone Hero</title>
-<style>
-  :root { color-scheme: dark; }
-  * { box-sizing: border-box; }
-  body { font-family: "Segoe UI", system-ui, sans-serif; background: #12151c;
-         color: #e6e9ef; margin: 0; }
-  main { max-width: 680px; margin: 0 auto; padding: 24px 16px 64px; }
-  h1 { font-size: 1.6rem; margin: 8px 0 4px; }
-  h2 { font-size: 1.05rem; margin: 28px 0 8px; color: #8fd3ff; }
-  .card { background: #1b2130; border: 1px solid #2a3247; border-radius: 10px;
-          padding: 16px; margin-top: 10px; }
-  .muted { color: #9aa4b8; font-size: .9rem; }
-  a { color: #8fd3ff; }
-  button { font: inherit; border: 0; border-radius: 8px; padding: 10px 18px;
-           cursor: pointer; background: #2f3a56; color: #e6e9ef; }
-  button.primary { background: #2f7d4f; }
-  button:disabled { opacity: .45; cursor: default; }
-  select, input[type=text] { font: inherit; background: #0d1017; color: #e6e9ef;
-           border: 1px solid #2a3247; border-radius: 8px; padding: 9px 12px; }
-  input[type=text] { width: 100%; }
-  .file-row { display: flex; justify-content: space-between; align-items: center;
-              padding: 6px 4px; border-bottom: 1px solid #2a3247; }
-  .file-row button { padding: 4px 10px; background: #54303a; font-size: .85rem; }
-  #drop { border: 2px dashed #3a4456; border-radius: 10px; text-align: center; }
-  #drop.over { border-color: #8fd3ff; background: #20293d; }
-  .job-track { height: 9px; background: #2a3247; border-radius: 99px; margin-top: 9px; overflow: hidden; }
-  .job-fill { height: 100%; width: 0; background: #8fd3ff; transition: width .25s ease; }
-  #log { background: #0d1017; border: 1px solid #2a3247; border-radius: 8px;
-         padding: 10px 12px; margin-top: 12px; max-height: 240px; overflow-y: auto;
-         font-family: Consolas, "Cascadia Mono", monospace; font-size: .8rem;
-         white-space: pre-wrap; }
-  .ok { color: #6fd08c; }
-  .bad { color: #ff7a7a; }
-  code { background: #0d1017; padding: 1px 6px; border-radius: 5px; }
-  .hidden { display: none; }
-</style>
-</head>
-<body>
-<main>
-  <h1>🎸 CSV to Clone Hero</h1>
-  <p class="muted">Turn your music library exports into a Clone Hero / YARG song library.
-     <a href="/advanced">advanced mode →</a></p>
-
-  <h2>1 · Where does your music live?</h2>
-  <div class="card">
-    <select id="service">
-      <option value="spotify">Spotify</option>
-      <option value="itunes">iTunes / Apple Music</option>
-    </select>
-    <div id="serviceHelp" class="muted" style="margin-top:10px"></div>
-  </div>
-
-  <h2>2 · Drop your export files</h2>
-  <div class="card" id="drop">
-    <input type="file" id="picker" accept=".csv" multiple>
-    <p class="muted" id="dropHint">or drag &amp; drop CSV files anywhere on this box</p>
-    <div id="files" style="text-align:left"></div>
-  </div>
-
-  <h2>3 · Choose the output folder</h2>
-  <div class="card">
-    <input type="text" id="outPath" value="__OUTPUT_DEFAULT__" spellcheck="false">
-    <div id="pathStatus" class="muted" style="margin-top:6px"></div>
-    <p class="muted">This can point straight at your Clone Hero <code>Songs</code> folder.
-       The app state and reports never move.</p>
-    <label class="muted"><input type="checkbox" id="expansion">
-      Also find more songs by my artists</label>
-  </div>
-
-  <div class="card" style="text-align:center">
-    <button id="start" class="primary" disabled>Start</button>
-  </div>
-
-  <div id="jobCard" class="card hidden">
-    <div style="display:flex; justify-content:space-between; gap:12px">
-      <b id="jobHeadline">Working…</b><span id="jobElapsed" class="muted"></span>
-    </div>
-    <div class="job-track"><div id="jobFill" class="job-fill"></div></div>
-    <div id="jobActivity" class="muted" style="margin-top:6px"></div>
-    <div id="log"></div>
-  </div>
-
-  <div id="doneCard" class="card hidden">
-    <h2 style="margin-top:0">Done</h2>
-    <div id="doneCounts"></div>
-    <button id="openFolder" class="primary" style="margin-top:10px">Open folder</button>
-    <span id="openFolderMsg" class="muted" style="margin-left:10px"></span>
-    <p class="muted">Point Clone Hero or YARG at this folder (Settings → Songs) and scan.</p>
-  </div>
-</main>
-<script>
-const $ = (id) => document.getElementById(id);
-let files = [];
-let pathOk = false;
-let jobRunning = false;
-
-const SERVICES = {
-  spotify: {
-    accept: '.csv',
-    hint: 'or drag & drop CSV files anywhere on this box',
-    help: `Export each playlist to CSV with a free tool, then drop the files below:
-      <ul><li><a href="https://www.chosic.com/spotify-playlist-exporter/" target="_blank" rel="noopener">Chosic Spotify Playlist Exporter</a></li>
-      <li><a href="https://exportify.net/" target="_blank" rel="noopener">Exportify</a></li></ul>`
-  },
-  itunes: {
-    accept: '.txt,.xml',
-    hint: 'or drag & drop iTunes .txt / .xml exports anywhere on this box',
-    help: `In iTunes or the Music app: select a playlist, then
-      <b>File → Library → Export Playlist…</b> and choose <i>Plain Text</i> (.txt).
-      For your whole library use <b>File → Library → Export Library…</b> (.xml).`
-  }
-};
-
-function applyService() {
-  const svc = SERVICES[$('service').value];
-  $('serviceHelp').innerHTML = svc.help;
-  $('picker').accept = svc.accept;
-  $('dropHint').textContent = svc.hint;
-}
-$('service').addEventListener('change', applyService);
-applyService();
-
-function updateStart() {
-  const enabledCount = files.filter(f => f.enabled).length;
-  $('start').disabled = !(enabledCount > 0 && pathOk) || jobRunning;
-}
-
-async function refreshFiles() {
-  files = await (await fetch('/api/files')).json();
-  $('files').innerHTML = files.length
-    ? files.map(f => `<div class="file-row" style="${f.enabled ? '' : 'opacity:.5'}"><label style="cursor:pointer;flex:1;display:flex;align-items:center;gap:8px">
-        <input type="checkbox" ${f.enabled ? 'checked' : ''} onchange="toggleFile('${f.name.replace(/'/g, "\\'")}', this.checked)">
-        <span>📄 ${f.name} <span class="muted">(${(f.size/1024).toFixed(0)} KB)</span></span></label>
-        <button onclick="delFile('${f.name.replace(/'/g, "\\'")}')">remove</button></div>`).join('')
-    : '<p class="muted">No files yet.</p>';
-  updateStart();
-}
-
-async function toggleFile(name, enabled) {
-  await fetch('/api/files/toggle', {method: 'POST',
-    headers: {'Content-Type': 'application/json'}, body: JSON.stringify({name, enabled})});
-  await refreshFiles();
-}
-
-async function delFile(name) {
-  await fetch('/api/files/delete', {method: 'POST',
-    headers: {'Content-Type': 'application/json'}, body: JSON.stringify({name})});
-  await refreshFiles();
-}
-
-async function upload(fileList) {
-  const data = new FormData();
-  for (const f of fileList) data.append('files', f);
-  const res = await (await fetch('/api/upload', {method: 'POST', body: data})).json();
-  if (res.rejected && res.rejected.length)
-    alert('Skipped (unsupported type): ' + res.rejected.join(', '));
-  await refreshFiles();
-}
-
-$('picker').addEventListener('change', e => upload(e.target.files));
-const drop = $('drop');
-['dragover','dragenter'].forEach(ev => drop.addEventListener(ev, e => {e.preventDefault(); drop.classList.add('over');}));
-['dragleave','drop'].forEach(ev => drop.addEventListener(ev, e => {e.preventDefault(); drop.classList.remove('over');}));
-drop.addEventListener('drop', e => upload(e.dataTransfer.files));
-
-let pathTimer = null;
-async function checkPath() {
-  const path = $('outPath').value;
-  const res = await (await fetch('/api/output-path/check', {method: 'POST',
-    headers: {'Content-Type': 'application/json'}, body: JSON.stringify({path})})).json();
-  pathOk = res.ok;
-  $('pathStatus').innerHTML = res.ok
-    ? `<span class="ok">✔</span> ${res.resolved}`
-    : `<span class="bad">✖</span> ${res.error}`;
-  updateStart();
-}
-$('outPath').addEventListener('input', () => {
-  clearTimeout(pathTimer);
-  pathTimer = setTimeout(checkPath, 300);
-});
-
-function formatDuration(seconds) {
-  seconds = Math.max(0, Math.floor(Number(seconds) || 0));
-  const minutes = Math.floor(seconds / 60);
-  return minutes ? `${minutes}m ${String(seconds % 60).padStart(2, '0')}s` : `${seconds}s`;
-}
-
-function renderStatus(s) {
-  jobRunning = s.running;
-  const stages = s.stages || [];
-  const progress = s.search_progress || {};
-  const doneStages = stages.filter(st => st.status === 'done').length;
-  const current = stages.findIndex(st => st.status === 'running');
-  const total = Math.max(stages.length, 6);
-  let percent = stages.length ? (doneStages / total) * 100 : 0;
-  if (s.search_active && progress.queries_total) {
-    const stageBase = (doneStages / total) * 100;
-    percent = stageBase + (progress.queries_done / progress.queries_total) * (100 / total);
-  } else if (s.running && current >= 0) {
-    percent = ((doneStages + 0.25) / total) * 100;
-  } else if (!s.running && s.finished_at) {
-    percent = s.error ? Math.min(99, percent) : 100;
-  }
-  $('jobFill').style.width = `${Math.max(0, Math.min(100, percent))}%`;
-  $('jobHeadline').textContent = s.running ? 'Working…'
-    : s.error ? 'Failed' : s.finished_at ? 'Complete' : 'Ready';
-  $('jobActivity').textContent = s.activity || '';
-  const elapsed = s.running && s.started_at
-    ? (Date.now() / 1000 - s.started_at) : s.elapsed_seconds;
-  $('jobElapsed').textContent = elapsed ? formatDuration(elapsed) : '';
-  $('log').textContent = (s.events || [])
-    .map(e => `[${new Date(e.ts * 1000).toLocaleTimeString()}] ${e.message}`)
-    .join('\\n');
-  $('log').scrollTop = $('log').scrollHeight;
-  if (!s.running && s.finished_at && !s.error && s.result) showDone(s.result);
-  updateStart();
-}
-
-function showDone(result) {
-  $('doneCard').classList.remove('hidden');
-  const rows = [
-    ['Songs matched', result.matched],
-    ['Songs without a chart', result.no_match],
-  ];
-  if (result.expansion_selected) rows.push(['Expansion songs selected', result.expansion_selected]);
-  rows.push(['Charts downloaded', result.downloaded]);
-  if (result.download_errors) rows.push(['Download errors', result.download_errors]);
-  $('doneCounts').innerHTML = '<table>' + rows.map(r =>
-    `<tr><td>${r[0]}</td><td style="text-align:right; padding-left:18px"><b>${r[1]}</b></td></tr>`
-  ).join('') + '</table>';
-}
-
-async function poll() {
-  const s = await (await fetch('/api/status')).json();
-  renderStatus(s);
-  if (s.running) setTimeout(poll, 900);
-}
-
-$('start').addEventListener('click', async () => {
-  $('doneCard').classList.add('hidden');
-  $('jobCard').classList.remove('hidden');
-  $('log').textContent = '';
-  const body = {output_dir: $('outPath').value, expansion: $('expansion').checked};
-  const res = await fetch('/api/run/simple', {method: 'POST',
-    headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)});
-  if (!res.ok) {
-    const err = await res.json();
-    alert(err.error || 'Could not start the job.');
-    return;
-  }
-  poll();
-});
-
-$('openFolder').addEventListener('click', async () => {
-  const res = await fetch('/api/open-folder', {method: 'POST'});
-  const body = await res.json();
-  $('openFolderMsg').textContent = res.ok ? '' : (body.error || 'Could not open the folder.');
-});
-
-refreshFiles();
-checkPath();
-fetch('/api/status').then(r => r.json()).then(s => {
-  if (s.running) { $('jobCard').classList.remove('hidden'); poll(); }
-  else renderStatus(s);
 });
 </script>
 </body>

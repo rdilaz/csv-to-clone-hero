@@ -18,7 +18,6 @@ from __future__ import annotations
 import hashlib
 import hmac
 import inspect
-import io
 import json
 import logging
 import os

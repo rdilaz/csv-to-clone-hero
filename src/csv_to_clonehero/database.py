@@ -16,7 +16,7 @@ from typing import Any
 
 from csv_to_clonehero.models import ChartCandidate, Track
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 11
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);
@@ -410,6 +410,128 @@ CREATE TABLE IF NOT EXISTS workspace_expansion_artists (
     UNIQUE (workspace_id, artist_norm)
 );
 
+CREATE TABLE IF NOT EXISTS library_sources (
+    id INTEGER PRIMARY KEY,
+    workspace_id INTEGER NOT NULL REFERENCES discovery_workspaces(id) ON DELETE CASCADE,
+    provider TEXT NOT NULL,
+    source_key TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'active',
+    scope_json TEXT NOT NULL DEFAULT '{}',
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    UNIQUE(workspace_id, provider, source_key)
+);
+CREATE TABLE IF NOT EXISTS source_imports (
+    id INTEGER PRIMARY KEY,
+    workspace_id INTEGER NOT NULL REFERENCES discovery_workspaces(id) ON DELETE CASCADE,
+    source_id INTEGER NOT NULL REFERENCES library_sources(id) ON DELETE CASCADE,
+    status TEXT NOT NULL DEFAULT 'complete',
+    started_at REAL NOT NULL,
+    completed_at REAL,
+    total_rows INTEGER NOT NULL DEFAULT 0,
+    accepted_rows INTEGER NOT NULL DEFAULT 0,
+    skipped_rows INTEGER NOT NULL DEFAULT 0,
+    duplicate_rows INTEGER NOT NULL DEFAULT 0,
+    error TEXT NOT NULL DEFAULT '',
+    report_json TEXT NOT NULL DEFAULT '{}'
+);
+CREATE TABLE IF NOT EXISTS library_tracks (
+    id INTEGER PRIMARY KEY,
+    workspace_id INTEGER NOT NULL REFERENCES discovery_workspaces(id) ON DELETE CASCADE,
+    normalized_artist TEXT NOT NULL,
+    normalized_title TEXT NOT NULL,
+    title TEXT NOT NULL,
+    artist TEXT NOT NULL,
+    album TEXT NOT NULL DEFAULT '',
+    duration_ms INTEGER,
+    isrc TEXT NOT NULL DEFAULT '',
+    url TEXT NOT NULL DEFAULT '',
+    liked INTEGER NOT NULL DEFAULT 0,
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    UNIQUE(workspace_id, normalized_artist, normalized_title)
+);
+CREATE TABLE IF NOT EXISTS library_track_provenance (
+    id INTEGER PRIMARY KEY,
+    library_track_id INTEGER NOT NULL REFERENCES library_tracks(id) ON DELETE CASCADE,
+    source_id INTEGER NOT NULL REFERENCES library_sources(id) ON DELETE CASCADE,
+    source_import_id INTEGER NOT NULL REFERENCES source_imports(id) ON DELETE CASCADE,
+    provider_id TEXT NOT NULL,
+    title TEXT NOT NULL DEFAULT '',
+    artist TEXT NOT NULL DEFAULT '',
+    album TEXT NOT NULL DEFAULT '',
+    isrc TEXT NOT NULL DEFAULT '',
+    url TEXT NOT NULL DEFAULT '',
+    liked INTEGER NOT NULL DEFAULT 0,
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    imported_at REAL NOT NULL,
+    UNIQUE(source_id, provider_id)
+);
+CREATE TABLE IF NOT EXISTS library_playlists (
+    id INTEGER PRIMARY KEY,
+    source_id INTEGER NOT NULL REFERENCES library_sources(id) ON DELETE CASCADE,
+    provider_id TEXT NOT NULL,
+    name TEXT NOT NULL DEFAULT '',
+    liked INTEGER NOT NULL DEFAULT 0,
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    updated_at REAL NOT NULL,
+    UNIQUE(source_id, provider_id)
+);
+CREATE TABLE IF NOT EXISTS library_track_playlists (
+    library_track_id INTEGER NOT NULL REFERENCES library_tracks(id) ON DELETE CASCADE,
+    playlist_id INTEGER NOT NULL REFERENCES library_playlists(id) ON DELETE CASCADE,
+    position INTEGER,
+    PRIMARY KEY(library_track_id, playlist_id)
+);
+CREATE INDEX IF NOT EXISTS idx_library_sources_workspace ON library_sources(workspace_id);
+CREATE INDEX IF NOT EXISTS idx_library_tracks_workspace ON library_tracks(workspace_id);
+
+CREATE TABLE IF NOT EXISTS workspace_expansion_batches (
+    id INTEGER PRIMARY KEY,
+    workspace_id INTEGER NOT NULL REFERENCES discovery_workspaces(id) ON DELETE CASCADE,
+    run_id TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    phase TEXT NOT NULL DEFAULT 'preview',
+    cancel_requested INTEGER NOT NULL DEFAULT 0,
+    selection_fingerprint TEXT NOT NULL,
+    total_artists INTEGER NOT NULL DEFAULT 0 CHECK (total_artists BETWEEN 0 AND 25),
+    completed_artists INTEGER NOT NULL DEFAULT 0,
+    failed_artists INTEGER NOT NULL DEFAULT 0,
+    skipped_artists INTEGER NOT NULL DEFAULT 0,
+    network_requests INTEGER NOT NULL DEFAULT 0,
+    current_artist TEXT NOT NULL DEFAULT '',
+    heartbeat_at REAL NOT NULL,
+    created_at REAL NOT NULL,
+    started_at REAL,
+    completed_at REAL,
+    updated_at REAL NOT NULL,
+    error TEXT,
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    UNIQUE (workspace_id, run_id)
+);
+
+CREATE TABLE IF NOT EXISTS workspace_expansion_batch_artists (
+    id INTEGER PRIMARY KEY,
+    batch_id INTEGER NOT NULL REFERENCES workspace_expansion_batches(id) ON DELETE CASCADE,
+    expansion_artist_id INTEGER REFERENCES workspace_expansion_artists(id) ON DELETE SET NULL,
+    artist_name TEXT NOT NULL,
+    artist_norm TEXT NOT NULL,
+    ordinal INTEGER NOT NULL,
+    preview_status TEXT NOT NULL DEFAULT 'pending',
+    search_status TEXT NOT NULL DEFAULT 'pending',
+    preview_requests INTEGER NOT NULL DEFAULT 0,
+    search_requests INTEGER NOT NULL DEFAULT 0,
+    error TEXT,
+    started_at REAL,
+    completed_at REAL,
+    updated_at REAL NOT NULL,
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    UNIQUE (batch_id, artist_norm),
+    UNIQUE (batch_id, ordinal)
+);
+
 CREATE TABLE IF NOT EXISTS workspace_scope (
     workspace_id INTEGER PRIMARY KEY REFERENCES discovery_workspaces(id) ON DELETE CASCADE,
     playlist_ids_json TEXT NOT NULL DEFAULT '[]',
@@ -522,6 +644,8 @@ CREATE INDEX IF NOT EXISTS idx_discovery_tasks_workspace ON discovery_tasks(work
 CREATE INDEX IF NOT EXISTS idx_workspace_candidates_track ON workspace_candidates(workspace_id, track_id);
 CREATE INDEX IF NOT EXISTS idx_workspace_selections_workspace ON workspace_selections(workspace_id, status);
 CREATE INDEX IF NOT EXISTS idx_workspace_library_tracks_workspace ON workspace_library_tracks(workspace_id, already_owned);
+CREATE INDEX IF NOT EXISTS idx_expansion_batches_workspace ON workspace_expansion_batches(workspace_id, status);
+CREATE INDEX IF NOT EXISTS idx_expansion_batch_artists_status ON workspace_expansion_batch_artists(batch_id, preview_status, search_status);
 CREATE INDEX IF NOT EXISTS idx_inventory_charts_identity ON inventory_charts(root_id, artist_norm, title_norm);
 CREATE INDEX IF NOT EXISTS idx_inventory_charts_freshness ON inventory_charts(root_id, relative_path, mtime_ns, size_bytes);
 CREATE INDEX IF NOT EXISTS idx_export_items_managed ON export_items(managed, target_relpath);
@@ -589,7 +713,36 @@ CREATE TABLE IF NOT EXISTS background_jobs (
     created_at REAL NOT NULL,
     started_at REAL,
     finished_at REAL,
+    cancel_requested INTEGER NOT NULL DEFAULT 0,
+    heartbeat_at REAL,
     updated_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS provider_tokens (
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    provider TEXT NOT NULL,
+    encrypted_refresh_token TEXT NOT NULL DEFAULT '',
+    scope_json TEXT NOT NULL DEFAULT '[]',
+    rotate_version INTEGER NOT NULL DEFAULT 1,
+    updated_at REAL NOT NULL,
+    PRIMARY KEY (user_id, provider)
+);
+
+CREATE TABLE IF NOT EXISTS source_preflights (
+    source_name TEXT PRIMARY KEY,
+    endpoint TEXT NOT NULL,
+    request_version TEXT NOT NULL,
+    checked_at REAL NOT NULL,
+    expires_at REAL NOT NULL,
+    success INTEGER NOT NULL DEFAULT 0,
+    supported INTEGER NOT NULL DEFAULT 0,
+    authoritative INTEGER NOT NULL DEFAULT 0,
+    found INTEGER,
+    out_of INTEGER,
+    returned_count INTEGER NOT NULL DEFAULT 0,
+    page INTEGER,
+    error TEXT NOT NULL DEFAULT '',
+    metadata_json TEXT NOT NULL DEFAULT '{}'
 );
 
 CREATE INDEX IF NOT EXISTS idx_user_sessions_expires ON user_sessions(expires_at);
@@ -890,6 +1043,13 @@ def _normalise_spotify_playlist(value: Any) -> dict[str, Any]:
 
 
 class Database:
+    """SQLite gateway for both local state and public workspace state.
+
+    Connections use foreign keys, a busy timeout, and WAL where supported.
+    Callers should open one instance per thread and close it when the operation
+    ends; the database is the only module that should own SQL persistence.
+    """
+
     def __init__(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(str(path), timeout=30.0)
@@ -968,6 +1128,8 @@ class Database:
                 ("candidate_charts", "diff_vocals_harm2", "INTEGER"),
                 ("candidate_charts", "diff_vocals_harm3", "INTEGER"),
                 ("candidate_charts", "difficulty_fields_json", "TEXT NOT NULL DEFAULT '{}'"),
+                ("background_jobs", "cancel_requested", "INTEGER NOT NULL DEFAULT 0"),
+                ("background_jobs", "heartbeat_at", "REAL"),
             ):
                 self._ensure_column(table, column, definition)
             # Older query rows predate the explicit returned-count field.  This
@@ -977,6 +1139,16 @@ class Database:
                 self._conn.execute(
                     "UPDATE search_queries SET returned_count = result_count "
                     "WHERE returned_count IS NULL OR returned_count = 0"
+                )
+            if current < 11:
+                # Version 10 accidentally persisted the truncation marker as a
+                # literal suffix. Normalize those user workspace keys while
+                # retaining all workspace-scoped rows by updating the parent
+                # key in place.
+                self._conn.execute(
+                    "UPDATE discovery_workspaces "
+                    "SET workspace_key = substr(workspace_key, 1, length(workspace_key) - 5) "
+                    "WHERE workspace_key LIKE 'spotify:u:%[:64]'"
                 )
             row = self._conn.execute("SELECT COUNT(*) AS c FROM schema_version").fetchone()
             if row["c"] == 0:
@@ -1009,6 +1181,127 @@ class Database:
     def get_meta(self, key: str, default: str = "") -> str:
         row = self._conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
         return row["value"] if row else default
+
+    # --------------------------------------------------- neutral library store
+    def upsert_library_snapshot(
+        self,
+        workspace_id: int | str,
+        snapshot: Any,
+        *,
+        scope: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Persist one provider snapshot without replacing other providers."""
+        import time as _time
+
+        from csv_to_clonehero.providers.base import provider_track_to_track
+
+        db_id = self._workspace_db_id(workspace_id)
+        if db_id is None:
+            raise ValueError("workspace is required")
+        now = _time.time()
+        provider = str(snapshot.provider).strip().casefold()
+        source_key = str((snapshot.metadata or {}).get("import", "api")).strip() or "api"
+        report = snapshot.import_report.as_dict() if getattr(snapshot, "import_report", None) else {}
+        with self._conn:
+            source = self._conn.execute(
+                "SELECT id FROM library_sources WHERE workspace_id=? AND provider=? AND source_key=?",
+                (db_id, provider, source_key),
+            ).fetchone()
+            if source:
+                source_id = int(source["id"])
+                self._conn.execute(
+                    "UPDATE library_sources SET status='active', scope_json=?, metadata_json=?, updated_at=? WHERE id=?",
+                    (_json_text(scope or {}, {}), _json_text(snapshot.metadata or {}, {}), now, source_id),
+                )
+            else:
+                cur = self._conn.execute(
+                    "INSERT INTO library_sources(workspace_id,provider,source_key,status,scope_json,metadata_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",
+                    (db_id, provider, source_key, "active", _json_text(scope or {}, {}), _json_text(snapshot.metadata or {}, {}), now, now),
+                )
+                source_id = int(cur.lastrowid)
+            cur = self._conn.execute(
+                "INSERT INTO source_imports(workspace_id,source_id,status,started_at,completed_at,total_rows,accepted_rows,skipped_rows,duplicate_rows,report_json) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (db_id, source_id, "complete", now, now, report.get("total_rows", len(snapshot.tracks)), report.get("accepted_rows", len(snapshot.tracks)), report.get("skipped_rows", 0), report.get("duplicate_rows", 0), _json_text(report, {})),
+            )
+            import_id = int(cur.lastrowid)
+            legacy_tracks = []
+            for value in snapshot.tracks:
+                track = provider_track_to_track(value)
+                legacy_tracks.append(track)
+                self._conn.execute(
+                    """INSERT INTO library_tracks(workspace_id,normalized_artist,normalized_title,title,artist,album,duration_ms,isrc,url,liked,metadata_json,created_at,updated_at)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+                       ON CONFLICT(workspace_id,normalized_artist,normalized_title) DO UPDATE SET
+                         title=excluded.title, artist=excluded.artist, album=CASE WHEN excluded.album!='' THEN excluded.album ELSE library_tracks.album END,
+                         duration_ms=COALESCE(excluded.duration_ms,library_tracks.duration_ms), isrc=CASE WHEN excluded.isrc!='' THEN excluded.isrc ELSE library_tracks.isrc END,
+                         url=CASE WHEN excluded.url!='' THEN excluded.url ELSE library_tracks.url END, liked=MAX(library_tracks.liked,excluded.liked),
+                         metadata_json=excluded.metadata_json, updated_at=excluded.updated_at""",
+                    (db_id, value.artist_norm, value.title_norm, value.title, value.artist, value.album, value.duration_ms, value.isrc, value.url, int(value.liked), _json_text(value.metadata, {}), now, now),
+                )
+                row = self._conn.execute(
+                    "SELECT id FROM library_tracks WHERE workspace_id=? AND normalized_artist=? AND normalized_title=?",
+                    (db_id, value.artist_norm, value.title_norm),
+                ).fetchone()
+                if row:
+                    provider_id = str(value.provider_id or f"{value.artist_norm}|{value.title_norm}")
+                    self._conn.execute(
+                        """INSERT INTO library_track_provenance(library_track_id,source_id,source_import_id,provider_id,title,artist,album,isrc,url,liked,metadata_json,imported_at)
+                           VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(source_id,provider_id) DO UPDATE SET
+                           library_track_id=excluded.library_track_id, source_import_id=excluded.source_import_id, title=excluded.title, artist=excluded.artist,
+                           album=excluded.album, isrc=excluded.isrc, url=excluded.url, liked=excluded.liked, metadata_json=excluded.metadata_json, imported_at=excluded.imported_at""",
+                        (int(row["id"]), source_id, import_id, provider_id, value.title, value.artist, value.album, value.isrc, value.url, int(value.liked), _json_text(value.metadata, {}), now),
+                    )
+            # Keep the existing chart engine projection usable for all callers.
+            stored = self.upsert_spotify_tracks(legacy_tracks)
+            for track in stored:
+                if track.db_id is not None:
+                    self._conn.execute(
+                        "INSERT OR IGNORE INTO workspace_library_tracks(workspace_id,track_id,already_owned,owned_count,membership_json) VALUES(?,?,?,?,?)",
+                        (db_id, track.db_id, 0, 0, "{}"),
+                    )
+        return {"provider": provider, "source_id": source_id, "import_id": import_id, "tracks": len(snapshot.tracks), "report": report}
+
+    def get_neutral_library_tracks(self, workspace_id: int | str, *, provider: str | None = None) -> list[sqlite3.Row]:
+        db_id = self._workspace_db_id(workspace_id)
+        if db_id is None:
+            return []
+        params: list[Any] = [db_id]
+        clause = ""
+        if provider:
+            clause = " AND EXISTS (SELECT 1 FROM library_track_provenance p JOIN library_sources s ON s.id=p.source_id WHERE p.library_track_id=t.id AND s.provider=?)"
+            params.append(str(provider).casefold())
+        return list(self._conn.execute("SELECT t.* FROM library_tracks t WHERE t.workspace_id=?" + clause + " ORDER BY t.artist,t.title", params))
+
+    def get_source_summary(self, workspace_id: int | str, provider: str | None = None) -> list[sqlite3.Row]:
+        db_id = self._workspace_db_id(workspace_id)
+        if db_id is None:
+            return []
+        params: list[Any] = [db_id]
+        clause = ""
+        if provider:
+            clause = " AND s.provider=?"
+            params.append(str(provider).casefold())
+        return list(self._conn.execute(
+            """SELECT s.provider,s.source_key,s.status,COUNT(DISTINCT p.library_track_id) AS tracks,
+                      COUNT(DISTINCT p.provider_id) AS provenance, MAX(i.skipped_rows) AS skipped_rows,
+                      MAX(i.duplicate_rows) AS duplicate_rows, MAX(i.report_json) AS report_json
+                 FROM library_sources s LEFT JOIN library_track_provenance p ON p.source_id=s.id
+                 LEFT JOIN source_imports i ON i.source_id=s.id WHERE s.workspace_id=?""" + clause + " GROUP BY s.id ORDER BY s.provider,s.source_key", params))
+
+    def get_combined_summary(self, workspace_id: int | str) -> dict[str, int]:
+        rows = self.get_neutral_library_tracks(workspace_id)
+        return {"tracks": len(rows), "artists": len({row["normalized_artist"] for row in rows}), "sources": len(self.get_source_summary(workspace_id))}
+
+    def get_track_provenance(self, workspace_id: int | str) -> list[sqlite3.Row]:
+        db_id = self._workspace_db_id(workspace_id)
+        if db_id is None:
+            return []
+        return list(self._conn.execute(
+            """SELECT t.normalized_artist,t.normalized_title,p.provider_id,s.provider,p.title,p.artist,p.album,p.liked
+               FROM library_tracks t JOIN library_track_provenance p ON p.library_track_id=t.id
+               JOIN library_sources s ON s.id=p.source_id WHERE t.workspace_id=? ORDER BY t.artist,t.title""",
+            (db_id,),
+        ))
 
     def get_disabled_files(self) -> set[str]:
         try:
@@ -1585,6 +1878,35 @@ class Database:
 
     save_workspace_scope = set_workspace_scope
 
+    def get_workspace_minimum_score(self, workspace_id: int | str) -> float:
+        """Return the persisted public match threshold, defaulting to 50."""
+        row = self.get_workspace(workspace_id)
+        if row is None:
+            raise ValueError(f"unknown discovery workspace: {workspace_id}")
+        metadata = _load_json(row["metadata_json"], {})
+        try:
+            value = float(metadata.get("minimum_score", 50)) if isinstance(metadata, dict) else 50.0
+        except (TypeError, ValueError):
+            value = 50.0
+        return max(0.0, min(100.0, value))
+
+    def set_workspace_minimum_score(self, workspace_id: int | str, minimum_score: Any) -> float:
+        try:
+            value = float(minimum_score)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("minimum_score must be a number from 0 to 100") from exc
+        if not 0 <= value <= 100:
+            raise ValueError("minimum_score must be a number from 0 to 100")
+        row = self.get_workspace(workspace_id)
+        if row is None:
+            raise ValueError(f"unknown discovery workspace: {workspace_id}")
+        metadata = _load_json(row["metadata_json"], {})
+        if not isinstance(metadata, dict):
+            metadata = {}
+        metadata["minimum_score"] = value
+        self.update_workspace(workspace_id, metadata=metadata)
+        return value
+
     def get_workspace_scope(self, workspace_id: int | str) -> sqlite3.Row | None:
         db_id = self._workspace_db_id(workspace_id)
         return self._conn.execute("SELECT * FROM workspace_scope WHERE workspace_id = ?", (db_id,)).fetchone()
@@ -1667,6 +1989,44 @@ class Database:
                 )
                 recovered += 1
         return recovered
+
+    def recover_discovery_run(self, workspace_id: int | str, run_id: str) -> bool:
+        """Mark one still-active legacy run interrupted, without touching newer runs."""
+        db_id = self._workspace_db_id(workspace_id)
+        now = time.time()
+        message = "The local Spotify worker stopped; cached work can be resumed."
+        with self._conn:
+            row = self._conn.execute(
+                "SELECT id, status, metadata_json FROM discovery_workspaces WHERE id = ?",
+                (db_id,),
+            ).fetchone()
+            if row is None or str(row["status"]) not in {"running", "pending"}:
+                return False
+            metadata = _load_json(row["metadata_json"], {})
+            if not isinstance(metadata, dict) or str(metadata.get("run_id") or "") != str(run_id):
+                return False
+            metadata.update({"interrupted": True, "resume_message": message})
+            self._conn.execute(
+                "UPDATE discovery_workspaces SET status = 'interrupted', phase = 'interrupted', metadata_json = ?, completed_at = ?, updated_at = ? WHERE id = ? AND status IN ('running', 'pending')",
+                (_json_text(metadata, {}), now, now, db_id),
+            )
+            self._conn.execute(
+                "UPDATE discovery_progress SET status = 'interrupted', phase = 'interrupted', message = ?, error = ?, updated_at = ? WHERE workspace_id = ?",
+                (message, message, now, db_id),
+            )
+            self._conn.execute(
+                "UPDATE discovery_tasks SET status = 'interrupted', error = ?, finished_at = ? WHERE workspace_id = ? AND status IN ('running', 'pending')",
+                (message, now, db_id),
+            )
+            self._conn.execute(
+                "UPDATE discovery_scans SET status = 'interrupted', finished_at = ? WHERE workspace_id = ? AND status = 'running'",
+                (now, db_id),
+            )
+            self._conn.execute(
+                "UPDATE workspace_expansion_batches SET status = 'interrupted', phase = 'interrupted', error = ?, completed_at = ?, heartbeat_at = ?, updated_at = ? WHERE workspace_id = ? AND run_id = ? AND status IN ('running', 'pending')",
+                (message, now, now, now, db_id, str(run_id)),
+            )
+        return True
 
     # -------------------------------------------------------- local inventory
     def get_inventory_root(self, root_path: str | Path) -> sqlite3.Row | None:
@@ -2149,6 +2509,63 @@ class Database:
             (str(workspace_id), int(str(workspace_id)) if str(workspace_id).isdigit() else -1),
         ).fetchone()
 
+    def adopt_workspace_key(
+        self,
+        source_key: str,
+        target_key: str,
+        *,
+        name: str = "",
+    ) -> int | None:
+        """Attach an anonymous workspace to a newly authenticated user.
+
+        Anonymous source imports are created before Spotify login. Re-keying the
+        existing parent row preserves every cascaded library/provenance row
+        without copying chart candidates or tokens. If the user already has a
+        workspace, it is left untouched and the existing user workspace ID is
+        returned; callers can safely let the user import again in that rare
+        collision case.
+        """
+        source_key = str(source_key or "")
+        target_key = str(target_key or "")
+        if not source_key or not target_key or source_key == target_key:
+            row = self.get_workspace(target_key or source_key)
+            return int(row["id"]) if row is not None else None
+        with self._conn:
+            source = self._conn.execute(
+                "SELECT id, metadata_json FROM discovery_workspaces WHERE workspace_key = ?",
+                (source_key,),
+            ).fetchone()
+            if source is None:
+                target = self._conn.execute(
+                    "SELECT id FROM discovery_workspaces WHERE workspace_key = ?",
+                    (target_key,),
+                ).fetchone()
+                return int(target["id"]) if target is not None else None
+            target = self._conn.execute(
+                "SELECT id FROM discovery_workspaces WHERE workspace_key = ?",
+                (target_key,),
+            ).fetchone()
+            if target is not None:
+                return int(target["id"])
+            metadata = _load_json(source["metadata_json"], {})
+            if not isinstance(metadata, dict):
+                metadata = {}
+            metadata.pop("anonymous", None)
+            metadata["adopted_from"] = source_key
+            assignments = ["workspace_key = ?", "metadata_json = ?", "updated_at = ?"]
+            values: list[Any] = [target_key, _json_text(metadata, {}), time.time()]
+            if name:
+                assignments.insert(1, "name = ?")
+                values.insert(1, str(name))
+            values.append(int(source["id"]))
+            self._conn.execute(
+                "UPDATE discovery_workspaces SET "
+                + ", ".join(assignments)
+                + " WHERE id = ?",
+                values,
+            )
+            return int(source["id"])
+
     get_discovery_workspace = get_workspace
     get_workspace_by_key = get_workspace
 
@@ -2161,6 +2578,87 @@ class Database:
                 )
             )
         return list(self._conn.execute("SELECT * FROM discovery_workspaces ORDER BY updated_at DESC"))
+
+    def delete_workspace_by_key(self, workspace_key: str) -> int:
+        """Delete one workspace and its cascaded workspace-scoped state."""
+        with self._conn:
+            cur = self._conn.execute(
+                "DELETE FROM discovery_workspaces WHERE workspace_key = ?",
+                (str(workspace_key),),
+            )
+        return int(cur.rowcount)
+
+    def reset_workspace_if_idle(self, workspace_key: str, user_id: int) -> bool:
+        """Atomically clear one workspace unless its owner has an active job."""
+        key = str(workspace_key)
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            if self.get_active_job(int(user_id), workspace_key=key) is not None:
+                self._conn.rollback()
+                return False
+            row = self._conn.execute(
+                "SELECT id FROM discovery_workspaces WHERE workspace_key = ?", (key,)
+            ).fetchone()
+            if row is None:
+                self._conn.commit()
+                return True
+            workspace_id = int(row["id"])
+            for table in (
+                "workspace_selections",
+                "workspace_candidates",
+                "workspace_library_tracks",
+                "workspace_expansion_batches",
+                "workspace_expansion_artists",
+                "spotify_item_statuses",
+                "discovery_tasks",
+                "discovery_scans",
+            ):
+                self._conn.execute(f"DELETE FROM {table} WHERE workspace_id = ?", (workspace_id,))
+            now = time.time()
+            self._conn.execute(
+                """UPDATE discovery_workspaces SET status = 'ready_for_scope',
+                   phase = 'ready_for_scope', total_tasks = 0, completed_tasks = 0,
+                   failed_tasks = 0, total_tracks = 0, completed_tracks = 0,
+                   source_count = 0, error_count = 0, progress_json = '{}',
+                   completed_at = NULL, updated_at = ? WHERE id = ?""",
+                (now, workspace_id),
+            )
+            self._conn.execute(
+                """UPDATE discovery_progress SET phase = 'ready_for_scope',
+                   status = 'ready_for_scope', total_tasks = 0, completed_tasks = 0,
+                   failed_tasks = 0, total_tracks = 0, completed_tracks = 0,
+                   message = '', error = NULL, metadata_json = '{}', updated_at = ?
+                   WHERE workspace_id = ?""",
+                (now, workspace_id),
+            )
+            self._conn.commit()
+            return True
+        except Exception:
+            self._conn.rollback()
+            raise
+
+    def delete_workspace_if_idle(self, workspace_key: str, user_id: int) -> tuple[bool, bool]:
+        """Atomically delete one idle workspace without touching global cache rows."""
+        key = str(workspace_key)
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            if self.get_active_job(int(user_id), workspace_key=key) is not None:
+                self._conn.rollback()
+                return False, False
+            cursor = self._conn.execute(
+                "DELETE FROM discovery_workspaces WHERE workspace_key = ?", (key,)
+            )
+            self._conn.execute(
+                """UPDATE background_jobs SET workspace_key = '', updated_at = ?
+                   WHERE user_id = ? AND workspace_key = ?
+                     AND status NOT IN ('queued', 'running')""",
+                (time.time(), int(user_id), key),
+            )
+            self._conn.commit()
+            return True, bool(cursor.rowcount)
+        except Exception:
+            self._conn.rollback()
+            raise
 
     def update_workspace(
         self,
@@ -2316,9 +2814,10 @@ class Database:
             self._conn.execute(
                 """INSERT INTO discovery_scans
                    (workspace_id, scan_key, kind, status, started_at, finished_at, metadata_json)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(workspace_id, scan_key) DO UPDATE SET
                       kind = excluded.kind, status = excluded.status,
+                      started_at = excluded.started_at,
                       finished_at = excluded.finished_at,
                       metadata_json = excluded.metadata_json""",
                  (db_id, scan_key, kind, status, now, finished_at, _json_text(data.get("metadata", {}), {})),
@@ -2658,6 +3157,47 @@ class Database:
     record_workspace_match = upsert_workspace_candidate
     persist_workspace_candidate = upsert_workspace_candidate
 
+    def clear_workspace_candidates(
+        self,
+        workspace_id: int | str,
+        kind: str | None = None,
+    ) -> int:
+        """Discard workspace candidate results and their manual selections.
+
+        If kind is specified (e.g. 'expansion'), only removes candidates/selections of that kind.
+        Otherwise removes all candidates and selections for the workspace.
+        """
+        db_id = self._workspace_db_id(workspace_id)
+        with self._conn:
+            if kind:
+                self._conn.execute(
+                    "DELETE FROM workspace_selections WHERE workspace_id = ? AND kind = ?",
+                    (db_id, kind),
+                )
+                cur = self._conn.execute(
+                    "DELETE FROM workspace_candidates WHERE workspace_id = ? AND kind = ?",
+                    (db_id, kind),
+                )
+            else:
+                self._conn.execute(
+                    "DELETE FROM workspace_selections WHERE workspace_id = ?",
+                    (db_id,),
+                )
+                cur = self._conn.execute(
+                    "DELETE FROM workspace_candidates WHERE workspace_id = ?",
+                    (db_id,),
+                )
+        return int(cur.rowcount)
+
+    def clear_workspace_expansion_candidates(self, workspace_id: int | str) -> int:
+        """Discard prior expansion results and their manual selections.
+
+        Expansion is an explicitly confirmed, derived Spotify queue.  A fresh
+        queue must not leave stale artist-wide results selectable alongside
+        the new per-song results.
+        """
+        return self.clear_workspace_candidates(workspace_id, kind="expansion")
+
     def upsert_workspace_candidates(
         self,
         workspace_id: int | str,
@@ -2829,6 +3369,7 @@ class Database:
         metadata: Mapping[str, Any] | None = None,
         candidate_id: Any = None,
         force: bool = False,
+        require_workspace_candidate: bool = False,
     ) -> int:
         db_id = self._workspace_db_id(workspace_id)
         if candidate is None:
@@ -2853,7 +3394,13 @@ class Database:
                    ORDER BY id DESC LIMIT 1""",
                 (db_id, candidate_id, kind),
             ).fetchone()
+        if check is None and require_workspace_candidate:
+            raise ValueError("candidate does not belong to this workspace track")
         if check:
+            breakdown = _load_json(check["breakdown_json"], {})
+            gate_factors = breakdown.get("gate_factors", {}) if isinstance(breakdown, Mapping) else {}
+            if isinstance(gate_factors, Mapping) and gate_factors.get("hard_gate"):
+                raise ValueError("candidate is blocked by a hard compatibility gate")
             blocked = {"excluded", "incompatible", "reject", "rejected", "not_exportable"}
             if str(check["eligibility"] or "").lower() in blocked or str(check["decision"] or "").lower() in blocked:
                 if not force or str(check["eligibility"] or "").lower() == "incompatible":
@@ -3155,9 +3702,26 @@ class Database:
         artists: Iterable[Mapping[str, Any] | Any],
     ) -> list[int]:
         db_id = self._workspace_db_id(workspace_id)
+        values = list(artists)
+        norms = [
+            str(_first_value(_as_mapping(value), "artist_norm", "normalized", default="") or "")
+            for value in values
+        ]
         ids: list[int] = []
         with self._conn:
-            for value in artists:
+            if norms:
+                placeholders = ",".join("?" for _ in norms)
+                self._conn.execute(
+                    f"DELETE FROM workspace_expansion_artists WHERE workspace_id = ? "
+                    f"AND artist_norm NOT IN ({placeholders})",
+                    (db_id, *norms),
+                )
+            else:
+                self._conn.execute(
+                    "DELETE FROM workspace_expansion_artists WHERE workspace_id = ?",
+                    (db_id,),
+                )
+            for value in values:
                 data = _as_mapping(value)
                 name = str(_first_value(data, "artist_name", "name", "artist", default="") or "")
                 norm = str(_first_value(data, "artist_norm", "normalized", default=name) or name)
@@ -3187,6 +3751,31 @@ class Database:
                 ).fetchone()
                 ids.append(int(row["id"]) if row else int(cur.lastrowid))
         return ids
+
+    def clear_workspace_expansion_artists(self, workspace_id: int | str) -> int:
+        """Discard expansion artist choices and cached discography previews."""
+        db_id = self._workspace_db_id(workspace_id)
+        with self._conn:
+            cur = self._conn.execute(
+                "DELETE FROM workspace_expansion_artists WHERE workspace_id = ?",
+                (db_id,),
+            )
+        return int(cur.rowcount)
+
+    def update_workspace_expansion_artist_metadata(
+        self,
+        workspace_id: int | str,
+        artist_norm: str,
+        metadata: Mapping[str, Any],
+    ) -> None:
+        """Update one artist preview without replacing the workspace artist list."""
+        db_id = self._workspace_db_id(workspace_id)
+        with self._conn:
+            self._conn.execute(
+                """UPDATE workspace_expansion_artists SET metadata_json = ?
+                   WHERE workspace_id = ? AND artist_norm = ?""",
+                (_json_text(metadata, {}), db_id, artist_norm),
+            )
 
     def set_expansion_artist_selected(
         self,
@@ -3219,6 +3808,435 @@ class Database:
         return list(self._conn.execute(sql, params))
 
     list_expansion_artists = get_workspace_expansion_artists
+
+    # ---------------------------------------------- durable expansion batches
+    def create_expansion_batch(
+        self,
+        workspace_id: int | str,
+        artists: Iterable[Mapping[str, Any] | Any],
+        *,
+        run_id: str = "",
+        selection_fingerprint: str = "",
+        status: str = "pending",
+        phase: str = "preview",
+        metadata: Mapping[str, Any] | None = None,
+    ) -> int:
+        """Create a durable, ordered batch for at most 25 existing artists."""
+        db_id = self._workspace_db_id(workspace_id)
+        values = list(artists)
+        if len(values) > 25:
+            raise ValueError("artist expansion batches may contain at most 25 artists")
+        resolved: list[sqlite3.Row] = []
+        seen: set[str] = set()
+        for value in values:
+            data = _as_mapping(value)
+            if not data and isinstance(value, str):
+                data = {"artist_norm": value}
+            norm = str(_first_value(data, "artist_norm", "normalized", default="") or "")
+            if not norm or norm in seen:
+                continue
+            row = self._conn.execute(
+                """SELECT * FROM workspace_expansion_artists
+                   WHERE workspace_id = ? AND artist_norm = ?""",
+                (db_id, norm),
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"unknown workspace expansion artist: {norm}")
+            seen.add(norm)
+            resolved.append(row)
+        if len(resolved) > 25:
+            raise ValueError("artist expansion batches may contain at most 25 artists")
+        actual_run_id = run_id.strip() or uuid.uuid4().hex
+        fingerprint = selection_fingerprint.strip() or hashlib.sha256(
+            "\n".join(sorted(seen)).encode("utf-8")
+        ).hexdigest()
+        now = time.time()
+        started_at = now if status in {"running", "previewing", "searching"} else None
+        with self._conn:
+            cur = self._conn.execute(
+                """INSERT INTO workspace_expansion_batches
+                   (workspace_id, run_id, status, phase, selection_fingerprint,
+                    total_artists, heartbeat_at, created_at, started_at, updated_at,
+                    metadata_json)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    db_id, actual_run_id, status, phase, fingerprint, len(resolved),
+                    now, now, started_at, now, _json_text(metadata or {}, {}),
+                ),
+            )
+            batch_id = int(cur.lastrowid)
+            self._conn.executemany(
+                """INSERT INTO workspace_expansion_batch_artists
+                   (batch_id, expansion_artist_id, artist_name, artist_norm,
+                    ordinal, updated_at) VALUES (?, ?, ?, ?, ?, ?)""",
+                [
+                    (batch_id, row["id"], row["artist_name"], row["artist_norm"], ordinal, now)
+                    for ordinal, row in enumerate(resolved)
+                ],
+            )
+        return batch_id
+
+    def get_expansion_batch(
+        self,
+        batch_id: int | None = None,
+        *,
+        workspace_id: int | str | None = None,
+        run_id: str = "",
+    ) -> sqlite3.Row | None:
+        """Load a batch by id, workspace/run id, or the workspace's latest batch."""
+        if batch_id is not None:
+            return self._conn.execute(
+                "SELECT * FROM workspace_expansion_batches WHERE id = ?", (batch_id,)
+            ).fetchone()
+        if workspace_id is None:
+            raise ValueError("batch_id or workspace_id is required")
+        db_id = self._workspace_db_id(workspace_id)
+        if run_id:
+            return self._conn.execute(
+                """SELECT * FROM workspace_expansion_batches
+                   WHERE workspace_id = ? AND run_id = ?""",
+                (db_id, run_id),
+            ).fetchone()
+        return self._conn.execute(
+            """SELECT * FROM workspace_expansion_batches
+               WHERE workspace_id = ? ORDER BY id DESC LIMIT 1""",
+            (db_id,),
+        ).fetchone()
+
+    load_expansion_batch = get_expansion_batch
+
+    def get_expansion_batch_artists(self, batch_id: int) -> list[sqlite3.Row]:
+        return list(
+            self._conn.execute(
+                """SELECT * FROM workspace_expansion_batch_artists
+                   WHERE batch_id = ? ORDER BY ordinal""",
+                (batch_id,),
+            )
+        )
+
+    list_expansion_batch_artists = get_expansion_batch_artists
+
+    def request_expansion_batch_cancel(self, batch_id: int) -> sqlite3.Row:
+        now = time.time()
+        with self._conn:
+            self._conn.execute(
+                """UPDATE workspace_expansion_batches
+                   SET cancel_requested = 1, heartbeat_at = ?, updated_at = ?
+                   WHERE id = ?""",
+                (now, now, batch_id),
+            )
+        row = self.get_expansion_batch(batch_id)
+        if row is None:
+            raise ValueError(f"unknown expansion batch: {batch_id}")
+        return row
+
+    cancel_expansion_batch = request_expansion_batch_cancel
+
+    def resume_expansion_batch(
+        self,
+        batch_id: int,
+        *,
+        run_id: str = "",
+        phase: str | None = None,
+        retry_failed: bool = False,
+    ) -> sqlite3.Row:
+        """Assign a new run id and continue only unfinished artist phases."""
+        row = self.get_expansion_batch(batch_id)
+        if row is None:
+            raise ValueError(f"unknown expansion batch: {batch_id}")
+        now = time.time()
+        statuses = ["running", "interrupted"]
+        if retry_failed:
+            statuses.append("failed")
+        placeholders = ",".join("?" for _ in statuses)
+        with self._conn:
+            for column in ("preview_status", "search_status"):
+                self._conn.execute(
+                    f"""UPDATE workspace_expansion_batch_artists
+                        SET {column} = 'pending', error = NULL, completed_at = NULL,
+                            updated_at = ?
+                        WHERE batch_id = ? AND {column} IN ({placeholders})""",
+                    (now, batch_id, *statuses),
+                )
+            self._conn.execute(
+                """UPDATE workspace_expansion_batches
+                   SET run_id = ?, status = 'running', phase = ?, cancel_requested = 0,
+                       current_artist = '', heartbeat_at = ?, started_at = ?,
+                       completed_at = NULL, updated_at = ?, error = NULL
+                   WHERE id = ?""",
+                (run_id.strip() or uuid.uuid4().hex, phase or row["phase"], now, now, now, batch_id),
+            )
+            aggregate_phase = "search" if "search" in str(phase or row["phase"]) else "preview"
+            self._refresh_expansion_batch_totals(batch_id, aggregate_phase, now)
+        resumed = self.get_expansion_batch(batch_id)
+        assert resumed is not None
+        return resumed
+
+    def update_expansion_batch(
+        self,
+        batch_id: int,
+        updates: Mapping[str, Any] | None = None,
+        **values: Any,
+    ) -> sqlite3.Row:
+        """Checkpoint batch progress and refresh its heartbeat."""
+        data = dict(updates or {})
+        data.update(values)
+        allowed = {
+            "status", "phase", "cancel_requested", "completed_artists",
+            "failed_artists", "skipped_artists", "network_requests",
+            "current_artist", "error", "metadata_json", "completed_at",
+        }
+        terminal = {"complete", "completed", "partial", "failed", "cancelled", "interrupted"}
+        assignments: list[str] = []
+        params: list[Any] = []
+        if "metadata" in data and "metadata_json" not in data:
+            data["metadata_json"] = data.pop("metadata")
+        for key, value in data.items():
+            if key not in allowed:
+                continue
+            if key == "metadata_json" and not isinstance(value, str):
+                value = _json_text(value, {})
+            if key == "cancel_requested":
+                value = int(bool(value))
+            assignments.append(f"{key} = ?")
+            params.append(value)
+        now = time.time()
+        if str(data.get("status") or "").lower() in terminal and "completed_at" not in data:
+            assignments.append("completed_at = ?")
+            params.append(now)
+        assignments.extend(["heartbeat_at = ?", "updated_at = ?"])
+        params.extend([now, now, batch_id])
+        with self._conn:
+            cur = self._conn.execute(
+                "UPDATE workspace_expansion_batches SET " + ", ".join(assignments) + " WHERE id = ?",
+                params,
+            )
+        if cur.rowcount == 0:
+            raise ValueError(f"unknown expansion batch: {batch_id}")
+        row = self.get_expansion_batch(batch_id)
+        assert row is not None
+        return row
+
+    update_expansion_batch_progress = update_expansion_batch
+    heartbeat_expansion_batch = update_expansion_batch
+
+    def checkpoint_expansion_batch_artist(
+        self,
+        batch_id: int,
+        artist_norm: str,
+        *,
+        phase: str,
+        status: str,
+        request_count: int | None = None,
+        error: str | None = None,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> sqlite3.Row:
+        """Persist one preview/search boundary and refresh aggregate progress."""
+        if phase not in {"preview", "search"}:
+            raise ValueError("expansion artist phase must be 'preview' or 'search'")
+        status_column = f"{phase}_status"
+        requests_column = f"{phase}_requests"
+        terminal = status in {"complete", "completed", "success", "failed", "skipped", "cancelled"}
+        now = time.time()
+        assignments = [f"{status_column} = ?", "error = ?", "updated_at = ?"]
+        params: list[Any] = [status, error, now]
+        if request_count is not None:
+            assignments.append(f"{requests_column} = ?")
+            params.append(max(0, int(request_count)))
+        if metadata is not None:
+            assignments.append("metadata_json = ?")
+            params.append(_json_text(metadata, {}))
+        if status == "running":
+            assignments.append("started_at = COALESCE(started_at, ?)")
+            params.append(now)
+        if terminal:
+            assignments.append("completed_at = ?")
+            params.append(now)
+        params.extend([batch_id, artist_norm])
+        with self._conn:
+            cur = self._conn.execute(
+                "UPDATE workspace_expansion_batch_artists SET " + ", ".join(assignments)
+                + " WHERE batch_id = ? AND artist_norm = ?",
+                params,
+            )
+            if cur.rowcount == 0:
+                raise ValueError(f"unknown expansion batch artist: {artist_norm}")
+            self._refresh_expansion_batch_totals(batch_id, phase, now)
+        row = self._conn.execute(
+            """SELECT * FROM workspace_expansion_batch_artists
+               WHERE batch_id = ? AND artist_norm = ?""",
+            (batch_id, artist_norm),
+        ).fetchone()
+        assert row is not None
+        return row
+
+    def _refresh_expansion_batch_totals(self, batch_id: int, phase: str, now: float) -> None:
+        column = "preview_status" if phase == "preview" else "search_status"
+        counts = self._conn.execute(
+            f"""SELECT
+                  SUM(CASE WHEN {column} IN ('complete', 'completed', 'success') THEN 1 ELSE 0 END) AS completed,
+                  SUM(CASE WHEN {column} = 'failed' THEN 1 ELSE 0 END) AS failed,
+                  SUM(CASE WHEN {column} = 'skipped' THEN 1 ELSE 0 END) AS skipped,
+                  SUM(preview_requests + search_requests) AS requests
+                FROM workspace_expansion_batch_artists WHERE batch_id = ?""",
+            (batch_id,),
+        ).fetchone()
+        self._conn.execute(
+            """UPDATE workspace_expansion_batches SET completed_artists = ?,
+               failed_artists = ?, skipped_artists = ?, network_requests = ?,
+               heartbeat_at = ?, updated_at = ? WHERE id = ?""",
+            (
+                int(counts["completed"] or 0), int(counts["failed"] or 0),
+                int(counts["skipped"] or 0), int(counts["requests"] or 0),
+                now, now, batch_id,
+            ),
+        )
+
+    def mark_active_expansion_batches_interrupted(self) -> int:
+        """Mark durable work left active by a previous process as interrupted."""
+        now = time.time()
+        active = ("created", "pending", "queued", "starting", "running", "previewing", "searching")
+        placeholders = ",".join("?" for _ in active)
+        with self._conn:
+            rows = list(
+                self._conn.execute(
+                    f"SELECT id FROM workspace_expansion_batches WHERE status IN ({placeholders})",
+                    active,
+                )
+            )
+            ids = [int(row["id"]) for row in rows]
+            for batch_id in ids:
+                self._conn.execute(
+                    """UPDATE workspace_expansion_batch_artists SET
+                       preview_status = CASE WHEN preview_status = 'running' THEN 'interrupted' ELSE preview_status END,
+                       search_status = CASE WHEN search_status = 'running' THEN 'interrupted' ELSE search_status END,
+                       updated_at = ? WHERE batch_id = ?""",
+                    (now, batch_id),
+                )
+                self._conn.execute(
+                    """UPDATE workspace_expansion_batches SET status = 'interrupted',
+                       completed_at = ?, heartbeat_at = ?, updated_at = ? WHERE id = ?""",
+                    (now, now, now, batch_id),
+                )
+        return len(ids)
+
+    interrupt_active_expansion_batches = mark_active_expansion_batches_interrupted
+
+    def replace_expansion_artist_candidates(
+        self,
+        workspace_id: int | str,
+        artist_norm: str,
+        candidates: Iterable[Any],
+        *,
+        batch_id: int | None = None,
+        request_count: int | None = None,
+    ) -> list[int]:
+        """Atomically replace one artist's expansion rows and stale selections."""
+        db_id = self._workspace_db_id(workspace_id)
+        prepared: list[dict[str, Any]] = []
+        seen: set[tuple[int | None, int]] = set()
+        for value in candidates:
+            data = _as_mapping(value)
+            candidate = data.get("candidate") or data.get("chart") or data.get("candidate_id") or value
+            candidate_id = self._candidate_db_id(candidate)
+            track_value = data.get("track_id") or data.get("spotify_track_id") or data.get("track")
+            track_id = self._resolve_track_value(track_value) if track_value is not None else None
+            identity = (track_id, candidate_id)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            breakdown = data.get("breakdown_json", data.get("breakdown", {}))
+            score = float(data.get("score", data.get("final_score", 0)) or 0)
+            prepared.append({
+                "candidate_id": candidate_id,
+                "track_id": track_id,
+                "task_id": data.get("task_id"),
+                "score": score,
+                "quality": float(data.get("quality", self._candidate_quality(candidate, breakdown)) or 0),
+                "decision": str(data.get("decision") or ""),
+                "eligibility": str(data.get("eligibility") or ""),
+                "breakdown_json": breakdown if isinstance(breakdown, str) else _json_text(breakdown, {}),
+                "metadata_json": _json_text(data.get("metadata", {}), {}),
+            })
+        now = time.time()
+        ids: list[int] = []
+        with self._conn:
+            self._conn.execute(
+                """DELETE FROM workspace_selections
+                   WHERE workspace_id = ? AND kind = 'expansion' AND artist_norm = ?""",
+                (db_id, artist_norm),
+            )
+            self._conn.execute(
+                """DELETE FROM workspace_candidates
+                   WHERE workspace_id = ? AND kind = 'expansion' AND artist_norm = ?""",
+                (db_id, artist_norm),
+            )
+            for item in prepared:
+                cur = self._conn.execute(
+                    """INSERT INTO workspace_candidates
+                       (workspace_id, track_id, candidate_id, kind, artist_norm,
+                        task_id, score, quality, decision, eligibility,
+                        breakdown_json, metadata_json)
+                       VALUES (?, ?, ?, 'expansion', ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        db_id, item["track_id"], item["candidate_id"], artist_norm,
+                        item["task_id"], item["score"], item["quality"],
+                        item["decision"], item["eligibility"],
+                        item["breakdown_json"] or "{}", item["metadata_json"],
+                    ),
+                )
+                ids.append(int(cur.lastrowid))
+            if batch_id is not None:
+                cur = self._conn.execute(
+                    """UPDATE workspace_expansion_batch_artists SET search_status = 'complete',
+                       search_requests = COALESCE(?, search_requests), error = NULL,
+                       completed_at = ?, updated_at = ?
+                       WHERE batch_id = ? AND artist_norm = ?""",
+                    (request_count, now, now, batch_id, artist_norm),
+                )
+                if cur.rowcount == 0:
+                    raise ValueError(f"unknown expansion batch artist: {artist_norm}")
+                self._refresh_expansion_batch_totals(batch_id, "search", now)
+        return ids
+
+    replace_workspace_expansion_artist_candidates = replace_expansion_artist_candidates
+
+    def clear_workspace_expansion_state(self, workspace_id: int | str) -> None:
+        """Clear expansion-only work while preserving exact discovery state."""
+        db_id = self._workspace_db_id(workspace_id)
+        rows = list(
+            self._conn.execute(
+                """SELECT id, metadata_json FROM workspace_expansion_artists
+                   WHERE workspace_id = ?""",
+                (db_id,),
+            )
+        )
+        with self._conn:
+            self._conn.execute(
+                "DELETE FROM workspace_selections WHERE workspace_id = ? AND kind = 'expansion'",
+                (db_id,),
+            )
+            self._conn.execute(
+                "DELETE FROM workspace_candidates WHERE workspace_id = ? AND kind = 'expansion'",
+                (db_id,),
+            )
+            self._conn.execute(
+                "DELETE FROM workspace_expansion_batches WHERE workspace_id = ?",
+                (db_id,),
+            )
+            for row in rows:
+                try:
+                    metadata = json.loads(str(row["metadata_json"] or "{}"))
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    metadata = {}
+                if not isinstance(metadata, dict):
+                    metadata = {}
+                metadata.pop("discography_preview", None)
+                self._conn.execute(
+                    """UPDATE workspace_expansion_artists
+                       SET selected = 0, metadata_json = ? WHERE id = ?""",
+                    (_json_text(metadata, {}), int(row["id"])),
+                )
 
     def select_expansion_candidate(
         self,
@@ -4735,7 +5753,7 @@ class Database:
         safe = "".join(ch for ch in safe if ch.isalnum() or ch in "._-")
         if not safe:
             safe = "anon"
-        return f"{base}:u:{safe}[:64]"
+        return f"{base}:u:{safe[:64]}"
 
     # ---- users ------------------------------------------------------------
     def upsert_user(self, *, spotify_user_id: str, display_name: str = "", **fields: Any) -> sqlite3.Row:
@@ -4844,6 +5862,37 @@ class Database:
         with self._conn:
             self._conn.execute("DELETE FROM user_tokens WHERE user_id = ?", (user_id,))
 
+    def set_provider_token(
+        self, user_id: int, provider: str, encrypted_refresh_token: str,
+        scope: Iterable[str] = (),
+    ) -> None:
+        """Store a provider-scoped encrypted refresh token."""
+        with self._conn:
+            self._conn.execute(
+                """INSERT INTO provider_tokens
+                   (user_id, provider, encrypted_refresh_token, scope_json, rotate_version, updated_at)
+                   VALUES (?, ?, ?, ?, 1, ?)
+                   ON CONFLICT(user_id, provider) DO UPDATE SET
+                     encrypted_refresh_token = excluded.encrypted_refresh_token,
+                     scope_json = excluded.scope_json,
+                     rotate_version = provider_tokens.rotate_version + 1,
+                     updated_at = excluded.updated_at""",
+                (int(user_id), str(provider), str(encrypted_refresh_token or ""), _json_text(list(scope), []), time.time()),
+            )
+
+    def get_provider_token(self, user_id: int, provider: str) -> sqlite3.Row | None:
+        return self._conn.execute(
+            "SELECT * FROM provider_tokens WHERE user_id = ? AND provider = ?",
+            (int(user_id), str(provider)),
+        ).fetchone()
+
+    def clear_provider_token(self, user_id: int, provider: str) -> None:
+        with self._conn:
+            self._conn.execute(
+                "DELETE FROM provider_tokens WHERE user_id = ? AND provider = ?",
+                (int(user_id), str(provider)),
+            )
+
     # ---- notification email (opt-in, not identity) -------------------------
     def set_user_email(self, user_id: int, email: str) -> None:
         email = str(email or "").strip()
@@ -4860,6 +5909,66 @@ class Database:
         return row["email"] if row else ""
 
     # ---- background jobs ---------------------------------------------------
+    def record_source_preflight(
+        self,
+        result: Mapping[str, Any] | Any,
+        *,
+        ttl_seconds: float,
+    ) -> sqlite3.Row:
+        data = _as_mapping(result)
+        source_name = str(data.get("source_name") or data.get("source") or "").strip()
+        if not source_name:
+            raise ValueError("source preflight requires a source name")
+        checked_at = float(data.get("checked_at") or time.time())
+        expires_at = checked_at + max(1.0, float(ttl_seconds))
+        with self._conn:
+            self._conn.execute(
+                """INSERT INTO source_preflights
+                   (source_name, endpoint, request_version, checked_at, expires_at,
+                    success, supported, authoritative, found, out_of,
+                    returned_count, page, error, metadata_json)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(source_name) DO UPDATE SET
+                     endpoint = excluded.endpoint,
+                     request_version = excluded.request_version,
+                     checked_at = excluded.checked_at,
+                     expires_at = excluded.expires_at,
+                     success = excluded.success,
+                     supported = excluded.supported,
+                     authoritative = excluded.authoritative,
+                     found = excluded.found,
+                     out_of = excluded.out_of,
+                     returned_count = excluded.returned_count,
+                     page = excluded.page,
+                     error = excluded.error,
+                     metadata_json = excluded.metadata_json""",
+                (
+                    source_name,
+                    str(data.get("endpoint") or ""),
+                    str(data.get("request_version") or ""),
+                    checked_at,
+                    expires_at,
+                    int(bool(data.get("success"))),
+                    int(bool(data.get("supported"))),
+                    int(bool(data.get("authoritative"))),
+                    data.get("found"),
+                    data.get("out_of"),
+                    max(0, int(data.get("returned_count") or 0)),
+                    data.get("page"),
+                    str(data.get("error") or "")[:1000],
+                    _json_text(data.get("metadata"), {}),
+                ),
+            )
+        row = self.get_source_preflight(source_name)
+        assert row is not None
+        return row
+
+    def get_source_preflight(self, source_name: str) -> sqlite3.Row | None:
+        return self._conn.execute(
+            "SELECT * FROM source_preflights WHERE source_name = ?",
+            (str(source_name),),
+        ).fetchone()
+
     def create_job(
         self,
         user_id: int,
@@ -4878,6 +5987,47 @@ class Database:
             job_id = int(cursor.lastrowid)
         return self.get_job(job_id)
 
+    def create_or_get_active_job(
+        self,
+        user_id: int,
+        kind: str,
+        *,
+        workspace_key: str = "",
+        notify_email: str = "",
+    ) -> tuple[sqlite3.Row, bool]:
+        """Atomically return an active equivalent job or create one."""
+        key = str(workspace_key or "")
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            existing = self._conn.execute(
+                """SELECT * FROM background_jobs
+                   WHERE user_id = ? AND kind = ? AND workspace_key = ?
+                     AND status IN ('queued', 'running')
+                   ORDER BY id LIMIT 1""",
+                (int(user_id), str(kind), key),
+            ).fetchone()
+            if existing is not None:
+                self._conn.commit()
+                return existing, False
+            now = time.time()
+            cursor = self._conn.execute(
+                """INSERT INTO background_jobs
+                   (user_id, kind, status, phase, message, error, workspace_key,
+                    notify_email, created_at, updated_at)
+                   VALUES (?, ?, 'queued', 'queued', '', '', ?, ?, ?, ?)""",
+                (int(user_id), str(kind), key, str(notify_email or ""), now, now),
+            )
+            row = self._conn.execute(
+                "SELECT * FROM background_jobs WHERE id = ?",
+                (int(cursor.lastrowid),),
+            ).fetchone()
+            self._conn.commit()
+            assert row is not None
+            return row, True
+        except Exception:
+            self._conn.rollback()
+            raise
+
     def get_job(self, job_id: int) -> sqlite3.Row | None:
         return self._conn.execute("SELECT * FROM background_jobs WHERE id = ?", (int(job_id),)).fetchone()
 
@@ -4892,6 +6042,52 @@ class Database:
             "SELECT * FROM background_jobs WHERE status IN ('queued', 'running') ORDER BY id"
         ))
 
+    def get_active_job(
+        self,
+        user_id: int,
+        *,
+        workspace_key: str,
+        kind: str = "discovery",
+        exclude_job_id: int | None = None,
+    ) -> sqlite3.Row | None:
+        sql = (
+            "SELECT * FROM background_jobs WHERE user_id = ? AND kind = ? "
+            "AND workspace_key = ? AND status IN ('queued', 'running')"
+        )
+        values: list[Any] = [int(user_id), str(kind), str(workspace_key or "")]
+        if exclude_job_id is not None:
+            sql += " AND id != ?"
+            values.append(int(exclude_job_id))
+        sql += " ORDER BY id LIMIT 1"
+        return self._conn.execute(sql, values).fetchone()
+
+    def recover_running_jobs(self) -> int:
+        """Mark jobs owned by a previous server process as interrupted."""
+        now = time.time()
+        with self._conn:
+            cursor = self._conn.execute(
+                """UPDATE background_jobs
+                   SET status = 'interrupted', phase = 'interrupted',
+                       error = 'The server stopped while this job was running.',
+                       finished_at = ?, updated_at = ?
+                   WHERE status = 'running'""",
+                (now, now),
+            )
+        return int(cursor.rowcount or 0)
+
+    def request_job_cancel(self, job_id: int) -> sqlite3.Row | None:
+        now = time.time()
+        with self._conn:
+            self._conn.execute(
+                """UPDATE background_jobs SET cancel_requested = 1,
+                   status = CASE WHEN status = 'queued' THEN 'cancelled' ELSE status END,
+                   phase = CASE WHEN status = 'queued' THEN 'cancelled' ELSE phase END,
+                   finished_at = CASE WHEN status = 'queued' THEN ? ELSE finished_at END,
+                   updated_at = ? WHERE id = ? AND status IN ('queued', 'running')""",
+                (now, now, int(job_id)),
+            )
+        return self.get_job(job_id)
+
     def update_job(
         self,
         job_id: int,
@@ -4905,6 +6101,8 @@ class Database:
         started_at: float | None = None,
         finished_at: float | None = None,
         workspace_key: str | None = None,
+        cancel_requested: bool | None = None,
+        heartbeat_at: float | None = None,
     ) -> sqlite3.Row:
         fields_to_set = {
             "phase": phase,
@@ -4913,12 +6111,16 @@ class Database:
             "started_at": started_at,
             "finished_at": finished_at,
             "workspace_key": workspace_key,
+            "heartbeat_at": heartbeat_at,
         }
         assignments: list[str] = []
         values: list[Any] = []
         if status is not None:
             assignments.append("status = ?")
             values.append(status)
+        if cancel_requested is not None:
+            assignments.append("cancel_requested = ?")
+            values.append(int(bool(cancel_requested)))
         for column, value in fields_to_set.items():
             if value is not None:
                 if column == "started_at":
@@ -4949,9 +6151,9 @@ class Database:
         now = time.time() if started_at is None else started_at
         with self._conn:
             cursor = self._conn.execute(
-                "UPDATE background_jobs SET status = 'running', phase = 'running', started_at = ?, updated_at = ? "
+                "UPDATE background_jobs SET status = 'running', phase = 'running', started_at = ?, heartbeat_at = ?, updated_at = ? "
                 "WHERE id = ? AND status = 'queued'",
-                (now, now, int(job_id)),
+                (now, now, now, int(job_id)),
             )
             if int(cursor.rowcount or 0) == 0:
                 return None

@@ -85,6 +85,22 @@ _FEAT_RE = re.compile(
     re.IGNORECASE,
 )
 
+_ENCHOR_FEATURE_CLAUSE_RE = re.compile(
+    r"\s*[\(\[]\s*(?:feat\.?|ft\.?|featuring|with)\b.*?[\)\]]+",
+    re.IGNORECASE,
+)
+_ENCHOR_NOISE_CLAUSE_RE = re.compile(
+    r"\s*[\(\[][^\)\]]*\b(?:remaster(?:ed)?|live|deluxe|version|edit|mono|stereo|"
+    r"soundtrack|anniversary|karaoke)\b[^\)\]]*[\)\]]",
+    re.IGNORECASE,
+)
+_ENCHOR_TRAILING_NOISE_RE = re.compile(
+    r"\s+[-\u2013\u2014]\s+.*\b(?:remaster(?:ed)?|live|deluxe|version|edit|mono|stereo|"
+    r"soundtrack|anniversary|karaoke)\b.*$",
+    re.IGNORECASE,
+)
+_ENCHOR_UNSAFE_RE = re.compile(r'''[\"“”'‘’\(\)\[\]{}\\/]+''')
+
 
 def _fold_unicode(text: str) -> str:
     text = unicodedata.normalize("NFKC", text)
@@ -122,6 +138,36 @@ def normalize_title(title: str) -> str:
 def normalize_artist(artist: str) -> str:
     """Comparison key for artist names."""
     return normalize_text(artist)
+
+
+def sanitize_query_for_enchor(
+    artist: str,
+    title: str,
+    *,
+    max_length: int = 180,
+) -> tuple[str, str]:
+    """Return compact, parser-safe display text for an Enchor song query."""
+
+    def clean(value: str, *, remove_versions: bool) -> str:
+        result = _fold_unicode(str(value or ""))
+        previous = None
+        while result != previous:
+            previous = result
+            result = _ENCHOR_FEATURE_CLAUSE_RE.sub("", result)
+            if remove_versions:
+                result = _ENCHOR_NOISE_CLAUSE_RE.sub("", result)
+                result = _ENCHOR_TRAILING_NOISE_RE.sub("", result)
+        result = _ENCHOR_UNSAFE_RE.sub(" ", result)
+        result = _WS_RE.sub(" ", result).strip(" .,-_")
+        return result
+
+    clean_artist = clean(artist, remove_versions=False)
+    clean_title = clean(strip_version_noise(title), remove_versions=True)
+    if max_length > 0:
+        clean_artist = clean_artist[: min(80, max_length)].rstrip()
+        remaining = max(1, max_length - len(clean_artist) - bool(clean_artist))
+        clean_title = clean_title[:remaining].rstrip()
+    return clean_artist, clean_title
 
 
 def version_markers(title: str) -> set[str]:

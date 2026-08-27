@@ -1,5 +1,16 @@
 # User data - never commit private playlist exports
 input_playlists/*.csv
+input_playlists/*.txt
+input_playlists/*.xml
+input_playlists/*.json
+input_playlists/*.jsonl
+overrides.yaml
+
+# The catalog is a large, generated metadata snapshot. Keep it local and
+# regenerate it with `catalog-export` rather than pushing it to GitHub.
+catalog/*.jsonl
+catalog/*.partial
+catalog/*.checkpoint.json
 
 # Secrets and local configuration - NEVER commit
 config.yaml

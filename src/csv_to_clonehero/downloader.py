@@ -26,6 +26,8 @@ def _md5_of(path: Path) -> str:
 
 
 class DownloadManager:
+    """Resume and validate direct chart downloads for a local library build."""
+
     def __init__(self, config: AppConfig, db: Database) -> None:
         self.config = config
         self.db = db

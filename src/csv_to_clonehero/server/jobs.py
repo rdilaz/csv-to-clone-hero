@@ -21,14 +21,13 @@ import logging
 import threading
 import time
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
-from pathlib import Path
+from dataclasses import dataclass, field
 from typing import Any
 
 from csv_to_clonehero.config import AppConfig
 from csv_to_clonehero.database import Database
 from csv_to_clonehero.sources.base import ChartSource
-from csv_to_clonehero.server.auth import build_oauth, build_spotify_client
+from csv_to_clonehero.server.auth import build_oauth, build_soundcloud_oauth, build_spotify_client
 from csv_to_clonehero.server.notifications import EmailSender
 from csv_to_clonehero.server.security import TokenCipher
 from csv_to_clonehero.server.throttle import global_gate
@@ -49,10 +48,12 @@ class JobResult:
     phase: str = "queued"
     message: str = ""
     error: str = ""
-    progress: dict[str, Any] = None  # type: ignore[assignment]
-    result: dict[str, Any] = None  # type: ignore[assignment]
+    progress: dict[str, Any] = field(default_factory=dict)
+    result: dict[str, Any] = field(default_factory=dict)
     started_at: float | None = None
     finished_at: float | None = None
+    cancel_requested: bool = False
+    heartbeat_at: float | None = None
 
 
 def _row_value(row: Any, *names: str, default: Any = None) -> Any:
@@ -97,6 +98,8 @@ def _job_payload(row: Any) -> dict[str, Any]:
         "notify_email": _row_value(row, "notify_email", "") or "",
         "started_at": _row_value(row, "started_at", None),
         "finished_at": _row_value(row, "finished_at", None),
+        "cancel_requested": bool(_row_value(row, "cancel_requested", default=0)),
+        "heartbeat_at": _row_value(row, "heartbeat_at", default=None),
         "created_at": _row_value(row, "created_at", None),
         "updated_at": _row_value(row, "updated_at", None),
     }
@@ -118,6 +121,8 @@ def _from_row(row: Any) -> JobResult:
         result=payload["result"],
         started_at=payload["started_at"],
         finished_at=payload["finished_at"],
+        cancel_requested=payload["cancel_requested"],
+        heartbeat_at=payload["heartbeat_at"],
     )
 
 
@@ -143,10 +148,21 @@ class JobManager:
         self._shutdown_event = threading.Event()
         self._thread: threading.Thread | None = None
         self._handles: dict[int, JobResult] = {}
+        self._cancel_events: dict[int, threading.Event] = {}
+        self._recover_orphaned_jobs()
         if auto_start:
             self.start()
 
     # ---- lifecycle ---------------------------------------------------------
+    def _recover_orphaned_jobs(self) -> None:
+        db = Database(self.config.database_path)
+        try:
+            recovered = db.recover_running_jobs()
+        finally:
+            db.close()
+        if recovered:
+            log.warning("marked %s orphaned background job(s) interrupted", recovered)
+
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
             return
@@ -159,6 +175,8 @@ class JobManager:
 
     def shutdown(self, timeout: float = 5.0) -> None:
         self._shutdown_event.set()
+        for event in self._cancel_events.values():
+            event.set()
         with self._cv:
             self._cv.notify_all()
         if self._thread is not None:
@@ -173,9 +191,25 @@ class JobManager:
         workspace_key: str = "",
         notify_email: str = "",
     ) -> JobResult:
+        result, _created = self.enqueue_unique(
+            user_id,
+            kind,
+            workspace_key=workspace_key,
+            notify_email=notify_email,
+        )
+        return result
+
+    def enqueue_unique(
+        self,
+        user_id: int,
+        kind: str,
+        *,
+        workspace_key: str = "",
+        notify_email: str = "",
+    ) -> tuple[JobResult, bool]:
         db = Database(self.config.database_path)
         try:
-            row = db.create_job(
+            row, created = db.create_or_get_active_job(
                 user_id, kind, workspace_key=workspace_key, notify_email=notify_email
             )
             result = _from_row(row)
@@ -184,7 +218,7 @@ class JobManager:
         with self._cv:
             self._handles[result.id] = result
             self._cv.notify_all()
-        return result
+        return result, created
 
     def get(self, job_id: int) -> JobResult | None:
         db = Database(self.config.database_path)
@@ -232,17 +266,51 @@ class JobManager:
             db.close()
 
     def _run_job(self, job: JobResult) -> None:
-        with global_gate().acquire(tag=f"job-{job.id}"):
-            if self._shutdown_event.is_set():
-                self._mark(job.id, status="cancelled", error="server shutdown")
+        self._cancel_events.setdefault(job.id, threading.Event())
+        try:
+            if self._cancelled(job.id):
+                self._mark(job.id, status="cancelled", phase="cancelled", message="Job cancelled")
                 return
-            try:
+            if job.kind == "discovery":
+                from csv_to_clonehero.server.safeguards import (
+                    get_enchor_preflight,
+                    refresh_enchor_preflight,
+                )
+
+                db = Database(self.config.database_path)
+                try:
+                    if not get_enchor_preflight(db).get("fresh"):
+                        refresh_enchor_preflight(self.config, db, self.source_factory)
+                finally:
+                    db.close()
+            if self._cancelled(job.id):
+                self._mark(job.id, status="cancelled", phase="cancelled", message="Job cancelled")
+                return
+            with global_gate().acquire(tag=f"job-{job.id}"):
+                if self._shutdown_event.is_set() or self._cancelled(job.id):
+                    self._mark(job.id, status="cancelled", error="server shutdown")
+                    return
                 self._execute(job)
-            except Exception as exc:  # noqa: BLE001 - surfaced per-job
-                log.exception("job %s failed", job.id)
-                self._mark(job.id, status="failed", error=str(exc)[:1000])
-            finally:
-                self._maybe_notify(job.id)
+        except Exception as exc:  # noqa: BLE001 - surfaced per-job
+            log.exception("job %s failed", job.id)
+            self._mark(job.id, status="failed", error=str(exc)[:1000])
+        finally:
+            self._maybe_notify(job.id)
+            self._cancel_events.pop(job.id, None)
+
+    def _cancelled(self, job_id: int) -> bool:
+        event = self._cancel_events.setdefault(job_id, threading.Event())
+        if event.is_set():
+            return True
+        db = Database(self.config.database_path)
+        try:
+            row = db.get_job(job_id)
+            requested = row is not None and bool(row["cancel_requested"])
+        finally:
+            db.close()
+        if requested:
+            event.set()
+        return requested
 
     def _execute(self, job: JobResult) -> None:
         if job.kind == "discovery":
@@ -252,14 +320,44 @@ class JobManager:
 
     def _run_discovery(self, job: JobResult) -> None:
         from csv_to_clonehero.spotify_pipeline import run_spotify_discovery
+        from csv_to_clonehero.server.safeguards import validate_discovery_start
 
         self._mark(job.id, status="running", phase="starting", message="Starting discovery")
         db = Database(self.config.database_path)
         sources: list[ChartSource] = []
+        client: Any | None = None
+        soundcloud_client: Any | None = None
         try:
+            validation = validate_discovery_start(
+                db,
+                self.config,
+                user_id=job.user_id,
+                workspace_key=job.workspace_key,
+                current_job_id=job.id,
+            )
+            if not validation.ok:
+                raise RuntimeError(" ".join(validation.errors))
             user = db.get_user(job.user_id)
             if user is None:
                 raise RuntimeError("user no longer exists")
+            workspace = db.get_workspace(job.workspace_key)
+            if workspace is not None and db.get_neutral_library_tracks(int(workspace["id"])):
+                from csv_to_clonehero.combined_pipeline import discover_combined
+                from csv_to_clonehero.providers.base import LibrarySnapshot, ProviderTrack
+                grouped: dict[str, list[ProviderTrack]] = {}
+                for row in db.get_track_provenance(int(workspace["id"])):
+                    provider = str(row["provider"])
+                    grouped.setdefault(provider, []).append(ProviderTrack(
+                        provider=provider, provider_id=str(row["provider_id"]), title=str(row["title"]),
+                        artist=str(row["artist"]), album=str(row["album"] or ""), liked=bool(row["liked"]),
+                    ))
+                self._mark(job.id, status="running", phase="combine", message="Combining imported sources locally")
+                combined = discover_combined(
+                    self.config, db, [LibrarySnapshot(name, tracks) for name, tracks in grouped.items()],
+                    workspace_key=job.workspace_key, workspace_name="Combined library",
+                )
+                self._mark(job.id, status=combined.status, phase=combined.phase, message="Combined catalog discovery complete.", result=vars(combined))
+                return
             self._mark(
                 job.id,
                 status="running",
@@ -268,6 +366,26 @@ class JobManager:
             )
             oauth = build_oauth(self.config, job.user_id, self.cipher)
             client = build_spotify_client(self.config, oauth)
+            workspace = db.get_workspace(job.workspace_key)
+            metadata = _json_object(workspace["metadata_json"] if workspace is not None else "{}")
+            soundcloud_scope = metadata.get("soundcloud_scope")
+            if isinstance(soundcloud_scope, dict) and (
+                soundcloud_scope.get("playlist_ids") or soundcloud_scope.get("include_liked")
+            ):
+                from csv_to_clonehero.combined_pipeline import discover_combined
+                from csv_to_clonehero.providers.soundcloud_api import SoundCloudAPIProvider, SoundCloudClient
+                from csv_to_clonehero.providers.spotify import SpotifyLibraryProvider
+
+                spotify_snapshot = SpotifyLibraryProvider(client).import_library(scope=metadata.get("spotify_scope") or {})
+                soundcloud_oauth = build_soundcloud_oauth(self.config, job.user_id)
+                soundcloud_client = SoundCloudClient(soundcloud_oauth, timeout=float(self.config.network.timeout_seconds or 20))
+                soundcloud_snapshot = SoundCloudAPIProvider(soundcloud_client).import_library(scope=soundcloud_scope)
+                combined = discover_combined(
+                    self.config, db, [spotify_snapshot, soundcloud_snapshot],
+                    workspace_key=job.workspace_key, workspace_name=user["spotify_user_id"],
+                )
+                self._mark(job.id, status="complete", phase="complete", message="Combined catalog discovery complete.", result=vars(combined))
+                return
             sources = self.source_factory(self.config)
 
             def on_progress(payload: Mapping[str, Any]) -> None:
@@ -279,6 +397,7 @@ class JobManager:
                     phase=str(data.get("phase") or "running"),
                     message=message,
                     progress=data,
+                    heartbeat_at=time.time(),
                 )
 
             def on_log(message: Any) -> None:
@@ -294,21 +413,34 @@ class JobManager:
                 workspace_name=user["spotify_user_id"],
                 on_progress=on_progress,
                 on_log=on_log,
+                cancellation_event=self._cancel_events[job.id],
             )
             stats = getattr(result, "stats", None)
+            cancelled = self._cancelled(job.id)
             self._mark(
                 job.id,
-                status=str(result.status or "complete"),
-                phase=str(result.phase or result.status or "complete"),
+                status="cancelled" if cancelled else str(result.status or "complete"),
+                phase="cancelled" if cancelled else str(result.phase or result.status or "complete"),
                 error=str(result.error or "") or None,
-                message=_completion_message(result),
+                message="Job cancelled" if cancelled else _completion_message(result),
                 progress=_stats_payload(stats),
                 result=_stats_payload(stats),
             )
         finally:
+            if client is not None:
+                try:
+                    client.close()
+                except Exception:  # noqa: BLE001
+                    pass
             for source in sources:
                 try:
                     source.close()
+                except Exception:  # noqa: BLE001
+                    pass
+            if soundcloud_client is not None:
+                try:
+                    soundcloud_client.close()
+                    soundcloud_client.oauth.close()
                 except Exception:  # noqa: BLE001
                     pass
             db.close()
@@ -323,7 +455,10 @@ class JobManager:
         error: str | None = None,
         progress: Mapping[str, Any] | None = None,
         result: Mapping[str, Any] | None = None,
+        heartbeat_at: float | None = None,
     ) -> None:
+        if status == "running" and heartbeat_at is None:
+            heartbeat_at = time.time()
         db = Database(self.config.database_path)
         try:
             row = db.update_job(
@@ -336,18 +471,34 @@ class JobManager:
                 result=result,
                 started_at=time.time() if status == "running" else None,
                 finished_at=time.time() if status in ("complete", "failed", "partial", "cancelled") else None,
+                heartbeat_at=heartbeat_at,
             )
         finally:
             db.close()
         if row is not None:
             self._handles[job_id] = _from_row(row)
 
+    def cancel(self, job_id: int, user_id: int) -> JobResult | None:
+        db = Database(self.config.database_path)
+        try:
+            row = db.get_job(job_id)
+            if row is None or int(row["user_id"]) != int(user_id):
+                return None
+            row = db.request_job_cancel(job_id)
+            result = _from_row(row) if row is not None else None
+        finally:
+            db.close()
+        self._cancel_events.setdefault(int(job_id), threading.Event()).set()
+        with self._cv:
+            self._cv.notify_all()
+        return result
+
     def _maybe_notify(self, job_id: int) -> None:
         job = self.get(job_id)
         if job is None or not job.notify_email:
             return
         subject = f"CSV to Clone Hero: your job {job.kind} finished"
-        body = _completion_email(job)
+        body = _completion_email(job, self.config.public_base_url)
         self.sender.send(subject, body, job.notify_email)
 
 
@@ -377,10 +528,21 @@ def _completion_message(result: Any) -> str:
     return f"Discovery ended ({status})"
 
 
-def _completion_email(job: JobResult) -> str:
+def _json_object(value: Any) -> dict[str, Any]:
+    import json
+
+    try:
+        parsed = json.loads(value or "{}")
+        return parsed if isinstance(parsed, dict) else {}
+    except (TypeError, ValueError):
+        return {}
+
+
+def _completion_email(job: JobResult, public_base_url: str = "") -> str:
+    destination = public_base_url.rstrip("/") or "the application"
     return (
         f"Your chart search job #{job.id} ({job.kind}) finished with status "
         f"{job.status!r}.\n\n"
-        f"Sign back in to https://your-host to review and download your charts.\n\n"
+        f"Sign back in to {destination} to review and download your charts.\n\n"
         f"---\nCSV to Clone Hero\n"
     )

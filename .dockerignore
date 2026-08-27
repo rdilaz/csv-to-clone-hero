@@ -13,6 +13,7 @@ state/
 output_library/
 reports/
 backups/
+catalog/
 tests/
 docs/
 *.png

@@ -1,8 +1,6 @@
 """Manual review decisions: storage, pipeline application, web endpoints."""
 
-import io
 import json
-import time
 
 import pytest
 
@@ -10,7 +8,7 @@ from csv_to_clonehero.database import Database
 from csv_to_clonehero.pipeline import run_plan, run_search
 from csv_to_clonehero.webapp import create_app
 
-from .conftest import FIXTURES, FakeSource, make_chart, make_track
+from .conftest import FakeSource, make_chart, make_track
 
 
 def _seed_track(config, db, track):

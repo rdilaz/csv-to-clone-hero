@@ -1,139 +1,199 @@
 # Architecture
 
-CSV to Clone Hero is a multi-user, cloud-hosted web product that helps Clone
-Hero / YARG players find every song in their real Spotify library that already
-has a playable chart on Chorus Encore (Enchor), lets them pick the best match
-for each song, and delivers a ZIP of those chart files to **their own**
-computer. It does **not** store chart files server-side.
+This document describes the current implementation. The repository contains
+two application surfaces that share the matching and chart-source engine:
 
-## Hosting decision: consolidate all backends onto ONE stateful host
+| Surface | Entry point | Persistence | Intended use |
+| --- | --- | --- | --- |
+| Local app | `python -m csv_to_clonehero web` or `WEB_INTERFACE.bat` | Local SQLite state, reports, and a Songs-folder library | Single-user desktop workflows, including CSV/iTunes imports |
+| Public app | `wsgi.py` or `python -m csv_to_clonehero serve` | SQLite on a persistent server volume | Multi-user Spotify discovery and browser ZIP delivery |
 
-The operator has several products (mcb.ryo-nd.com, charts.ryo-nd.com) and was
-unsure whether they were on Google Cloud or Cloudflare. The current setup is:
-Cloudflare DNS/edge + a Cloudflare Tunnel for `charts.ryo-nd.com` (currently
-offline), no clear app host.
+The local app is owner-controlled through loopback access, or through a signed
+LAN token when explicitly enabled. The public app has its own Flask application
+factory and does not mount the local `/advanced` interface.
 
-**Recommendation (implemented here):**
+## Shared Engine
 
-| Layer            | Choice                                                                 |
-| ---------------- | ---------------------------------------------------------------------- |
-| DNS + TLS + edge | **Cloudflare** (already their edge). A Cloudflare Tunnel terminates TLS. |
-| Stateful app     | **One small container host** (e.g. a $4–8/mo VPS on Hetzner/DigitalOcean, or Fly.io with a single shared-cpu machine + volume). |
-| Reverse proxy    | Cloudflare Tunnel to the container; no separate Caddy needed.          |
-| Datastore        | **SQLite on a persistent volume** (single-instance; documented below). |
-| WSGI             | **waitress** (cross-platform) or gunicorn inside the container.        |
+The core data flow is:
 
-### Why one host for all products
-
-- One place to operate, monitor, back up, and bill. Boring and cheap.
-- `mcb` and `clonehero` become sibling containers on the same host, each on
-  its own subdomain (`mcb.ryo-nd.com`, `charts.ryo-nd.com`), each reached
-  through one Cloudflare Tunnel / route. They share nothing but the host and a
-  backup schedule.
-- Enchor rate-limits **per IP**. A single public IP shared by all users is the
-  simplest correct posture: one global worker + one shared query cache. Splitting
-  across hosts would multiply the requests Enchor sees — never split this product.
-
-### Why SQLite (and when to move to Postgres)
-
-This places deliberately on **single-instance-with-volume**, which the product
-constraints allow when chosen and documented:
-
-- One web process + one background worker, both on one host, can share SQLite
-  safely (WAL mode, busy timeout). No second service to operate.
-- The 7-day query cache, per-user encrypted tokens, job state, and survey data
-  fit comfortably in a few GB.
-- Moving to Postgres later is a contained change: the `Database` layer is the
-  only reader/writer of tables. Do it only if you scale past one host or need
-  zero-downtime multi-host deploys. Until then, Postgres adds cost, a second
-  moving part, and TLS/credentials to babysit for zero benefit at this scale.
-
-### The single global worker
-
-Enchor 429s hard above ~1–2 req/s per IP. Concurrency is the enemy. The app
-therefore runs **one** background job worker, FIFO across all users, and gates
-every Enchor-bound job with a process-global lock (`server/throttle.py`). Each
-job still uses its own adapter instance whose built-in AIMD throttle and
-`network.request_delay_seconds` pace individual queries. The shared 7-day
-query cache means repeated users never re-hit Enchor. Being slow is fine;
-correctness and completion messaging matter more than speed.
-
-## Components
-
+```text
+music export/API
+    -> provider-normalized Track records
+    -> SQLite workspace and provenance
+    -> ChartSource queries or a complete local catalog
+    -> deterministic scoring and quality gates
+    -> review/selection
+    -> storage planning
+    -> folder export, browser ZIP, or no download in dry-run mode
 ```
+
+The important boundaries are deliberately narrow:
+
+- `providers/base.py:LibraryProvider` converts Spotify or SoundCloud input into
+  neutral `ProviderTrack` and `LibrarySnapshot` values.
+- `sources/base.py:ChartSource` is the only interface used by matching,
+  planning, and chart downloads. Enchor is the only built-in adapter.
+- `models.py` contains source-neutral `Track`, `ChartCandidate`,
+  `ScoreBreakdown`, and selection data models.
+- `database.py` owns SQLite connections, migrations, query-cache state,
+  workspaces, candidates, selections, jobs, and export metadata.
+
+## Local Workflows
+
+### Legacy CSV build
+
+The CLI and local `/advanced` interface use this pipeline:
+
+1. `csv_import.py` reads Spotify-style CSV, iTunes/Music tab-delimited TXT, or
+   iTunes/Music XML plist files.
+2. `pipeline.run_scan` deduplicates tracks, applies manual ignore rules, and
+   stores the current import snapshot.
+3. `pipeline.run_exact_search` resolves source queries from the seven-day cache
+   or the chart adapter. Artists with enough tracks use one paginated artist
+   query; catalog-scored rejects and errors receive a per-song fallback query.
+4. `matching.py` computes title/artist similarity, version evidence, instrument
+   compatibility, quality bonuses, and hard rejection gates.
+5. `planner.py` keeps the best candidate per track, applies expansion caps,
+   avoids duplicate chart/song/path identities, and enforces the storage budget.
+6. `pipeline.run_relocation` moves previously completed files into the current
+   layout before `downloader.py` resumes missing downloads.
+7. `reporting.py` writes CSV, JSON, and text summaries outside the library root.
+
+### Source-neutral local import
+
+The local home page can combine an exported SoundCloud library and optional
+Spotify data. `library_pipeline.py` persists provider provenance, and
+`combined_pipeline.py` scores the merged normalized library against
+`catalog/enchor.jsonl` without issuing per-song chart requests.
+
+The catalog is only authoritative when its header marks it complete and its
+SHA-256 checksum covers every row. If it is absent, incomplete, or corrupt, the
+application reports that fact instead of treating every missing song as a
+definitive no-match. The catalog snapshot is generated with the
+`catalog-export` command and is intentionally kept outside Git because the
+current snapshot is too large for a normal GitHub repository.
+
+## Public Workflow
+
+The public app in `server/web.py` follows this sequence:
+
+1. Spotify Authorization Code + PKCE establishes identity and creates a
+   revocable server-side session.
+2. The user chooses playlists or Liked Songs. Optional SoundCloud OAuth or an
+   uploaded export can add source data.
+3. A bounded Enchor preflight is cached globally. Discovery cannot start until
+   the preflight is fresh, successful, and authoritative.
+4. `server/jobs.py:JobManager` stores a durable job and runs jobs FIFO on one
+   process-wide worker. `server/throttle.py:GlobalGate` prevents concurrent
+   Enchor-bound work from multiplying requests from the shared server IP.
+5. `spotify_pipeline.py` imports the selected library, resolves paginated chart
+   queries, persists progress, and records candidates and explainable scores in
+   the user workspace.
+6. Review endpoints change workspace selections only after checking ownership,
+   candidate membership, score thresholds, and hard-gate eligibility.
+7. `server/downloads.py` asks `exporter.py:ExportService` to assemble a ZIP in
+   a transient staging area. `BrowserDownloads` signs a short-lived, single-use
+   token, streams the archive, and removes it after delivery or expiry.
+
+Public chart bytes are not kept in the configured local artifact cache. Local
+folder builds may use the persistent `state/export-artifacts` cache to make
+repeated exports idempotent; that cache must never be mounted into the public
+service if browser-only retention is required.
+
+## Data Ownership
+
+The database intentionally separates global data from workspace data:
+
+- Query results and `candidate_charts` are global. Sharing them is the main
+  defense against Enchor's approximate 1-2 requests/second per-IP limit.
+- User identity, encrypted refresh tokens, sessions, jobs, library provenance,
+  candidates, and selections are scoped to a user workspace.
+- Local CSV state uses the same database schema but is not exposed by the public
+  WSGI application.
+- The `reports/`, `state/`, `output_library/`, and imported playlist files are
+  runtime data and are ignored by Git.
+- Public chart ZIPs and temporary verified artifacts are transient. Local
+  downloaded `.sng` files are intentionally durable because they are the user's
+  library output.
+
+`database.py` is the sole persistence boundary. Schema changes are additive and
+must update its migration logic and offline tests together.
+
+## Matching Method
+
+`matching.py` is deterministic and does not use popularity data or an ML model.
+It combines:
+
+- normalized title and artist similarity;
+- duration and ISRC evidence when available;
+- version-marker handling for live, remix, acoustic, cover, and related forms;
+- required five-fret guitar and optional six-fret/no-guitar rules;
+- official-game, full-band, rated-guitar, direct-download, and metadata-quality
+  bonuses;
+- penalties for single-instrument, unrated, modchart, issue, and wrong-version
+  candidates.
+
+Charts with no playable instrument content and no difficulty ratings are hard
+rejected. A final score is capped at 100, but `ScoreBreakdown.quality` remains a
+separate planner tie-break so two saturated scores do not become arbitrary.
+Legacy `decision` values and public-workflow `eligibility` values are kept
+separate for compatibility.
+
+## Source Policy
+
+All source-specific behavior belongs behind `ChartSource`. Enchor uses:
+
+- `POST https://api.enchor.us/search` for normal searches;
+- `POST https://api.enchor.us/search/advanced` for paginated artist searches;
+- `GET https://files.enchor.us/{md5}.sng` for direct chart downloads.
+
+Enchor's `md5` identifies the catalog record but is not guaranteed to hash the
+served `.sng` bytes, so the adapter does not perform a false checksum check.
+Transient query errors are not cached. Successful responses are cached for seven
+days, and the adapter uses adaptive throttling plus bounded retries.
+
+## Security Model
+
+- Spotify PKCE avoids storing a Spotify client secret.
+- Public refresh tokens are encrypted with Fernet using
+  `TOKEN_ENCRYPTION_KEY`; the key comes from the environment or a secret
+  manager, never `config.yaml`.
+- Public sessions are signed with `SECRET_KEY` and backed by revocable rows in
+  `user_sessions`.
+- User-supplied paths are resolved and checked before writes, folder exports,
+  archive extraction, or browser delivery.
+- Uploads have a configured size limit. SoundCloud browser export reads only
+  rendered metadata and never reads cookies, credentials, audio URLs, or private
+  endpoints.
+- OAuth and token-like values are redacted from logs and diagnostics.
+
+## Repository Map
+
+```text
 src/csv_to_clonehero/
-  normalization.py      # artist/title normalization (shared, unchanged)
-  matching.py           # quality gates + scoring (unchanged)
-  sources/base.py       # ChartSource interface (unchanged)
-  sources/enchor.py     # Enchor adapter, adaptive AIMD throttle (unchanged)
-  csv_import.py         # Spotify/iTunes CSV importers (single-user legacy)
-  library_inventory.py  # scan a local Songs folder (single-user legacy)
-  reporting.py          # reports (reused where sensible)
-  filesystem.py         # path building + safety (unchanged)
-  models.py             # dataclasses (unchanged)
-  database.py           # SQLite store; + multi-user tables/methods (Phase 2)
-  planner.py            # selection planning (unchanged)
-  exporter.py           # ZIP/folder export from selections (reused by downloads)
-  webapp.py             # LEGACY single-user Flask app (admin-only, kept isolated)
-  spotify.py            # Spotify OAuth + API primitives (reused)
-  spotify_pipeline.py   # resumable discovery (reused; per-user workspace keys)
-  server/               # NEW public product
-    security.py         # Fernet token encryption + secret resolution (Phase 2)
-    auth.py             # per-user encrypted credential store + OAuth (Phase 2)
-    jobs.py             # durable job queue + global worker (Phase 3)
-    throttle.py         # global egress gate (Phase 3)
-    notifications.py    # completion email (Phase 3)
-    downloads.py        # short-lived signed ZIP delivery (Phase 4)
-    web.py              # multi-user WSGI app factory (Phase 5)
-    templates/          # landing, legal, about, GoFundMe + ads (Phase 6)
+  cli.py                  command-line entry points
+  config.py               validated configuration and state migration
+  models.py               shared dataclasses
+  normalization.py        metadata normalization and query sanitization
+  csv_import.py           Spotify CSV and iTunes/Music importers
+  providers/              music-library provider adapters
+  sources/                chart-source protocol and Enchor adapter
+  matching.py             deterministic scoring and eligibility gates
+  planner.py              candidate selection and storage budgeting
+  pipeline.py             local scan/search/plan/build orchestration
+  spotify_pipeline.py     resumable Spotify discovery orchestration
+  combined_pipeline.py    local catalog-backed multi-provider discovery
+  library_inventory.py    read-only Songs-folder inventory
+  exporter.py             validated folder and ZIP export service
+  downloader.py           resumable direct chart downloads
+  database.py             SQLite persistence and migrations
+  reporting.py            user-facing report generation
+  webapp.py               local Flask application
+  server/                 public Flask application, jobs, auth, and delivery
+tests/                    offline unit and integration-boundary tests
+browser_export/           optional rendered-metadata SoundCloud userscript
+catalog/                  ignored generated Enchor metadata snapshot
 ```
 
-## Multi-user data model
-
-```
-users(id, spotify_user_id UNIQUE, …)          # identity = Spotify login
-user_sessions(session_id, user_id, expires…)  # server-side, revocable
-user_tokens(user_id, encrypted_refresh_token) # Fernet-encrypted at rest
-background_jobs(id, user_id, kind, status, workload, workspace_key, …)
-```
-
-Isolation without schema surgery: the discovery engine scopes every workspace
-by a globally-unique `workspace_key`. Each user gets
-`spotify:u:<user_id>` as their workspace key (`database.workspace_key_for_user`),
-so all workspace data (candidates, selections, progress) is per-user
-automatically. The **query cache and candidate table stay global on purpose** —
-that is the shared cache that makes a public app survive Enchor's rate limit.
-
-## Security model
-
-- No passwords, no accounts: sign in with Spotify PKCE. There is no client
-  secret (nothing to leak).
-- Each user's refresh token is encrypted at rest with **Fernet**
-  (`TOKEN_ENCRYPTION_KEY`), never the OS keyring, never in git.
-- Session cookie is signed with `SECRET_KEY` and validated server-side against
-  `user_sessions` (revocable/logout kills the DB row).
-- Charts never touch persistent storage: a ZIP is assembled on demand into a
-  per-user staging dir, handed to the browser via a **short-lived signed
-  single-use URL**, then deleted (stream + revoke, plus a sweeper).
-- OAuth pieces and any token-like values are redacted from logs (the existing
-  OAuth log filter and `_safe_message` redaction remain).
-
-## Legacy single-user CSV mode
-
-The old `/advanced` CSV/upload flow writes charts to a server directory, which
-does **not** fit the public download-to-browser model. It is kept intact but
-isolated behind `admin.enable_legacy_csv` **and** an allowlisted `admin.admins`
-Spotify user id — never exposed to the public product.
-
-## Decisions honored from the engine (AGENTS.md)
-
-- Enchor search at `https://api.enchor.us/search[/advanced]` (HTTP 201);
-  downloads at `https://files.enchor.us/{md5}.sng`; `md5` does **not** match
-  downloaded bytes (never checksum against it); some artist+title queries 500
-  → retry title-only.
-- Adaptive AIMD throttle in the Enchor adapter; keep `network.concurrency` low.
-- Query errors are never cached; successes cache 7 days.
-- Only `.sng` files belong in a library root; everything else stays in `reports/`.
-- All source logic behind `sources/base.py:ChartSource`.
-- Path decoupling: database pinned to base-dir state; per-run output overrides
-  never move the DB.
+Run `python -m pytest` for the offline suite. Live Enchor checks are marked
+`integration` and are excluded by default because the service is rate-limited.

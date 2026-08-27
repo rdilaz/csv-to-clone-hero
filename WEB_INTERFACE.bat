@@ -34,7 +34,7 @@ if not exist ".venv\Scripts\python.exe" (
     %PY% -m venv .venv
     if errorlevel 1 goto :setup_failed
     ".venv\Scripts\python.exe" -m pip install --upgrade pip >nul
-    ".venv\Scripts\python.exe" -m pip install -e .
+    ".venv\Scripts\python.exe" -m pip install -e ".[legacy-keyring]"
     if errorlevel 1 goto :setup_failed
 )
 

@@ -16,7 +16,6 @@ pagination envelope returned by an adapter.
 from __future__ import annotations
 
 import copy
-import hashlib
 import inspect
 import json
 import logging
@@ -43,6 +42,7 @@ from csv_to_clonehero.reporting import generate_spotify_reports
 from csv_to_clonehero.sources.base import (
     ChartSource,
     get_source_capabilities,
+    source_catalog_available,
     source_result_cap,
 )
 from csv_to_clonehero.spotify import LibraryImportResult, SpotifyClient
@@ -56,6 +56,7 @@ DEFAULT_WORKSPACE_NAME = "Spotify library"
 DEFAULT_SCAN_KEY = "exact"
 DEFAULT_EXPANSION_SCAN_KEY = "expansion"
 DEFAULT_RESULT_CAP = 250
+EXPANSION_FUZZY_TITLE_MINIMUM = 80.0
 CALIBRATION_SONG_COUNTS = (1, 5, 10, 25)
 
 ProgressCallback = Callable[..., None]
@@ -91,7 +92,13 @@ class DiscoveryStats:
     exact_eligible: int = 0
     exact_recommended: int = 0
     expansion_artists_requested: int = 0
+    expansion_artists_total: int = 0
     expansion_artists_scanned: int = 0
+    expansion_artists_completed: int = 0
+    expansion_songs_total: int = 0
+    expansion_catalog_unavailable_songs: int = 0
+    expansion_songs_with_charts: int = 0
+    expansion_songs_without_charts: int = 0
     expansion_candidates: int = 0
     expansion_candidates_scored: int = 0
     expansion_eligible: int = 0
@@ -100,6 +107,8 @@ class DiscoveryStats:
     partial: bool = False
     already_owned_tracks: int = 0
     suppressed_tracks: int = 0
+    catalog_eligible_tracks: int = 0
+    catalog_unavailable_tracks: int = 0
     estimate: dict[str, Any] = field(default_factory=dict)
     errors: int = 0
     error_messages: list[str] = field(default_factory=list)
@@ -266,6 +275,19 @@ def run_spotify_inventory(
         playlists = list(list_method() if callable(list_method) else [])
         db.upsert_spotify_playlists(playlists)
         stats.playlists = len(playlists)
+        liked_count = 0
+        liked_available = True
+        count_method = _value(
+            spotify_client,
+            "get_saved_tracks_count",
+            "saved_tracks_count",
+            default=None,
+        )
+        if callable(count_method):
+            try:
+                liked_count = max(0, int(count_method()))
+            except Exception:
+                liked_available = False
         if include_liked:
             liked_method = _value(spotify_client, "get_liked_tracks", "liked_tracks", default=None)
             if callable(liked_method):
@@ -273,7 +295,11 @@ def run_spotify_inventory(
         db.update_workspace(actual_id, status="ready_for_scope", phase="ready_for_scope", metadata={
             "workflow": "spotify_inventory", "playlist_count": stats.playlists,
             "liked_item_count": stats.library_items,
+            "liked_tracks_count": liked_count,
+            "liked_tracks_available": liked_available,
         })
+        db.set_meta("spotify_liked_tracks_count", str(liked_count))
+        db.set_meta("spotify_liked_tracks_available", "1" if liked_available else "0")
         payload = {"status": "ready_for_scope", "phase": "ready_for_scope", "message": "Spotify inventory ready for scope"}
         if on_progress is not None:
             _call_progress(on_progress, payload, 0, 0)
@@ -355,6 +381,8 @@ class _RunContext:
         self.track_done = 0
         self.scoring_total = 0
         self.scoring_done = 0
+        self.expansion_artists_total = 0
+        self.expansion_artists_completed = 0
         self._exact_keys: set[tuple[int, str, int]] = set()
         self._expansion_keys: set[tuple[str, str, int]] = set()
         self._exact_eligible: set[tuple[int, str, int]] = set()
@@ -392,6 +420,32 @@ class _RunContext:
         self.scoring_total += max(0, int(count))
         self.stats.scoring_tasks_total = self.scoring_total
         self.emit()
+
+    def expansion_score_finished(self, artist_name: str, title: str) -> None:
+        self.scoring_done += 1
+        self.stats.scoring_tasks_completed = self.scoring_done
+        self.emit(message=f"Scored expansion chart {self.scoring_done} / {self.scoring_total}: {artist_name} - {title}")
+
+    def set_expansion_artist_totals(self, total: int) -> None:
+        self.expansion_artists_total = max(0, int(total))
+        self.expansion_artists_completed = 0
+        self.stats.expansion_artists_total = self.expansion_artists_total
+        self.stats.expansion_artists_completed = 0
+        self.emit()
+
+    def expansion_artist_finished(self, artist_name: str) -> None:
+        self.expansion_artists_completed = min(
+            self.expansion_artists_total,
+            self.expansion_artists_completed + 1,
+        )
+        self.stats.expansion_artists_scanned = self.expansion_artists_completed
+        self.stats.expansion_artists_completed = self.expansion_artists_completed
+        self.emit(
+            message=(
+                f"Artist expansion {self.expansion_artists_completed} / "
+                f"{self.expansion_artists_total}: {artist_name}"
+            )
+        )
 
     def log(self, message: str, *, level: str = "info") -> None:
         text = str(message)[:1000]
@@ -504,6 +558,8 @@ class _RunContext:
             "failed_tasks": self.task_failed,
             "cached_queries": self.stats.cached_queries,
             "total_tracks": self.track_total,
+            "catalog_eligible_tracks": self.stats.catalog_eligible_tracks,
+            "catalog_unavailable_tracks": self.stats.catalog_unavailable_tracks,
             "completed_tracks": self.track_done,
             "scoring_tasks_total": self.scoring_total,
             "scoring_tasks_completed": self.scoring_done,
@@ -515,18 +571,35 @@ class _RunContext:
             "estimated_upper_seconds": duration["upper_seconds"],
             "estimated_query_seconds": duration["estimated_query_seconds"],
             "estimated_scoring_seconds": duration["estimated_scoring_seconds"],
+            "estimated_cached_queries": duration["cached_queries"],
             "estimated_completed_seconds": round(estimated_completed_seconds, 1),
+            "expansion_artists_total": self.expansion_artists_total,
+            "expansion_artists_completed": self.expansion_artists_completed,
+            "expansion_songs_total": self.stats.expansion_songs_total,
+            "expansion_catalog_unavailable_songs": self.stats.expansion_catalog_unavailable_songs,
+            "expansion_songs_with_charts": self.stats.expansion_songs_with_charts,
+            "expansion_songs_without_charts": self.stats.expansion_songs_without_charts,
             "done": self.task_done,
             "total": self.task_total,
             "partial": bool(self.stats.partial),
         }
 
     def emit(self, *, status: str = "running", message: str | None = None) -> None:
+        self.check_cancelled()
         payload = self.payload(status=status, message=message)
         if self.persist_progress:
-            self.db.update_workspace_progress(self.workspace_id, payload)
+            self.db.update_workspace_progress(
+                self.workspace_id,
+                payload,
+                metadata={
+                    "scan_key": self.scan_key,
+                    "expansion_artists_total": self.expansion_artists_total,
+                    "expansion_artists_completed": self.expansion_artists_completed,
+                },
+            )
         if self.on_progress is not None:
             _call_progress(self.on_progress, payload, self.task_done, self.task_total)
+        self.check_cancelled()
 
 
 def _value(owner: Any, *names: str, default: Any = None) -> Any:
@@ -1334,7 +1407,6 @@ def _resolve_queries(
         )
         task_ids[spec.key] = task_id
         db.update_discovery_task(task_id, status="running", completed=0, total=1)
-        ctx.log(f"Resolving {spec.source_name} {spec.kind} query: {spec.query_text}")
 
         cached_value: tuple[list[ChartCandidate], str | None] | None = None
         cache_metadata: Any = None
@@ -1407,6 +1479,8 @@ def _resolve_queries(
             continue
 
         try:
+            ctx.log(f"[{spec.source_name.title()} Live HTTP] Sending {spec.kind} search: {spec.query_text}")
+            ctx.emit(message=f"Sending live {spec.source_name.title()} request for {spec.query_text}...")
             raw_values, adapter_metadata = _invoke_source_search(spec, config)
             candidates, source_total, returned_count, cap_reached = _prepare_result_candidates(
                 db,
@@ -1508,15 +1582,42 @@ def _primary_artist_specs(
     query_specs: dict[str, list[_QuerySpec]] = {}
     for track in tracks:
         norm = track.primary_artist_norm or normalize_artist(track.primary_artist)
-        if catalog_first and counts.get(norm, 0) >= minimum:
+        memberships = {
+            id(source): source_catalog_available(source, track.primary_artist, track.title)
+            for source in sources
+        }
+        catalog_match = any(value is True for value in memberships.values())
+        if catalog_match:
+            logical = ("song", track.primary_artist, track.title)
+        elif catalog_first and counts.get(norm, 0) >= minimum:
             logical = ("artist", display_names.get(norm, track.primary_artist), "")
         else:
             logical = ("song", track.primary_artist, track.title)
         track_specs[track.track_key] = logical
         query_specs[track.track_key] = [
-            _make_query_spec(db, config, source, *logical) for source in sources
+            _make_query_spec(db, config, source, *logical)
+            for source in sources
+            if memberships[id(source)] is not False
         ]
     return track_specs, query_specs
+
+
+def _catalog_filter_tracks(
+    sources: Sequence[ChartSource], tracks: Iterable[Track]
+) -> tuple[list[Track], list[Track]]:
+    """Partition tracks using only definitive negatives from local snapshots."""
+    eligible: list[Track] = []
+    unavailable: list[Track] = []
+    for track in tracks:
+        memberships = [
+            source_catalog_available(source, track.primary_artist, track.title)
+            for source in sources
+        ]
+        if memberships and all(value is False for value in memberships):
+            unavailable.append(track)
+        else:
+            eligible.append(track)
+    return eligible, unavailable
 
 
 def _score_breakdown_json(breakdown: Any, eligibility: str, reasons: Sequence[str]) -> str:
@@ -1799,10 +1900,28 @@ def _finish(
     payload["error"] = error
     # Terminal state is always persisted even when periodic progress updates
     # are disabled by configuration.
-    ctx.db.update_workspace_progress(ctx.workspace_id, payload)
+    ctx.db.update_workspace_progress(
+        ctx.workspace_id,
+        payload,
+        metadata={
+            "scan_key": scan_key,
+            "expansion_artists_total": ctx.expansion_artists_total,
+            "expansion_artists_completed": ctx.expansion_artists_completed,
+        },
+    )
     if ctx.on_progress is not None:
         _call_progress(ctx.on_progress, payload, ctx.task_done, ctx.task_total)
+    existing_workspace = db.get_workspace(ctx.workspace_id)
+    existing_metadata: dict[str, Any] = {}
+    if existing_workspace is not None:
+        try:
+            loaded = json.loads(existing_workspace["metadata_json"] or "{}")
+            if isinstance(loaded, dict):
+                existing_metadata = loaded
+        except (TypeError, ValueError):
+            pass
     metadata = {
+        **existing_metadata,
         "workflow": "spotify_discovery",
         "scan_key": scan_key,
         "scan_id": scan_id,
@@ -1854,6 +1973,42 @@ def _finish(
     )
 
 
+def _cancel_discovery(
+    ctx: _RunContext,
+    db: Database,
+    *,
+    workspace_key: str,
+    scan_key: str,
+    scan_id: int,
+    error: str,
+    library_result: LibraryImportResult | None = None,
+) -> DiscoveryResult:
+    try:
+        db.clear_workspace_candidates(ctx.workspace_id)
+        db.update_workspace(
+            ctx.workspace_id,
+            status="cancelled",
+            phase="cancelled",
+            metadata={"cancelled": True, "message": "Scan cancelled. Partial progress discarded."},
+        )
+        for task in db.get_discovery_tasks(ctx.workspace_id):
+            if task["status"] in {"pending", "running"}:
+                db.update_discovery_task(int(task["id"]), status="cancelled", error=error)
+    except Exception:
+        pass
+    return _finish(
+        ctx,
+        db,
+        workspace_key=workspace_key,
+        scan_key=scan_key,
+        scan_id=scan_id,
+        status="cancelled",
+        phase="cancelled",
+        library_result=library_result,
+        error=error,
+    )
+
+
 def build_spotify_estimate(
     config: AppConfig,
     db: Database,
@@ -1869,6 +2024,7 @@ def build_spotify_estimate(
     track_list = list(tracks)
     owned_ids = db.get_workspace_owned_track_ids(workspace_id) if workspace_id is not None else set()
     searchable = [track for track in track_list if int(track.db_id or 0) not in owned_ids]
+    searchable, unavailable = _catalog_filter_tracks(source_list, searchable)
     _track_specs, specs_by_track = _primary_artist_specs(db, config, source_list, searchable)
     specs = {spec.key: spec for values in specs_by_track.values() for spec in values}
     enabled, ttl_days, resume, _retry_failed = _cache_settings(config)
@@ -1900,6 +2056,8 @@ def build_spotify_estimate(
     return {
         "selected_tracks": len(track_list),
         "searchable_tracks": len(searchable),
+        "catalog_eligible_tracks": len(searchable),
+        "catalog_unavailable_tracks": len(unavailable),
         "already_owned": len(track_list) - len(searchable),
         "suppressed_tracks": len(track_list) - len(searchable),
         "catalog_queries": catalog,
@@ -2026,14 +2184,14 @@ def run_spotify_discovery(
         on_track_scored=on_track_scored,
         cancel_event=cancellation_event,
     )
-    ctx.set_phase("spotify_sync", "Fetching Spotify library")
-
     try:
+        ctx.set_phase("spotify_sync", "Fetching Spotify library")
         library = _normalise_library_result(prefetched) if prefetched is not None else _fetch_library(
             spotify_client if spotify_client is not None else _default_spotify_client(config),
             include_liked,
             selected_playlist_ids,
         )
+        ctx.check_cancelled()
         stored = db.replace_spotify_library(library, workspace_id=actual_workspace_id)
         stats.playlists = len(library.playlists)
         stats.library_items = len(library.outcomes) or int(
@@ -2043,6 +2201,15 @@ def run_spotify_discovery(
         stats.total_tracks = len(stored)
         ctx.set_totals(tracks=len(stored))
         ctx.log(f"Imported {len(stored)} Spotify tracks from {len(library.playlists)} playlists")
+    except DiscoveryCancelled as exc:
+        return _cancel_discovery(
+            ctx,
+            db,
+            workspace_key=actual_workspace_key,
+            scan_key=actual_scan_key,
+            scan_id=scan_id,
+            error=_error_text(exc),
+        )
     except Exception as exc:
         error = _error_text(exc)
         db.record_error("spotify_sync", error)
@@ -2065,9 +2232,12 @@ def run_spotify_discovery(
         # sync.
         tracks = list(stored)
         owned_ids = db.get_workspace_owned_track_ids(actual_workspace_id)
-        searchable_tracks = [track for track in tracks if int(track.db_id or 0) not in owned_ids]
-        stats.already_owned_tracks = len(tracks) - len(searchable_tracks)
-        stats.suppressed_tracks = stats.already_owned_tracks
+        unowned_tracks = [track for track in tracks if int(track.db_id or 0) not in owned_ids]
+        searchable_tracks, unavailable_tracks = _catalog_filter_tracks(source_list, unowned_tracks)
+        stats.already_owned_tracks = len(tracks) - len(unowned_tracks)
+        stats.catalog_eligible_tracks = len(searchable_tracks)
+        stats.catalog_unavailable_tracks = len(unavailable_tracks)
+        stats.suppressed_tracks = stats.already_owned_tracks + stats.catalog_unavailable_tracks
         stats.library_tracks = len(tracks)
         stats.total_tracks = len(searchable_tracks)
         ctx.set_phase("source_search", "Preparing chart-source queries")
@@ -2178,18 +2348,14 @@ def run_spotify_discovery(
             library_result=library,
         )
     except DiscoveryCancelled as exc:
-        message = _error_text(exc)
-        try:
-            db.update_workspace(actual_workspace_id, status="cancelled", phase="cancelled", metadata={"cancelled": True, "message": message})
-            for task in db.get_discovery_tasks(actual_workspace_id):
-                if task["status"] in {"pending", "running"}:
-                    db.update_discovery_task(int(task["id"]), status="cancelled", error=message)
-        except Exception:
-            pass
-        return _finish(
-            ctx, db, workspace_key=actual_workspace_key, scan_key=actual_scan_key,
-            scan_id=scan_id, status="cancelled", phase="cancelled", library_result=library,
-            error=message,
+        return _cancel_discovery(
+            ctx,
+            db,
+            workspace_key=actual_workspace_key,
+            scan_key=actual_scan_key,
+            scan_id=scan_id,
+            library_result=library,
+            error=_error_text(exc),
         )
     except Exception as exc:
         error = _error_text(exc)
@@ -2216,25 +2382,170 @@ def _expansion_cap(config: Any, track_count: int) -> int:
     return max(0, int(_value(expansion, "cap_one_song", default=10) or 0))
 
 
-def _current_spotify_tracks(db: Database) -> list[Track]:
-    """Prefer tracks in the current Spotify membership snapshot on resync."""
-    tracks = db.get_spotify_tracks()
-    try:
-        membership_ids = {
-            str(row["spotify_track_id"])
-            for row in db.get_spotify_playlist_memberships()
-            if row["spotify_track_id"]
-        }
-        membership_ids.update(
-            str(row["spotify_track_id"])
-            for row in db.get_spotify_liked_tracks()
-            if row["spotify_track_id"]
+def _expansion_metadata(data: Mapping[str, Any]) -> dict[str, Any]:
+    """Read the persisted Spotify discography preview for an expansion artist."""
+    metadata = data.get("metadata")
+    if isinstance(metadata, Mapping):
+        return dict(metadata)
+    raw = data.get("metadata_json")
+    if isinstance(raw, Mapping):
+        return dict(raw)
+    if isinstance(raw, str):
+        try:
+            loaded = json.loads(raw)
+        except (TypeError, ValueError):
+            loaded = {}
+        if isinstance(loaded, Mapping):
+            return dict(loaded)
+    return {}
+
+
+def _preview_track(item: Mapping[str, Any], artist_name: str, artist_norm: str) -> Track | None:
+    title = str(item.get("title") or "").strip()
+    artist = str(item.get("artist") or artist_name).strip()
+    if not title or not artist:
+        return None
+    title_norm = normalize_title(title)
+    resolved_artist_norm = normalize_artist(artist)
+    return Track(
+        track_key=f"expansion:{artist_norm}:{title_norm}",
+        title=title,
+        title_norm=title_norm,
+        artist_full=artist,
+        artist_norm=resolved_artist_norm,
+        primary_artist=artist,
+        primary_artist_norm=resolved_artist_norm,
+        album=str(item.get("album") or ""),
+        album_norm=normalize_title(str(item.get("album") or "")),
+        spotify_id=str(item.get("spotify_id") or ""),
+        album_id=str(item.get("album_id") or ""),
+        duration_ms=item.get("duration_ms"),
+        origin="spotify_discography",
+    )
+
+
+def _replace_expansion_candidates_for_artist(
+    db: Database,
+    workspace_id: int,
+    artist_norm: str,
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    batch_id: int | str | None = None,
+    request_count: int | None = None,
+) -> None:
+    """Atomically replace one artist without touching other expansion rows.
+
+    The schema-v6 integration point is expected to accept
+    ``(workspace_id, artist_norm, rows)`` where each row contains the keyword
+    arguments accepted by ``Database.upsert_workspace_candidate``.  The local
+    fallback is intentionally isolated here until that helper is available.
+    """
+    replace = _value(
+        db,
+        "replace_workspace_expansion_candidates_for_artist",
+        "replace_workspace_expansion_artist_candidates",
+        "replace_expansion_artist_candidates",
+        default=None,
+    )
+    if callable(replace):
+        kwargs = {}
+        try:
+            parameters = inspect.signature(replace).parameters
+        except (TypeError, ValueError):
+            parameters = {}
+        if "batch_id" in parameters:
+            kwargs["batch_id"] = int(batch_id) if batch_id is not None else None
+        if "request_count" in parameters:
+            kwargs["request_count"] = request_count
+        replace(workspace_id, artist_norm, list(rows), **kwargs)
+        return
+
+    workspace_db_id = db._workspace_db_id(workspace_id)
+    with db._conn:
+        db._conn.execute(
+            "DELETE FROM workspace_selections WHERE workspace_id = ? AND kind = 'expansion' AND artist_norm = ?",
+            (workspace_db_id, artist_norm),
         )
-    except (AttributeError, KeyError, TypeError):
-        return tracks
-    if not membership_ids:
-        return tracks
-    return [track for track in tracks if str(track.spotify_id) in membership_ids]
+        db._conn.execute(
+            "DELETE FROM workspace_candidates WHERE workspace_id = ? AND kind = 'expansion' AND artist_norm = ?",
+            (workspace_db_id, artist_norm),
+        )
+        for row in rows:
+            candidate = row["candidate"]
+            db._conn.execute(
+                """INSERT INTO workspace_candidates
+                   (workspace_id, track_id, candidate_id, kind, artist_norm, task_id,
+                    score, quality, decision, eligibility, breakdown_json, metadata_json)
+                   VALUES (?, NULL, ?, 'expansion', ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    workspace_db_id,
+                    db._candidate_db_id(candidate),
+                    artist_norm,
+                    row.get("task_id"),
+                    row.get("score", 0.0),
+                    row.get("quality", 0.0),
+                    row.get("decision", "REJECT"),
+                    row.get("eligibility", EXCLUDED),
+                    row.get("breakdown_json", "{}"),
+                    json.dumps(row.get("metadata", {}), ensure_ascii=True, default=str),
+                ),
+            )
+
+
+def _checkpoint_expansion_artist(
+    db: Database,
+    workspace_id: int,
+    batch_id: int | str | None,
+    artist_norm: str,
+    *,
+    status: str,
+    metadata: Mapping[str, Any],
+    error: str | None = None,
+) -> None:
+    """Use the optional schema-v6 per-artist durable checkpoint API.
+
+    Expected signature: ``checkpoint_expansion_batch_artist(batch_id,
+    artist_norm, *, phase, status, request_count, metadata, error=None)``.
+    Older callers without a durable batch id simply skip this checkpoint.
+    """
+    checkpoint = getattr(db, "checkpoint_expansion_batch_artist", None)
+    if callable(checkpoint) and batch_id is not None:
+        checkpoint(
+            batch_id,
+            artist_norm,
+            phase="search",
+            status=status,
+            request_count=int(metadata.get("request_count", 0) or 0),
+            metadata=dict(metadata),
+            error=error,
+        )
+
+
+def _map_catalog_candidate_to_preview(
+    candidate: ChartCandidate,
+    preview_tracks: Sequence[Track],
+    exact_titles: Mapping[str, Track],
+    config: AppConfig,
+    source: ChartSource,
+) -> tuple[Track, Any, str] | None:
+    candidate_title = str(candidate.name_norm or normalize_title(candidate.name))
+    exact = exact_titles.get(candidate_title)
+    if exact is not None:
+        return exact, score_candidate(exact, candidate, config, source), "exact"
+
+    best: tuple[float, float, Track, Any] | None = None
+    for track in preview_tracks:
+        breakdown = score_candidate(track, candidate, config, source)
+        title_score = float(getattr(breakdown, "title_score", 0.0) or 0.0)
+        artist_score = float(getattr(breakdown, "artist_score", 0.0) or 0.0)
+        value = (title_score, artist_score, track, breakdown)
+        if best is None or value[:2] > best[:2]:
+            best = value
+    if best is None or best[0] < EXPANSION_FUZZY_TITLE_MINIMUM:
+        return None
+    if bool(getattr(best[3], "gate_factors", {}).get("artist_conflict")):
+        return None
+    return best[2], best[3], "fuzzy"
 
 
 def run_expansion_discovery(
@@ -2251,6 +2562,10 @@ def run_expansion_discovery(
     scan_key: str = DEFAULT_EXPANSION_SCAN_KEY,
     on_progress: ProgressCallback | None = None,
     on_log: LogCallback | None = None,
+    cancellation_event: Any | None = None,
+    cancel_event: Any | None = None,
+    expansion_batch_id: int | str | None = None,
+    batch_id: int | str | None = None,
 ) -> DiscoveryResult:
     """Discover expansion charts only for explicitly selected primary artists.
 
@@ -2276,6 +2591,10 @@ def run_expansion_discovery(
     )
     actual_scan_key = scan_key.strip() or DEFAULT_EXPANSION_SCAN_KEY
     scan_id = _begin_scan(db, actual_workspace_id, actual_scan_key, "expansion")
+    if cancellation_event is None:
+        cancellation_event = cancel_event
+    if expansion_batch_id is None:
+        expansion_batch_id = batch_id
     stats = DiscoveryStats()
     ctx = _RunContext(
         config,
@@ -2285,10 +2604,11 @@ def run_expansion_discovery(
         stats,
         on_progress=on_progress,
         on_log=on_log,
+        cancel_event=cancellation_event,
     )
     try:
         source_list = _resolve_sources(config, sources)
-        tracks = _current_spotify_tracks(db)
+        tracks = db.get_library_tracks(workspace_id=actual_workspace_id)
         stats.library_tracks = len(tracks)
         stats.total_tracks = len(tracks)
         primary: dict[str, dict[str, Any]] = {}
@@ -2317,6 +2637,10 @@ def run_expansion_discovery(
         else:
             values = list(selected_artists)
 
+        stored_rows = {
+            str(row["artist_norm"]): dict(row)
+            for row in db.get_workspace_expansion_artists(actual_workspace_id)
+        }
         selected: list[dict[str, Any]] = []
         seen: set[str] = set()
         for value in values:
@@ -2335,6 +2659,7 @@ def run_expansion_discovery(
             if norm not in primary or norm in seen:
                 continue
             entry = dict(primary[norm])
+            stored = stored_rows.get(norm, {})
             configured_cap = data.get("cap")
             try:
                 entry["cap"] = (
@@ -2345,14 +2670,27 @@ def run_expansion_discovery(
             except (TypeError, ValueError):
                 entry["cap"] = _expansion_cap(config, entry["track_count"])
             entry["selected"] = True
+            # A preview is produced by the web workflow before Enchor matching.
+            # Preserve it when this run rebuilds the selected artist rows.
+            entry["metadata"] = _expansion_metadata({**stored, **data})
             selected.append(entry)
             seen.add(norm)
 
-        db.replace_workspace_expansion_artists(actual_workspace_id, selected)
+        replacement = {
+            norm: row
+            for norm, row in stored_rows.items()
+            if norm in primary
+        }
+        replacement.update({entry["artist_norm"]: entry for entry in selected})
+        db.replace_workspace_expansion_artists(
+            actual_workspace_id, replacement.values()
+        )
         for entry in selected:
             db.set_expansion_artist_selected(actual_workspace_id, entry["artist_norm"], True)
         stats.expansion_artists_requested = len(selected)
         eligible_artists = [entry for entry in selected if entry["cap"] > 0]
+        stats.expansion_artists_total = len(eligible_artists)
+        ctx.set_expansion_artist_totals(len(eligible_artists))
         ctx.set_phase("expansion_search", "Preparing selected artist expansion")
         ctx.set_totals(tasks=len(eligible_artists) * len(source_list), tracks=0)
         # Expansion does not rescore exact tracks, but the workspace still
@@ -2363,6 +2701,214 @@ def run_expansion_discovery(
         ctx.scoring_total = 0
         stats.scoring_tasks_total = 0
 
+        preview_by_artist: dict[str, list[Track]] = {}
+        has_preview = False
+        preview_errors = 0
+        preview_song_count = 0
+        for entry in eligible_artists:
+            preview = entry.get("metadata", {}).get("discography_preview", {})
+            if isinstance(preview, Mapping) and (
+                "tracks" in preview or "discovered_at" in preview
+            ):
+                has_preview = True
+                if preview.get("error"):
+                    preview_errors += 1
+            raw_tracks = preview.get("tracks", []) if isinstance(preview, Mapping) else []
+            seen_preview_songs: set[str] = set()
+            for raw_item in raw_tracks:
+                if not isinstance(raw_item, Mapping):
+                    continue
+                song = _preview_track(raw_item, entry["artist_name"], entry["artist_norm"])
+                if song is None:
+                    continue
+                if song.title_norm in seen_preview_songs:
+                    continue
+                seen_preview_songs.add(song.title_norm)
+                preview_song_count += 1
+                memberships = [
+                    source_catalog_available(source, song.primary_artist, song.title)
+                    for source in source_list
+                ]
+                if memberships and all(value is False for value in memberships):
+                    stats.expansion_catalog_unavailable_songs += 1
+                    continue
+                preview_by_artist.setdefault(entry["artist_norm"], []).append(song)
+
+        if has_preview:
+            stats.expansion_songs_total = preview_song_count
+            stats.expansion_songs_with_charts = 0
+            stats.expansion_songs_without_charts = 0
+            query_artists = sum(bool(preview_by_artist.get(entry["artist_norm"])) for entry in eligible_artists)
+            ctx.set_totals(tasks=query_artists * len(source_list), tracks=0)
+            if preview_errors:
+                stats.partial = True
+                stats.error_messages.extend(
+                    [
+                        f"Spotify discography preview failed for {entry['artist_name']}"
+                        for entry in eligible_artists
+                        if (
+                            isinstance(entry.get("metadata", {}).get("discography_preview"), Mapping)
+                            and entry["metadata"]["discography_preview"].get("error")
+                        )
+                    ]
+                )
+            ctx.set_phase(
+                "expansion_catalog_search",
+                f"Searching artist catalogs for {len(eligible_artists)} Spotify artists",
+            )
+            stats.catalog_queries = len(eligible_artists) * len(source_list)
+            source_by_name = {_source_name(source): source for source in source_list}
+            for entry in eligible_artists:
+                ctx.check_cancelled()
+                artist_norm = entry["artist_norm"]
+                preview_tracks = preview_by_artist.get(artist_norm, [])
+                if not preview_tracks:
+                    _replace_expansion_candidates_for_artist(
+                        db, actual_workspace_id, artist_norm, [],
+                        batch_id=expansion_batch_id, request_count=0,
+                    )
+                    _checkpoint_expansion_artist(
+                        db, actual_workspace_id, expansion_batch_id, artist_norm,
+                        status="complete",
+                        metadata={
+                            "query_kind": "local_catalog",
+                            "preview_track_count": 0,
+                            "catalog_unavailable": True,
+                            "request_count": 0,
+                        },
+                    )
+                    ctx.expansion_artist_finished(entry["artist_name"])
+                    continue
+                exact_titles = {track.title_norm: track for track in preview_tracks}
+                specs = [
+                    _make_query_spec(db, config, source, "artist", entry["artist_name"])
+                    for source in source_list
+                ]
+                outcomes: dict[str, _QueryOutcome] = {}
+                task_ids: dict[str, int] = {}
+                _resolve_queries(ctx, config, db, specs, outcomes, task_ids, scan_id)
+                ctx.check_cancelled()
+                rows: list[dict[str, Any]] = []
+                matched_song_keys: set[str] = set()
+                source_errors: list[str] = []
+                successful_sources = 0
+                catalog_truncated = False
+                seen_candidates: set[tuple[str, int]] = set()
+                for spec in specs:
+                    outcome = outcomes.get(spec.key, _QueryOutcome(error="query did not reach a terminal state"))
+                    if outcome.error:
+                        source_errors.append(f"{spec.source_name}: {outcome.error}")
+                        db.record_error("spotify_expansion", source_errors[-1], artist_norm)
+                        continue
+                    successful_sources += 1
+                    catalog_truncated = catalog_truncated or outcome.cap_reached
+                    for candidate in outcome.candidates:
+                        identity = (str(candidate.source), _chart_id(candidate))
+                        if identity in seen_candidates:
+                            continue
+                        seen_candidates.add(identity)
+                        source = source_by_name.get(str(candidate.source), spec.source)
+                        try:
+                            mapped = _map_catalog_candidate_to_preview(
+                                candidate, preview_tracks, exact_titles, config, source
+                            )
+                        except Exception as exc:
+                            db.record_error("spotify_expansion_score", _error_text(exc), artist_norm)
+                            continue
+                        if mapped is None:
+                            continue
+                        song, breakdown, match_method = mapped
+                        eligibility, reasons = _score_eligibility(breakdown, config)
+                        matched_song_keys.add(song.track_key)
+                        rows.append({
+                            "candidate": candidate,
+                            "score": float(getattr(breakdown, "final_score", 0.0) or 0.0),
+                            "quality": float(getattr(breakdown, "quality", 0.0) or 0.0),
+                            "decision": str(getattr(breakdown, "decision", "REJECT") or "REJECT"),
+                            "eligibility": eligibility,
+                            "task_id": outcome.task_id,
+                            "breakdown_json": _score_breakdown_json(breakdown, eligibility, reasons),
+                            "metadata": {
+                                "query_kind": "artist_catalog",
+                                "artist_norm": artist_norm,
+                                "artist_cap": entry["cap"],
+                                "matched_spotify_title": song.title,
+                                "discography_song_title": song.title,
+                                "discography_song_artist": song.primary_artist,
+                                "spotify_track_id": song.spotify_id,
+                                "spotify_album": song.album,
+                                "spotify_album_id": song.album_id,
+                                "preview_match_method": match_method,
+                                "preview_title_similarity": float(getattr(breakdown, "title_score", 0.0) or 0.0),
+                                "query_key": spec.key,
+                                "source_version": spec.source_version,
+                                "source_total": outcome.source_total,
+                                "returned_count": outcome.returned_count,
+                                "catalog_truncated": outcome.cap_reached,
+                            },
+                        })
+                rows.sort(key=lambda row: (
+                    -float(row["score"]), -float(row["quality"]),
+                    str(row["candidate"].source), _chart_id(row["candidate"]),
+                ))
+                retained = rows[: entry["cap"]]
+                for rank, row in enumerate(retained, 1):
+                    row["metadata"]["cap_rank"] = rank
+                    row["metadata"]["within_artist_cap"] = True
+                    row["metadata"]["catalog_partial"] = bool(catalog_truncated or source_errors)
+                ctx.add_scoring_tasks(len(retained))
+                if successful_sources or not source_list:
+                    _replace_expansion_candidates_for_artist(
+                        db,
+                        actual_workspace_id,
+                        artist_norm,
+                        retained,
+                        batch_id=expansion_batch_id,
+                        request_count=sum(not outcomes[spec.key].cached for spec in specs),
+                    )
+                for row in retained:
+                    ctx.note_expansion_score(artist_norm, row["candidate"], row["eligibility"])
+                    ctx.expansion_score_finished(entry["artist_name"], row["metadata"]["matched_spotify_title"])
+                stats.expansion_songs_with_charts += len(matched_song_keys)
+                stats.expansion_songs_without_charts += max(0, len(preview_tracks) - len(matched_song_keys))
+                artist_failed = bool(source_list and not successful_sources)
+                artist_partial = bool(catalog_truncated or source_errors or entry.get("metadata", {}).get("discography_preview", {}).get("error"))
+                if artist_partial:
+                    stats.partial = True
+                _checkpoint_expansion_artist(
+                    db,
+                    actual_workspace_id,
+                    expansion_batch_id,
+                    artist_norm,
+                    status="failed" if artist_failed else "complete",
+                    metadata={
+                        "query_kind": "artist_catalog",
+                        "preview_track_count": len(preview_tracks),
+                        "matched_track_count": len(matched_song_keys),
+                        "retained_candidate_count": len(retained),
+                        "candidate_cap": entry["cap"],
+                        "catalog_truncated": catalog_truncated,
+                        "partial": artist_partial,
+                        "source_errors": source_errors,
+                        "preserved_previous_results": artist_failed,
+                        "request_count": sum(not outcomes[spec.key].cached for spec in specs),
+                    },
+                    error="; ".join(source_errors) or None,
+                )
+                ctx.expansion_artist_finished(entry["artist_name"])
+
+            return _finish(
+                ctx,
+                db,
+                workspace_key=actual_workspace_key,
+                scan_key=actual_scan_key,
+                scan_id=scan_id,
+                status="partial" if ctx.stats.partial else "complete",
+                phase="complete",
+            )
+
+        # Compatibility fallback for non-web callers that have not generated
+        # a Spotify discography preview yet.
         specs: list[tuple[dict[str, Any], _QuerySpec]] = []
         for entry in eligible_artists:
             for source in source_list:
@@ -2396,7 +2942,17 @@ def run_expansion_discovery(
             outcome = outcomes.get(spec.key, _QueryOutcome(error="query did not reach a terminal state"))
             by_artist.setdefault(entry["artist_norm"], []).append((spec, outcome, entry))
 
+        scoring_keys = {
+            (artist_norm, str(candidate.source), _chart_id(candidate))
+            for artist_norm, artist_queries in by_artist.items()
+            for _spec, outcome, _entry in artist_queries
+            if not outcome.error
+            for candidate in outcome.candidates
+        }
+        ctx.add_scoring_tasks(len(scoring_keys))
+
         for artist_norm, artist_queries in by_artist.items():
+            ctx.check_cancelled()
             entry = artist_queries[0][2]
             ctx.set_phase("expansion_scoring", f"Scoring expansion for {entry['artist_name']}")
             candidates: dict[tuple[str, int], tuple[ChartCandidate, _QuerySpec, int | None]] = {}
@@ -2422,10 +2978,6 @@ def run_expansion_discovery(
                 eligibility, reasons = _score_eligibility(breakdown, config)
                 scored.append((candidate, breakdown, eligibility, reasons, spec, task_id))
 
-            # Preserve every returned result for review, while storing a stable
-            # rank and the configured artist cap in metadata.  Consumers can
-            # enforce the cap at selection/export time without hiding lower
-            # ranked source-owned cards.
             scored.sort(
                 key=lambda item: (
                     -float(getattr(item[1], "final_score", 0.0) or 0.0),
@@ -2434,32 +2986,34 @@ def run_expansion_discovery(
                     int(item[0].chart_id),
                 )
             )
-            for rank, (candidate, breakdown, eligibility, reasons, spec, task_id) in enumerate(scored, 1):
+            retained_rows: list[dict[str, Any]] = []
+            for rank, (candidate, breakdown, eligibility, reasons, spec, task_id) in enumerate(scored[: entry["cap"]], 1):
                 metadata = {
                     "query_kind": "artist",
                     "artist_norm": artist_norm,
                     "artist_cap": entry["cap"],
                     "cap_rank": rank,
-                    "within_artist_cap": rank <= entry["cap"],
+                    "within_artist_cap": True,
                     "query_key": spec.key,
                     "source_version": spec.source_version,
                 }
-                db.upsert_workspace_candidate(
-                    actual_workspace_id,
-                    None,
-                    candidate,
-                    score=float(getattr(breakdown, "final_score", 0.0) or 0.0),
-                    quality=float(getattr(breakdown, "quality", 0.0) or 0.0),
-                    decision=str(getattr(breakdown, "decision", "REJECT") or "REJECT"),
-                    eligibility=eligibility,
-                    kind="expansion",
-                    artist_norm=artist_norm,
-                    task_id=task_id,
-                    breakdown_json=_score_breakdown_json(breakdown, eligibility, reasons),
-                    metadata=metadata,
-                )
+                retained_rows.append({
+                    "candidate": candidate,
+                    "score": float(getattr(breakdown, "final_score", 0.0) or 0.0),
+                    "quality": float(getattr(breakdown, "quality", 0.0) or 0.0),
+                    "decision": str(getattr(breakdown, "decision", "REJECT") or "REJECT"),
+                    "eligibility": eligibility,
+                    "task_id": task_id,
+                    "breakdown_json": _score_breakdown_json(breakdown, eligibility, reasons),
+                    "metadata": metadata,
+                })
                 ctx.note_expansion_score(artist_norm, candidate, eligibility)
-            stats.expansion_artists_scanned += 1
+                ctx.expansion_score_finished(entry["artist_name"], candidate.name)
+            if any(not outcome.error for _spec, outcome, _entry in artist_queries):
+                _replace_expansion_candidates_for_artist(
+                    db, actual_workspace_id, artist_norm, retained_rows
+                )
+            ctx.expansion_artist_finished(entry["artist_name"])
 
         return _finish(
             ctx,
@@ -2469,6 +3023,30 @@ def run_expansion_discovery(
             scan_id=scan_id,
             status="complete",
             phase="complete",
+        )
+    except DiscoveryCancelled as exc:
+        message = _error_text(exc)
+        try:
+            db.update_workspace(
+                actual_workspace_id,
+                status="cancelled",
+                phase="cancelled",
+                metadata={"cancelled": True, "message": "Scan cancelled. Completed artists were preserved."},
+            )
+            for task in db.get_discovery_tasks(actual_workspace_id):
+                if task["status"] in {"pending", "running"}:
+                    db.update_discovery_task(int(task["id"]), status="cancelled", error=message)
+        except Exception:
+            pass
+        return _finish(
+            ctx,
+            db,
+            workspace_key=actual_workspace_key,
+            scan_key=actual_scan_key,
+            scan_id=scan_id,
+            status="cancelled",
+            phase="cancelled",
+            error=message,
         )
     except Exception as exc:
         error = _error_text(exc)

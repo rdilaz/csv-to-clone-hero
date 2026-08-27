@@ -84,6 +84,12 @@ def _progress() -> Progress:
 
 # ---------------------------------------------------------------------- scan
 def run_scan(config: AppConfig, db: Database, overrides: Overrides) -> ScanStats:
+    """Import the configured playlist directory into the legacy track tables.
+
+    Disabled files and explicit ignored-track overrides are applied before the
+    current snapshot replaces the previous CSV track set. Search cache rows are
+    intentionally preserved so a scan can be followed by a resumable search.
+    """
     disabled_files = db.get_disabled_files()
     result = import_playlist_dir(config.input_path, skip=disabled_files)
 
@@ -664,6 +670,12 @@ def run_search(
     on_track_scored=None,
     on_search_start=None,
 ) -> SearchStats:
+    """Run the exact pass and, when requested, the artist expansion pass.
+
+    ``include_expansion`` selects the legacy expansion strategy while the exact
+    pass remains the source of truth for playlist matches. Results and summary
+    counters are persisted for the web UI and later planning.
+    """
     if include_expansion is None:
         # Preserve the terminal pipeline's historical default. Web callers
         # pass False for the exact-only first pass.
@@ -786,6 +798,13 @@ def run_plan(
     on_progress=None,
     include_expansion: bool | None = None,
 ) -> PlanStats:
+    """Build and persist a storage-aware selection plan.
+
+    Source adapters may provide real chart sizes through ``head_size``; failed
+    size probes fall back to the configured estimate. Exact songs are planned
+    before expansion songs, and the planner persists one current selection set
+    while retaining candidate-keyed download history.
+    """
     def size_lookup(candidate: ChartCandidate) -> int | None:
         for source in sources:
             if source.name == candidate.source and hasattr(source, "head_size"):
@@ -900,7 +919,12 @@ def cleanup_empty_folders(config: AppConfig) -> int:
 def run_downloads(
     config: AppConfig, db: Database, sources: list[ChartSource], on_progress=None
 ) -> tuple[int, int, int]:
-    """Download all selected charts. Returns (downloaded, errors, bytes)."""
+    """Download selected charts through the source boundary.
+
+    The manager validates destination containment, resumes candidate-keyed
+    downloads, writes through temporary files, and records each terminal result.
+    The return value is ``(successful_items, failed_items, bytes_written)``.
+    """
     manager = DownloadManager(config, db)
     source_by_name = {s.name: s for s in sources}
     selections = db.get_selections(status="selected")
@@ -942,7 +966,12 @@ def run_build(
     on_track_scored=None,
     on_search_start=None,
 ) -> BuildResult:
-    """Full pipeline with friendly console output."""
+    """Run scan, search, plan, optional download, relocation, and reporting.
+
+    ``dry_run`` and ``build.direct_download_enabled`` stop before filesystem
+    downloads but still produce the search, plan, and report state needed for a
+    later build. Progress callbacks are forwarded to the search stage.
+    """
     result = BuildResult()
     if include_expansion is None:
         include_expansion = config.expansion.enabled
