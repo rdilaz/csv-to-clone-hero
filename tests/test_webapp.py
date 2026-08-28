@@ -6,6 +6,7 @@ import json
 import os
 import re
 import shutil
+import struct
 import subprocess
 import threading
 import time
@@ -43,38 +44,133 @@ def wait_for_soundcloud_import(client, payload, timeout=5.0):
     pytest.fail("SoundCloud import did not finish in time")
 
 
-def test_index_serves_spotify_workflow(client):
+def seed_local_workspace(config, workspace_id, charts=True):
+    from csv_to_clonehero.providers.base import LibrarySnapshot, ProviderTrack
+
+    db = Database(config.database_path)
+    try:
+        snapshot = LibrarySnapshot(
+            "soundcloud",
+            [
+                ProviderTrack(
+                    provider="soundcloud",
+                    provider_id="sc-song",
+                    title="Song",
+                    artist="Artist",
+                    album="Album",
+                ),
+                ProviderTrack(
+                    provider="soundcloud",
+                    provider_id="sc-missing",
+                    title="Missing Song",
+                    artist="Artist",
+                ),
+            ],
+        )
+        db.upsert_library_snapshot(workspace_id, snapshot)
+        tracks = {track.title: track for track in db.get_spotify_tracks(True)}
+        if charts:
+            good = make_chart("Song", "Artist", chart_id=301)
+            review = make_chart("Song (Live)", "Artist", chart_id=302)
+            blocked = make_chart(
+                "Song", "Artist", chart_id=303, instruments=[], diff_guitar=None
+            )
+            good_breakdown = {
+                "eligibility": "RECOMMENDED",
+                "factors": {
+                    "match": {
+                        "title": {"similarity": 100, "exact_normalized": True},
+                        "artist": {"similarity": 100, "exact_normalized": True},
+                    },
+                    "quality": {"full_band": 8},
+                    "gates": {
+                        "hard_gate": False,
+                        "playable_content": True,
+                        "required_five_fret_guitar": True,
+                    },
+                },
+            }
+            review_breakdown = {
+                "eligibility": "ELIGIBLE_REVIEW",
+                "factors": {
+                    "match": {
+                        "title": {"similarity": 92},
+                        "artist": {"similarity": 96},
+                        "version_markers": {"track": [], "candidate": ["live"]},
+                    },
+                    "quality": {"unrated_guitar": -3},
+                    "gates": {
+                        "hard_gate": False,
+                        "playable_content": True,
+                        "required_five_fret_guitar": True,
+                    },
+                },
+            }
+            blocked_breakdown = {
+                "eligibility": "INCOMPATIBLE",
+                "decision": "REJECT",
+                "reasons": ["no playable chart content"],
+                "factors": {
+                    "gates": {
+                        "hard_gate": True,
+                        "playable_content": False,
+                        "hard_gate_reasons": ["no playable chart content"],
+                    },
+                },
+            }
+            for chart, score, eligibility, decision, breakdown in (
+                (good, 94, "RECOMMENDED", "AUTO_ACCEPT", good_breakdown),
+                (review, 82, "ELIGIBLE_REVIEW", "REVIEW", review_breakdown),
+                (blocked, 99, "INCOMPATIBLE", "REJECT", blocked_breakdown),
+            ):
+                db.upsert_candidate(chart)
+                db.upsert_workspace_candidate(
+                    workspace_id,
+                    tracks["Song"].track_key,
+                    chart,
+                    score=score,
+                    eligibility=eligibility,
+                    decision=decision,
+                    breakdown_json=json.dumps(breakdown),
+                    kind="exact",
+                )
+        db.update_workspace(
+            workspace_id,
+            status="complete",
+            phase="complete",
+            message="Catalog matching complete.",
+            error="",
+        )
+        db.update_workspace_progress(
+            workspace_id,
+            status="complete",
+            phase="complete",
+            message="Catalog matching complete.",
+            error="",
+            metadata={"run_id": "local-test-run", "scan_key": "catalog"},
+        )
+        return tracks["Song"]
+    finally:
+        db.close()
+
+
+def test_index_serves_source_neutral_workflow(client):
     response = client.get("/")
     assert response.status_code == 200
     html = response.get_data(as_text=True)
     for text in (
-        "Sign in with Spotify",
+        "Music to Clone Hero and YARG",
+        "SoundCloud export",
+        "Import SoundCloud export",
         "Connect Spotify",
-        "Choose your music",
         "Find chart matches",
         "Review and export",
-        "Optional: link an existing library",
-        "Resume or manage saved work",
-        "Preview additional songs",
-        "Find charts for this preview",
-        "Selected charts",
+        "Review matches",
     ):
         assert text in html
-    for element_id in (
-        "scopePanel",
-        "scopeList",
-        "expansionPreview",
-        "expansionStart",
-        "expansionCancel",
-        "expansionAll",
-        "expansionNone",
-        "artists",
-        "tray",
-        "traySummary",
-        "serverExport",
-        "remoteExport",
-    ):
-        assert f'id="{element_id}"' in html
+    assert "source_key" not in html
+    assert "provenance" not in html
+    assert "Open advanced review and download" not in html
     ids = re.findall(r'id="([^\"]+)"', html)
     assert len(ids) == len(set(ids))
 
@@ -100,6 +196,190 @@ def test_home_inline_script_parses_in_javascript_engine(client, tmp_path):
     assert "/api/discovery/start" in scripts[0]
 
 
+def test_advanced_inline_script_parses_in_javascript_engine(client, tmp_path):
+    if shutil.which("node") is None:
+        pytest.skip("Node.js is not installed")
+
+    html = client.get("/advanced").get_data(as_text=True)
+    scripts = re.findall(r"<script>\s*(.*?)\s*</script>", html, flags=re.DOTALL)
+    assert len(scripts) == 1
+    script_path = tmp_path / "advanced.js"
+    script_path.write_text(scripts[0], encoding="utf-8")
+    checked = subprocess.run(
+        ["node", "--check", str(script_path)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert checked.returncode == 0, checked.stderr
+    assert "exported successfully" in scripts[0]
+
+
+def test_local_journey_summary_and_review_rehydrate_after_fresh_app(client, config):
+    initial = client.get("/api/sources").get_json()
+    track = seed_local_workspace(config, initial["workspace_id"])
+
+    fresh_app = create_app(config, source_factory=lambda cfg: [FakeSource()])
+    fresh_app.config["TESTING"] = True
+    with fresh_app.test_client() as fresh:
+        sources = fresh.get("/api/sources").get_json()
+        journey = sources["journey"]
+        assert journey["matching_status"] == "complete"
+        assert journey["counts"] == {
+            "imported_songs": 2,
+            "chart_options": 1,
+            "candidate_charts": 3,
+            "strong_matches": 1,
+            "needs_review": 1,
+            "no_candidate_songs": 1,
+            "not_playable_songs": 0,
+            "no_suitable_songs": 1,
+            "selected_charts": 0,
+        }
+        assert journey["review_url"].startswith("/advanced?workspace_id=")
+
+        status = fresh.get(
+            f"/api/discovery/status?workspace_id={initial['workspace_id']}"
+        ).get_json()
+        assert status["journey"]["headline"] == "Matching complete"
+
+        review = fresh.get("/api/review").get_json()
+        assert review["source_neutral"] is True
+        assert review["journey"]["counts"]["no_candidate_songs"] == 1
+        assert len(review["tracks"]) == 1
+        candidates = {
+            item["chart_id"]: item for item in review["tracks"][0]["candidates"]
+        }
+        assert review["tracks"][0]["review_label"] == "Strong match"
+        assert candidates[301]["review"]["summary"]
+        assert candidates[302]["review_label"] == "Needs review"
+        assert "live-version mismatch" in candidates[302]["review_summary"]
+        assert candidates[303]["review_label"] == "Not playable"
+        assert candidates[303]["selectable"] is False
+
+        selected = fresh.post(
+            "/api/review/decide",
+            json={
+                "track_key": track.track_key,
+                "source": "test",
+                "chart_id": 301,
+                "decision": "accept",
+                "workspace_id": initial["workspace_id"],
+            },
+        )
+        assert selected.status_code == 200
+        after = fresh.get("/api/review").get_json()
+        assert after["tracks"][0]["selected"] is True
+        assert after["tracks"][0]["selected_candidate_id"] == candidates[301]["candidate_id"]
+        assert after["journey"]["counts"]["selected_charts"] == 1
+
+    home = client.get("/").get_data(as_text=True)
+    assert "Review matches" in home
+    assert "source_key" not in home
+    assert "provenance" not in home
+
+
+def test_local_export_reports_one_human_readable_success(config):
+    archive = io.BytesIO()
+    with zipfile.ZipFile(archive, "w") as chart_zip:
+        chart_zip.writestr("song.ini", "[Song]\nname = Song\n")
+        chart_zip.writestr(
+            "notes.chart",
+            "[Song]\n{\nResolution = 192\n}\n"
+            "[ExpertSingle]\n{\n0 = N 0 0\n}\n",
+        )
+    content = archive.getvalue()
+    md5 = hashlib.md5(content).hexdigest()
+    source = FakeSource(files={md5: content})
+    app = create_app(config, source_factory=lambda cfg: [source])
+    app.config["TESTING"] = True
+    with app.test_client() as http:
+        sources = http.get("/api/sources").get_json()
+        workspace_id = sources["workspace_id"]
+        track = seed_local_workspace(config, workspace_id, charts=False)
+        chart = make_chart("Song", "Artist", chart_id=401, md5=md5)
+        db = Database(config.database_path)
+        try:
+            db.upsert_candidate(chart)
+            db.upsert_workspace_candidate(
+                workspace_id,
+                track.track_key,
+                chart,
+                score=94,
+                eligibility="RECOMMENDED",
+                decision="AUTO_ACCEPT",
+                breakdown_json=json.dumps({
+                    "eligibility": "RECOMMENDED",
+                    "factors": {
+                        "gates": {
+                            "hard_gate": False,
+                            "playable_content": True,
+                            "required_five_fret_guitar": True,
+                        },
+                    },
+                }),
+                kind="exact",
+            )
+        finally:
+            db.close()
+        selected = http.post(
+            "/api/review/decide",
+            json={
+                "track_key": track.track_key,
+                "source": "test",
+                "chart_id": 401,
+                "decision": "accept",
+                "workspace_id": workspace_id,
+            },
+        )
+        assert selected.status_code == 200
+        started = http.post(
+            "/api/spotify/export/start",
+            json={"kind": "folder", "workspace_id": workspace_id, "path": str(config.base_dir / "Songs")},
+        )
+        assert started.status_code == 200
+        deadline = time.time() + 10
+        status = None
+        while time.time() < deadline:
+            status = http.get("/api/spotify/export/status").get_json()
+            if not status["running"]:
+                break
+            time.sleep(0.05)
+        assert status is not None and status["status"] == "complete"
+        assert status["result"]["success"] is True
+        assert status["result"]["published"] == 1
+        assert status["result"]["failed"] == 0
+        assert "exported successfully" in http.get("/advanced").get_data(as_text=True)
+
+
+def test_local_journey_distinguishes_catalog_failure_and_incomplete_matching(client, config):
+    initial = client.get("/api/sources").get_json()
+    seed_local_workspace(config, initial["workspace_id"], charts=False)
+
+    unavailable = client.get("/api/sources").get_json()["journey"]
+    assert unavailable["matching_status"] == "complete"
+    assert unavailable["headline"] == "Chart catalog unavailable"
+    assert unavailable["catalog_available"] is False
+
+    db = Database(config.database_path)
+    try:
+        db.update_workspace(
+            initial["workspace_id"],
+            status="partial",
+            phase="catalog_match",
+            message="Matching was interrupted.",
+        )
+    finally:
+        db.close()
+
+    incomplete = client.get("/api/sources").get_json()["journey"]
+    assert incomplete["matching_status"] == "incomplete"
+    assert incomplete["headline"] == "Matching incomplete"
+    review = client.get("/api/review").get_json()
+    assert review["progress"]["has_search_run"] is True
+    assert review["progress"]["exact_scoring_complete"] is False
+
+
 def test_soundcloud_export_is_first_class_local_source_without_spotify(client):
     response = client.post(
         "/api/sources/soundcloud/import",
@@ -119,6 +399,8 @@ def test_soundcloud_export_is_first_class_local_source_without_spotify(client):
     assert result["combined"]["tracks"] == 1
     summary = client.get("/api/sources").get_json()
     assert summary["sources"][0]["provider"] == "soundcloud"
+    assert summary["journey"]["matching_status"] == "ready"
+    assert summary["journey"]["counts"]["imported_songs"] == 1
 
 
 def test_soundcloud_import_persists_redacted_diagnostics(client, config):
@@ -999,7 +1281,7 @@ def test_advanced_page_serves_music_file_import_workflow(client):
     assert response.status_code == 200
     html = response.get_data(as_text=True)
     for text in (
-        "CSV &amp; music-file import",
+        "Review and export charts",
         "Add music exports",
         "Preview chart matches",
         "Review your matches",
@@ -1015,6 +1297,9 @@ def test_advanced_page_serves_music_file_import_workflow(client):
     assert 'id="review"' in html
     assert 'id="jobStatus"' in html
     assert 'href="/"' in html
+    assert 'id="legacyImportSources"' in html
+    assert 'id="localJourney"' in html
+    assert "Spotify library workflow" not in html
 
 
 def test_upload_list_delete_csv(client, config):
@@ -1115,7 +1400,7 @@ def test_dry_run_job_completes(client, config):
 
 
 def test_full_build_job_downloads(config):
-    content = b"sng-bytes" * 100
+    content = _sng_bytes()
     md5 = hashlib.md5(content).hexdigest()
     chart = make_chart("Humble", "Kendrick Lamar", chart_id=1, md5=md5)
     source = FakeSource(
@@ -1235,7 +1520,7 @@ def test_open_folder_404_when_missing(client):
 
 
 def test_simple_run_end_to_end(config, monkeypatch):
-    content = b"sng-bytes" * 100
+    content = _sng_bytes()
     md5 = hashlib.md5(content).hexdigest()
     chart = make_chart("Humble", "Kendrick Lamar", chart_id=1, md5=md5)
     source = FakeSource(
@@ -1419,11 +1704,75 @@ def _sng_bytes(name="Test", artist="Test Artist") -> bytes:
     payload = io.BytesIO()
     with zipfile.ZipFile(payload, "w") as archive:
         archive.writestr("song.ini", f"[song]\nname = {name}\nartist = {artist}\n")
-        archive.writestr("notes.chart", "notes")
+        archive.writestr(
+            "notes.chart",
+            "[Song]\n{\nResolution = 192\n}\n"
+            "[ExpertSingle]\n{\n0 = N 0 0\n}\n",
+        )
         # Incompressible padding keeps the file above the "unusually small"
         # cleanup heuristic, like a real chart with audio.
         archive.writestr("audio.ogg", os.urandom(150_000))
     return payload.getvalue()
+
+
+def _sngpkg_bytes(
+    name="Test",
+    artist="Test Artist",
+    album="Test Album",
+    song_length="185000",
+) -> bytes:
+    def pair(key: str, value: str) -> bytes:
+        key_bytes = key.encode("utf-8")
+        value_bytes = value.encode("utf-8")
+        return (
+            struct.pack("<i", len(key_bytes))
+            + key_bytes
+            + struct.pack("<i", len(value_bytes))
+            + value_bytes
+        )
+
+    metadata = b"".join(
+        pair(key, value)
+        for key, value in (
+            ("name", name),
+            ("artist", artist),
+            ("album", album),
+            ("song_length", song_length),
+        )
+    )
+    chart = (
+        "[Song]\n{\nResolution = 192\n}\n"
+        "[ExpertSingle]\n{\n0 = N 0 0\n}\n"
+    ).encode("utf-8")
+    mask = bytes(range(16))
+    files = [("notes.chart", chart), ("guitar.opus", b"audio")]
+    index_length = sum(1 + len(file_name.encode("utf-8")) + 16 for file_name, _ in files)
+    data_start = 26 + 16 + len(metadata) + 16 + index_length + 8
+    index = bytearray()
+    encoded: list[bytes] = []
+    offset = data_start
+    for file_name, plain in files:
+        masked = bytes(
+            value ^ mask[position % 16] ^ (position % 256)
+            for position, value in enumerate(plain)
+        )
+        encoded.append(masked)
+        name_bytes = file_name.encode("utf-8")
+        index.extend(bytes([len(name_bytes)]))
+        index.extend(name_bytes)
+        index.extend(struct.pack("<QQ", len(masked), offset))
+        offset += len(masked)
+    return (
+        b"SNGPKG"
+        + struct.pack("<I", 1)
+        + mask
+        + struct.pack("<QQ", 8 + len(metadata), 4)
+        + metadata
+        + struct.pack("<QQ", 8 + len(index), len(files))
+        + index
+        + struct.pack("<Q", sum(map(len, encoded)))
+        + b"".join(encoded)
+    )
 
 
 def _build_library(folder):
@@ -1465,26 +1814,9 @@ def test_library_link_scan_status_and_verify(config, tmp_path):
 
 def test_library_scan_reads_sngpkg_metadata(config, tmp_path):
     from csv_to_clonehero.library_inventory import scan_library
-
-    def pair(key: str, value: str) -> bytes:
-        key_bytes = key.encode("utf-8")
-        value_bytes = value.encode("utf-8")
-        return (
-            len(key_bytes).to_bytes(4, "little")
-            + key_bytes
-            + len(value_bytes).to_bytes(4, "little")
-            + value_bytes
-        )
-
-    metadata = b"".join(
-        [
-            pair("name", "Lost"),
-            pair("artist", "Linkin Park"),
-            pair("album", "Meteora"),
-            pair("song_length", "201392"),
-        ]
+    package = _sngpkg_bytes(
+        name="Lost", artist="Linkin Park", album="Meteora", song_length="201392"
     )
-    package = b"SNGPKG" + (1).to_bytes(4, "little") + b"\x00" * 16 + metadata + b"\x00" * 32
 
     songs = tmp_path / "Songs"
     songs.mkdir()

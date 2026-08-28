@@ -41,6 +41,7 @@ from csv_to_clonehero.csv_import import (
     artist_track_counts,
     import_playlist_dir,
 )
+from csv_to_clonehero.catalog import load_enchor_catalog
 from csv_to_clonehero.database import Database
 from csv_to_clonehero.diagnostics import RunDiagnostics, diagnostics_path
 from csv_to_clonehero.exporter import ExportOptions, ExportService
@@ -82,7 +83,11 @@ from csv_to_clonehero.pipeline import (
 from csv_to_clonehero.reporting import generate_reports, generate_spotify_reports
 from csv_to_clonehero.review_presentation import build_review_presentation
 from csv_to_clonehero.sources import build_sources
-from csv_to_clonehero.sources.base import ChartSource, source_catalog_available
+from csv_to_clonehero.sources.base import (
+    ChartSource,
+    source_catalog_available,
+    source_catalog_contains_chart,
+)
 from csv_to_clonehero.normalization import normalize_artist, normalize_title
 
 log = logging.getLogger(__name__)
@@ -941,6 +946,23 @@ def _discovery_result_payload(result: Any) -> dict[str, Any]:
         "catalog_diagnostic": _safe_message(getattr(result, "catalog_diagnostic", "") or ""),
         "catalog_snapshot_id": getattr(result, "catalog_snapshot_id", ""),
         "catalog_chart_count": getattr(result, "catalog_chart_count", 0),
+        "catalog_load_seconds": getattr(result, "catalog_load_seconds", 0.0),
+        "artist_found_title_different": getattr(result, "artist_found_title_different", 0),
+        "title_found_artist_different": getattr(result, "title_found_artist_different", 0),
+        "broader_retrieval_tracks": getattr(result, "broader_retrieval_tracks", 0),
+        "zero_candidate_tracks": getattr(result, "zero_candidate_tracks", 0),
+        "candidate_charts_evaluated": getattr(result, "candidate_charts_evaluated", 0),
+        "unique_charts_evaluated": getattr(result, "unique_charts_evaluated", 0),
+        "strong_match_tracks": getattr(result, "strong_match_tracks", 0),
+        "review_match_tracks": getattr(result, "review_match_tracks", 0),
+        "hard_rejected_only_tracks": getattr(result, "hard_rejected_only_tracks", 0),
+        "soft_rejected_only_tracks": getattr(result, "soft_rejected_only_tracks", 0),
+        "no_plausible_tracks": getattr(result, "no_plausible_tracks", 0),
+        "persisted_candidates": getattr(result, "persisted_candidates", 0),
+        "retrieval_seconds": getattr(result, "retrieval_seconds", 0.0),
+        "scoring_seconds": getattr(result, "scoring_seconds", 0.0),
+        "discovery_seconds": getattr(result, "discovery_seconds", 0.0),
+        "funnel": getattr(result, "funnel", {}),
     }
 
 
@@ -1325,10 +1347,175 @@ def _json_meta(db: Database, key: str) -> dict:
     return value if isinstance(value, dict) else {}
 
 
+REVIEW_DEFAULT_PAGE_SIZE = 50
+REVIEW_MAX_PAGE_SIZE = 100
+
+
+def _review_page_options(args: Mapping[str, Any]) -> dict[str, Any]:
+    """Parse bounded card-level review paging and inspection filters."""
+    try:
+        limit = int(args.get("limit", REVIEW_DEFAULT_PAGE_SIZE))
+    except (TypeError, ValueError):
+        limit = REVIEW_DEFAULT_PAGE_SIZE
+    limit = max(1, min(REVIEW_MAX_PAGE_SIZE, limit))
+    try:
+        offset = int(args.get("offset", 0))
+    except (TypeError, ValueError):
+        offset = 0
+    if args.get("page") not in (None, "") and args.get("offset") in (None, ""):
+        try:
+            offset = max(0, int(args.get("page")) - 1) * limit
+        except (TypeError, ValueError):
+            offset = 0
+    return {
+        "offset": max(0, offset),
+        "limit": limit,
+        "search": str(args.get("search", "") or "").strip(),
+        "state": str(args.get("state", "all") or "all").strip().casefold(),
+        "sort": str(args.get("sort", "artist") or "artist").strip().casefold(),
+    }
+
+
+def _review_card_matches(card: Mapping[str, Any], state: str) -> bool:
+    if state in {"", "all"}:
+        return True
+    review_state = str(card.get("review_state", "") or "").casefold()
+    status = str(card.get("status", "") or "").casefold()
+    if state in {"eligible", "matched"}:
+        return bool(card.get("has_eligible_match")) or review_state in {"strong", "needs_review"}
+    if state in {"strong", "recommended", "auto_accept"}:
+        return bool(card.get("has_strong_match")) or review_state == "strong" or status in {"accepted", "auto_accept"}
+    if state in {"review", "needs_review"}:
+        return bool(card.get("has_review_match")) or review_state == "needs_review" or status == "review"
+    if state in {"selected", "chosen"}:
+        return bool(card.get("selected"))
+    if state in {"unselected", "unchosen"}:
+        return not bool(card.get("selected"))
+    if state in {"not_playable", "incompatible"}:
+        return review_state == "not_playable"
+    return True
+
+
+def _review_card_search_text(card: Mapping[str, Any]) -> str:
+    if card.get("_search_text"):
+        return str(card["_search_text"])
+    values = [
+        card.get("artist"),
+        card.get("title"),
+        card.get("album"),
+        *(card.get("playlists") or ()),
+    ]
+    for candidate in card.get("candidates") or ():
+        values.extend(
+            candidate.get(name)
+            for name in ("candidate_artist", "candidate_title", "charter", "reference")
+            if isinstance(candidate, Mapping)
+        )
+    return " ".join(str(value or "") for value in values).casefold()
+
+
+def _review_row_state(row: Any) -> str:
+    """Translate persisted eligibility into the lightweight card state."""
+    data = _row_dict(row)
+    eligibility = str(data.get("eligibility") or "").strip().upper()
+    decision = str(data.get("decision") or "").strip().upper()
+    if eligibility == INCOMPATIBLE or decision == INCOMPATIBLE:
+        return "not_playable"
+    if eligibility in {RECOMMENDED, "AUTO_ACCEPT"} or decision == "AUTO_ACCEPT":
+        return "strong"
+    if eligibility in {ELIGIBLE_REVIEW, "REVIEW"} or decision == "REVIEW":
+        return "needs_review"
+    return "not_recommended"
+
+
+def _review_row_search_text(row: Any, track: Track) -> str:
+    data = _row_dict(row)
+    candidate = _json_object(data.get("candidate_json"), {})
+    candidate = candidate if isinstance(candidate, Mapping) else {}
+    values = [
+        track.artist_full,
+        track.title,
+        track.album,
+        *(track.playlists or ()),
+        candidate.get("artist"),
+        candidate.get("name"),
+        candidate.get("charter"),
+        candidate.get("url"),
+        candidate.get("md5"),
+        data.get("source"),
+        data.get("chart_id"),
+    ]
+    return " ".join(str(value or "") for value in values).casefold()
+
+
+def _paginate_review_cards(
+    cards: list[dict],
+    *,
+    offset: int = 0,
+    limit: int = REVIEW_DEFAULT_PAGE_SIZE,
+    search: str = "",
+    state: str = "all",
+    sort: str = "artist",
+) -> dict[str, Any]:
+    """Filter and page complete cards while retaining every card alternative."""
+    filtered = [
+        card
+        for card in cards
+        if _review_card_matches(card, state)
+        and (not search or search.casefold() in _review_card_search_text(card))
+    ]
+    if sort in {"score", "best"}:
+        filtered.sort(
+            key=lambda card: (
+                -float(
+                    card.get(
+                        "_best_score",
+                        (card.get("candidates") or [{}])[0].get("score") or 0,
+                    )
+                    or 0
+                ),
+                str(card.get("artist") or "").casefold(),
+                str(card.get("title") or "").casefold(),
+            )
+        )
+    else:
+        filtered.sort(
+            key=lambda card: (
+                str(card.get("artist") or "").casefold(),
+                str(card.get("title") or "").casefold(),
+                str(card.get("track_key") or ""),
+            )
+        )
+    total = len(filtered)
+    offset = max(0, int(offset))
+    limit = max(1, min(REVIEW_MAX_PAGE_SIZE, int(limit)))
+    page_cards = filtered[offset:offset + limit]
+    page_count = (total + limit - 1) // limit if total else 0
+    page = {
+        "offset": offset,
+        "limit": limit,
+        "page": (offset // limit) + 1 if total and offset < total else 0,
+        "page_count": page_count,
+        "total": total,
+        "returned": len(page_cards),
+        "has_more": offset + len(page_cards) < total,
+        "search": search,
+        "state": state or "all",
+        "sort": sort or "artist",
+    }
+    return {"tracks": page_cards, "page": page}
+
+
 def _review_payload(
     db: Database,
     state_snapshot: dict,
     include_rejected: bool = False,
+    *,
+    offset: int = 0,
+    limit: int = REVIEW_DEFAULT_PAGE_SIZE,
+    search: str = "",
+    state: str = "all",
+    sort: str = "artist",
 ) -> dict:
     """Build one review card per Spotify track from persisted score rows."""
     tracks = {track.db_id: track for track in db.get_tracks(include_ignored=True)}
@@ -1517,7 +1704,24 @@ def _review_payload(
         "exact_complete": exact_complete,
         "has_search_run": started,
     }
-    return {"tracks": cards, "progress": metadata, **metadata}
+    page = _paginate_review_cards(
+        cards,
+        offset=offset,
+        limit=limit,
+        search=search,
+        state=state,
+        sort=sort,
+    )
+    return {
+        "tracks": page["tracks"],
+        "progress": metadata,
+        **metadata,
+        "page": page["page"],
+        "track_total": page["page"]["total"],
+        "track_offset": page["page"]["offset"],
+        "track_limit": page["page"]["limit"],
+        "has_more": page["page"]["has_more"],
+    }
 
 
 def _estimate_work(
@@ -2754,16 +2958,30 @@ def create_app(
                     for source in catalog_sources
                     if str(getattr(source, "name", "")) == str(data.get("source") or "")
                 ]
-                memberships = [
-                    source_catalog_available(
+                chart_memberships = [
+                    source_catalog_contains_chart(
                         source,
-                        str(data.get("track_artist") or ""),
-                        str(data.get("track_title") or ""),
+                        int(data.get("chart_id")),
+                        source_name=str(data.get("source") or ""),
                     )
                     for source in relevant
+                    if data.get("chart_id") not in (None, "")
                 ]
-                if memberships and all(value is False for value in memberships):
+                if chart_memberships and any(value is True for value in chart_memberships):
+                    pass
+                elif chart_memberships and all(value is False for value in chart_memberships):
                     return False, "song is unavailable in the local chart catalog"
+                else:
+                    memberships = [
+                        source_catalog_available(
+                            source,
+                            str(data.get("track_artist") or ""),
+                            str(data.get("track_title") or ""),
+                        )
+                        for source in relevant
+                    ]
+                    if memberships and all(value is False for value in memberships):
+                        return False, "song is unavailable in the local chart catalog"
             finally:
                 for source in catalog_sources:
                     try:
@@ -3569,6 +3787,8 @@ def create_app(
                     grouped.setdefault(provider, []).append(ProviderTrack(
                         provider=provider, provider_id=str(row["provider_id"]), title=str(row["title"]),
                         artist=str(row["artist"]), album=str(row["album"] or ""), liked=bool(row["liked"]),
+                        isrc=str(row["isrc"] or ""), url=str(row["url"] or ""),
+                        metadata=_json_object(row["metadata_json"], {}),
                     ))
                 spotify_job.progress_update({"phase": "combine", "message": "Combining imported sources locally...", "total_tracks": sum(map(len, grouped.values()))})
                 run_id = spotify_job.run_id
@@ -3592,11 +3812,59 @@ def create_app(
                 if diagnostics:
                     diagnostics.update("selection", counters={"selected_charts": 0})
                     diagnostics.update("export", counters={"export_attempts": 0, "exported_charts": 0})
-                    diagnostics.finish(result.status, workspace_id=workspace, workspace_key=workspace_key, counters={"exact_hits": result.exact_hits, "exact_misses": result.exact_misses, "candidate_charts_created": result.candidates, "eligible_candidates": result.eligible_candidates, "rejected_candidates": result.rejected_candidates})
+                    diagnostics.finish(
+                        result.status,
+                        workspace_id=workspace,
+                        workspace_key=workspace_key,
+                        counters={
+                            "exact_hits": result.exact_hits,
+                            "exact_misses": result.exact_misses,
+                            "artist_found_title_different": result.artist_found_title_different,
+                            "title_found_artist_different": result.title_found_artist_different,
+                            "broader_retrieval_tracks": result.broader_retrieval_tracks,
+                            "zero_candidate_tracks": result.zero_candidate_tracks,
+                            "tracks_with_candidates": result.tracks_with_candidates,
+                            "candidate_charts_evaluated": result.candidate_charts_evaluated,
+                            "unique_charts_evaluated": result.unique_charts_evaluated,
+                            "strong_match_tracks": result.strong_match_tracks,
+                            "review_match_tracks": result.review_match_tracks,
+                            "hard_rejected_only_tracks": result.hard_rejected_only_tracks,
+                            "soft_rejected_only_tracks": result.soft_rejected_only_tracks,
+                            "no_plausible_tracks": result.no_plausible_tracks,
+                            "candidate_charts_created": result.persisted_candidates,
+                            "eligible_candidates": result.eligible_candidates,
+                            "rejected_candidates": result.rejected_candidates,
+                            "retrieval_seconds": round(result.retrieval_seconds, 3),
+                            "scoring_seconds": round(result.scoring_seconds, 3),
+                            "discovery_seconds": round(result.discovery_seconds, 3),
+                        },
+                    )
             except Exception as exc:  # noqa: BLE001
-                spotify_job.fail(exc)
+                message = _safe_message(exc)
+                spotify_job.fail(message)
+                try:
+                    db.update_workspace(
+                        workspace,
+                        status="failed",
+                        phase="catalog_match",
+                        message="Matching stopped before it finished.",
+                        error=message,
+                    )
+                    db.update_workspace_progress(
+                        workspace,
+                        status="failed",
+                        phase="catalog_match",
+                        message="Matching stopped before it finished.",
+                        error=message,
+                        metadata={"run_id": run_id, "scan_key": "catalog"},
+                    )
+                except Exception:
+                    log.warning("Could not persist local matching failure", exc_info=True)
                 if diagnostics:
-                    diagnostics.finish("failed", error=_safe_message(exc))
+                    try:
+                        diagnostics.finish("failed", error=message)
+                    except OSError:
+                        log.warning("Could not persist local matching diagnostics", exc_info=True)
             finally:
                 db.close()
 
@@ -3619,7 +3887,22 @@ def create_app(
     @app.get("/api/discovery/progress")
     def spotify_scan_status():
         payload = request.args.get("workspace_id")
-        return jsonify(_workspace_status(payload))
+        status = _workspace_status(payload)
+        workspace_id = status.get("workspace_id")
+        if workspace_id is not None:
+            db = Database(config.database_path)
+            try:
+                local_key = db.get_meta("local_workspace_key")
+                local_workspace = db.get_workspace(local_key) if local_key else None
+                try:
+                    requested_workspace_id = int(workspace_id)
+                except (TypeError, ValueError):
+                    requested_workspace_id = None
+                if local_workspace is not None and requested_workspace_id == int(local_workspace["id"]):
+                    status["journey"] = _local_journey_payload(db, int(workspace_id))
+            finally:
+                db.close()
+        return jsonify(status)
 
     @app.post("/api/spotify/workspace/save")
     def spotify_workspace_save():
@@ -5995,6 +6278,213 @@ def create_app(
         finally:
             db.close()
 
+    def _local_journey_payload(
+        db: Database,
+        workspace: int | str,
+    ) -> dict[str, Any]:
+        """Build the local workflow summary from authoritative persisted state."""
+        neutral_tracks = db.get_neutral_library_tracks(workspace)
+        workspace_track_ids = db.get_workspace_library_track_ids(workspace)
+        candidate_rows = db.get_workspace_candidates(
+            workspace,
+            kind="exact",
+            include_rejected=True,
+            include_candidate_data=False,
+        )
+        if not workspace_track_ids:
+            # Older local snapshots may not have the workspace projection. The
+            # candidate rows are already workspace-scoped, so use their engine
+            # track ids as a safe fallback.
+            workspace_track_ids = {
+                int(row["track_id"])
+                for row in candidate_rows
+                if row["track_id"] is not None
+            }
+        by_track: dict[int, set[str]] = {}
+        for row in candidate_rows:
+            track_id = row["track_id"]
+            if track_id is None or int(track_id) not in workspace_track_ids:
+                continue
+            by_track.setdefault(int(track_id), set()).add(
+                str(row["eligibility"] or "").upper()
+            )
+
+        option_tracks = set(by_track)
+        strong_tracks = {
+            track_id
+            for track_id, states in by_track.items()
+            if RECOMMENDED in states
+        }
+        review_tracks = {
+            track_id
+            for track_id, states in by_track.items()
+            if ELIGIBLE_REVIEW in states
+        }
+        not_playable_tracks = {
+            track_id
+            for track_id, states in by_track.items()
+            if INCOMPATIBLE in states
+            and not states.intersection({RECOMMENDED, ELIGIBLE_REVIEW})
+        }
+
+        workspace_row = db.get_workspace(workspace)
+        progress_row = db.get_workspace_progress(workspace)
+        workspace_status = str(
+            workspace_row["status"] if workspace_row is not None else ""
+        ).casefold()
+        progress_status = str(
+            progress_row["status"] if progress_row is not None else ""
+        ).casefold()
+        metadata = _json_object(
+            workspace_row["metadata_json"] if workspace_row is not None else {},
+            {},
+        )
+        progress_metadata = _json_object(
+            progress_row["metadata_json"] if progress_row is not None else {},
+            {},
+        )
+        metadata = metadata if isinstance(metadata, Mapping) else {}
+        progress_metadata = (
+            progress_metadata if isinstance(progress_metadata, Mapping) else {}
+        )
+        partial = bool(
+            metadata.get("partial")
+            or progress_metadata.get("partial")
+            or (workspace_row is not None and int(workspace_row["error_count"] or 0) > 0)
+        )
+        with soundcloud_import_job.lock:
+            import_active = bool(
+                soundcloud_import_job.running
+                and int(soundcloud_import_job.workspace_id or 0) == int(workspace)
+            )
+        with spotify_job.lock:
+            matching_active = bool(
+                spotify_job.running
+                and int(spotify_job.workspace_id or 0) == int(workspace)
+            )
+        stale_active = (
+            (workspace_status in {"pending", "running"} or progress_status in {"pending", "running"})
+            and not import_active
+            and not matching_active
+        )
+        active = import_active or matching_active
+        failed = workspace_status in {"failed", "error"} or progress_status in {
+            "failed",
+            "error",
+        }
+        incomplete = stale_active or partial or workspace_status in {
+            "partial",
+            "interrupted",
+            "cancelled",
+        } or progress_status in {"partial", "interrupted", "cancelled"}
+        matching_started = bool(
+            active
+            or workspace_status not in {"", "created", "ready_for_matching", "source_setup", "idle"}
+            and (
+                candidate_rows
+                or metadata.get("run_id")
+                or progress_metadata.get("run_id")
+                or workspace_status
+                in {"complete", "completed", "success", "failed", "error", "partial", "interrupted", "cancelled"}
+            )
+        )
+        if import_active:
+            matching_status = "running"
+            headline = "Import in progress"
+            message = "Your music is still being imported. Matching will be available when the import finishes."
+        elif matching_active:
+            matching_status = "running"
+            headline = "Matching in progress"
+            message = "We are checking your songs for playable charts. You can leave this page and return later."
+        elif failed:
+            matching_status = "failed"
+            headline = "Matching stopped"
+            message = "Matching did not finish. Run Find chart matches again before deciding about the remaining songs."
+        elif incomplete:
+            matching_status = "incomplete"
+            headline = "Matching incomplete"
+            message = "Some songs could not be checked. Review the results, then run Find chart matches again."
+        elif workspace_status in {"complete", "completed", "success"} or (
+            candidate_rows and workspace_status not in {"created", "ready_for_matching", "source_setup", "idle"}
+        ):
+            matching_status = "complete"
+            # Persisted local candidates already prove that the catalog was
+            # available for this completed run. Avoid reloading the full
+            # 94k-chart snapshot just to paint the review page.
+            if candidate_rows:
+                catalog_available = True
+            else:
+                catalog = load_enchor_catalog(config.catalog_path)
+                catalog_available = catalog.available
+            if catalog_available:
+                headline = "Matching complete"
+                message = "Your songs have been checked. Review the recommended charts before exporting."
+            else:
+                headline = "Chart catalog unavailable"
+                message = "Your music was imported, but the local chart catalog is unavailable. No recommendations were made."
+        elif neutral_tracks:
+            matching_status = "ready"
+            headline = "Ready to find charts"
+            message = "Your music is imported. Find chart matches when you are ready."
+        else:
+            matching_status = "empty"
+            headline = "Add your music"
+            message = "Import a SoundCloud export to start finding playable charts."
+
+        if matching_status not in {"complete"}:
+            catalog_available = None
+            catalog_diagnostic = ""
+        else:
+            if candidate_rows:
+                catalog_available = True
+                catalog_diagnostic = ""
+            else:
+                catalog = load_enchor_catalog(config.catalog_path)
+                catalog_available = catalog.available
+                catalog_diagnostic = str(getattr(catalog, "diagnostic", "") or "")
+
+        selected = len(db.list_workspace_selections(workspace, kind="exact"))
+        total = len(neutral_tracks)
+        safe_tracks = strong_tracks | review_tracks
+        terminal = matching_status in {"complete", "incomplete", "failed"}
+        run_id = str(
+            progress_metadata.get("run_id")
+            or metadata.get("run_id")
+            or db.get_meta("local_current_run_id", "")
+            or ""
+        )
+        return {
+            "source_neutral": True,
+            "has_imported_music": bool(neutral_tracks),
+            "workspace_id": int(workspace),
+            "matching_status": matching_status,
+            "headline": headline,
+            "message": message,
+            "matching_started": matching_started,
+            "matching_complete": matching_status == "complete",
+            "review_available": terminal,
+            "catalog_available": catalog_available,
+            "catalog_diagnostic": catalog_diagnostic,
+            "run_id": run_id,
+            "review_url": f"/advanced?workspace_id={int(workspace)}",
+            "counts": {
+                "imported_songs": total,
+                "chart_options": len(option_tracks),
+                "candidate_charts": sum(
+                    1
+                    for row in candidate_rows
+                    if row["track_id"] is not None
+                    and int(row["track_id"]) in workspace_track_ids
+                ),
+                "strong_matches": len(strong_tracks),
+                "needs_review": len(review_tracks),
+                "no_candidate_songs": max(0, total - len(option_tracks)),
+                "not_playable_songs": len(not_playable_tracks),
+                "no_suitable_songs": max(0, total - len(safe_tracks)),
+                "selected_charts": selected,
+            },
+        }
+
     @app.get("/")
     def index():
         return (
@@ -6023,7 +6513,8 @@ def create_app(
         try:
             summaries = [dict(row) for row in db.get_source_summary(workspace)]
             return jsonify({"workspace_id": workspace, "workspace_key": key, "sources": summaries,
-                            "combined": db.get_combined_summary(workspace)})
+                            "combined": db.get_combined_summary(workspace),
+                            "journey": _local_journey_payload(db, workspace)})
         finally:
             db.close()
 
@@ -6161,6 +6652,10 @@ def create_app(
                         on_progress=progress,
                     )
                     provider = None  # run_library_import closes each provider.
+                    # A new source snapshot invalidates old exact results and
+                    # selections; otherwise a fresh import could display a
+                    # recommendation for a song no longer in the export.
+                    db.clear_workspace_candidates(workspace, kind="exact")
                     source_result = imported.sources.get("soundcloud")
                     source_payload = source_result.__dict__ if source_result else {}
                     combined = imported.combined_summary
@@ -6192,6 +6687,21 @@ def create_app(
                         "sources": sources,
                         "combined": combined,
                     }
+                    db.update_workspace(
+                        workspace,
+                        status="ready_for_matching",
+                        phase="ready_for_matching",
+                        message="Music imported; ready to find charts.",
+                        error="",
+                    )
+                    db.update_workspace_progress(
+                        workspace,
+                        status="ready_for_matching",
+                        phase="ready_for_matching",
+                        message="Music imported; ready to find charts.",
+                        error="",
+                        metadata={"run_id": run_id, "scan_key": "import"},
+                    )
                 except (UnicodeDecodeError, ValueError, json.JSONDecodeError) as exc:
                     message = _safe_message(exc)
                     diagnostics.finish("failed", error=message)
@@ -6496,38 +7006,143 @@ def create_app(
         db: Database,
         workspace: int | str,
         include_rejected: bool = False,
+        *,
+        offset: int = 0,
+        limit: int = REVIEW_DEFAULT_PAGE_SIZE,
+        search: str = "",
+        state: str = "all",
+        sort: str = "artist",
     ) -> dict[str, Any]:
         """Expose source-neutral catalog candidates on the existing review page."""
+        journey = _local_journey_payload(db, workspace)
+        workspace_track_ids = db.get_workspace_library_track_ids(workspace)
         tracks = {
             int(track.db_id): track
             for track in db.get_tracks(include_ignored=True)
             if track.db_id is not None
+            and (not workspace_track_ids or int(track.db_id) in workspace_track_ids)
         }
-        grouped: dict[int, list[dict[str, Any]]] = {}
+        manual_decisions = db.get_manual_decisions()
         rows = db.get_workspace_candidates(
             workspace,
             kind="exact",
-            include_rejected=include_rejected,
+            # Keep hard-gated results visible so a user can understand why a
+            # song has no safe recommendation. Softly rejected rows stay
+            # behind the explicit rejected-results disclosure.
+            include_rejected=True,
+            include_candidate_data=bool(search),
         )
+        grouped_rows: dict[int, list[Any]] = {}
         for row in rows:
             data = _row_dict(row)
             track_id = data.get("track_id")
             if track_id is None or int(track_id) not in tracks:
                 continue
-            candidate = _candidate_payload(row)
-            candidate["manual"] = ""
-            candidate["manual_decision"] = ""
-            candidate["review"] = build_review_presentation(candidate)
-            candidate["review_state"] = candidate["review"]["state"]
-            candidate["review_label"] = candidate["review"]["label"]
-            candidate["review_summary"] = candidate["review"]["summary"]
-            candidate["selectable"] = candidate["review"]["selectable"]
-            candidate["selection_action"] = candidate["review"]["action"]
-            grouped.setdefault(int(track_id), []).append(candidate)
+            track = tracks[int(track_id)]
+            row_state = _review_row_state(row)
+            if not include_rejected and row_state not in {
+                "strong",
+                "needs_review",
+                "not_playable",
+            }:
+                continue
+            grouped_rows.setdefault(int(track_id), []).append(row)
+
+        summaries: list[dict[str, Any]] = []
+        for track_id, row_group in grouped_rows.items():
+            track = tracks[track_id]
+            states = {_review_row_state(row) for row in row_group}
+            selected = any(
+                bool(_row_dict(row).get("selected"))
+                or manual_decisions.get(
+                    (
+                        track.track_key,
+                        str(_row_dict(row).get("source") or ""),
+                        int(_row_dict(row).get("chart_id") or 0),
+                    ),
+                    "",
+                )
+                == "accept"
+                for row in row_group
+            )
+            best_score = max(
+                (float(_row_dict(row).get("score") or 0) for row in row_group),
+                default=0.0,
+            )
+            summaries.append({
+                "_track_id": track_id,
+                "_best_score": best_score,
+                "track_key": track.track_key,
+                "artist": track.artist_full,
+                "title": track.title,
+                "album": track.album,
+                "playlists": list(track.playlists),
+                "selected": selected,
+                "status": "ACCEPTED" if selected else "AUTO_ACCEPT" if "strong" in states else "REVIEW" if "needs_review" in states else "REJECT",
+                "review_state": "strong" if "strong" in states else "needs_review" if "needs_review" in states else "not_playable" if "not_playable" in states else "not_recommended",
+                "has_eligible_match": bool(states & {"strong", "needs_review"}),
+                "has_strong_match": "strong" in states,
+                "has_review_match": "needs_review" in states and "strong" not in states,
+                "_search_text": (
+                    ""
+                    if not search
+                    else " ".join(
+                        [
+                            track.artist_full,
+                            track.title,
+                            track.album,
+                            *(track.playlists or ()),
+                            *(_review_row_search_text(row, track) for row in row_group),
+                        ]
+                    ).casefold()
+                ),
+            })
+        page = _paginate_review_cards(
+            summaries,
+            offset=offset,
+            limit=limit,
+            search=search,
+            state=state,
+            sort=sort,
+        )
 
         cards: list[dict[str, Any]] = []
-        for track_id, candidates in grouped.items():
+        page_rows = db.get_workspace_candidates_for_tracks(
+            workspace,
+            [int(summary["_track_id"]) for summary in page["tracks"]],
+            kind="exact",
+            include_rejected=True,
+        )
+        for summary in page["tracks"]:
+            track_id = int(summary["_track_id"])
             track = tracks[track_id]
+            candidates: list[dict[str, Any]] = []
+            detail_rows = [
+                row
+                for row in page_rows.get(track_id, ())
+                if include_rejected
+                or _review_row_state(row)
+                in {"strong", "needs_review", "not_playable"}
+            ]
+            for row in detail_rows:
+                candidate = _candidate_payload(row)
+                manual = manual_decisions.get(
+                    (
+                        track.track_key,
+                        str(candidate.get("source") or ""),
+                        int(candidate.get("chart_id") or 0),
+                    ),
+                    "",
+                )
+                candidate["manual"] = manual
+                candidate["manual_decision"] = manual
+                candidate["review"] = build_review_presentation(candidate)
+                candidate["review_state"] = candidate["review"]["state"]
+                candidate["review_label"] = candidate["review"]["label"]
+                candidate["review_summary"] = candidate["review"]["summary"]
+                candidate["selectable"] = candidate["review"]["selectable"]
+                candidate["selection_action"] = candidate["review"]["action"]
+                candidates.append(candidate)
             candidates.sort(
                 key=lambda item: (
                     -float(item.get("score") or 0),
@@ -6557,41 +7172,55 @@ def create_app(
                 "status": "selected" if selected else "matched",
                 "review_status": primary["review_label"],
                 "candidates": candidates,
-                "best_candidate_id": best["chart_id"],
-                "selected_candidate_id": selected["chart_id"] if selected else None,
+                "best_candidate_id": best["candidate_id"],
+                "selected_candidate_id": selected["candidate_id"] if selected else None,
                 "selected": bool(selected),
                 "review": primary["review"],
                 "review_state": primary["review_state"],
                 "review_label": primary["review_label"],
                 "review_summary": primary["review_summary"],
+                "has_eligible_match": summary["has_eligible_match"],
+                "has_strong_match": summary["has_strong_match"],
+                "has_review_match": summary["has_review_match"],
             })
-        cards.sort(key=lambda item: (item["artist"].casefold(), item["title"].casefold()))
-        workspace_row = db.get_workspace(workspace)
-        complete = bool(workspace_row and str(workspace_row["status"]).casefold() in {"complete", "partial"})
         total_tracks = len(tracks)
-        candidate_count = sum(len(card["candidates"]) for card in cards)
+        candidate_count = sum(len(row_group) for row_group in grouped_rows.values())
+        page_metadata = page["page"]
         return {
             "workspace_id": int(workspace),
             "source_neutral": True,
+            "journey": journey,
             "tracks": cards,
             "progress": {
-                "has_search_run": bool(rows),
+                "has_search_run": bool(journey["matching_started"]),
                 "total_tracks": total_tracks,
-                "scored_tracks": total_tracks if complete else len(cards),
+                "scored_tracks": total_tracks if journey["matching_complete"] else len(cards),
                 "review_track_count": len(cards),
                 "review_tracks": len(cards),
                 "review_candidate_count": candidate_count,
                 "review_candidates": candidate_count,
                 "candidate_count": candidate_count,
-                "searching": False,
-                "exact_scoring_complete": complete,
-                "exact_complete": complete,
+                "page_track_count": page_metadata["returned"],
+                "searching": journey["matching_status"] == "running",
+                "exact_scoring_complete": journey["matching_complete"],
+                "exact_complete": journey["matching_complete"],
+                "matching_status": journey["matching_status"],
+                "catalog_available": journey["catalog_available"],
+                "no_candidate_tracks": journey["counts"]["no_candidate_songs"],
+                "no_suitable_tracks": journey["counts"]["no_suitable_songs"],
+                "selected_count": journey["counts"]["selected_charts"],
             },
+            "page": page_metadata,
+            "track_total": page_metadata["total"],
+            "track_offset": page_metadata["offset"],
+            "track_limit": page_metadata["limit"],
+            "has_more": page_metadata["has_more"],
         }
 
     @app.get("/api/review")
     def review_items():
         include_rejected = request.args.get("include_rejected") == "1"
+        page_options = _review_page_options(request.args)
         db = Database(config.database_path)
         try:
             local_key = db.get_meta("local_workspace_key")
@@ -6599,13 +7228,26 @@ def create_app(
             if local_workspace is not None:
                 neutral_rows = db.get_neutral_library_tracks(int(local_workspace["id"]))
                 neutral_candidates = db.get_workspace_candidates(
-                    int(local_workspace["id"]), kind="exact", include_rejected=True
+                    int(local_workspace["id"]),
+                    kind="exact",
+                    include_rejected=True,
+                    include_candidate_data=False,
                 )
                 if neutral_rows or neutral_candidates:
                     return jsonify(_local_neutral_review_payload(
-                        db, int(local_workspace["id"]), include_rejected
+                        db,
+                        int(local_workspace["id"]),
+                        include_rejected,
+                        **page_options,
                     ))
-            return jsonify(_review_payload(db, state.snapshot(), include_rejected))
+            return jsonify(
+                _review_payload(
+                    db,
+                    state.snapshot(),
+                    include_rejected,
+                    **page_options,
+                )
+            )
         finally:
             db.close()
 
@@ -6732,40 +7374,22 @@ def create_app(
                 workspace = int(local_workspace["id"])
                 neutral_tracks = db.get_neutral_library_tracks(workspace)
                 if neutral_tracks:
-                    candidates = db.get_workspace_candidates(
-                        workspace, kind="exact", include_rejected=True
-                    )
-                    grouped = {
-                        int(row["track_id"])
-                        for row in candidates
-                        if row["track_id"] is not None
-                    }
-                    recommended = {
-                        int(row["track_id"])
-                        for row in candidates
-                        if row["track_id"] is not None
-                        and str(row["eligibility"] or "").upper() == RECOMMENDED
-                    }
-                    review = {
-                        int(row["track_id"])
-                        for row in candidates
-                        if row["track_id"] is not None
-                        and str(row["eligibility"] or "").upper() == ELIGIBLE_REVIEW
-                    }
-                    selections = db.list_workspace_selections(workspace)
+                    journey = _local_journey_payload(db, workspace)
+                    counts = journey["counts"]
                     return jsonify({
                         "csv_files": len(db.get_source_summary(workspace)),
                         "unique_tracks": len(neutral_tracks),
                         "primary_artists": len({row["normalized_artist"] for row in neutral_tracks}),
                         "exact": {
-                            "auto_matches": len(recommended),
-                            "review": len(review),
-                            "no_match": max(0, len(neutral_tracks) - len(grouped)),
+                            "auto_matches": counts["strong_matches"],
+                            "review": counts["needs_review"],
+                            "no_match": counts["no_candidate_songs"],
                         },
                         "expansion": {"selected": 0},
-                        "manual_decisions": {"accept": len(selections), "reject": 0},
+                        "manual_decisions": {"accept": counts["selected_charts"], "reject": 0},
                         "plan": {"estimated_gib": 0},
                         "downloads": {"completed": 0, "gib_downloaded": 0},
+                        "journey": journey,
                     })
         finally:
             db.close()
@@ -6800,54 +7424,59 @@ def create_app(
 
 _UNIFIED_PAGE = r'''<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Music to Clone Hero</title><style>
-body{font:16px system-ui,sans-serif;max-width:980px;margin:auto;padding:24px;background:#10131a;color:#eee}section{background:#1b202b;border:1px solid #394150;border-radius:12px;padding:20px;margin:14px 0}button{padding:10px 14px;border:0;border-radius:7px;background:#3b82f6;color:white;cursor:pointer;margin:4px}button:disabled{opacity:.5}input{margin:8px}small,.muted{color:#aab3c2}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:12px}.card{border:1px solid #465064;padding:14px;border-radius:8px}.bar{height:8px;background:#303747}.bar span{display:block;background:#42d392;height:100%;width:0}</style></head>
-<body><h1>Music to Clone Hero and YARG</h1><p class="muted">Import music from any supported source. Spotify is optional.</p>
-<section><h2>1. Connect or import sources</h2><div class="grid"><div class="card"><h3>SoundCloud export</h3><p>Upload a TuneMyMusic CSV or SoundCloud JSON export. No SoundCloud login is required.</p><input id="soundcloudFile" type="file" accept=".csv,.json"><button id="soundcloudImport">Import SoundCloud</button><p id="soundcloudMsg" class="muted"></p><a href="/browser-exporter.js">Download browser exporter</a></div>
-<div class="card"><h3>Spotify (optional)</h3><p>Connect Spotify to add playlists and Liked Songs to this same combined library.</p><button id="spotifyConnect">Sign in with Spotify</button><p class="muted">Spotify remains available as an optional source.</p></div></div></section>
-<section><h2>2. Source summaries</h2><div id="summary" class="muted">No sources imported yet.</div><button id="refresh">Refresh summaries</button></section>
- <section><h2>3. Catalog results</h2><p class="muted">Matching and expansion use the local Enchor catalog. No provider search is performed.</p><button id="find" disabled>Find chart matches</button><div id="progress"></div><p id="diagnostics" class="muted"></p></section>
-<section id="review" style="display:none"><h2>4. Review and export</h2><p>Choose chart versions, adjust the cutoff, then use the existing download/export controls.</p><div id="cards"></div><a href="/advanced">Open advanced review and download</a></section>
-<!-- Compatibility controls retained for existing integrations. --><span hidden>Sign in with Spotify Connect Spotify Choose your music Find chart matches Review and export Optional: link an existing library Resume or manage saved work Preview additional songs Find charts for this preview Selected charts</span>
-<span hidden id="scopePanel"></span><span hidden id="scopeList"></span><span hidden id="expansionPreview"></span><span hidden id="expansionStart"></span><span hidden id="expansionCancel"></span><span hidden id="expansionAll"></span><span hidden id="expansionNone"></span><span hidden id="artists"></span><span hidden id="tray"></span><span hidden id="traySummary"></span><span hidden id="serverExport"></span><span hidden id="remoteExport"></span>
+<title>Music to Clone Hero</title><link rel="icon" href="data:,"><style>
+:root{color-scheme:dark;--bg:#10131a;--panel:#1b202b;--line:#394150;--muted:#aab3c2;--accent:#8fd3ff;--success:#42d392;--warn:#ffd479}
+*{box-sizing:border-box}body{font:16px system-ui,sans-serif;width:100%;max-width:980px;margin:auto;padding:24px;background:var(--bg);color:#eee;overflow-wrap:anywhere}
+section{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:20px;margin:14px 0;min-width:0}
+button,.primary{font:inherit;padding:10px 14px;border:1px solid #4b83bb;border-radius:7px;background:#3b82f6;color:white;cursor:pointer;margin:4px;text-decoration:none;display:inline-block}
+button:disabled{opacity:.5;cursor:default}button:focus-visible,a:focus-visible,input:focus-visible,summary:focus-visible{outline:3px solid var(--accent);outline-offset:3px}
+input{margin:8px;max-width:100%}small,.muted{color:var(--muted)}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(240px,100%),1fr));gap:12px}.card{border:1px solid #465064;padding:14px;border-radius:8px;min-width:0}
+.journey-status{border-top:1px solid var(--line);margin-top:16px;padding-top:16px}.journey-status h3{margin:0 0 6px}.journey-status p{margin:6px 0}.journey-status--warning{border-left:3px solid var(--warn);padding-left:12px}.journey-status--success{border-left:3px solid var(--success);padding-left:12px}
+details{margin-top:12px}summary{cursor:pointer}.diagnostics{font-size:.9rem}.diagnostics a{color:var(--accent)}
+@media(max-width:600px){body{padding:14px}section{padding:15px}button,.primary{width:100%;margin:4px 0}}
+</style></head>
+<body>
+<h1>Music to Clone Hero and YARG</h1>
+<p class="muted">Turn music you already love into playable charts. Start with a SoundCloud export; Spotify is optional.</p>
+<section aria-labelledby="importHeading"><h2 id="importHeading">1. Add your music</h2>
+  <div class="grid"><div class="card"><h3>SoundCloud export</h3>
+    <p>Upload a TuneMyMusic CSV or SoundCloud JSON export. No SoundCloud login is required.</p>
+    <label for="soundcloudFile">SoundCloud export file</label><input id="soundcloudFile" type="file" accept=".csv,.json">
+    <button id="soundcloudImport">Import SoundCloud export</button><p id="soundcloudMsg" class="muted" role="status" aria-live="polite"></p>
+    <a href="/browser-exporter.js">Download the optional browser exporter</a>
+  </div><div class="card"><h3>Spotify (optional)</h3><p>Connect Spotify only if you also want to add its playlists or Liked Songs.</p>
+    <button id="spotifyConnect">Connect Spotify</button><p class="muted">Your SoundCloud export works without this step.</p>
+  </div></div>
+  <div id="summary" class="muted" style="margin-top:14px">No music imported yet.</div>
+</section>
+<section aria-labelledby="matchingHeading"><h2 id="matchingHeading">2. Find playable charts</h2>
+  <p class="muted">We compare your songs with the local chart catalog without downloading anything.</p>
+  <button id="find" disabled>Find chart matches</button>
+  <p id="progress" class="muted" role="status" aria-live="polite"></p>
+</section>
+<section id="review" class="journey-status" hidden aria-labelledby="reviewHeading">
+  <h2 id="reviewHeading">3. Review and export</h2>
+  <h3 id="outcomeHeadline"></h3><p id="outcomeDetails"></p>
+  <a id="reviewLink" class="primary" href="/advanced" hidden>Review matches</a>
+  <details id="diagnosticsPanel" hidden><summary>Technical details</summary><p id="diagnostics" class="muted diagnostics"></p></details>
+</section>
 <script>
-const publicMode = __PUBLIC_MODE__; const lanAccessToken = __LAN_ACCESS_TOKEN__; const $=id=>document.getElementById(id);let workspaceId=null;let importTimer=null;
+const publicMode = __PUBLIC_MODE__; const lanAccessToken = __LAN_ACCESS_TOKEN__;
+const $=id=>document.getElementById(id);let workspaceId=null;let importTimer=null;let matchingTimer=null;
 async function api(url,opt){const r=await fetch(url,opt);const d=await r.json().catch(()=>({}));if(!r.ok)throw Error(d.error||'Request failed');return d}
-function showDiagnostics(d){if(d&&d.run_id&&d.diagnostics_url)$('diagnostics').innerHTML=`Run <code>${d.run_id}</code> | <a href="${d.diagnostics_url}">Download diagnostics</a>`}
-function render(d){workspaceId=d.workspace_id||workspaceId;const s=d.sources||[];const c=d.combined||{};$('summary').innerHTML=(s.length?s.map(x=>`<div><b>${x.provider}</b> (${x.source_key}): ${x.tracks||0} unique songs, ${x.provenance||0} source records, ${x.skipped_rows||0} skipped, ${x.duplicate_rows||0} duplicates</div>`).join(''):'No sources imported yet.')+`<p><b>Combined:</b> ${c.tracks||0} songs, ${c.artists||0} artists</p>`;$('find').disabled=!c.tracks;showDiagnostics(d)}
-function importMessage(s){const p=s.progress||{};if(s.phase==='persist'&&p.total_tracks)return `${s.message||'Saving tracks...'} ${p.persisted_tracks||0} / ${p.total_tracks}`;return s.message||s.phase||'Importing SoundCloud export...'}
-function pollImport(runId){if(importTimer)clearTimeout(importTimer);const poll=async()=>{try{const s=await api('/api/sources/soundcloud/import/status?run_id='+encodeURIComponent(runId));workspaceId=s.workspace_id||workspaceId;$('soundcloudMsg').textContent=importMessage(s);showDiagnostics(s);if(s.running){importTimer=setTimeout(poll,500);return}importTimer=null;$('soundcloudImport').disabled=false;if(s.status==='complete'||s.status==='partial'){const d=s.result||{};render(d);$('soundcloudMsg').textContent=d.message||`Imported ${d.source?.tracks||0} SoundCloud songs.`}else $('soundcloudMsg').textContent=s.error||'SoundCloud import failed.'}catch(e){importTimer=null;$('soundcloudImport').disabled=false;$('soundcloudMsg').textContent=e.message}};poll()}
-async function refresh(){try{const d=await api('/api/sources');render(d);const s=await api('/api/sources/soundcloud/import/status');showDiagnostics(s);if(s.running&&s.run_id){workspaceId=s.workspace_id||workspaceId;$('soundcloudImport').disabled=true;$('find').disabled=true;pollImport(s.run_id)}}catch(e){$('summary').textContent=e.message}}
-$('soundcloudImport').onclick=async()=>{const f=$('soundcloudFile').files[0];if(!f)return $('soundcloudMsg').textContent='Choose a CSV or JSON export first.';$('soundcloudImport').disabled=true;$('find').disabled=true;$('soundcloudMsg').textContent='Uploading export...';try{const fd=new FormData;fd.append('file',f);const d=await api('/api/sources/soundcloud/import',{method:'POST',body:fd});workspaceId=d.workspace_id;$('soundcloudMsg').textContent='Upload accepted; importing in the background...';showDiagnostics(d);pollImport(d.run_id)}catch(e){$('soundcloudMsg').textContent=e.message;$('soundcloudImport').disabled=false}};$('spotifyConnect').onclick=async()=>{try{const d=await api('/api/auth/spotify/start');location.href=d.authorization_url}catch(e){alert(e.message)}};
- $('refresh').onclick=refresh;
- $('find').onclick=async()=>{
-   try {
-     const d=await api('/api/discovery/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({source:'combined',workspace_id:workspaceId})});
-     $('progress').textContent='Catalog matching started...';
-     const timer=setInterval(async()=>{
-       try {
-         const s=await api('/api/discovery/status?workspace_id='+workspaceId);
-         $('progress').textContent=s.message||s.phase||'Matching...';
-         if(!s.running){
-           clearInterval(timer);
-           showDiagnostics(s);
-           if(s.result){
-             $('review').style.display='block';
-             const r=s.result;
-             $('cards').textContent=r.candidates
-               ? `${r.candidates} chart candidates found; review them in Advanced.`
-               : (!r.catalog_available
-                 ? `Catalog unavailable: ${r.catalog_diagnostic}`
-                 : r.exact_hits
-                   ? `All ${r.exact_hits} exact songs had candidates rejected by quality rules.`
-                   : 'No exact catalog hits. Download diagnostics for lookup details.');
-           }
-         }
-       }catch(e){clearInterval(timer);$('progress').textContent=e.message}
-     },1000);
-   }catch(e){$('progress').textContent=e.message}
- };
- refresh();
+function esc(value){return String(value??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+function number(value){return Number(value||0).toLocaleString()}
+function showDiagnostics(d){const panel=$('diagnosticsPanel');if(!d||!d.run_id||!d.diagnostics_url){panel.hidden=true;return}$('diagnostics').innerHTML=`Matching details: <code>${esc(d.run_id)}</code> · <a href="${esc(d.diagnostics_url)}">Download diagnostics</a>`;panel.hidden=false}
+function sourceLabel(provider){return String(provider||'').toLowerCase()==='soundcloud'?'SoundCloud export':String(provider||'Imported music')}
+function render(d){workspaceId=d.workspace_id||workspaceId;const sources=d.sources||[];const combined=d.combined||{};$('summary').innerHTML=(sources.length?sources.map(source=>{const details=[];if(source.skipped_rows)details.push(`${number(source.skipped_rows)} skipped`);if(source.duplicate_rows)details.push(`${number(source.duplicate_rows)} duplicates`);return `<div><b>${esc(sourceLabel(source.provider))}</b>: ${number(source.tracks)} songs imported${details.length?` · ${esc(details.join(' · '))}`:''}</div>`}).join(''):'No music imported yet.')+`<p><b>Your music:</b> ${number(combined.tracks)} songs from ${number(combined.artists)} artists</p>`;$('find').disabled=!combined.tracks;showDiagnostics(d);if(d.journey)renderJourney(d.journey)}
+function journeyDetails(journey){const counts=journey.counts||{};if(journey.matching_status==='complete'&&journey.catalog_available===false)return 'Your music was imported, but no charts could be checked because the local chart catalog is unavailable.';if(journey.matching_status==='complete')return `${number(counts.imported_songs)} songs checked. ${number(counts.chart_options)} songs have chart options across ${number(counts.candidate_charts)} chart versions: ${number(counts.strong_matches)} strong matches and ${number(counts.needs_review)} that need review. ${number(counts.no_suitable_songs)} songs have no safe recommendation.`;if(journey.matching_status==='incomplete')return `${number(counts.imported_songs)} songs were imported. ${number(counts.chart_options)} have saved chart options, but matching did not finish for everything.`;if(journey.matching_status==='failed')return `${number(counts.imported_songs)} songs were imported, but matching stopped before it finished.`;return journey.message||''}
+function renderJourney(journey){if(!journey)return;const counts=journey.counts||{};const review=$('review');const status=journey.matching_status||'empty';const active=status==='running';$('find').disabled=!counts.imported_songs||active;$('progress').textContent=active?journey.message||'Matching your songs...':status==='ready'?journey.message||'Your music is ready to match.':'';if(['complete','incomplete','failed'].includes(status)){review.hidden=false;$('outcomeHeadline').textContent=journey.headline||'Matching complete';$('outcomeDetails').textContent=journeyDetails(journey);$('reviewLink').hidden=!journey.review_available;$('reviewLink').href=journey.review_url||'/advanced';review.classList.toggle('journey-status--success',status==='complete'&&journey.catalog_available!==false);review.classList.toggle('journey-status--warning',status!=='complete'||journey.catalog_available===false)}else{review.hidden=true}}
+function importMessage(s){const p=s.progress||{};if(s.phase==='persist'&&p.total_tracks)return `${s.message||'Saving tracks...'} ${number(p.persisted_tracks)} / ${number(p.total_tracks)}`;return s.message||s.phase||'Importing SoundCloud export...'}
+function pollImport(runId){if(importTimer)clearTimeout(importTimer);const poll=async()=>{try{const s=await api('/api/sources/soundcloud/import/status?run_id='+encodeURIComponent(runId));workspaceId=s.workspace_id||workspaceId;$('soundcloudMsg').textContent=importMessage(s);showDiagnostics(s);if(s.running){$('find').disabled=true;importTimer=setTimeout(poll,500);return}importTimer=null;$('soundcloudImport').disabled=false;if(s.status==='complete'||s.status==='partial'){const d=await api('/api/sources');render(d);$('soundcloudMsg').textContent=s.result?.message||`Imported ${number(s.result?.source?.tracks)} SoundCloud songs.`}else{$('find').disabled=true;$('soundcloudMsg').textContent=s.error||'SoundCloud import failed.'}}catch(e){importTimer=null;$('soundcloudImport').disabled=false;$('find').disabled=true;$('soundcloudMsg').textContent=e.message}};poll()}
+async function refresh(){try{const d=await api('/api/sources');render(d);const status=await api('/api/discovery/status?workspace_id='+encodeURIComponent(d.workspace_id));showDiagnostics(status);if(status.journey)renderJourney(status.journey);if(status.running)pollMatching(d.workspace_id);const imported=await api('/api/sources/soundcloud/import/status');if(imported.running&&imported.run_id){workspaceId=imported.workspace_id||workspaceId;$('soundcloudImport').disabled=true;$('find').disabled=true;pollImport(imported.run_id)}}catch(e){$('summary').textContent=e.message}}
+async function pollMatching(workspace){if(matchingTimer)clearTimeout(matchingTimer);const poll=async()=>{try{const status=await api('/api/discovery/status?workspace_id='+encodeURIComponent(workspace));showDiagnostics(status);if(status.journey)renderJourney(status.journey);if(status.running){matchingTimer=setTimeout(poll,700);return}matchingTimer=null;const d=await api('/api/sources');render(d)}catch(e){matchingTimer=null;$('progress').textContent=e.message}};poll()}
+$('soundcloudImport').onclick=async()=>{const file=$('soundcloudFile').files[0];if(!file){$('soundcloudMsg').textContent='Choose a CSV or JSON export first.';return}$('soundcloudImport').disabled=true;$('find').disabled=true;$('soundcloudMsg').textContent='Uploading export...';try{const body=new FormData;body.append('file',file);const d=await api('/api/sources/soundcloud/import',{method:'POST',body});workspaceId=d.workspace_id;$('soundcloudMsg').textContent='Upload accepted; importing in the background...';showDiagnostics(d);pollImport(d.run_id)}catch(e){$('soundcloudMsg').textContent=e.message;$('soundcloudImport').disabled=false}};
+$('spotifyConnect').onclick=async()=>{try{const d=await api('/api/auth/spotify/start');location.href=d.authorization_url}catch(e){$('soundcloudMsg').textContent=e.message}};$('find').onclick=async()=>{if(!workspaceId)return;$('find').disabled=true;$('progress').textContent='Starting chart matching...';try{const d=await api('/api/discovery/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({source:'combined',workspace_id:workspaceId})});workspaceId=d.workspace_id||workspaceId;pollMatching(workspaceId)}catch(e){$('find').disabled=false;$('progress').textContent=e.message}};refresh();
 </script></body></html>'''
 
 
@@ -6859,7 +7488,8 @@ _ADVANCED_PAGE = """<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>CSV to Clone Hero | CSV &amp; music-file import</title>
+<link rel="icon" href="data:,">
+   <title>CSV to Clone Hero | Review and export</title>
 <style>
    :root { color-scheme:dark; --ink:#f4f6fa; --muted:#aab3c2; --bg:#11151c; --panel:#1a202a; --line:#354052; --accent:#7cb7ff; --success:#72d4a0; }
    * { box-sizing:border-box; }
@@ -6925,6 +7555,11 @@ _ADVANCED_PAGE = """<!doctype html>
    .review-why th { color: var(--muted); font-weight: 600; width: 34%; }
    .review-alternatives { border-top: 1px solid var(--line); margin-top: 14px; padding-top: 11px; }
    .review-selection-note { background: #102319; border-left: 3px solid var(--success); margin: 12px 0 0; padding: 8px 11px; }
+   .local-journey { border-left: 3px solid var(--accent); background: #111d2a; margin-top: 12px; padding: 10px 12px; }
+   .local-journey h3 { margin: 0 0 5px; }
+   .local-journey p { margin: 5px 0 0; }
+   .export-feedback { min-height: 1.4em; margin: 8px 0 0; }
+   .export-feedback.error { color: #ff7a7a; }
    @media (max-width: 600px) {
      .review-card-head, .review-option-head { align-items: flex-start; flex-direction: column; }
      .review-option-actions { justify-content: flex-start; }
@@ -6934,34 +7569,34 @@ _ADVANCED_PAGE = """<!doctype html>
 </head>
 <body>
 <main>
-   <h1>CSV &amp; music-file import</h1>
-   <p class="muted">Add exported music lists, preview chart matches, review choices, then download selected charts.
+   <h1>Review and export charts</h1>
+   <p class="muted">Add your music, preview chart matches, review the recommendation for each song, then export your choices.
        Library folder: <code id="libraryRoot">__LIBRARY_ROOT__</code>
-      · <a href="/">← Spotify library workflow</a></p>
+      · <a href="/">← Back to your music</a></p>
 
-   <h2>1 · Add music exports</h2>
-  <div class="card">
-     Export Spotify playlists to CSV with one of these tools, or add iTunes/Music TXT or XML exports:
+   <h2 id="importStepHeading">1 · Add music exports</h2>
+   <div class="card" id="legacyImportSources">
+      Export Spotify playlists to CSV with one of these tools, or add iTunes/Music TXT or XML exports:
     <ul>
       <li><a href="https://www.chosic.com/spotify-playlist-exporter/" target="_blank" rel="noopener">Chosic Spotify Playlist Exporter</a> — log in with Spotify, pick a playlist, download CSV</li>
       <li><a href="https://exportify.net/" target="_blank" rel="noopener">Exportify</a> — log in with Spotify, export playlists to CSV</li>
     </ul>
   </div>
 
-   <h2>2 · Choose files to import</h2>
+   <h2 id="legacyFileStepHeading">2 · Choose files to import</h2>
    <div class="card" id="drop">
      <input type="file" id="picker" accept=".csv,.txt,.xml" multiple>
      <span class="muted">Spotify CSV, iTunes/Music TXT, or iTunes/Music XML · or drag files anywhere on this box</span>
     <div id="files"></div>
   </div>
 
-   <h2>3 · Preview chart matches</h2>
+   <h2 id="matchingStepHeading">3 · Preview chart matches</h2>
    <div class="card">
      <div id="estimate" class="muted">Calculating search estimate...</div>
-     <p class="muted">Preview searches your imported songs without downloading. Review choices before downloading selected charts.</p>
-     <button id="exactDry" class="primary">Preview chart matches</button>
-     <button id="exactBuild">Download selected charts</button>
-     <details style="margin-top:14px"><summary class="muted">Advanced search options</summary><div style="margin-top:10px"><p class="muted">Artist expansion is optional and runs in a separate pass.</p><button id="expansionDry">Preview artist expansion</button><button id="expansionBuild">Download artist expansion charts</button></div></details>
+      <p id="matchingIntro" class="muted">Preview searches your imported songs without downloading. Review choices before downloading selected charts.</p>
+      <button id="exactDry" class="primary">Preview chart matches</button>
+      <button id="exactBuild">Download selected charts</button>
+      <details id="advancedSearchOptions" style="margin-top:14px"><summary class="muted">Advanced search options</summary><div style="margin-top:10px"><p class="muted">Artist expansion is optional and runs in a separate pass.</p><button id="expansionDry">Preview artist expansion</button><button id="expansionBuild">Download artist expansion charts</button></div></details>
     <div id="jobStatus" class="job-status" aria-live="polite">
       <div class="job-status-head">
         <span><span id="jobDot" class="job-dot"></span><b id="jobHeadline">Ready</b></span>
@@ -6974,29 +7609,62 @@ _ADVANCED_PAGE = """<!doctype html>
     <div id="stages" style="margin-top:12px"></div>
   </div>
 
+   <div id="localJourney" class="local-journey" hidden role="status" aria-live="polite"><h3 id="localJourneyHeadline"></h3><p id="localJourneyMessage"></p><p id="localJourneyCounts"></p></div>
+
    <h2>4 · Review your matches</h2>
    <div class="card">
      <p class="muted">One card represents one song from your music list. Start with the best chart and its short explanation; open other versions only when you need to compare them. Choices save immediately and apply to the next download build.</p>
      <div id="reviewProgress" class="muted"></div>
-     <div class="review-toolbar">
-       <button id="acceptAll" class="primary">Choose best review matches</button>
-       <span class="muted">Use this only when the recommended chart for every song looks right.</span>
-     </div>
-     <label class="muted" style="margin-left:12px">
-       <input type="checkbox" id="showRejected"> also show charts the app did not recommend</label>
-     <input type="text" id="reviewFilter" placeholder="Filter your music" aria-label="Filter your music" style="margin-left:12px; background:#0d1017; border:1px solid #2a3247; color:#e6e9ef; border-radius:6px; padding:6px 10px;">
-     <div id="review" style="margin-top:10px"></div>
+      <div class="review-toolbar">
+        <button id="acceptAll" class="primary">Choose best review matches</button>
+        <span class="muted">Use this only when the recommended chart for every song looks right.</span>
+      </div>
+      <div class="review-toolbar">
+        <label class="muted">View
+          <select id="reviewState" aria-label="Filter matches by state">
+            <option value="eligible" selected>All eligible matches</option>
+            <option value="strong">Strong matches</option>
+            <option value="review">Needs review</option>
+            <option value="selected">Selected</option>
+            <option value="unselected">Unselected</option>
+            <option value="not_playable">Not playable</option>
+            <option value="all">All result cards</option>
+          </select>
+        </label>
+        <label class="muted">Sort
+          <select id="reviewSort" aria-label="Sort matches">
+            <option value="artist" selected>Artist and title</option>
+            <option value="score">Best score</option>
+          </select>
+        </label>
+        <label class="muted" style="margin-left:12px">
+          <input type="checkbox" id="showRejected"> also show charts the app did not recommend</label>
+        <input type="text" id="reviewFilter" placeholder="Search artist, title, chart, or charter" aria-label="Search matches" style="background:#0d1017; border:1px solid #2a3247; color:#e6e9ef; border-radius:6px; padding:6px 10px; min-width:220px;">
+      </div>
+      <div id="reviewPager" class="review-toolbar" hidden>
+        <button id="reviewPrevious" type="button">Previous</button>
+        <span id="reviewPageStatus" class="muted"></span>
+        <button id="reviewNext" type="button">Next</button>
+      </div>
+      <div id="review" style="margin-top:10px"></div>
   </div>
 
-   <h2>5 · Download and reports</h2>
-  <div class="card">
-    <div id="summary" class="muted">No results yet — run a dry run first.</div>
-    <div class="reports" id="reports" style="margin-top:10px"></div>
+   <h2>5 · Export your choices</h2>
+   <div class="card">
+     <div id="summary" class="muted">No results yet — run a dry run first.</div>
+     <p id="exportFeedback" class="export-feedback" role="status" aria-live="polite"></p>
+     <div class="reports" id="reports" style="margin-top:10px"></div>
   </div>
 </main>
 <script>
 const $ = (id) => document.getElementById(id);
 let latestStatus = null;
+async function api(url, options) {
+  const response = await fetch(url, options);
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) throw Error(data.error || 'Request failed.');
+  return data;
+}
 
 function formatDuration(seconds) {
   seconds = Math.max(0, Math.floor(Number(seconds) || 0));
@@ -7004,10 +7672,22 @@ function formatDuration(seconds) {
   return minutes ? `${minutes}m ${String(seconds % 60).padStart(2, '0')}s` : `${seconds}s`;
 }
 
+function setExportFeedback(message, isError = false) {
+  const element = $('exportFeedback');
+  if (!element) return;
+  element.textContent = String(message || '');
+  element.classList.toggle('error', Boolean(isError));
+}
+
 function renderJobStatus(status) {
   latestStatus = status;
   const stages = status.stages || [];
   const progress = status.search_progress || {};
+  const localExport = typeof reviewData !== 'undefined'
+    && reviewData.source_neutral
+    && reviewData.journey?.has_imported_music
+    && status.action === 'exact-build';
+  const exportResult = status.result || {};
   const doneStages = stages.filter(stage => stage.status === 'done').length;
   const currentStage = stages.findIndex(stage => stage.status === 'running');
   const stageTotal = Math.max(stages.length, 5);
@@ -7026,17 +7706,47 @@ function renderJobStatus(status) {
     detail = status.error || 'All stages finished.';
   }
   $('jobFill').style.width = `${Math.max(0, Math.min(100, percent))}%`;
-  $('jobDot').className = 'job-dot' + (status.error ? ' failed' : status.running ? ' running' : '');
+  const exportFailed = localExport && !status.running && status.status === 'failed';
+  $('jobDot').className = 'job-dot' + (status.error || exportFailed ? ' failed' : status.running ? ' running' : '');
   const actionLabels = {
     'dry-run': 'Exact dry run', 'build': 'Exact build',
     'exact-dry-run': 'Exact dry run', 'exact-build': 'Exact build',
     'expansion-dry-run': 'Expansion dry run', 'expansion-build': 'Expansion build'
   };
-  $('jobHeadline').textContent = status.running
+  let headline = status.running
     ? `Running: ${actionLabels[status.action] || status.action || 'job'}`
     : status.error ? 'Job failed' : status.finished_at ? 'Last run complete' : 'Ready';
-  $('jobActivity').textContent = status.activity || detail || 'Waiting to start.';
-  $('jobDetail').textContent = detail;
+  let activity = status.activity || detail || 'Waiting to start.';
+  let userDetail = detail;
+  if (localExport) {
+    const published = Number(exportResult.published || 0);
+    const failed = Number(exportResult.failed || 0);
+    if (status.running) {
+      headline = 'Exporting selected charts';
+      activity = status.activity || 'Writing your selected charts into the library.';
+      userDetail = '';
+      setExportFeedback('Export is in progress...');
+    } else if (status.status === 'complete' && exportResult.success) {
+      headline = `${published} chart${published === 1 ? '' : 's'} exported successfully`;
+      activity = published
+        ? 'Your selected charts are now in the library.'
+        : 'No charts were exported.';
+      userDetail = failed ? `${failed} chart${failed === 1 ? '' : 's'} failed.` : '';
+      setExportFeedback(
+        failed
+          ? `${published} chart${published === 1 ? '' : 's'} exported successfully; ${failed} failed.`
+          : `${published} chart${published === 1 ? '' : 's'} exported successfully.`,
+      );
+    } else if (!status.running) {
+      headline = 'Export could not complete';
+      activity = status.error || 'No charts were exported.';
+      userDetail = failed ? `${failed} chart${failed === 1 ? '' : 's'} failed.` : '';
+      setExportFeedback(activity, true);
+    }
+  }
+  $('jobHeadline').textContent = headline;
+  $('jobActivity').textContent = activity;
+  $('jobDetail').textContent = userDetail;
   const elapsed = status.running && status.started_at
     ? (Date.now() / 1000 - status.started_at)
     : status.elapsed_seconds;
@@ -7054,7 +7764,7 @@ async function refreshFiles() {
   $('files').innerHTML = files.length
     ? files.map(f => `<div class="file-row" style="${f.enabled ? '' : 'opacity:.5'}"><label style="cursor:pointer;flex:1;display:flex;align-items:center;gap:8px">
         <input type="checkbox" ${f.enabled ? 'checked' : ''} onchange="toggleFile('${f.name.replace(/'/g, "\\'")}', this.checked)">
-        <span>📄 ${f.name} <span class="muted">(${(f.size/1024).toFixed(0)} KB)</span></span></label>
+        <span>${f.name} <span class="muted">(${(f.size/1024).toFixed(0)} KB)</span></span></label>
         <button onclick="delFile('${f.name.replace(/'/g, "\\'")}')">remove</button></div>`).join('')
     : '<p class="muted">No music exports yet.</p>';
 }
@@ -7097,7 +7807,7 @@ function setRunButtons(disabled) {
 }
 
 async function run(action) {
-  if (reviewData.source_neutral && action === 'exact-build') {
+  if (isLocalJourney() && action === 'exact-build') {
     await runNeutralExport();
     return;
   }
@@ -7147,11 +7857,12 @@ async function poll() {
 async function runNeutralExport() {
   jobRunning = true;
   setRunButtons(true);
+  setExportFeedback('Preparing your selected charts...');
   renderJobStatus({running: true, action: 'exact-build', activity: 'Exporting selected charts...', stages: [], search_progress: {}});
   try {
     const response = await fetch('/api/spotify/export/start', {method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({kind: 'folder', workspace_id: reviewData.workspace_id,
+      body: JSON.stringify({kind: 'folder', workspace_id: reviewData.workspace_id || reviewData.journey?.workspace_id,
         path: $('libraryRoot').textContent.trim()})});
     const result = await response.json().catch(() => ({}));
     if (!response.ok) throw Error(result.error || 'Could not start the export.');
@@ -7159,6 +7870,7 @@ async function runNeutralExport() {
   } catch (err) {
     jobRunning = false;
     setRunButtons(false);
+    setExportFeedback(err.message || 'Could not start the export.', true);
     renderJobStatus({running: false, error: err.message, activity: err.message, stages: [], search_progress: {}});
   }
 }
@@ -7172,7 +7884,10 @@ async function pollNeutralExport() {
       action: 'exact-build',
       activity: status.current || (status.running ? 'Exporting selected charts...' : status.error || 'Export complete.'),
       error: status.error,
+      status: status.status,
+      result: status.result,
       started_at: status.started_at,
+      finished_at: status.running ? null : (Date.now() / 1000),
       elapsed_seconds: 0,
       stages: [],
       search_progress: {},
@@ -7187,13 +7902,77 @@ async function pollNeutralExport() {
   } catch (err) {
     jobRunning = false;
     setRunButtons(false);
+    setExportFeedback(err.message || 'Export status is unavailable.', true);
     renderJobStatus({running: false, error: err.message, activity: err.message, stages: [], search_progress: {}});
   }
 }
 
+function isLocalJourney(journey = reviewData.journey) {
+  return Boolean(journey && journey.source_neutral && journey.has_imported_music);
+}
+
+function renderLocalJourney(journey) {
+  const local = isLocalJourney(journey);
+  const panel = $('localJourney');
+  if (!local) {
+    panel.hidden = true;
+    $('importStepHeading').hidden = false;
+    $('legacyImportSources').hidden = false;
+    $('legacyFileStepHeading').hidden = false;
+    $('drop').hidden = false;
+    $('advancedSearchOptions').hidden = false;
+    $('matchingStepHeading').textContent = '3 · Preview chart matches';
+    $('matchingIntro').textContent = 'Preview searches your imported songs without downloading. Review choices before downloading selected charts.';
+    $('exactDry').hidden = false;
+    return;
+  }
+  const counts = journey.counts || {};
+  panel.hidden = false;
+  $('localJourneyHeadline').textContent = journey.headline || 'Your music is ready';
+  $('localJourneyMessage').textContent = journey.message || '';
+  const selected = Number(counts.selected_charts || 0);
+  $('localJourneyCounts').textContent = `${Number(counts.imported_songs || 0).toLocaleString()} songs checked · ${Number(counts.chart_options || 0).toLocaleString()} songs with chart options across ${Number(counts.candidate_charts || 0).toLocaleString()} chart versions · ${Number(counts.strong_matches || 0).toLocaleString()} strong matches · ${Number(counts.needs_review || 0).toLocaleString()} need review · ${Number(counts.no_suitable_songs || 0).toLocaleString()} without a safe recommendation · ${selected.toLocaleString()} selected for export`;
+  $('importStepHeading').hidden = true;
+  $('legacyImportSources').hidden = true;
+  $('legacyFileStepHeading').hidden = true;
+  $('drop').hidden = true;
+  $('advancedSearchOptions').hidden = true;
+  $('matchingStepHeading').textContent = '2 · Matching results';
+  $('matchingIntro').textContent = journey.matching_status === 'running'
+    ? 'Matching is still in progress. Results will appear here when the check finishes.'
+    : 'Your matching results are ready. Review the recommendation for each song before exporting.';
+  $('exactDry').hidden = true;
+  $('exactDry').textContent = journey.matching_status === 'running'
+    ? 'Matching in progress'
+    : journey.matching_status === 'ready'
+      ? 'Find chart matches on the home page'
+      : 'Matching complete';
+  $('exactDry').disabled = true;
+  $('exactBuild').textContent = 'Export selected charts';
+  updateLocalExportState();
+}
+
+function updateLocalExportState() {
+  const journey = reviewData.journey;
+  if (!isLocalJourney(journey)) return;
+  const selected = Number(journey.counts?.selected_charts || 0);
+  const matching = journey.matching_status === 'running';
+  $('exactBuild').disabled = jobRunning || matching || selected === 0;
+  $('exactBuild').title = selected
+    ? 'Export the charts currently selected below.'
+    : 'Choose at least one chart below before exporting.';
+}
+
 async function refreshEstimate() {
   try {
-    const data = await (await fetch('/api/estimate')).json();
+    const sourceData = await api('/api/sources');
+    if (sourceData.journey?.has_imported_music) {
+      reviewData.journey = sourceData.journey;
+      renderLocalJourney(sourceData.journey);
+      $('estimate').textContent = `${Number(sourceData.journey.counts?.imported_songs || 0).toLocaleString()} imported songs. Matching results appear below.`;
+      return;
+    }
+    const data = await api('/api/estimate');
     const exact = data.exact || {};
     const expansion = data.expansion || {};
     $('estimate').innerHTML = `Exact: <b>${exact.song_count || 0}</b> songs,
@@ -7206,21 +7985,31 @@ async function refreshEstimate() {
 }
 
 async function refreshSummary() {
-  const s = await (await fetch('/api/summary')).json();
+  const s = await api('/api/summary');
   if (!s) return;
+  if (s.journey?.has_imported_music) {
+    reviewData.journey = s.journey;
+    renderLocalJourney(s.journey);
+    const counts = s.journey.counts || {};
+    const selected = Number(counts.selected_charts || 0);
+    $('summary').innerHTML = `<p><b>${selected.toLocaleString()} chart${selected === 1 ? '' : 's'} selected</b> for export.</p><p>${Number(counts.chart_options || 0).toLocaleString()} songs have chart options across ${Number(counts.candidate_charts || 0).toLocaleString()} chart versions: ${Number(counts.strong_matches || 0).toLocaleString()} strong matches and ${Number(counts.needs_review || 0).toLocaleString()} that need review. ${selected ? 'Export is ready when you are.' : 'Choose a chart above to make export available.'}</p>`;
+    updateLocalExportState();
+    return;
+  }
+  renderLocalJourney(null);
   const exact = s.exact || {};
   const expansion = s.expansion || {};
   const plan = s.plan || {};
   const downloads = s.downloads || {};
   const manual = s.manual_decisions || {};
   $('summary').innerHTML = `<table>
-    <tr><td>Playlist CSVs</td><td class="num">${s.csv_files}</td></tr>
-    <tr><td>Unique tracks</td><td class="num">${s.unique_tracks}</td></tr>
-    <tr><td>Primary artists</td><td class="num">${s.primary_artists}</td></tr>
-     <tr><td>Exact: strong / needs review / no suitable chart</td>
+    <tr><td>Music-list files</td><td class="num">${s.csv_files}</td></tr>
+    <tr><td>Songs imported</td><td class="num">${s.unique_tracks}</td></tr>
+    <tr><td>Artists represented</td><td class="num">${s.primary_artists}</td></tr>
+     <tr><td>Strong / needs review / no suitable chart</td>
         <td class="num">${exact.auto_matches || 0} / ${exact.review || 0} / ${exact.no_match || 0}</td></tr>
     <tr><td>Expansion selected</td><td class="num">${expansion.selected || 0}</td></tr>
-    <tr><td>Manual accepts / rejects</td><td class="num">${manual.accept || 0} / ${manual.reject || 0}</td></tr>
+    <tr><td>Chart choices</td><td class="num">${manual.accept || 0}</td></tr>
     <tr><td>Estimated library size</td><td class="num">${plan.estimated_gib || 0} GiB</td></tr>
     <tr><td>Downloaded</td><td class="num">${downloads.completed || 0} (${downloads.gib_downloaded || 0} GiB)</td></tr>
   </table>`;
@@ -7234,55 +8023,102 @@ async function refreshReports() {
 }
 
 // ------------------------------------------------------------- review UI
-let reviewData = {tracks: [], progress: {}};
+let reviewData = {tracks: [], progress: {}, journey: null};
 let jobRunning = false;
 let lastSaved = '';
+let reviewOffset = 0;
+const reviewPageSize = 50;
 
 function esc(s) {
   return String(s ?? '').replace(/[&<>"']/g, c =>
     ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
 
+function reviewQueryUrl() {
+  const params = new URLSearchParams();
+  params.set('limit', String(reviewPageSize));
+  params.set('offset', String(reviewOffset));
+  const state = $('reviewState').value || 'eligible';
+  const sort = $('reviewSort').value || 'artist';
+  const search = $('reviewFilter').value.trim();
+  params.set('state', state);
+  params.set('sort', sort);
+  if (search) params.set('search', search);
+  if ($('showRejected').checked) params.set('include_rejected', '1');
+  return `/api/review?${params.toString()}`;
+}
+
 async function loadReview(showLoading = true) {
   if (showLoading && !reviewData.tracks.length) $('review').innerHTML = '<p class="muted">Loading...</p>';
-  const showRejected = $('showRejected').checked;
   try {
-    reviewData = await (await fetch(
-      '/api/review' + (showRejected ? '?include_rejected=1' : ''))).json();
+    reviewData = await api(reviewQueryUrl());
   } catch (err) {
-    $('review').innerHTML = '<p class="muted">Review state unavailable.</p>';
+    setReviewFeedback('We could not load your matches. Refresh the page and try again.', true);
+    $('review').innerHTML = '<p class="muted">Your match results are temporarily unavailable.</p>';
     return;
   }
+  const page = reviewData.page || {};
+  if (page.total && reviewOffset >= page.total) {
+    reviewOffset = Math.max(0, (Number(page.page_count || 1) - 1) * reviewPageSize);
+    return loadReview(showLoading);
+  }
+  if (reviewData.journey) renderLocalJourney(reviewData.journey);
   renderReview();
+}
+
+function renderReviewPager() {
+  const page = reviewData.page || {};
+  const total = Number(page.total || 0);
+  const offset = Number(page.offset || 0);
+  const returned = Number(page.returned || 0);
+  const pager = $('reviewPager');
+  if (!pager) return;
+  pager.hidden = total <= Number(page.limit || reviewPageSize);
+  $('reviewPrevious').disabled = offset <= 0;
+  $('reviewNext').disabled = !page.has_more;
+  if (!total) {
+    $('reviewPageStatus').textContent = '';
+    return;
+  }
+  $('reviewPageStatus').textContent = `Showing ${offset + 1}-${offset + returned} of ${total} songs`;
 }
 
 function renderReview() {
   const progress = reviewData.progress || {};
   const allTracks = reviewData.tracks || [];
+  const local = isLocalJourney();
+  if (local) renderLocalJourney(reviewData.journey);
   $('acceptAll').disabled = jobRunning;
-  const filter = $('reviewFilter').value.trim().toLowerCase();
-  let items = allTracks;
-  if (filter) {
-    items = items.filter(track => {
-      const text = [track.artist, track.title, track.album,
-        ...(track.playlists || []), ...(track.candidates || []).flatMap(c =>
-          [c.candidate_artist, c.candidate_title, c.charter, c.reference])].join(' ');
-      return text.toLowerCase().includes(filter);
-    });
-  }
-  const statusText = progress.has_search_run
-    ? `${progress.review_track_count || 0} songs need a decision · ` +
-      `${progress.scored_tracks || 0} / ${progress.total_tracks || 0} songs checked` +
-      (progress.searching ? ' · checking is still in progress' :
-       progress.exact_scoring_complete ? '' : ' · matching is incomplete')
-    : 'Run Preview chart matches to start a review.';
+  const items = allTracks;
+  const page = reviewData.page || {};
+  renderReviewPager();
+  const viewCount = Number(page.total ?? (local ? reviewData.journey.counts?.chart_options : allTracks.length) ?? 0);
+  const viewLabel = page.state === 'eligible' ? 'eligible songs' :
+    page.state === 'strong' ? 'strong songs' :
+    page.state === 'review' ? 'songs needing review' :
+    page.state === 'selected' ? 'selected songs' : 'result cards';
+  const statusText = local
+    ? `${viewCount.toLocaleString()} ${viewLabel} · ${Number(reviewData.journey.counts?.selected_charts || 0).toLocaleString()} selected for export`
+    : progress.has_search_run
+      ? `${progress.review_track_count || 0} songs need a decision · ` +
+        `${progress.scored_tracks || 0} / ${progress.total_tracks || 0} songs checked` +
+        (progress.searching ? ' · checking is still in progress' :
+         progress.exact_scoring_complete ? '' : ' · matching is incomplete')
+      : 'Run Preview chart matches to start a review.';
   $('reviewProgress').textContent = lastSaved ? `${lastSaved} | ${statusText}` : statusText;
   if (!items.length) {
     let empty = 'There are no songs needing review right now.';
-    if (!progress.has_search_run) empty = 'Run Preview chart matches to check your music.';
+    if (local) {
+      const journey = reviewData.journey;
+      if (journey.matching_status === 'running') empty = 'Matching is still checking your songs; no decision is ready yet.';
+      else if (journey.catalog_available === false) empty = 'Chart catalog is unavailable, so no recommendations were made.';
+      else if (journey.counts?.no_candidate_songs) empty = `No suitable chart was found for ${Number(journey.counts.no_candidate_songs).toLocaleString()} songs.`;
+      else if (journey.counts?.no_suitable_songs) empty = 'No safe chart recommendation is available for the imported songs.';
+       else if (page.search || page.state !== 'all') empty = 'No songs match this filter.';
+    } else if (!progress.has_search_run) empty = 'Run Preview chart matches to check your music.';
     else if (progress.searching) empty = 'Matching is still checking your songs; no decision is ready yet.';
     else if (!progress.exact_scoring_complete) empty = 'Matching did not finish; run the preview again before deciding.';
-    else if (filter) empty = 'No songs match this filter.';
+     else if (page.search || page.state !== 'all') empty = 'No songs match this filter.';
     $('review').innerHTML = `<p class="muted">${empty}</p>`;
     return;
   }
@@ -7293,6 +8129,7 @@ function renderReview() {
     const review = track.review || {state:'needs_review', label:'Needs review', summary:'Review this chart carefully.', why:[], concerns:[], details:[]};
     const stateClass = reviewStatusClass(review);
     const selected = candidates.find(candidate => candidate.selected || candidate.manual === 'accept');
+    const selectedIsAlternative = Boolean(selected && selected !== best);
     const selectedNote = selected
       ? `<p class="review-selection-note"><b>Already selected:</b> ${esc(selected.candidate_artist)} — ${esc(selected.candidate_title)}. Choosing another chart will replace this choice.</p>`
       : '';
@@ -7308,7 +8145,7 @@ function renderReview() {
         <div class="review-eyebrow" style="margin-top:14px">Best chart</div>
         ${best ? candidateHtml(track, best, true) : `<div class="review-option review-option-blocked"><b>${esc(review.label)}</b><p class="review-summary">${esc(review.summary)}</p></div>`}
       </section>
-      ${alternatives.length ? `<details class="review-alternatives"><summary>Other versions (${alternatives.length})</summary>
+      ${alternatives.length ? `<details class="review-alternatives"${selectedIsAlternative ? ' open' : ''}><summary>Other versions (${alternatives.length})</summary>
         ${alternatives.map(candidate => candidateHtml(track, candidate, false)).join('')}</details>` : ''}
     </article>`;
   }).join('');
@@ -7367,21 +8204,22 @@ function reviewDetails(candidate) {
 }
 
 async function decide(trackKey, source, chartId, decision) {
-  const response = await fetch('/api/review/decide', {method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({track_key: trackKey, source, chart_id: chartId, decision,
-      workspace_id: reviewData.workspace_id || undefined})});
-  const result = await response.json().catch(() => ({}));
-  if (!response.ok) {
-    lastSaved = result.error || 'Could not save that choice.';
+  try {
+    const result = await api('/api/review/decide', {method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({track_key: trackKey, source, chart_id: chartId, decision,
+        workspace_id: reviewData.workspace_id || undefined})});
+    lastSaved = decision === 'clear' ? 'Current choice cleared.' : 'Chart choice saved.';
+    // Reload the authoritative persisted rows instead of making the card state
+    // optimistic or allowing it to drift from SQLite.
+    await loadReview(false);
+    await refreshSummary();
+    setTimeout(() => { lastSaved = ''; renderReview(); }, 4000);
+    return result;
+  } catch (error) {
+    lastSaved = error.message || 'Could not save that choice.';
     renderReview();
-    return;
   }
-  lastSaved = decision === 'clear' ? 'Current choice cleared.' : 'Chart choice saved.';
-  // Reload the authoritative persisted rows instead of making the card state
-  // optimistic or allowing it to drift from SQLite.
-  await loadReview(false);
-  setTimeout(() => { lastSaved = ''; renderReview(); }, 4000);
 }
 
 async function acceptAllReview() {
@@ -7393,27 +8231,55 @@ async function acceptAllReview() {
     return;
   }
   if (!confirm(`Choose the best chart for all ${count} songs that need review?`)) return;
-  const response = await fetch('/api/review/accept-all', {method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({workspace_id: reviewData.workspace_id || undefined})});
-  const result = await response.json();
-  if (!response.ok) {
-    lastSaved = result.error || 'Bulk accept failed.';
+  try {
+    const result = await api('/api/review/accept-all', {method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({workspace_id: reviewData.workspace_id || undefined})});
+    lastSaved = `Saved ${result.accepted || 0} chart choices.`;
+    await loadReview(false);
+    await refreshSummary();
+    setTimeout(() => { lastSaved = ''; renderReview(); }, 5000);
+  } catch (error) {
+    lastSaved = error.message || 'Bulk accept failed.';
     renderReview();
-    return;
   }
-  lastSaved = `Saved ${result.accepted || 0} chart choices.`;
-  await loadReview(false);
-  setTimeout(() => { lastSaved = ''; renderReview(); }, 5000);
 }
 
-$('showRejected').addEventListener('change', loadReview);
-$('reviewFilter').addEventListener('input', renderReview);
+function resetReviewPage() {
+  reviewOffset = 0;
+  loadReview();
+}
+
+let reviewSearchTimer = null;
+function scheduleReviewSearch() {
+  reviewOffset = 0;
+  if (reviewSearchTimer) clearTimeout(reviewSearchTimer);
+  reviewSearchTimer = setTimeout(() => loadReview(false), 250);
+}
+
+$('showRejected').addEventListener('change', resetReviewPage);
+$('reviewState').addEventListener('change', resetReviewPage);
+$('reviewSort').addEventListener('change', resetReviewPage);
+$('reviewFilter').addEventListener('input', scheduleReviewSearch);
+$('reviewPrevious').addEventListener('click', () => {
+  if (reviewOffset <= 0) return;
+  reviewOffset = Math.max(0, reviewOffset - reviewPageSize);
+  loadReview(false);
+});
+$('reviewNext').addEventListener('click', () => {
+  if (!(reviewData.page || {}).has_more) return;
+  reviewOffset += reviewPageSize;
+  loadReview(false);
+});
 $('acceptAll').addEventListener('click', acceptAllReview);
 
 $('exactDry').addEventListener('click', () => run('exact-dry-run'));
 $('exactBuild').addEventListener('click', () => {
-  if (confirm('Download exact playlist charts into the library now?')) run('exact-build');
+  if (isLocalJourney()) {
+    run('exact-build');
+  } else if (confirm('Export the selected charts into the library now?')) {
+    run('exact-build');
+  }
 });
 $('expansionDry').addEventListener('click', () => run('expansion-dry-run'));
 $('expansionBuild').addEventListener('click', () => {

@@ -247,6 +247,61 @@ class TestReviewApi:
         all_payload = http.get("/api/review?include_rejected=1").get_json()
         assert [c["chart_id"] for c in all_payload["tracks"][0]["candidates"]] == [1, 2, 3]
 
+    def test_review_cards_are_server_paged_and_searchable(self, client):
+        http, config = client
+        db = Database(config.database_path)
+        tracks = [make_track(f"Song {index:03d}", f"Artist {index:03d}") for index in range(120)]
+        db.replace_tracks(tracks, {"test.csv": len(tracks)})
+        for index, track in enumerate(db.get_tracks(), start=1):
+            chart = make_chart(
+                track.title,
+                track.primary_artist,
+                chart_id=index,
+            )
+            db.upsert_candidate(chart)
+            db.record_match_score(
+                track.db_id,
+                chart.db_id,
+                75.0,
+                "REVIEW",
+                json.dumps({"explanation": "review"}),
+            )
+        db.close()
+
+        first = http.get(
+            "/api/review",
+            query_string={"limit": 10, "offset": 0, "state": "review"},
+        ).get_json()
+        assert len(first["tracks"]) == 10
+        assert first["page"] == {
+            "offset": 0,
+            "limit": 10,
+            "page": 1,
+            "page_count": 12,
+            "total": 120,
+            "returned": 10,
+            "has_more": True,
+            "search": "",
+            "state": "review",
+            "sort": "artist",
+        }
+        assert first["progress"]["review_track_count"] == 120
+
+        second = http.get(
+            "/api/review",
+            query_string={"limit": 10, "offset": 110, "state": "review"},
+        ).get_json()
+        assert len(second["tracks"]) == 10
+        assert second["page"]["has_more"] is False
+        assert second["tracks"][0]["title"] == "Song 110"
+
+        searched = http.get(
+            "/api/review",
+            query_string={"limit": 50, "search": "Artist 011", "state": "eligible"},
+        ).get_json()
+        assert searched["page"]["total"] == 1
+        assert searched["tracks"][0]["artist"] == "Artist 011"
+
 
 def test_manual_accept_is_definitive_even_when_lower_scored(config):
     db = Database(config.database_path)

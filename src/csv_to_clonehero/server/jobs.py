@@ -350,6 +350,8 @@ class JobManager:
                     grouped.setdefault(provider, []).append(ProviderTrack(
                         provider=provider, provider_id=str(row["provider_id"]), title=str(row["title"]),
                         artist=str(row["artist"]), album=str(row["album"] or ""), liked=bool(row["liked"]),
+                        isrc=str(row["isrc"] or ""), url=str(row["url"] or ""),
+                        metadata=_json_object(row["metadata_json"], {}),
                     ))
                 self._mark(job.id, status="running", phase="combine", message="Combining imported sources locally")
                 combined = discover_combined(
