@@ -1013,7 +1013,10 @@ def _normalise_spotify_playlist(value: Any) -> dict[str, Any]:
                 break
     owner = data.get("owner") if isinstance(data.get("owner"), Mapping) else {}
     tracks = data.get("tracks") if isinstance(data.get("tracks"), Mapping) else {}
-    total_tracks = _first_value(data, "total_tracks", "item_count", default=tracks.get("total"))
+    items = data.get("items") if isinstance(data.get("items"), Mapping) else {}
+    total_tracks = _first_value(data, "total_tracks", "item_count", default=items.get("total"))
+    if total_tracks is None:
+        total_tracks = tracks.get("total")
     try:
         total_tracks = int(total_tracks) if total_tracks is not None else None
     except (TypeError, ValueError):
@@ -1303,8 +1306,10 @@ class Database:
         params: list[Any] = [db_id]
         clause = ""
         if provider:
-            clause = " AND EXISTS (SELECT 1 FROM library_track_provenance p JOIN library_sources s ON s.id=p.source_id WHERE p.library_track_id=t.id AND s.provider=?)"
+            clause = " AND EXISTS (SELECT 1 FROM library_track_provenance p JOIN library_sources s ON s.id=p.source_id WHERE p.library_track_id=t.id AND p.source_import_id=(SELECT MAX(i2.id) FROM source_imports i2 WHERE i2.source_id=s.id) AND s.provider=?)"
             params.append(str(provider).casefold())
+        else:
+            clause = " AND EXISTS (SELECT 1 FROM library_track_provenance p JOIN library_sources s ON s.id=p.source_id WHERE p.library_track_id=t.id AND p.source_import_id=(SELECT MAX(i2.id) FROM source_imports i2 WHERE i2.source_id=s.id))"
         return list(self._conn.execute("SELECT t.* FROM library_tracks t WHERE t.workspace_id=?" + clause + " ORDER BY t.artist,t.title", params))
 
     def get_source_summary(self, workspace_id: int | str, provider: str | None = None) -> list[sqlite3.Row]:
@@ -1318,10 +1323,13 @@ class Database:
             params.append(str(provider).casefold())
         return list(self._conn.execute(
             """SELECT s.provider,s.source_key,s.status,COUNT(DISTINCT p.library_track_id) AS tracks,
-                      COUNT(DISTINCT p.provider_id) AS provenance, MAX(i.skipped_rows) AS skipped_rows,
-                      MAX(i.duplicate_rows) AS duplicate_rows, MAX(i.report_json) AS report_json
-                 FROM library_sources s LEFT JOIN library_track_provenance p ON p.source_id=s.id
-                 LEFT JOIN source_imports i ON i.source_id=s.id WHERE s.workspace_id=?""" + clause + " GROUP BY s.id ORDER BY s.provider,s.source_key", params))
+                      COUNT(DISTINCT p.provider_id) AS provenance, i.skipped_rows AS skipped_rows,
+                      i.duplicate_rows AS duplicate_rows, i.report_json AS report_json,
+                      i.id AS import_id, i.total_rows AS total_rows, i.accepted_rows AS accepted_rows
+                 FROM library_sources s
+                 LEFT JOIN source_imports i ON i.id=(SELECT MAX(i2.id) FROM source_imports i2 WHERE i2.source_id=s.id)
+                 LEFT JOIN library_track_provenance p ON p.source_id=s.id AND p.source_import_id=i.id
+                 WHERE s.workspace_id=?""" + clause + " GROUP BY s.id ORDER BY s.provider,s.source_key", params))
 
     def get_combined_summary(self, workspace_id: int | str) -> dict[str, int]:
         rows = self.get_neutral_library_tracks(workspace_id)
@@ -1335,7 +1343,9 @@ class Database:
             """SELECT t.normalized_artist,t.normalized_title,p.provider_id,s.provider,p.title,p.artist,p.album,p.liked,
                       p.isrc,p.url,p.metadata_json
                FROM library_tracks t JOIN library_track_provenance p ON p.library_track_id=t.id
-               JOIN library_sources s ON s.id=p.source_id WHERE t.workspace_id=? ORDER BY t.artist,t.title""",
+               JOIN library_sources s ON s.id=p.source_id
+               WHERE t.workspace_id=? AND p.source_import_id=(SELECT MAX(i.id) FROM source_imports i WHERE i.source_id=s.id)
+               ORDER BY t.artist,t.title""",
             (db_id,),
         ))
 
@@ -3991,9 +4001,26 @@ class Database:
             query += " AND (artist LIKE ? OR title LIKE ?)"
             value = f"%{search.strip()}%"
             params.extend([value, value])
-        query += " ORDER BY artist COLLATE NOCASE, title COLLATE NOCASE LIMIT ? OFFSET ?"
+        query += " ORDER BY updated_at DESC LIMIT ? OFFSET ?"
         params.extend([limit, offset])
         return list(self._conn.execute(query, params))
+
+    def get_discovery_song_progress_summary(self, workspace_id: int | str) -> dict[str, Any]:
+        """Return compact current-run classification totals for the UI."""
+        db_id = self._workspace_db_id(workspace_id)
+        row = self._conn.execute(
+            """SELECT COUNT(*) AS total,
+                      SUM(CASE WHEN status='complete' THEN 1 ELSE 0 END) AS completed,
+                      SUM(CASE WHEN status='checking' THEN 1 ELSE 0 END) AS checking,
+                      SUM(CASE WHEN classification='strong' THEN 1 ELSE 0 END) AS strong,
+                      SUM(CASE WHEN classification='review' THEN 1 ELSE 0 END) AS review,
+                      SUM(CASE WHEN classification='no_suitable' THEN 1 ELSE 0 END) AS no_suitable,
+                      SUM(CASE WHEN classification='not_playable' THEN 1 ELSE 0 END) AS not_playable,
+                      SUM(CASE WHEN classification='no_catalog_candidate' THEN 1 ELSE 0 END) AS no_catalog_candidate
+                 FROM discovery_song_progress WHERE workspace_id=?""",
+            (db_id,),
+        ).fetchone()
+        return {key: int(row[key] or 0) for key in ("total", "completed", "checking", "strong", "review", "no_suitable", "not_playable", "no_catalog_candidate")}
 
     def count_discovery_song_progress(
         self, workspace_id: int | str, *, search: str = ""

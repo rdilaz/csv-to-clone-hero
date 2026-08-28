@@ -29,6 +29,15 @@ from csv_to_clonehero.spotify_pipeline import (
 )
 
 
+def test_spotify_playlist_count_prefers_current_items_total_and_preserves_unknown():
+    current = SpotifyPlaylist.from_payload({"id": "current", "name": "Current", "items": {"total": 18}, "tracks": {"total": 0}})
+    legacy = SpotifyPlaylist.from_payload({"id": "legacy", "name": "Legacy", "tracks": {"total": 7}})
+    unknown = SpotifyPlaylist.from_payload({"id": "unknown", "name": "Unknown", "items": []})
+    assert current is not None and current.total_tracks == 18
+    assert legacy is not None and legacy.total_tracks == 7
+    assert unknown is not None and unknown.total_tracks is None
+
+
 def test_pkce_exchange_only_persists_refresh_token():
     store = InMemoryCredentialStore()
     transport = httpx.MockTransport(

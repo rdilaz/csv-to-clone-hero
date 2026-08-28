@@ -44,7 +44,10 @@ def run_library_import(
         if on_progress:
             on_progress({"phase": "import", "provider": provider_name})
         try:
-            snapshot = provider.import_library(scope=scopes.get(provider_name) or {})
+            import_kwargs = {"scope": scopes.get(provider_name) or {}}
+            if provider_name == "spotify" and on_progress is not None:
+                import_kwargs["on_progress"] = on_progress
+            snapshot = provider.import_library(**import_kwargs)
 
             def persistence_progress(payload: Mapping[str, Any]) -> None:
                 if on_progress:

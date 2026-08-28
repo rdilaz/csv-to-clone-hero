@@ -973,10 +973,12 @@ class SpotifyPlaylist:
                     artwork_url = str(image["url"])
                     break
         total_tracks: int | None = None
-        tracks = payload.get("tracks") or payload.get("items")
-        if isinstance(tracks, Mapping) and tracks.get("total") is not None:
+        items = payload.get("items")
+        tracks = payload.get("tracks")
+        count = items.get("total") if isinstance(items, Mapping) else tracks.get("total") if isinstance(tracks, Mapping) else None
+        if count is not None:
             try:
-                total_tracks = int(tracks["total"])
+                total_tracks = int(count)
             except (TypeError, ValueError):
                 total_tracks = None
         owner = payload.get("owner") if isinstance(payload.get("owner"), Mapping) else {}
@@ -1756,6 +1758,7 @@ class SpotifyClient:
         limit: int | None = None,
         query: Mapping[str, Any] | None = None,
         cancellation_event: Any | None = None,
+        on_page: Any | None = None,
     ) -> list[Any]:
         page_limit = self.page_size if limit is None else limit
         if page_limit < 1 or page_limit > MAX_PAGE_SIZE:
@@ -1783,6 +1786,8 @@ class SpotifyClient:
             # Preserve null item slots so the library parser can report them
             # instead of silently changing Spotify's terminal counts.
             items.extend(page)
+            if callable(on_page):
+                on_page(len(items), payload.get("total"))
             next_url = payload.get("next")
             if next_url:
                 next_value = urljoin(url, str(next_url))
@@ -1817,19 +1822,19 @@ class SpotifyClient:
     get_playlists = list_playlists
     fetch_playlists = list_playlists
 
-    def get_playlist_items(self, playlist_id: str, *, limit: int | None = None) -> list[Any]:
+    def get_playlist_items(self, playlist_id: str, *, limit: int | None = None, on_page: Any | None = None) -> list[Any]:
         """Fetch all items from the current playlist using Spotify's items endpoint."""
         if not str(playlist_id).strip():
             raise ValueError("playlist_id is required")
         encoded_id = quote(str(playlist_id), safe="")
-        return self._paginate(f"/playlists/{encoded_id}/items", limit=limit)
+        return self._paginate(f"/playlists/{encoded_id}/items", limit=limit, on_page=on_page)
 
     playlist_items = get_playlist_items
     fetch_playlist_items = get_playlist_items
 
-    def get_liked_tracks(self, *, limit: int | None = None) -> list[Any]:
+    def get_liked_tracks(self, *, limit: int | None = None, on_page: Any | None = None) -> list[Any]:
         """Fetch all saved tracks from ``/v1/me/tracks``."""
-        return self._paginate("/me/tracks", limit=limit)
+        return self._paginate("/me/tracks", limit=limit, on_page=on_page)
 
     def get_saved_tracks_count(self) -> int:
         """Fetch the saved-track total without downloading the library."""
@@ -1939,6 +1944,7 @@ class SpotifyClient:
         *,
         include_liked: bool = True,
         playlists: Sequence[SpotifyPlaylist] | None = None,
+        on_progress: Any | None = None,
     ) -> LibraryImportResult:
         """Fetch and parse accessible playlists and optionally saved tracks."""
         accessible_playlists = list(playlists) if playlists is not None else self.list_playlists()
@@ -1946,7 +1952,15 @@ class SpotifyClient:
         inaccessible: list[LibraryItemOutcome] = []
         for index, playlist in enumerate(accessible_playlists):
             try:
-                playlist_batches.append((playlist, self.get_playlist_items(playlist.id)))
+                if callable(on_progress):
+                    on_progress({"phase": "playlist", "playlist_index": index + 1, "playlist_total": len(accessible_playlists), "playlist_name": playlist.name, "playlist_total_items": playlist.total_tracks})
+                items = self.get_playlist_items(
+                    playlist.id,
+                    on_page=(lambda count, total, index=index, playlist=playlist: on_progress({"phase": "playlist", "playlist_index": index + 1, "playlist_total": len(accessible_playlists), "playlist_name": playlist.name, "playlist_items_read": count, "playlist_total_items": total or playlist.total_tracks}) if callable(on_progress) else None),
+                )
+                playlist_batches.append((playlist, items))
+                if callable(on_progress):
+                    on_progress({"phase": "playlist", "playlist_index": index + 1, "playlist_total": len(accessible_playlists), "playlist_name": playlist.name, "playlist_items_read": len(items), "playlist_total_items": playlist.total_tracks})
             except SpotifyPermissionError as exc:
                 # A playlist can be listed while its current items endpoint is
                 # inaccessible (for example, a followed private playlist).
@@ -1984,7 +1998,13 @@ class SpotifyClient:
                         reason=str(exc),
                     )
                 )
-        liked = self.get_liked_tracks() if include_liked else []
+        if callable(on_progress) and include_liked:
+            on_progress({"phase": "liked", "liked_total_items": None, "liked_items_read": 0})
+        liked = self.get_liked_tracks(
+            on_page=(lambda count, total: on_progress({"phase": "liked", "liked_items_read": count, "liked_total_items": total}) if callable(on_progress) else None),
+        ) if include_liked else []
+        if callable(on_progress) and include_liked:
+            on_progress({"phase": "liked", "liked_total_items": len(liked), "liked_items_read": len(liked)})
         result = parse_library(playlist_batches, liked, playlists=accessible_playlists)
         if inaccessible:
             result.outcomes.extend(inaccessible)

@@ -17,13 +17,13 @@ class SpotifyLibraryProvider:
     def capabilities(self) -> Mapping[str, bool]:
         return {"official_api": True, "oauth": True, "user_export": False, "public_playlist": False}
 
-    def import_library(self, *, scope: Mapping[str, Any] | None = None) -> LibrarySnapshot:
+    def import_library(self, *, scope: Mapping[str, Any] | None = None, on_progress: Any | None = None) -> LibrarySnapshot:
         scope = scope or {}
         playlist_ids = {str(value) for value in scope.get("playlist_ids", []) if str(value).strip()}
         include_liked = bool(scope.get("include_liked"))
         playlists = list(self.client.list_playlists())
         selected = [playlist for playlist in playlists if not playlist_ids or playlist.id in playlist_ids]
-        result = self.client.fetch_library(include_liked=include_liked, playlists=selected)
+        result = self.client.fetch_library(include_liked=include_liked, playlists=selected, on_progress=on_progress)
         tracks = [
             ProviderTrack(
                 provider="spotify",
