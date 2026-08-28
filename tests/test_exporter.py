@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import struct
 import zipfile
 
 from csv_to_clonehero.exporter import ExportSelection, ExportService, validate_sng
@@ -13,7 +14,11 @@ def _chart_bytes() -> bytes:
     payload = io.BytesIO()
     with zipfile.ZipFile(payload, "w") as archive:
         archive.writestr("song.ini", "[song]\nname = Test\n")
-        archive.writestr("notes.chart", "notes")
+        archive.writestr(
+            "notes.chart",
+            "[Song]\n{\nResolution = 192\n}\n"
+            "[ExpertSingle]\n{\n0 = N 0 0\n}\n",
+        )
     return payload.getvalue()
 
 
@@ -45,7 +50,39 @@ def _sngpkg_bytes(
             pair("charter", "Charter"),
         ]
     )
-    return b"SNGPKG" + (1).to_bytes(4, "little") + b"\x00" * 16 + metadata + b"\x00" * 32
+    chart = (
+        "[Song]\n{\nResolution = 192\n}\n"
+        "[ExpertSingle]\n{\n0 = N 0 0\n}\n"
+    ).encode("utf-8")
+    mask = bytes(range(16))
+    files = [("notes.chart", chart), ("guitar.opus", b"audio")]
+    index_length = sum(1 + len(name.encode("utf-8")) + 16 for name, _ in files)
+    data_start = 26 + 16 + len(metadata) + 16 + index_length + 8
+    index = bytearray()
+    encoded: list[bytes] = []
+    offset = data_start
+    for name, plain in files:
+        masked = bytes(
+            value ^ mask[index_value % 16] ^ (index_value % 256)
+            for index_value, value in enumerate(plain)
+        )
+        encoded.append(masked)
+        name_bytes = name.encode("utf-8")
+        index.extend(bytes([len(name_bytes)]))
+        index.extend(name_bytes)
+        index.extend(struct.pack("<QQ", len(masked), offset))
+        offset += len(masked)
+    return (
+        b"SNGPKG"
+        + struct.pack("<I", 1)
+        + mask
+        + struct.pack("<QQ", 8 + len(metadata), 7)
+        + metadata
+        + struct.pack("<QQ", 8 + len(index), len(files))
+        + index
+        + struct.pack("<Q", sum(map(len, encoded)))
+        + b"".join(encoded)
+    )
 
 
 def test_export_validates_sng_and_supports_folder_then_zip(config, tmp_path):

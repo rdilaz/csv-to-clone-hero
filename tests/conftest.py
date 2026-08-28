@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import io
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -13,6 +15,18 @@ from csv_to_clonehero.normalization import (
 )
 
 FIXTURES = Path(__file__).parent / "fixtures"
+
+
+def valid_sng_bytes(name: str = "Song") -> bytes:
+    payload = io.BytesIO()
+    with zipfile.ZipFile(payload, "w") as archive:
+        archive.writestr("song.ini", f"[song]\nname = {name}\n")
+        archive.writestr(
+            "notes.chart",
+            "[Song]\n{\nResolution = 192\n}\n"
+            "[ExpertSingle]\n{\n0 = N 0 0\n}\n",
+        )
+    return payload.getvalue()
 
 
 @pytest.fixture

@@ -16,7 +16,7 @@ from typing import Any
 
 from csv_to_clonehero.models import ChartCandidate, Track
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);
@@ -172,6 +172,8 @@ CREATE TABLE IF NOT EXISTS downloads (
     bytes INTEGER NOT NULL DEFAULT 0,
     path TEXT,
     md5 TEXT,
+    sha256 TEXT,
+    validation_json TEXT NOT NULL DEFAULT '{}',
     downloaded_at REAL,
     error TEXT
 );
@@ -1130,6 +1132,8 @@ class Database:
                 ("candidate_charts", "difficulty_fields_json", "TEXT NOT NULL DEFAULT '{}'"),
                 ("background_jobs", "cancel_requested", "INTEGER NOT NULL DEFAULT 0"),
                 ("background_jobs", "heartbeat_at", "REAL"),
+                ("downloads", "sha256", "TEXT"),
+                ("downloads", "validation_json", "TEXT NOT NULL DEFAULT '{}'"),
             ):
                 self._ensure_column(table, column, definition)
             # Older query rows predate the explicit returned-count field.  This
@@ -1313,7 +1317,8 @@ class Database:
         if db_id is None:
             return []
         return list(self._conn.execute(
-            """SELECT t.normalized_artist,t.normalized_title,p.provider_id,s.provider,p.title,p.artist,p.album,p.liked
+            """SELECT t.normalized_artist,t.normalized_title,p.provider_id,s.provider,p.title,p.artist,p.album,p.liked,
+                      p.isrc,p.url,p.metadata_json
                FROM library_tracks t JOIN library_track_provenance p ON p.library_track_id=t.id
                JOIN library_sources s ON s.id=p.source_id WHERE t.workspace_id=? ORDER BY t.artist,t.title""",
             (db_id,),
@@ -3254,6 +3259,7 @@ class Database:
         *,
         kind: str | None = None,
         include_rejected: bool = True,
+        include_candidate_data: bool = True,
     ) -> list[sqlite3.Row]:
         db_id = self._workspace_db_id(workspace_id)
         clauses = ["wc.workspace_id = ?"]
@@ -3267,9 +3273,10 @@ class Database:
             params.append(kind)
         if not include_rejected:
             clauses.append("COALESCE(LOWER(wc.decision), '') NOT IN ('reject', 'rejected', 'incompatible')")
+        candidate_json = "c.data_json AS candidate_json" if include_candidate_data else "'' AS candidate_json"
         return list(
             self._conn.execute(
-                """SELECT wc.*, c.source, c.chart_id, c.data_json AS candidate_json,
+                f"""SELECT wc.*, c.source, c.chart_id, {candidate_json},
                           t.track_key, t.spotify_id, t.title AS track_title,
                           t.artist_full AS track_artist,
                           EXISTS (SELECT 1 FROM workspace_selections ws
@@ -5612,16 +5619,36 @@ class Database:
         path: str = "",
         md5: str = "",
         error: str = "",
+        sha256: str = "",
+        validation_json: str | Mapping[str, Any] = "",
     ) -> None:
+        validation_text = (
+            _json_text(validation_json, {})
+            if isinstance(validation_json, Mapping)
+            else str(validation_json or "{}")
+        )
         with self._conn:
             self._conn.execute(
-                """INSERT INTO downloads (candidate_id, status, bytes, path, md5, downloaded_at, error)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)
+                """INSERT INTO downloads
+                   (candidate_id, status, bytes, path, md5, sha256, validation_json, downloaded_at, error)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(candidate_id) DO UPDATE SET
                        status = excluded.status, bytes = excluded.bytes, path = excluded.path,
-                       md5 = excluded.md5, downloaded_at = excluded.downloaded_at,
+                       md5 = excluded.md5, sha256 = excluded.sha256,
+                       validation_json = excluded.validation_json,
+                       downloaded_at = excluded.downloaded_at,
                        error = excluded.error""",
-                (candidate_id, status, bytes_count, path, md5, time.time(), error),
+                (
+                    candidate_id,
+                    status,
+                    bytes_count,
+                    path,
+                    md5,
+                    sha256,
+                    validation_text,
+                    time.time(),
+                    error,
+                ),
             )
 
     def update_download_path(self, candidate_id: int, path: str) -> None:

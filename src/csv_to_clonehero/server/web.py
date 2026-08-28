@@ -40,7 +40,10 @@ from csv_to_clonehero.server.safeguards import (
 )
 from csv_to_clonehero.server.security import resolve_session_key, resolve_token_cipher
 from csv_to_clonehero.review_presentation import build_review_presentation
-from csv_to_clonehero.sources.base import source_catalog_available
+from csv_to_clonehero.sources.base import (
+    source_catalog_available,
+    source_catalog_contains_chart,
+)
 
 log = logging.getLogger(__name__)
 
@@ -623,9 +626,23 @@ def create_app(
                     catalog_sources = list(jobs.source_factory(config))
                     try:
                         relevant = [source for source in catalog_sources if str(getattr(source, "name", "")) == str(candidate_row["source"] or "")]
-                        memberships = [source_catalog_available(source, str(candidate_row["track_artist"] or ""), str(candidate_row["track_title"] or "")) for source in relevant]
-                        if memberships and all(value is False for value in memberships):
+                        chart_memberships = [
+                            source_catalog_contains_chart(
+                                source,
+                                int(candidate_row["chart_id"]),
+                                source_name=str(candidate_row["source"] or ""),
+                            )
+                            for source in relevant
+                            if candidate_row["chart_id"] not in (None, "")
+                        ]
+                        if chart_memberships and any(value is True for value in chart_memberships):
+                            pass
+                        elif chart_memberships and all(value is False for value in chart_memberships):
                             raise ValueError("song is unavailable in the local chart catalog")
+                        else:
+                            memberships = [source_catalog_available(source, str(candidate_row["track_artist"] or ""), str(candidate_row["track_title"] or "")) for source in relevant]
+                            if memberships and all(value is False for value in memberships):
+                                raise ValueError("song is unavailable in the local chart catalog")
                     finally:
                         for source in catalog_sources:
                             try:
@@ -659,7 +676,7 @@ def create_app(
             "diagnostic": catalog.diagnostic,
             "chart_count": catalog.chart_count if catalog.available else 0,
             "artist_count": len(catalog.artists()) if catalog.available else 0,
-            "song_count": sum(1 for _ in catalog._songs) if catalog.available else 0,
+            "song_count": catalog.song_count if catalog.available else 0,
             "snapshot_id": catalog.snapshot_id,
         })
 

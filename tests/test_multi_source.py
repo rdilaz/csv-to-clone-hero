@@ -14,7 +14,7 @@ from csv_to_clonehero.database import Database
 from csv_to_clonehero.pipeline import run_downloads, run_plan, run_search
 from csv_to_clonehero.sources import build_sources
 
-from .conftest import FakeSource, make_chart, make_track
+from .conftest import FakeSource, make_chart, make_track, valid_sng_bytes
 
 
 class _NamedSource(FakeSource):
@@ -24,8 +24,8 @@ class _NamedSource(FakeSource):
 
 
 def _build_two_sources():
-    content_a = b"guitar-only" * 100
-    content_b = b"full-band-official" * 100
+    content_a = valid_sng_bytes("Song A")
+    content_b = valid_sng_bytes("Song B")
     md5_a = hashlib.md5(content_a).hexdigest()
     md5_b = hashlib.md5(content_b).hexdigest()
     # Source A: single-instrument, unrated chart of the same song.

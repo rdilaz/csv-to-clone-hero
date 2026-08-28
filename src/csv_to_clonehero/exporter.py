@@ -24,6 +24,7 @@ import os
 import re
 import stat
 import shutil
+import struct
 import tempfile
 import threading
 import time
@@ -133,6 +134,11 @@ class SngValidation:
     metadata_members: tuple[str, ...] = ()
     chart_members: tuple[str, ...] = ()
     error: str = ""
+    format: str = ""
+    chart_member: str = ""
+    playable_note_count: int = 0
+    note_counts: tuple[tuple[str, int], ...] = ()
+    validation_version: str = "sng-playability-v1"
 
     def __bool__(self) -> bool:
         return self.valid
@@ -748,29 +754,439 @@ def parse_sngpkg_metadata(data: bytes) -> dict[str, str]:
     return {}
 
 
-def _validate_sngpkg(archive: Path, size: int, max_archive_bytes: int) -> SngValidation:
-    """Validate an ``SNGPKG`` binary .sng package (the format Enchor serves)."""
-    try:
-        with open(archive, "rb") as fh:
-            head = fh.read(8192)
-    except OSError as exc:
-        return SngValidation(False, size_bytes=size, error=f"cannot read chart package: {exc}")
-    if len(head) < 10 or head[:6] != SNGPKG_MAGIC:
-        return SngValidation(False, size_bytes=size, error="malformed chart package header")
-    version = int.from_bytes(head[6:10], "little")
-    if not 1 <= version <= 16:
-        return SngValidation(False, size_bytes=size, error=f"unsupported chart package version: {version}")
-    if size > max_archive_bytes:
-        return SngValidation(False, size_bytes=size, error="chart package is too large")
-    if not parse_sngpkg_metadata(head):
-        return SngValidation(False, size_bytes=size, error="chart package lacks song metadata")
+_SNGPKG_HEADER_SIZE = 6 + 4 + 16
+_SNGPKG_SECTION_LIMIT = 64 * 1024 * 1024
+_MIDI_MARKER_NOTES = {103, 116, 120, 126, 127}
+_MIDI_DIFFICULTY_RANGES = (
+    ("easy", 58, 69),
+    ("medium", 70, 81),
+    ("hard", 82, 93),
+    ("expert", 94, 102),
+)
+_MIDI_TRACK_INSTRUMENTS = (
+    ("guitar coop ghl", "guitarcoopghl"),
+    ("guitar ghl", "guitarghl"),
+    ("guitar coop", "guitarcoop"),
+    ("double guitar", "guitarcoop"),
+    ("rhythm ghl", "rhythmghl"),
+    ("rhythm", "rhythm"),
+    ("bass ghl", "bassghl"),
+    ("bass", "bass"),
+    ("guitar", "guitar"),
+    ("drums", "drums"),
+    ("keys", "keys"),
+    ("keyboard", "keys"),
+    ("vocals", "vocals"),
+    ("vocal", "vocals"),
+)
+_CHART_NOTE_RE = re.compile(r"^\s*\d+\s*=\s*N\s+(-?\d+)(?:\s+\d+)?\s*$", re.IGNORECASE)
+_CHART_SECTION_RE = re.compile(r"^\s*\[([^\]]+)\]\s*$")
+_MIDI_TRACK_NAME_RE = re.compile(r"\s+", re.UNICODE)
+
+
+def _note_result(
+    *,
+    valid: bool,
+    size: int,
+    members: tuple[str, ...],
+    metadata_members: tuple[str, ...],
+    chart_members: tuple[str, ...],
+    format_name: str,
+    chart_member: str = "",
+    note_counts: Mapping[str, int] | None = None,
+    error: str = "",
+    require_five_fret_guitar: bool = False,
+) -> SngValidation:
+    counts = tuple(sorted((str(key), int(value)) for key, value in (note_counts or {}).items() if value))
+    playable = sum(value for _, value in counts)
+    if valid and playable <= 0:
+        valid = False
+        error = "chart contains no playable notes"
+    if valid and require_five_fret_guitar and not any(
+        key.startswith("guitar:") and value > 0 for key, value in counts
+    ):
+        valid = False
+        error = "chart contains no playable five-fret guitar notes"
     return SngValidation(
-        True,
+        valid,
         size_bytes=size,
-        members=("package",),
-        metadata_members=("package:metadata",),
-        chart_members=("package:charts",),
+        members=members,
+        metadata_members=metadata_members,
+        chart_members=chart_members,
+        error=error,
+        format=format_name,
+        chart_member=chart_member,
+        playable_note_count=playable,
+        note_counts=counts,
     )
+
+
+def _chart_section_instrument(section: str) -> tuple[str, str] | None:
+    value = section.strip().casefold()
+    for difficulty in ("expert", "hard", "medium", "easy"):
+        if not value.startswith(difficulty):
+            continue
+        tail = value[len(difficulty):]
+        if tail in {"single", "guitar"}:
+            return "guitar", difficulty
+        if tail in {"doubleguitar", "double guitar"}:
+            return "guitarcoop", difficulty
+        if tail in {"doublerhythm", "double rhythm"}:
+            return "rhythm", difficulty
+        if tail in {"doublebass", "double bass"}:
+            return "bass", difficulty
+        if tail in {"drums", "drum"}:
+            return "drums", difficulty
+        if tail in {"keyboard", "keys"}:
+            return "keys", difficulty
+    return None
+
+
+def _parse_chart_notes(data: bytes) -> dict[str, int]:
+    """Parse enough of a text ``.chart`` file to prove playable note data."""
+    try:
+        text = data.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        text = data.decode("cp1252", errors="replace")
+    groups: dict[str, set[int]] = {}
+    current: tuple[str, str] | None = None
+    in_body = False
+    for line in text.splitlines():
+        section = _CHART_SECTION_RE.match(line)
+        if section:
+            current = _chart_section_instrument(section.group(1))
+            in_body = False
+            continue
+        stripped = line.strip()
+        if stripped == "{":
+            in_body = current is not None
+            continue
+        if stripped == "}":
+            in_body = False
+            current = None
+            continue
+        if not in_body or current is None:
+            continue
+        note = _CHART_NOTE_RE.match(line)
+        if note is None:
+            continue
+        fret = int(note.group(1))
+        if not 0 <= fret <= 7:
+            continue
+        instrument, difficulty = current
+        groups.setdefault(f"{instrument}:{difficulty}", set()).add(
+            int(line.split("=", 1)[0].strip())
+        )
+    return {key: len(ticks) for key, ticks in groups.items()}
+
+
+def _read_vlq(data: bytes, offset: int, end: int) -> tuple[int, int]:
+    value = 0
+    for _ in range(4):
+        if offset >= end:
+            raise ValueError("truncated MIDI variable-length value")
+        byte = data[offset]
+        offset += 1
+        value = (value << 7) | (byte & 0x7F)
+        if not byte & 0x80:
+            return value, offset
+    raise ValueError("invalid MIDI variable-length value")
+
+
+def _midi_track_instrument(name: str) -> str:
+    value = _MIDI_TRACK_NAME_RE.sub(" ", name.casefold()).strip()
+    if value.startswith("part "):
+        value = value[5:]
+    for marker, instrument in _MIDI_TRACK_INSTRUMENTS:
+        if marker in value:
+            return instrument
+    if "vocals" in value or "vocal" in value:
+        return "vocals"
+    return "unknown"
+
+
+def _midi_note_class(note: int) -> str | None:
+    if note in _MIDI_MARKER_NOTES:
+        return None
+    for difficulty, low, high in _MIDI_DIFFICULTY_RANGES:
+        if low <= note <= high:
+            return difficulty
+    return None
+
+
+def _parse_midi_notes(data: bytes) -> dict[str, int]:
+    """Parse paired MIDI note events without decoding audio or MIDI text."""
+    if len(data) < 14 or data[:4] != b"MThd":
+        raise ValueError("chart data is not a MIDI file")
+    header_length = struct.unpack_from(">I", data, 4)[0]
+    if header_length < 6 or 8 + header_length > len(data):
+        raise ValueError("malformed MIDI header")
+    midi_format, track_count, _division = struct.unpack_from(">HHH", data, 8)
+    if midi_format not in {0, 1}:
+        raise ValueError(f"unsupported MIDI format: {midi_format}")
+    offset = 8 + header_length
+    groups: dict[str, set[int]] = {}
+    for _ in range(track_count):
+        if offset + 8 > len(data) or data[offset:offset + 4] != b"MTrk":
+            raise ValueError("malformed MIDI track header")
+        track_length = struct.unpack_from(">I", data, offset + 4)[0]
+        start = offset + 8
+        end = start + track_length
+        if end > len(data):
+            raise ValueError("truncated MIDI track")
+        position = start
+        absolute_tick = 0
+        running_status: int | None = None
+        track_name = ""
+        active: dict[tuple[int, int], list[tuple[int, str, str | None]]] = {}
+        while position < end:
+            delta, position = _read_vlq(data, position, end)
+            absolute_tick += delta
+            if position >= end:
+                raise ValueError("truncated MIDI event")
+            status = data[position]
+            if status < 0x80:
+                if running_status is None:
+                    raise ValueError("MIDI event has no running status")
+                status = running_status
+            else:
+                position += 1
+                if 0x80 <= status < 0xF0:
+                    running_status = status
+            if status == 0xFF:
+                if position >= end:
+                    raise ValueError("truncated MIDI meta event")
+                meta_type = data[position]
+                position += 1
+                length, position = _read_vlq(data, position, end)
+                payload_end = position + length
+                if payload_end > end:
+                    raise ValueError("truncated MIDI meta payload")
+                if meta_type == 0x03:
+                    track_name = data[position:payload_end].decode("utf-8", errors="replace")
+                position = payload_end
+                running_status = None
+                continue
+            if status in {0xF0, 0xF7}:
+                length, position = _read_vlq(data, position, end)
+                position += length
+                if position > end:
+                    raise ValueError("truncated MIDI sysex payload")
+                running_status = None
+                continue
+            event_type = status & 0xF0
+            channel = status & 0x0F
+            data_length = 1 if event_type in {0xC0, 0xD0} else 2
+            if position + data_length > end:
+                raise ValueError("truncated MIDI channel event")
+            first = data[position]
+            second = data[position + 1] if data_length == 2 else 0
+            position += data_length
+            if event_type == 0x90 and second:
+                difficulty = _midi_note_class(first)
+                instrument = _midi_track_instrument(track_name)
+                if instrument == "vocals":
+                    difficulty = "vocals"
+                if difficulty is not None:
+                    active.setdefault((channel, first), []).append(
+                        (absolute_tick, instrument, difficulty)
+                    )
+            elif event_type in {0x80, 0x90}:
+                pending = active.get((channel, first))
+                if pending:
+                    start_tick, instrument, difficulty = pending.pop()
+                    groups.setdefault(f"{instrument}:{difficulty}", set()).add(start_tick)
+                    if not pending:
+                        active.pop((channel, first), None)
+        offset = end
+    return {key: len(ticks) for key, ticks in groups.items()}
+
+
+def _parse_playable_notes(data: bytes) -> tuple[str, dict[str, int]]:
+    if data.startswith(b"MThd"):
+        return "midi", _parse_midi_notes(data)
+    return "chart", _parse_chart_notes(data)
+
+
+def _sngpkg_text(value: bytes, label: str) -> str:
+    if b"\x00" in value:
+        raise ValueError(f"SNGPKG {label} is invalid")
+    try:
+        return value.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"SNGPKG {label} is not UTF-8") from exc
+
+
+def _sngpkg_pairs(data: bytes, count: int) -> dict[str, str]:
+    metadata: dict[str, str] = {}
+    offset = 0
+    for _ in range(count):
+        if offset + 4 > len(data):
+            raise ValueError("truncated SNGPKG metadata key length")
+        key_length = struct.unpack_from("<i", data, offset)[0]
+        offset += 4
+        if key_length <= 0 or key_length > 4096 or offset + key_length + 4 > len(data):
+            raise ValueError("invalid SNGPKG metadata key length")
+        key = _sngpkg_text(data[offset:offset + key_length], "metadata key")
+        offset += key_length
+        value_length = struct.unpack_from("<i", data, offset)[0]
+        offset += 4
+        if value_length < 0 or value_length > _SNGPKG_SECTION_LIMIT or offset + value_length > len(data):
+            raise ValueError("invalid SNGPKG metadata value length")
+        metadata[key] = _sngpkg_text(data[offset:offset + value_length], "metadata value")
+        offset += value_length
+    if offset != len(data):
+        raise ValueError("SNGPKG metadata section has trailing bytes")
+    return metadata
+
+
+def _sngpkg_member(name: str) -> str:
+    normalized, directory = _safe_archive_member_name(name)
+    if directory:
+        raise ValueError("SNGPKG file index contains a directory")
+    return normalized
+
+
+def _is_chart_member(name: str) -> bool:
+    basename = name.rsplit("/", 1)[-1].casefold()
+    return basename in _CHART_BASENAMES or basename.endswith((".chart", ".mid", ".midi"))
+
+
+def _validate_sngpkg(
+    archive: Path,
+    size: int,
+    max_archive_bytes: int,
+    max_members: int = 4096,
+    max_member_bytes: int = 512 * 1024 * 1024,
+    require_five_fret_guitar: bool = False,
+) -> SngValidation:
+    """Validate and inspect an SNGPKG v1 package without extracting it."""
+    if size > max_archive_bytes:
+        return SngValidation(False, size_bytes=size, error="chart package is too large", format="sngpkg")
+    try:
+        with archive.open("rb") as stream:
+            header = stream.read(_SNGPKG_HEADER_SIZE)
+            if len(header) < _SNGPKG_HEADER_SIZE or header[:6] != SNGPKG_MAGIC:
+                raise ValueError("malformed chart package header")
+            version = struct.unpack_from("<I", header, 6)[0]
+            if not 1 <= version <= 16:
+                raise ValueError(f"unsupported chart package version: {version}")
+            xor_mask = header[10:26]
+
+            metadata_length_raw = stream.read(8)
+            metadata_count_raw = stream.read(8)
+            if len(metadata_length_raw) != 8 or len(metadata_count_raw) != 8:
+                raise ValueError("truncated SNGPKG metadata header")
+            metadata_length = struct.unpack("<Q", metadata_length_raw)[0]
+            metadata_count = struct.unpack("<Q", metadata_count_raw)[0]
+            if metadata_length < 8 or metadata_length > _SNGPKG_SECTION_LIMIT or metadata_count > max_members:
+                raise ValueError("SNGPKG metadata section exceeds safety limits")
+            metadata_payload = stream.read(metadata_length - 8)
+            if len(metadata_payload) != metadata_length - 8:
+                raise ValueError("truncated SNGPKG metadata section")
+            metadata = _sngpkg_pairs(metadata_payload, int(metadata_count))
+            if not {"name", "artist", "album"}.intersection(metadata):
+                raise ValueError("chart package lacks song metadata")
+
+            file_index_length_raw = stream.read(8)
+            file_count_raw = stream.read(8)
+            if len(file_index_length_raw) != 8 or len(file_count_raw) != 8:
+                raise ValueError("truncated SNGPKG file index header")
+            file_index_length = struct.unpack("<Q", file_index_length_raw)[0]
+            file_count = struct.unpack("<Q", file_count_raw)[0]
+            index_limit = min(_SNGPKG_SECTION_LIMIT, max(1, int(max_members)) * 1024)
+            if file_index_length < 8 or file_index_length > index_limit or file_count > max_members:
+                raise ValueError("SNGPKG file index exceeds safety limits")
+            index_payload = stream.read(file_index_length - 8)
+            if len(index_payload) != file_index_length - 8:
+                raise ValueError("truncated SNGPKG file index")
+
+            entries: list[tuple[str, int, int]] = []
+            index_offset = 0
+            seen_names: set[str] = set()
+            for _ in range(int(file_count)):
+                if index_offset + 1 > len(index_payload):
+                    raise ValueError("truncated SNGPKG filename length")
+                name_length = index_payload[index_offset]
+                index_offset += 1
+                if name_length <= 0 or index_offset + name_length + 16 > len(index_payload):
+                    raise ValueError("invalid SNGPKG filename")
+                name = _sngpkg_member(
+                    index_payload[index_offset:index_offset + name_length].decode("utf-8")
+                )
+                index_offset += name_length
+                content_length, content_index = struct.unpack_from(
+                    "<QQ", index_payload, index_offset
+                )
+                index_offset += 16
+                if name.casefold() in seen_names:
+                    raise ValueError(f"duplicate SNGPKG file: {name!r}")
+                seen_names.add(name.casefold())
+                if content_length > max_member_bytes:
+                    raise ValueError(f"SNGPKG member is too large: {name!r}")
+                entries.append((name, int(content_length), int(content_index)))
+            if index_offset != len(index_payload):
+                raise ValueError("SNGPKG file index has trailing bytes")
+
+            file_data_length_raw = stream.read(8)
+            if len(file_data_length_raw) != 8:
+                raise ValueError("truncated SNGPKG file data header")
+            file_data_length = struct.unpack("<Q", file_data_length_raw)[0]
+            data_start = stream.tell()
+            data_end = data_start + file_data_length
+            if file_data_length > max_archive_bytes or data_end != size:
+                raise ValueError("SNGPKG file data length does not match package size")
+            if sum(length for _, length, _ in entries) != file_data_length:
+                raise ValueError("SNGPKG file data length does not match file index")
+
+            ranges: list[tuple[int, int, str]] = []
+            for name, length, content_index in entries:
+                end = content_index + length
+                if content_index < data_start or end > data_end:
+                    raise ValueError(f"SNGPKG member offset is outside file data: {name!r}")
+                if length:
+                    ranges.append((content_index, end, name))
+            ranges.sort()
+            for previous, current in zip(ranges, ranges[1:]):
+                if current[0] < previous[1]:
+                    raise ValueError("SNGPKG file members overlap")
+
+            members = tuple(name for name, _, _ in entries)
+            chart_entries = [entry for entry in entries if _is_chart_member(entry[0])]
+            chart_members = tuple(entry[0] for entry in chart_entries)
+            if not chart_members:
+                raise ValueError("chart package lacks notes/chart data")
+            for name, length, content_index in chart_entries:
+                if length <= 0:
+                    continue
+                stream.seek(content_index)
+                masked = stream.read(length)
+                if len(masked) != length:
+                    raise ValueError(f"truncated SNGPKG chart member: {name!r}")
+                chart_data = bytes(
+                    value ^ xor_mask[index % 16] ^ (index % 256)
+                    for index, value in enumerate(masked)
+                )
+                try:
+                    format_name, counts = _parse_playable_notes(chart_data)
+                except ValueError:
+                    continue
+                result = _note_result(
+                    valid=True,
+                    size=size,
+                    members=members,
+                    metadata_members=("package:metadata",),
+                    chart_members=chart_members,
+                    format_name=f"sngpkg/{format_name}",
+                    chart_member=name,
+                    note_counts=counts,
+                    require_five_fret_guitar=require_five_fret_guitar,
+                )
+                if result.valid:
+                    return result
+            raise ValueError("chart package contains no playable notes")
+    except (OSError, UnicodeDecodeError, ValueError, struct.error) as exc:
+        return SngValidation(False, size_bytes=size, error=str(exc), format="sngpkg")
 
 
 def validate_sng(
@@ -780,14 +1196,16 @@ def validate_sng(
     max_member_bytes: int = 512 * 1024 * 1024,
     max_archive_bytes: int = 2 * 1024 * 1024 * 1024,
     max_compression_ratio: float = 10_000.0,
+    require_five_fret_guitar: bool = False,
 ) -> SngValidation:
-    """Safely validate a nonempty Clone Hero ``.sng`` ZIP.
+    """Safely validate a nonempty Clone Hero ``.sng`` package.
 
     Validation is performed in place and never extracts untrusted members.
     It checks ZIP integrity, safe member names, symlink entries, bounded
     declared sizes, and the presence of both chart data and song/chart
-    metadata.  The limits are deliberately configurable for unusual but
-    legitimate charts.
+    metadata. It also parses the chart data and requires at least one paired,
+    playable note event. The limits are deliberately configurable for unusual
+    but legitimate charts.
     """
     archive = Path(path)
     try:
@@ -802,7 +1220,14 @@ def validate_sng(
     except OSError as exc:
         return SngValidation(False, size_bytes=size, error=f"cannot read chart: {exc}")
     if magic == SNGPKG_MAGIC:
-        return _validate_sngpkg(archive, size, max_archive_bytes)
+        return _validate_sngpkg(
+            archive,
+            size,
+            max_archive_bytes,
+            max_members=max_members,
+            max_member_bytes=max_member_bytes,
+            require_five_fret_guitar=require_five_fret_guitar,
+        )
 
     members: list[str] = []
     metadata: list[str] = []
@@ -867,14 +1292,44 @@ def validate_sng(
             bad_member = zf.testzip()
             if bad_member is not None:
                 return SngValidation(False, size_bytes=size, members=tuple(members), metadata_members=tuple(metadata), chart_members=tuple(chart_files), error=f"ZIP CRC validation failed for {bad_member!r}")
+            for chart_member in chart_files:
+                try:
+                    chart_data = zf.read(chart_member)
+                    format_name, counts = _parse_playable_notes(chart_data)
+                except (OSError, ValueError, UnicodeDecodeError) as exc:
+                    log.debug("Could not parse chart member %s: %s", chart_member, exc)
+                    continue
+                result = _note_result(
+                    valid=True,
+                    size=size,
+                    members=tuple(members),
+                    metadata_members=tuple(metadata),
+                    chart_members=tuple(chart_files),
+                    format_name=f"zip/{format_name}",
+                    chart_member=chart_member,
+                    note_counts=counts,
+                    require_five_fret_guitar=require_five_fret_guitar,
+                )
+                if result.valid:
+                    return result
+            return SngValidation(
+                False,
+                size_bytes=size,
+                members=tuple(members),
+                metadata_members=tuple(metadata),
+                chart_members=tuple(chart_files),
+                error="chart ZIP contains no playable notes",
+                format="zip",
+            )
     except (OSError, ValueError, KeyError, RuntimeError, zipfile.BadZipFile, zipfile.LargeZipFile) as exc:
-        return SngValidation(False, size_bytes=size, error=f"malformed chart ZIP: {exc}")
+        return SngValidation(False, size_bytes=size, error=f"malformed chart ZIP: {exc}", format="zip")
     return SngValidation(
         True,
         size_bytes=size,
         members=tuple(members),
         metadata_members=tuple(metadata),
         chart_members=tuple(chart_files),
+        format="zip",
     )
 
 

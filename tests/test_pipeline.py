@@ -9,7 +9,7 @@ import time
 from csv_to_clonehero.database import Database
 from csv_to_clonehero.pipeline import run_build, run_scan, run_search
 
-from .conftest import FIXTURES, FakeSource, make_chart, make_track
+from .conftest import FIXTURES, FakeSource, make_chart, make_track, valid_sng_bytes
 
 
 def _prepare_input(config):
@@ -40,7 +40,7 @@ def _fake_source():
     files = {}
     for chart_list in charts.values():
         for chart in chart_list:
-            content = (chart.name * 1000).encode()
+            content = valid_sng_bytes(chart.name)
             chart.md5 = hashlib.md5(content).hexdigest()
             files[chart.md5] = content
     return FakeSource(song_results=charts, files=files)

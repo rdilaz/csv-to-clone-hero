@@ -17,7 +17,18 @@ from .conftest import FakeSource, make_chart, make_track
 def _seed_and_build_legacy(config):
     """Build one chart under the legacy layout; return (db, source, content)."""
     config.library.layout = "legacy"
-    content = b"sng-bytes" * 100
+    import io
+    import zipfile
+
+    payload = io.BytesIO()
+    with zipfile.ZipFile(payload, "w") as archive:
+        archive.writestr("song.ini", "[song]\nname = Song\n")
+        archive.writestr(
+            "notes.chart",
+            "[Song]\n{\nResolution = 192\n}\n"
+            "[ExpertSingle]\n{\n0 = N 0 0\n}\n",
+        )
+    content = payload.getvalue()
     md5 = hashlib.md5(content).hexdigest()
     track = make_track("Song", "Artist", album="Album")
     chart = make_chart("Song", "Artist", chart_id=1, md5=md5)

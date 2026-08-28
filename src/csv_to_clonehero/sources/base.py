@@ -202,11 +202,29 @@ def source_catalog_available(source: object, artist: str, title: str = "") -> bo
     return result if isinstance(result, bool) else None
 
 
+def source_catalog_contains_chart(source: object, chart_id: int, *, source_name: str = "") -> bool | None:
+    """Return authoritative membership for a known catalog chart identity."""
+    method = getattr(source, "catalog_contains_chart", None)
+    if not callable(method):
+        return None
+    try:
+        result = method(chart_id, source_name=source_name) if source_name else method(chart_id)
+    except TypeError:
+        try:
+            result = method(chart_id)
+        except Exception:
+            return None
+    except Exception:
+        return None
+    return result if isinstance(result, bool) else None
+
+
 # Short aliases keep integrations from having to depend on a particular
 # helper naming convention while the optional capability surface evolves.
 get_source_cap = get_source_capabilities
 get_result_cap = source_result_cap
 is_source_exportable = source_is_exportable
+catalog_contains_chart = source_catalog_contains_chart
 
 
 @runtime_checkable

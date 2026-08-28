@@ -137,6 +137,24 @@ def test_search_song_sends_sanitized_query(monkeypatch):
     assert queries == ["Artist Song"]
 
 
+def test_known_catalog_chart_can_be_verified_without_search(monkeypatch):
+    source = EnchorSource(request_delay=0, catalog_path="nonexistent_catalog.jsonl")
+    source.catalog = type(
+        "Catalog",
+        (),
+        {
+            "available": True,
+            "has_chart": lambda self, chart_id, source_name: int(chart_id) == 7
+            and source_name == "enchor",
+        },
+    )()
+    try:
+        assert source.catalog_contains_chart(7) is True
+        assert source.catalog_contains_chart(8) is False
+    finally:
+        source.close()
+
+
 def test_catalog_preflight_uses_one_bounded_authoritative_probe(monkeypatch):
     source = EnchorSource(request_delay=0, catalog_path="nonexistent_catalog.jsonl")
     calls = []

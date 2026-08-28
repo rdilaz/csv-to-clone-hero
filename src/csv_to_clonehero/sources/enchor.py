@@ -248,6 +248,14 @@ class EnchorSource:
             return None
         return self.catalog.has_song(artist, title) if title else self.catalog.has_artist(artist)
 
+    def catalog_contains_chart(self, chart_id: int, *, source_name: str = "") -> bool | None:
+        """Check a locally retrieved chart without issuing another API query."""
+        if source_name and source_name != self.name:
+            return False
+        if not self.catalog.available:
+            return None
+        return self.catalog.has_chart(chart_id, self.name)
+
     @staticmethod
     def _as_int(value: Any, default: int = 0) -> int:
         if isinstance(value, bool):
