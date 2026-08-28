@@ -53,6 +53,49 @@ def test_soundcloud_csv_file_export_preserves_csv_newlines(tmp_path):
     assert provider.import_library().unique_track_count == 1
 
 
+def test_soundcloud_blank_artist_uses_provisional_ascii_title_prefix():
+    provider = SoundCloudExportProvider.from_csv(
+        "Track name,Artist name,Type,Soundcloud - id\n"
+        '"Sample Artist - Sample Song",,Playlist,1\n'
+    )
+    track = provider.import_library().tracks[0]
+    assert track.artist == "Sample Artist"
+    assert track.title == "Sample Song"
+    assert track.metadata["artist_source"] == "title_prefix_provisional"
+    assert track.metadata["raw_title"] == "Sample Artist - Sample Song"
+
+
+def test_soundcloud_entity_rows_are_not_promoted_to_songs():
+    provider = SoundCloudExportProvider.from_csv(
+        "Track name,Artist name,Type,Soundcloud - id\n"
+        '"Sample Album - Deluxe",,Album,1\n'
+        '"Sample Artist - Profile",,Artist,2\n'
+        '"Sample Artist – Sample Song",,Playlist,3\n'
+    )
+    snapshot = provider.import_library()
+    assert snapshot.tracks == []
+    assert snapshot.import_report.skipped_rows == 3
+    assert snapshot.import_report.missing_artist_count == 1
+
+
+def test_soundcloud_json_preserves_permalink_url():
+    provider = SoundCloudExportProvider.from_json(
+        '{"tracks": [{"title": "Sample Song", "artist": "Sample Uploader",'
+        '"permalink_url": "https://soundcloud.com/example/sample-song"}]}'
+    )
+    track = provider.import_library().tracks[0]
+    assert track.url == "https://soundcloud.com/example/sample-song"
+
+
+def test_soundcloud_csv_id_url_is_retained_as_url():
+    provider = SoundCloudExportProvider.from_csv(
+        "Track name,Artist name,Soundcloud - id\n"
+        '"Sample Song","Sample Uploader","https://soundcloud.com/example/sample-song"\n'
+    )
+    track = provider.import_library().tracks[0]
+    assert track.url == "https://soundcloud.com/example/sample-song"
+
+
 def test_soundcloud_export_does_not_accept_unsupported_file(tmp_path):
     path = tmp_path / "export.txt"
     path.write_text("password=do-not-read", encoding="utf-8")

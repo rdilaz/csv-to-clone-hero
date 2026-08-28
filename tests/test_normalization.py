@@ -2,6 +2,9 @@ from csv_to_clonehero.normalization import (
     normalize_artist,
     normalize_text,
     normalize_title,
+    retrieval_artist_forms,
+    retrieval_title_forms,
+    retrieval_title_tokens,
     split_artists,
     strip_version_noise,
     version_markers,
@@ -82,3 +85,21 @@ def test_split_artists_single():
 
 def test_strip_version_noise_keeps_plain_titles():
     assert strip_version_noise("Everlong") == "Everlong"
+
+
+def test_retrieval_artist_forms_keep_full_and_primary_aliases():
+    forms = retrieval_artist_forms("Sample Artist feat. Guest")
+    assert normalize_artist("Sample Artist feat. Guest") in forms
+    assert normalize_artist("Sample Artist") in forms
+
+
+def test_retrieval_title_forms_remove_only_recognized_annotations():
+    forms = retrieval_title_forms("Sample Song (feat. Guest) [Club Remix]")
+    assert normalize_title("Sample Song") in forms
+    assert normalize_title("(Don't Fear) The Reaper") in retrieval_title_forms(
+        "(Don't Fear) The Reaper"
+    )
+
+
+def test_retrieval_title_tokens_exclude_annotation_words():
+    assert retrieval_title_tokens("Sample Song feat. Guest") == ("sample", "song", "guest")

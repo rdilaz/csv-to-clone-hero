@@ -166,6 +166,11 @@ search:
   result_cap: 250
   max_search_pages: 20
   candidate_shortlist_size: 50
+  # Local catalog retrieval is intentionally broader than final scoring.
+  catalog_artist_fuzzy_limit: 60
+  catalog_title_fuzzy_limit: 50
+  catalog_min_artist_similarity: 55.0
+  catalog_min_title_similarity: 20.0
 
 sources:
   enabled: [enchor]

@@ -1,0 +1,83 @@
+[
+  {
+    "id": "straightforward",
+    "track_artist": "Sample Artist",
+    "track_title": "Sample Song",
+    "chart_artist": "Sample Artist",
+    "chart_title": "Sample Song",
+    "retrieval": "RETRIEVED",
+    "acceptance": "HIGH"
+  },
+  {
+    "id": "punctuation",
+    "track_artist": "Sample Artist",
+    "track_title": "Sample, Song!",
+    "chart_artist": "Sample Artist",
+    "chart_title": "Sample Song",
+    "retrieval": "RETRIEVED",
+    "acceptance": "HIGH"
+  },
+  {
+    "id": "featured_artist",
+    "track_artist": "Sample Artist feat. Guest",
+    "track_title": "Sample Song",
+    "chart_artist": "Sample Artist",
+    "chart_title": "Sample Song",
+    "retrieval": "RETRIEVED",
+    "acceptance": "HIGH"
+  },
+  {
+    "id": "remaster_noise",
+    "track_artist": "Sample Artist",
+    "track_title": "Sample Song - 2024 Remaster",
+    "chart_artist": "Sample Artist",
+    "chart_title": "Sample Song",
+    "retrieval": "RETRIEVED",
+    "acceptance": "HIGH"
+  },
+  {
+    "id": "remix_version",
+    "track_artist": "Sample Artist",
+    "track_title": "Sample Song (Remix)",
+    "chart_artist": "Sample Artist",
+    "chart_title": "Sample Song",
+    "retrieval": "RETRIEVED",
+    "acceptance": "REVIEW"
+  },
+  {
+    "id": "uploader_identity",
+    "track_artist": "Uploader Account",
+    "track_title": "Sample Song",
+    "chart_artist": "Sample Artist",
+    "chart_title": "Sample Song",
+    "retrieval": "RETRIEVED_WITH_ALTERNATE_ARTIST",
+    "acceptance": "REJECTED"
+  },
+  {
+    "id": "unrelated_title",
+    "track_artist": "Sample Artist",
+    "track_title": "Sample Song",
+    "chart_artist": "Different Performer",
+    "chart_title": "Sample Song",
+    "retrieval": "NOT_RETRIEVED",
+    "acceptance": "REJECTED"
+  },
+  {
+    "id": "instrument_incompatible",
+    "track_artist": "Sample Artist",
+    "track_title": "Sample Song",
+    "chart_artist": "Sample Artist",
+    "chart_title": "Sample Song",
+    "retrieval": "RETRIEVED",
+    "acceptance": "HARD_INCOMPATIBLE"
+  },
+  {
+    "id": "catalog_miss",
+    "track_artist": "No Such Performer",
+    "track_title": "Zebra Quasar",
+    "chart_artist": "",
+    "chart_title": "",
+    "retrieval": "NOT_RETRIEVED",
+    "acceptance": "NO_CANDIDATE"
+  }
+]

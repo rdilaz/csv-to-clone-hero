@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from functools import lru_cache
 
 # Version-noise keywords that may appear in trailing " - ..." segments or in
 # parentheses/brackets and are safe to drop when comparing titles.
@@ -199,6 +200,176 @@ def split_artists(artist_string: str) -> tuple[str, list[str]]:
     if not parts:
         return "", []
     return parts[0], parts[1:]
+
+
+_RETRIEVAL_ARTIST_SUFFIX_RE = re.compile(r"\s*[\(\[][^\)\]]*[\)\]]\s*$")
+_RETRIEVAL_ANNOTATION_WORDS = frozenset(
+    {
+        "acapella",
+        "acoustic",
+        "audio",
+        "bootleg",
+        "clean",
+        "cover",
+        "demo",
+        "deluxe",
+        "edit",
+        "explicit",
+        "extended",
+        "feat",
+        "featuring",
+        "flip",
+        "ft",
+        "instrumental",
+        "karaoke",
+        "live",
+        "lyrics",
+        "mix",
+        "mono",
+        "original",
+        "prod",
+        "produced",
+        "radio",
+        "remaster",
+        "remastered",
+        "remix",
+        "rework",
+        "rmx",
+        "slowed",
+        "stereo",
+        "tribute",
+        "unplugged",
+        "version",
+        "video",
+        "visualizer",
+        "with",
+    }
+)
+_RETRIEVAL_CLAUSE_RE = re.compile(
+    r"\s*[\(\[](?=[^\)\]]*\b(?:"
+    + "|".join(sorted(_RETRIEVAL_ANNOTATION_WORDS))
+    + r")\b)[^\)\]]*[\)\]]",
+    re.IGNORECASE,
+)
+_RETRIEVAL_TRAILING_ANNOTATION_RE = re.compile(
+    r"\s+(?:feat\.?|ft\.?|featuring|with|prod\.?|produced(?:\s+by)?|"
+    r"official(?:\s+(?:audio|video))?|audio|video|visualizer|lyrics)\b.*$",
+    re.IGNORECASE,
+)
+_RETRIEVAL_DASH_ANNOTATION_RE = re.compile(
+    r"\s+[-\u2013\u2014]\s+.*\b(?:"
+    + "|".join(sorted(_RETRIEVAL_ANNOTATION_WORDS))
+    + r")\b.*$",
+    re.IGNORECASE,
+)
+
+
+@lru_cache(maxsize=16384)
+def retrieval_artist_forms(artist: str) -> tuple[str, ...]:
+    """Return conservative artist aliases used only for catalog retrieval.
+
+    These aliases never replace the artist stored on a :class:`Track` or a
+    :class:`ChartCandidate`; the deterministic matcher still scores the raw
+    metadata.  Keeping the aliases retrieval-only lets names such as
+    ``Artist (WaveGroup)`` and credited forms such as ``Artist & Guest`` reach
+    the matcher without making those representations identical everywhere.
+    """
+    text = _fold_unicode(str(artist or "")).strip()
+    if not text:
+        return ()
+
+    forms: list[str] = []
+
+    def add(value: str) -> None:
+        key = normalize_artist(value)
+        if key and key not in forms:
+            forms.append(key)
+
+    add(text)
+    primary, featured = split_artists(text)
+    add(primary)
+    for value in featured:
+        add(value)
+
+    # Some catalog payloads append a charter/source label to the artist.  Keep
+    # the complete form above, but also allow the musical name to be retrieved.
+    without_suffix = _RETRIEVAL_ARTIST_SUFFIX_RE.sub("", text).strip()
+    if without_suffix != text:
+        add(without_suffix)
+        suffix_primary, suffix_featured = split_artists(without_suffix)
+        add(suffix_primary)
+        for value in suffix_featured:
+            add(value)
+
+    # Ampersands are ambiguous in names, so retain the complete form and add
+    # each side only as a secondary retrieval alias.
+    for value in re.split(r"\s*&\s*", text):
+        add(value)
+    return tuple(forms)
+
+
+@lru_cache(maxsize=16384)
+def retrieval_artist_tokens(artist: str) -> tuple[str, ...]:
+    """Return tokens for the catalog's secondary artist inverted index."""
+    tokens: list[str] = []
+    for form in retrieval_artist_forms(artist):
+        for token in form.split():
+            if len(token) < 2 or token in {"a", "an", "and", "of", "the"}:
+                continue
+            if token not in tokens:
+                tokens.append(token)
+    return tuple(tokens)
+
+
+@lru_cache(maxsize=16384)
+def retrieval_title_forms(title: str) -> tuple[str, ...]:
+    """Return title aliases for high-recall catalog lookup.
+
+    The display title and ``normalize_title`` remain authoritative for final
+    scoring.  This projection removes only recognizable annotation clauses
+    (feature/producer/version text) and adds pipe-separated sides as aliases;
+    meaningful parenthesized title text is preserved when it has no such
+    marker.
+    """
+    text = _fold_unicode(str(title or "")).strip()
+    if not text:
+        return ()
+    forms: list[str] = []
+
+    def add(value: str) -> None:
+        key = normalize_title(value)
+        if key and key not in forms:
+            forms.append(key)
+
+    add(text)
+    simplified = strip_version_noise(text)
+    previous = None
+    while simplified != previous:
+        previous = simplified
+        simplified = _RETRIEVAL_CLAUSE_RE.sub("", simplified)
+        simplified = _RETRIEVAL_TRAILING_ANNOTATION_RE.sub("", simplified)
+        simplified = _RETRIEVAL_DASH_ANNOTATION_RE.sub("", simplified)
+        simplified = _WS_RE.sub(" ", simplified).strip()
+    add(simplified)
+
+    # SoundCloud titles sometimes carry a second identity after a pipe.  Both
+    # sides are aliases only; no orientation decision is made here.
+    for value in text.split("|"):
+        add(value.strip())
+    return tuple(forms)
+
+
+@lru_cache(maxsize=16384)
+def retrieval_title_tokens(title: str) -> tuple[str, ...]:
+    """Return annotation-light title tokens for an inverted index."""
+    tokens: list[str] = []
+    for form in retrieval_title_forms(title):
+        for token in form.split():
+            if token in _RETRIEVAL_ANNOTATION_WORDS or len(token) < 2:
+                continue
+            if token not in tokens:
+                tokens.append(token)
+    return tuple(tokens)
 
 
 def make_track_key(spotify_id: str, primary_artist_norm: str, title_norm: str) -> str:

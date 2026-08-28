@@ -185,6 +185,12 @@ class SearchConfig(BaseModel):
     # Full source responses stay cached, but only the strongest local matches
     # receive expensive scoring and workspace rows.
     candidate_shortlist_size: int = 50
+    # Local complete-catalog retrieval settings. These affect candidate
+    # generation only; score_candidate() remains the acceptance authority.
+    catalog_artist_fuzzy_limit: int = 60
+    catalog_title_fuzzy_limit: int = 50
+    catalog_min_artist_similarity: float = 55.0
+    catalog_min_title_similarity: float = 20.0
 
     @property
     def search_result_cap(self) -> int:

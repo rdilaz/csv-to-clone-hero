@@ -17,6 +17,7 @@ from __future__ import annotations
 import re
 from collections.abc import Iterator, Mapping
 from dataclasses import asdict, dataclass, field
+from functools import lru_cache
 from typing import Any
 
 from rapidfuzz import fuzz
@@ -218,7 +219,12 @@ def _new_breakdown() -> SpotifyScoreBreakdown:
 
 
 def _normal_key(value: Any) -> str:
-    return re.sub(r"[^a-z0-9]", "", str(value).casefold())
+    return _cached_normal_key(str(value))
+
+
+@lru_cache(maxsize=8192)
+def _cached_normal_key(value: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", value.casefold())
 
 
 def _mapping_value(mapping: Mapping[str, Any], names: tuple[str, ...] | list[str] | set[str]) -> Any:

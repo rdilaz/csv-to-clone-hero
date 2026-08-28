@@ -80,6 +80,7 @@ _ALIASES = {
     "isrc": ("isrc",),
     "provider_id": ("soundcloud - id", "id", "track_id", "urn"),
     "liked": ("liked", "favorited", "favorite", "favourite"),
+    "url": ("permalink_url", "permalink", "url", "link"),
 }
 
 
@@ -91,11 +92,22 @@ def _snapshot_from_rows(rows: list[Any]) -> LibrarySnapshot:
             _skip(report, row_number, "invalid row")
             continue
         normalized = {_header(key): value for key, value in row.items() if key is not None}
-        title = _value(normalized, "title")
-        artist = _value(normalized, "artist")
-        if not artist and " - " in title:
-            artist, title = title.split(" - ", 1)
-            artist, title = artist.strip(), title.strip()
+        raw_title = _value(normalized, "title")
+        raw_artist = _value(normalized, "artist")
+        title = raw_title
+        artist = raw_artist
+        row_type = _value(normalized, "row_type").casefold()
+        # SoundCloud exports include collection/entity rows alongside tracks.
+        # They are not songs even when their display label contains " - ".
+        if row_type in {"album", "artist"}:
+            _skip(report, row_number, "non-track row")
+            continue
+        artist_source = "explicit" if artist else ""
+        if not artist:
+            prefix = _parse_title_prefix(raw_title)
+            if prefix is not None:
+                artist, title = prefix
+                artist_source = "title_prefix_provisional"
         if not artist:
             report.missing_artist_count += 1
             _skip(report, row_number, "missing artist")
@@ -106,6 +118,9 @@ def _snapshot_from_rows(rows: list[Any]) -> LibrarySnapshot:
         provider_id = _value(normalized, "provider_id")
         if not provider_id:
             report.missing_provider_id_count += 1
+        url = _value(normalized, "url")
+        if not url and provider_id.startswith(("http://", "https://")):
+            url = provider_id
         track = _track_from_mapping({
             "title": title,
             "artist": artist,
@@ -115,6 +130,17 @@ def _snapshot_from_rows(rows: list[Any]) -> LibrarySnapshot:
             "isrc": _value(normalized, "isrc"),
             "row_type": _value(normalized, "row_type"),
             "liked": _value(normalized, "liked"),
+            "url": url,
+            "metadata": {
+                "export_row": True,
+                "raw_title": raw_title,
+                "raw_artist": raw_artist,
+                "row_type": row_type,
+                "artist_source": artist_source,
+                "artist_is_provisional": artist_source == "title_prefix_provisional",
+                "provider_id": provider_id,
+                "isrc": _value(normalized, "isrc"),
+            },
         })
         if track is None:
             _skip(report, row_number, "invalid track")
@@ -144,6 +170,22 @@ def _value(row: Mapping[str, Any], field: str) -> str:
     return ""
 
 
+def _parse_title_prefix(value: str) -> tuple[str, str] | None:
+    """Parse the export's documented ASCII ``artist - title`` fallback.
+
+    This is intentionally structural and conservative: Unicode dashes and
+    other separators remain part of the title, and the caller records that the
+    resulting artist is provisional rather than authoritative.
+    """
+    text = str(value or "").strip()
+    if " - " not in text:
+        return None
+    artist, title = (part.strip() for part in text.split(" - ", 1))
+    if not artist or not title:
+        return None
+    return artist, title
+
+
 def _skip(report: SourceImportReport, row_number: int, reason: str) -> None:
     report.skipped_rows += 1
     report.skipped_reasons.append({"row": row_number, "reason": reason})
@@ -164,6 +206,9 @@ def _track_from_mapping(row: Any) -> ProviderTrack | None:
         provider_id = f"export:{artist}:{title}"
     playlist = row.get("playlist") or row.get("playlist_name") or ""
     playlist_id = row.get("playlist_id") or ""
+    metadata = row.get("metadata")
+    metadata = dict(metadata) if isinstance(metadata, Mapping) else {}
+    metadata.setdefault("export_row", True)
     return ProviderTrack(
         provider="soundcloud",
         provider_id=provider_id,
@@ -178,7 +223,7 @@ def _track_from_mapping(row: Any) -> ProviderTrack | None:
         duration_ms=_optional_int(row.get("duration_ms") or row.get("duration")),
         url=str(row.get("permalink_url") or row.get("url") or "").strip(),
         isrc=str(row.get("isrc") or "").strip(),
-        metadata={"export_row": True},
+        metadata=metadata,
     )
 
 
