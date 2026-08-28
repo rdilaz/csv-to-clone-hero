@@ -3832,7 +3832,25 @@ def create_app(
                         isrc=str(row["isrc"] or ""), url=str(row["url"] or ""),
                         metadata=_json_object(row["metadata_json"], {}),
                     ))
-                spotify_job.progress_update({"phase": "combine", "message": "Combining imported sources locally...", "total_tracks": sum(map(len, grouped.values()))})
+                last_persisted = 0.0
+                def on_progress(value: Mapping[str, Any]) -> None:
+                    nonlocal last_persisted
+                    payload = dict(value)
+                    spotify_job.progress_update(payload)
+                    now = time.monotonic()
+                    if now - last_persisted >= 0.25 or payload.get("phase") == "complete":
+                        db.update_workspace_progress(
+                            workspace,
+                            status="running",
+                            phase=str(payload.get("phase") or "finding_charts"),
+                            message=str(payload.get("message") or "Matching your songs..."),
+                            error="",
+                            total_tracks=int(payload.get("total_tracks", 0) or 0),
+                            completed_tracks=int(payload.get("processed_tracks", 0) or 0),
+                            metadata={"run_id": spotify_job.run_id, "scan_key": "catalog", **payload},
+                        )
+                        last_persisted = now
+                on_progress({"phase": "combine", "message": "Combining imported sources locally...", "total_tracks": sum(map(len, grouped.values())), "processed_tracks": 0})
                 run_id = spotify_job.run_id
                 try:
                     diagnostics = RunDiagnostics(config.state_path, run_id)
@@ -3840,7 +3858,7 @@ def create_app(
                     db.set_meta("local_current_run_id", run_id)
                 except OSError:
                     diagnostics = None
-                result = discover_combined(config, db, [LibrarySnapshot(name, tracks) for name, tracks in grouped.items()], workspace_key=workspace_key, workspace_name="Local combined library", expansion_artists=payload.get("expansion_artists", ()), diagnostics=diagnostics)
+                result = discover_combined(config, db, [LibrarySnapshot(name, tracks) for name, tracks in grouped.items()], workspace_key=workspace_key, workspace_name="Local combined library", expansion_artists=payload.get("expansion_artists", ()), diagnostics=diagnostics, on_progress=on_progress)
                 spotify_job.finish(result)
                 db.update_workspace(workspace, status=result.status, phase=result.phase, message="Catalog matching complete.", error=result.error)
                 db.update_workspace_progress(
@@ -4213,6 +4231,111 @@ def create_app(
                             "inaccessible_count": sum(p.get("access_status") != "accessible" for p in playlists)})
         except (OSError, ValueError, sqlite3.OperationalError) as exc:
             return {"error": _safe_message(exc)}, 400
+
+    @app.post("/api/spotify/import")
+    def spotify_import_selected():
+        """Import the selected Spotify scope without starting chart matching."""
+        if not _safe_local_request():
+            return {"error": "Spotify workspace is local-only"}, 403
+        if not _is_authenticated():
+            return {"error": "sign in with Spotify first"}, 401
+        busy = _busy_response()
+        if busy is not None:
+            return busy
+        payload = request.get_json(silent=True) or {}
+        workspace = _workspace_id(payload.get("workspace_id"), required=False)
+        if workspace is None:
+            workspace, _ = _get_local_library_workspace()
+        db = Database(config.database_path)
+        try:
+            scope = db.get_workspace_scope_data(workspace) or {}
+            if not scope.get("playlist_ids") and not scope.get("include_liked"):
+                return {"error": "choose Liked Songs or at least one playlist first"}, 400
+        finally:
+            db.close()
+        with spotify_job.lock:
+            if spotify_job.running:
+                return {"error": "a Spotify operation is already running"}, 409
+            spotify_job.begin(workspace, workspace_key="local", scan_key="spotify_import")
+            run_id = spotify_job.run_id
+        status_db = Database(config.database_path)
+        try:
+            status_db.update_workspace(workspace, status="running", phase="spotify_import", metadata={"run_id": run_id, "scan_key": "spotify_import"})
+            status_db.update_workspace_progress(workspace, status="running", phase="spotify_import", message="Reading selected Spotify music...", error="", metadata={"run_id": run_id, "scan_key": "spotify_import"})
+        finally:
+            status_db.close()
+
+        def worker() -> None:
+            db = Database(config.database_path)
+            provider = None
+            try:
+                from csv_to_clonehero.library_pipeline import run_library_import
+                from csv_to_clonehero.providers.spotify import SpotifyLibraryProvider
+                client = _verified_spotify_client()
+                provider = SpotifyLibraryProvider(client)
+                started_at = time.monotonic()
+                progress_state: dict[str, Any] = {"playlist_items": {}, "liked_items": 0, "liked_total": None, "playlist_totals": {}}
+                last_persisted = 0.0
+
+                def progress(value: Mapping[str, Any]) -> None:
+                    nonlocal last_persisted
+                    update = dict(value)
+                    phase = str(update.get("phase") or "spotify_import")
+                    if phase == "playlist":
+                        index = int(update.get("playlist_index", 0) or 0)
+                        name = str(update.get("playlist_name") or "playlist")
+                        progress_state["playlist_items"][index] = int(update.get("playlist_items_read", progress_state["playlist_items"].get(index, 0)) or 0)
+                        if update.get("playlist_total_items") is not None:
+                            progress_state["playlist_totals"][index] = int(update["playlist_total_items"])
+                        message = f"Reading playlist {index} / {int(update.get('playlist_total', 0) or 0)}: {name}"
+                    elif phase == "liked":
+                        progress_state["liked_items"] = int(update.get("liked_items_read", 0) or 0)
+                        if update.get("liked_total_items") is not None:
+                            progress_state["liked_total"] = int(update["liked_total_items"])
+                        message = "Reading Liked Songs"
+                    else:
+                        message = str(update.get("message") or "Preparing Spotify import...")
+                    processed = int(progress_state["liked_items"]) + sum(progress_state["playlist_items"].values())
+                    expected_values = [value for value in [progress_state["liked_total"], *progress_state["playlist_totals"].values()] if value is not None]
+                    expected = sum(expected_values) if len(expected_values) == (1 if progress_state["liked_total"] is not None else 0) + len(progress_state["playlist_totals"]) else None
+                    elapsed = max(0.0, time.monotonic() - started_at)
+                    update.update({"phase": phase, "message": message, "spotify_items_processed": processed, "spotify_items_expected": expected, "elapsed_seconds": round(elapsed, 1)})
+                    if expected and processed >= 100 and elapsed >= 2:
+                        remaining = max(0, expected - processed)
+                        rate = processed / elapsed
+                        if rate > 0:
+                            update["eta_seconds"] = int(remaining / rate)
+                    spotify_job.progress_update(update)
+                    if time.monotonic() - last_persisted >= 0.25 or phase not in {"playlist", "liked"}:
+                        db.update_workspace_progress(workspace, status="running", phase=phase, message=message, error="", total_tracks=expected or 0, completed_tracks=processed, metadata={"run_id": run_id, "scan_key": "spotify_import", **update})
+                        last_persisted = time.monotonic()
+
+                imported = run_library_import(config, db, workspace, {"spotify": provider}, scopes={"spotify": scope}, on_progress=progress)
+                provider = None
+                summary = db.get_combined_summary(workspace)
+                source_summary = {str(row["provider"]): row for row in db.get_source_summary(workspace)}
+                spotify_unique = int(source_summary.get("spotify", {}).get("tracks", 0) or 0)
+                soundcloud_unique = int(source_summary.get("soundcloud", {}).get("tracks", 0) or 0)
+                overlap = max(0, spotify_unique + soundcloud_unique - int(summary.get("tracks", 0)))
+                progress({"phase": "merge", "message": f"Your Music updated: {spotify_unique} Spotify unique songs; {overlap} in both; {summary.get('tracks', 0)} canonical songs."})
+                db.update_workspace(workspace, status="ready_for_matching", phase="ready_for_matching", message="Spotify music added to Your Music.", error="")
+                db.update_workspace_progress(workspace, status="complete", phase="ready_for_matching", message="Spotify import complete.", error="", metadata={"run_id": run_id, "scan_key": "spotify_import", "spotify_unique": spotify_unique, "soundcloud_unique": soundcloud_unique, "canonical_count": summary.get("tracks", 0), "overlap": overlap, "elapsed_seconds": round(time.monotonic() - started_at, 1)})
+                spotify_job.finish(type("SpotifyImportResult", (), {"status": "complete", "phase": "ready_for_matching", "error": "", "partial": False})())
+            except Exception as exc:
+                message = _safe_message(exc, _oauth_secret_values())
+                db.update_workspace(workspace, status="failed", phase="spotify_import_failed", metadata={"run_id": run_id, "error": message})
+                db.update_workspace_progress(workspace, status="failed", phase="spotify_import_failed", message="Spotify import failed.", error=message, metadata={"run_id": run_id, "scan_key": "spotify_import"})
+                spotify_job.fail(message)
+            finally:
+                if provider is not None:
+                    provider.close()
+                db.close()
+                spotify_job.cleanup(run_id, threading.current_thread())
+
+        thread = threading.Thread(target=worker, daemon=True, name=f"spotify-import-{run_id}")
+        spotify_job.attach_worker(run_id, thread)
+        thread.start()
+        return jsonify({"started": True, "workspace_id": workspace, "run_id": run_id, "phase": "spotify_import"}), 202
 
     def _linked_library_root() -> Path | None:
         """Return the persisted linked Clone Hero/YARG Songs folder, if any."""
@@ -6826,6 +6949,18 @@ def create_app(
                 for row in candidate_rows
                 if row["track_id"] is not None
             }
+        current_keys = {
+            (str(track["normalized_artist"]), str(track["normalized_title"]))
+            for track in neutral_tracks
+        }
+        current_engine_ids = {
+            int(track.db_id)
+            for track in db.get_spotify_tracks(True)
+            if track.db_id is not None
+            and (str(track.artist_norm), str(track.title_norm)) in current_keys
+        }
+        if current_engine_ids:
+            workspace_track_ids &= current_engine_ids
         by_track: dict[int, set[str]] = {}
         for row in candidate_rows:
             track_id = row["track_id"]
@@ -6873,6 +7008,7 @@ def create_app(
         progress_metadata = (
             progress_metadata if isinstance(progress_metadata, Mapping) else {}
         )
+        spotify_import_active = progress_metadata.get("scan_key") == "spotify_import" and progress_status == "running"
         partial = bool(
             metadata.get("partial")
             or progress_metadata.get("partial")
@@ -6918,6 +7054,10 @@ def create_app(
             matching_status = "running"
             headline = "Import in progress"
             message = "Your music is still being imported. Matching will be available when the import finishes."
+        elif spotify_import_active:
+            matching_status = "running"
+            headline = "Reading Spotify music"
+            message = str(progress_row["message"] if progress_row is not None else "Reading selected Spotify music...")
         elif matching_active:
             matching_status = "running"
             headline = "Matching in progress"
@@ -6971,7 +7111,67 @@ def create_app(
 
         selected = len(db.list_workspace_selections(workspace, kind="exact"))
         total = len(neutral_tracks)
+        source_rows = [dict(row) for row in db.get_source_summary(workspace)]
+        source_by_provider = {str(row["provider"]).casefold(): row for row in source_rows}
+        provenance = db.get_track_provenance(workspace)
+        source_sets: dict[tuple[str, str], set[str]] = {}
+        display_names: dict[tuple[str, str], tuple[str, str]] = {}
+        for track in neutral_tracks:
+            key = (str(track["normalized_artist"]), str(track["normalized_title"]))
+            display_names[key] = (str(track["artist"]), str(track["title"]))
+            source_sets.setdefault(key, set())
+        for row in provenance:
+            key = (str(row["normalized_artist"]), str(row["normalized_title"]))
+            source_sets.setdefault(key, set()).add(str(row["provider"]).casefold())
+        music = [
+            {
+                "artist": display_names[key][0],
+                "title": display_names[key][1],
+                "sources": sorted(source_sets[key]),
+                "source_label": "both" if len(source_sets[key]) > 1 else (next(iter(source_sets[key]), "unknown")),
+            }
+            for key in sorted(source_sets, key=lambda value: display_names.get(value, value))
+        ]
+        combined_sources = {
+            "soundcloud_count": int(source_by_provider.get("soundcloud", {}).get("tracks", 0) or 0),
+            "spotify_count": int(source_by_provider.get("spotify", {}).get("tracks", 0) or 0),
+            "shared_count": sum(len(value) > 1 for value in source_sets.values()),
+            "duplicates_merged": sum(int(source_by_provider.get(provider, {}).get("duplicate_rows", 0) or 0) for provider in ("soundcloud", "spotify")),
+            "canonical_count": total,
+        }
+        progress_payload = dict(progress_row) if progress_row is not None else {}
+        progress_metadata = _json_object(progress_payload.get("metadata_json", "{}"), {})
+        catalog_chart_count = int(progress_metadata.get("catalog_chart_count", 0) or 0)
+        if matching_status == "complete" and not catalog_chart_count:
+            catalog = load_enchor_catalog(config.catalog_path)
+            catalog_chart_count = int(catalog.chart_count if catalog.available else 0)
+        activity_rows = [dict(row) for row in db.get_discovery_song_progress(workspace, limit=8, offset=0)]
+        matching_total = int(progress_payload.get("total_tracks", 0) or 0)
+        progress_summary = db.get_discovery_song_progress_summary(workspace)
+        effective_matching_total = matching_total or progress_summary["total"]
+        matching_total = effective_matching_total
+        if matching_status == "complete" and progress_summary["total"] == total and progress_summary["completed"] < total:
+            matching_status = "incomplete"
+            headline = "Matching incomplete"
+            message = "Matching stopped before every song received a final classification."
+        current_song = next((row for row in activity_rows if str(row.get("status") or "") == "checking"), None)
         safe_tracks = strong_tracks | review_tracks
+        if matching_status in {"running", "complete", "incomplete", "failed"} and effective_matching_total == total and progress_summary["total"] == total:
+            option_count = progress_summary["strong"] + progress_summary["review"]
+            strong_count = progress_summary["strong"]
+            review_count = progress_summary["review"]
+            not_playable_count = progress_summary["not_playable"]
+            no_candidate_count = progress_summary["no_catalog_candidate"]
+            no_suitable_count = progress_summary["no_suitable"]
+            completed_count = progress_summary["completed"]
+        else:
+            option_count = len(strong_tracks | review_tracks)
+            strong_count = len(strong_tracks)
+            review_count = len(review_tracks)
+            not_playable_count = len(not_playable_tracks)
+            no_candidate_count = max(0, total - len(option_tracks))
+            no_suitable_count = max(0, total - len(safe_tracks))
+            completed_count = int(progress_payload.get("completed_tracks", 0) or 0)
         terminal = matching_status in {"complete", "incomplete", "failed"}
         run_id = str(
             progress_metadata.get("run_id")
@@ -6993,21 +7193,66 @@ def create_app(
             "catalog_diagnostic": catalog_diagnostic,
             "run_id": run_id,
             "review_url": f"/advanced?workspace_id={int(workspace)}",
-            "counts": {
-                "imported_songs": total,
-                "chart_options": len(option_tracks),
+                "counts": {
+                    "imported_songs": total,
+                    "chart_options": option_count,
                 "candidate_charts": sum(
                     1
                     for row in candidate_rows
                     if row["track_id"] is not None
                     and int(row["track_id"]) in workspace_track_ids
                 ),
-                "strong_matches": len(strong_tracks),
-                "needs_review": len(review_tracks),
-                "no_candidate_songs": max(0, total - len(option_tracks)),
-                "not_playable_songs": len(not_playable_tracks),
-                "no_suitable_songs": max(0, total - len(safe_tracks)),
+                    "strong_matches": strong_count,
+                    "needs_review": review_count,
+                    "no_candidate_songs": no_candidate_count,
+                    "not_playable_songs": not_playable_count,
+                    "no_suitable_songs": no_suitable_count,
                 "selected_charts": selected,
+            },
+            "sources": {
+                "soundcloud": {"state": "imported" if "soundcloud" in source_by_provider else "not_imported", "count": combined_sources["soundcloud_count"], "raw_rows": int(source_by_provider.get("soundcloud", {}).get("total_rows", 0) or 0), "accepted_rows": int(source_by_provider.get("soundcloud", {}).get("accepted_rows", 0) or 0), "skipped": int(source_by_provider.get("soundcloud", {}).get("skipped_rows", 0) or 0), "duplicates": int(source_by_provider.get("soundcloud", {}).get("duplicate_rows", 0) or 0)},
+                "spotify": {"state": "connected" if _is_authenticated() else "not_connected", "imported": "spotify" in source_by_provider, "count": combined_sources["spotify_count"], "raw_rows": int(source_by_provider.get("spotify", {}).get("total_rows", 0) or 0), "accepted_rows": int(source_by_provider.get("spotify", {}).get("accepted_rows", 0) or 0), "skipped": int(source_by_provider.get("spotify", {}).get("skipped_rows", 0) or 0), "duplicates": int(source_by_provider.get("spotify", {}).get("duplicate_rows", 0) or 0)},
+            },
+            "combined": combined_sources,
+            "music": music[:250],
+            "music_total": len(music),
+            "catalog_chart_count": catalog_chart_count,
+            "activity": activity_rows,
+            "visualization": {
+                "spotify_count": combined_sources["spotify_count"],
+                "soundcloud_count": combined_sources["soundcloud_count"],
+                "shared_count": combined_sources["shared_count"],
+                "canonical_count": total,
+                "catalog_chart_count": catalog_chart_count,
+                "processed_count": int(progress_payload.get("completed_tracks", 0) or 0),
+                "chartable_count": len(option_tracks),
+                "strong_count": len(strong_tracks),
+                "review_count": len(review_tracks),
+                "phase": str(progress_payload.get("phase") or matching_status),
+                "complete": matching_status == "complete",
+                "spotify_items_processed": int(progress_metadata.get("spotify_items_processed", 0) or 0),
+                "spotify_items_expected": progress_metadata.get("spotify_items_expected"),
+                "spotify_playlist_index": progress_metadata.get("playlist_index"),
+                "spotify_playlist_total": progress_metadata.get("playlist_total"),
+                "spotify_playlist_name": progress_metadata.get("playlist_name", ""),
+                "spotify_playlist_items_read": progress_metadata.get("playlist_items_read"),
+                "spotify_playlist_total_items": progress_metadata.get("playlist_total_items"),
+                "elapsed_seconds": progress_metadata.get("elapsed_seconds"),
+                "eta_seconds": progress_metadata.get("eta_seconds"),
+                "eta_seconds": progress_metadata.get("eta_seconds"),
+            },
+            "matching_dataset": {
+                "canonical_count": total,
+                "matching_total": matching_total,
+                "consistent": matching_status not in {"complete", "incomplete", "failed"} or matching_total == total,
+            },
+            "progress": {
+                "phase": str(progress_payload.get("phase") or matching_status),
+                "processed": completed_count,
+                "total": effective_matching_total or total,
+                "elapsed_seconds": progress_metadata.get("elapsed_seconds"),
+                "current_song": {"artist": str(current_song["artist"]), "title": str(current_song["title"])} if current_song else None,
+                "recent": activity_rows,
             },
         }
 
@@ -7972,6 +8217,7 @@ button,.primary{font:inherit;padding:10px 14px;border:1px solid #4b83bb;border-r
 button:disabled{opacity:.5;cursor:default}button:focus-visible,a:focus-visible,input:focus-visible,summary:focus-visible{outline:3px solid var(--accent);outline-offset:3px}
 input{margin:8px;max-width:100%}small,.muted{color:var(--muted)}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(240px,100%),1fr));gap:12px}.card{border:1px solid #465064;padding:14px;border-radius:8px;min-width:0}
 .journey-status{border-top:1px solid var(--line);margin-top:16px;padding-top:16px}.journey-status h3{margin:0 0 6px}.journey-status p{margin:6px 0}.journey-status--warning{border-left:3px solid var(--warn);padding-left:12px}.journey-status--success{border-left:3px solid var(--success);padding-left:12px}
+.source-breakdown{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-top:14px}.source-breakdown .card{padding:12px}.source-breakdown strong{display:block;font-size:1.3rem}.source-filter{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin-top:12px}.source-filter button[aria-pressed="true"]{border-color:var(--accent);color:var(--accent)}.music-list{list-style:none;padding:0;max-height:280px;overflow:auto;border:1px solid var(--line)}.music-list li{padding:7px 10px;border-bottom:1px solid var(--line)}.music-list li:last-child{border-bottom:0}.happening-list{list-style:none;padding:0;margin:8px 0}.happening-list li{padding:7px 0;border-bottom:1px solid var(--line)}.happening-list li:last-child{border-bottom:0}.visual-placeholder{min-height:150px;display:grid;place-items:center;text-align:center;border:1px dashed var(--accent);border-radius:9px;background:#121b25}.visual-placeholder p{margin:4px}
 details{margin-top:12px}summary{cursor:pointer}.diagnostics{font-size:.9rem}.diagnostics a{color:var(--accent)}
 @media(max-width:600px){body{padding:14px}section{padding:15px}button,.primary{width:100%;margin:4px 0}}
 </style></head>
@@ -7984,15 +8230,19 @@ details{margin-top:12px}summary{cursor:pointer}.diagnostics{font-size:.9rem}.dia
     <label for="soundcloudFile">SoundCloud export file</label><input id="soundcloudFile" type="file" accept=".csv,.json">
     <button id="soundcloudImport">Import SoundCloud export</button><p id="soundcloudMsg" class="muted" role="status" aria-live="polite"></p>
     <a href="/browser-exporter.js">Download the optional browser exporter</a>
-  </div><div class="card"><h3>Spotify (optional)</h3><p>Connect Spotify only if you also want to add its playlists or Liked Songs.</p>
-    <button id="spotifyConnect">Connect Spotify</button><p class="muted">Your SoundCloud export works without this step.</p>
-  </div></div>
-  <div id="summary" class="muted" style="margin-top:14px">No music imported yet.</div>
+   </div><div class="card"><h3>Spotify</h3><p id="spotifyDescription">Connect Spotify to add Liked Songs or playlists.</p>
+     <button id="spotifyConnect">Connect Spotify</button><button id="spotifySync" hidden>Sync Spotify</button><p class="muted">Spotify music is not included until you choose a scope and add it.</p>
+     <div id="spotifyScope" hidden><h4>Choose Spotify music</h4><label><input id="spotifyLiked" type="checkbox"> Liked Songs <span id="spotifyLikedCount" class="muted"></span></label><div id="spotifyPlaylists"></div><button id="spotifySelectAll" type="button">Select all accessible playlists</button><button id="spotifyAdd" disabled>Add selected to Your Music</button><progress id="spotifyProgress" max="100" value="0" hidden aria-label="Spotify import progress"></progress><p id="spotifyScopeMsg" class="muted" role="status" aria-live="polite"></p></div>
+   </div></div>
+   <div id="summary" class="muted" style="margin-top:14px">No music imported yet.</div>
 </section>
-<section aria-labelledby="matchingHeading"><h2 id="matchingHeading">2. Find playable charts</h2>
-  <p class="muted">We compare your songs with the local chart catalog without downloading anything.</p>
-  <button id="find" disabled>Find chart matches</button>
-  <p id="progress" class="muted" role="status" aria-live="polite"></p>
+<section aria-labelledby="yourMusicHeading"><h2 id="yourMusicHeading">YOUR MUSIC</h2><div id="localSourceBreakdown" class="source-breakdown"></div><div class="source-filter" role="group" aria-label="Filter songs by source"><button data-source-filter="all" aria-pressed="true">All</button><button data-source-filter="soundcloud" aria-pressed="false">SoundCloud</button><button data-source-filter="spotify" aria-pressed="false">Spotify</button><button data-source-filter="both" aria-pressed="false">Both</button><label for="musicSearch">Search</label><input id="musicSearch" type="search" placeholder="Artist or title"></div><ul id="localMusicList" class="music-list"></ul><p id="localMusicMore" class="muted"></p></section>
+<section aria-labelledby="happeningHeading"><h2 id="happeningHeading">WHAT'S HAPPENING</h2><p id="localHappeningCurrent" class="muted" role="status" aria-live="polite">Loading current status...</p><ul id="localHappeningList" class="happening-list"></ul></section>
+ <section aria-labelledby="matchingHeading"><h2 id="matchingHeading">2. Find playable charts</h2>
+   <h3 id="matchingStateHeading">READY TO FIND CHARTS</h3><p id="matchingStateDetail" class="muted">We compare your songs with the local chart catalog without downloading anything.</p>
+   <progress id="matchingProgressBar" max="1" value="0" aria-label="Chart matching progress"></progress><p id="matchingProgressText" role="status" aria-live="polite"></p><p id="matchingCurrent" class="muted"></p>
+   <div id="matchingCounters" class="grid"></div><h3>RECENT</h3><ul id="matchingRecent" class="happening-list"></ul><details><summary>View all song activity</summary><input id="matchingActivitySearch" type="search" placeholder="Search songs"><select id="matchingActivityFilter"><option value="all">All statuses</option><option value="strong">Strong</option><option value="review">Needs review</option><option value="no_suitable">No suitable</option><option value="not_playable">Not playable</option><option value="no_catalog_candidate">No catalog candidate</option></select><p class="muted">Use the existing Review matches page for full paginated results.</p></details>
+   <div id="localVisual" hidden></div><button id="find" disabled>Find chart matches</button><p id="progress" class="muted" hidden></p>
 </section>
 <section id="review" class="journey-status" hidden aria-labelledby="reviewHeading">
   <h2 id="reviewHeading">3. Review and export</h2>
@@ -8008,15 +8258,28 @@ function esc(value){return String(value??'').replace(/[&<>"']/g,c=>({'&':'&amp;'
 function number(value){return Number(value||0).toLocaleString()}
 function showDiagnostics(d){const panel=$('diagnosticsPanel');if(!d||!d.run_id||!d.diagnostics_url){panel.hidden=true;return}$('diagnostics').innerHTML=`Matching details: <code>${esc(d.run_id)}</code> · <a href="${esc(d.diagnostics_url)}">Download diagnostics</a>`;panel.hidden=false}
 function sourceLabel(provider){return String(provider||'').toLowerCase()==='soundcloud'?'SoundCloud export':String(provider||'Imported music')}
-function render(d){workspaceId=d.workspace_id||workspaceId;const sources=d.sources||[];const combined=d.combined||{};$('summary').innerHTML=(sources.length?sources.map(source=>{const details=[];if(source.skipped_rows)details.push(`${number(source.skipped_rows)} skipped`);if(source.duplicate_rows)details.push(`${number(source.duplicate_rows)} duplicates`);return `<div><b>${esc(sourceLabel(source.provider))}</b>: ${number(source.tracks)} songs imported${details.length?` · ${esc(details.join(' · '))}`:''}</div>`}).join(''):'No music imported yet.')+`<p><b>Your music:</b> ${number(combined.tracks)} songs from ${number(combined.artists)} artists</p>`;$('find').disabled=!combined.tracks;showDiagnostics(d);if(d.journey)renderJourney(d.journey)}
-function journeyDetails(journey){const counts=journey.counts||{};if(journey.matching_status==='complete'&&journey.catalog_available===false)return 'Your music was imported, but no charts could be checked because the local chart catalog is unavailable.';if(journey.matching_status==='complete')return `${number(counts.imported_songs)} songs checked. ${number(counts.chart_options)} songs have chart options across ${number(counts.candidate_charts)} chart versions: ${number(counts.strong_matches)} strong matches and ${number(counts.needs_review)} that need review. ${number(counts.no_suitable_songs)} songs have no safe recommendation.`;if(journey.matching_status==='incomplete')return `${number(counts.imported_songs)} songs were imported. ${number(counts.chart_options)} have saved chart options, but matching did not finish for everything.`;if(journey.matching_status==='failed')return `${number(counts.imported_songs)} songs were imported, but matching stopped before it finished.`;return journey.message||''}
-function renderJourney(journey){if(!journey)return;const counts=journey.counts||{};const review=$('review');const status=journey.matching_status||'empty';const active=status==='running';$('find').disabled=!counts.imported_songs||active;$('progress').textContent=active?journey.message||'Matching your songs...':status==='ready'?journey.message||'Your music is ready to match.':'';if(['complete','incomplete','failed'].includes(status)){review.hidden=false;$('outcomeHeadline').textContent=journey.headline||'Matching complete';$('outcomeDetails').textContent=journeyDetails(journey);$('reviewLink').hidden=!journey.review_available;$('reviewLink').href=journey.review_url||'/advanced';review.classList.toggle('journey-status--success',status==='complete'&&journey.catalog_available!==false);review.classList.toggle('journey-status--warning',status!=='complete'||journey.catalog_available===false)}else{review.hidden=true}}
-function importMessage(s){const p=s.progress||{};if(s.phase==='persist'&&p.total_tracks)return `${s.message||'Saving tracks...'} ${number(p.persisted_tracks)} / ${number(p.total_tracks)}`;return s.message||s.phase||'Importing SoundCloud export...'}
+let localMusic=[];let localFilter='all';let localSearch='';
+function spotifyScopeReady(){return $('spotifyLiked').checked||document.querySelectorAll('#spotifyPlaylists input:checked').length>0}
+function updateSpotifyAdd(){if($('spotifyAdd'))$('spotifyAdd').disabled=!spotifyScopeReady()}
+function renderSpotifyScope(data){$('spotifyScope').hidden=false;$('spotifyLikedCount').textContent=data.liked_available?`(${number(data.liked_count)} songs)`:'(count unavailable)';$('spotifyLiked').checked=!!data.scope?.include_liked;$('spotifyPlaylists').innerHTML=(data.playlists||[]).map(p=>{const count=p.item_count==null?'count unknown':`${number(p.item_count)} songs`;const state=p.access_status==='accessible'?count:`${p.access_status||'inaccessible'}${p.access_reason?`: ${p.access_reason}`:''}`;return `<label style="display:block"><input type="checkbox" value="${esc(p.spotify_id)}" ${p.selected?'checked':''} ${p.access_status!=='accessible'?'disabled':''}> ${esc(p.name||'Untitled playlist')} <small>(${esc(state)})</small></label>`}).join('')||'<small>No playlists found.</small>';document.querySelectorAll('#spotifyPlaylists input').forEach(input=>input.onchange=updateSpotifyAdd);updateSpotifyAdd()}
+async function loadSpotifyScope(){try{const d=await api('/api/spotify/scope?workspace_id='+encodeURIComponent(workspaceId));renderSpotifyScope(d);$('localHappeningCurrent').textContent='Spotify inventory ready. Choose Liked Songs or playlists to add.'}catch(e){$('spotifyScopeMsg').textContent=e.message}}
+async function syncSpotify(){if(!workspaceId)return;const button=$('spotifyConnect');button.disabled=true;$('localHappeningCurrent').textContent='Spotify connected. Fetching playlists and checking Liked Songs...';try{const d=await api('/api/spotify/inventory',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({workspace_id:workspaceId})});const poll=async()=>{const s=await api('/api/spotify/status?workspace_id='+encodeURIComponent(workspaceId));$('localHappeningCurrent').textContent=s.running?'Spotify connected. Reading playlists and Liked Songs...':'Spotify inventory ready.';if(s.running){setTimeout(poll,600);return}button.disabled=false;await loadSpotifyScope()};poll()}catch(e){button.disabled=false;$('spotifyScopeMsg').textContent=e.message}}
+async function addSpotify(){const ids=Array.from(document.querySelectorAll('#spotifyPlaylists input:checked')).map(input=>input.value);const includeLiked=$('spotifyLiked').checked;const msg=$('spotifyScopeMsg');msg.textContent='Saving selected Spotify scope...';try{await api('/api/spotify/scope',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({workspace_id:workspaceId,playlist_ids:ids,include_liked:includeLiked})});$('spotifyAdd').disabled=true;msg.textContent='Reading selected Spotify music...';$('localHappeningCurrent').textContent='Spotify import is running. Your Music will update when it finishes.';await api('/api/spotify/import',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({workspace_id:workspaceId})});const poll=async()=>{const s=await api('/api/spotify/status?workspace_id='+encodeURIComponent(workspaceId));if(s.running){renderSpotifyImportProgress(s);await refresh();setTimeout(poll,600);return}$('spotifyProgress').hidden=true;msg.textContent=s.status==='failed'?s.error||'Spotify import failed.':'Spotify import complete.';await refresh()};poll()}catch(e){msg.textContent=e.message;updateSpotifyAdd()}}
+function renderLocalMusic(){const rows=localMusic.filter(song=>{const source=localFilter==='both'?song.sources.length>1:localFilter==='all'||song.sources.includes(localFilter);return source&&(!localSearch||`${song.artist} ${song.title}`.toLowerCase().includes(localSearch))});$('localMusicList').innerHTML=rows.map(song=>`<li>[${esc(song.source_label.toUpperCase())}] ${esc(song.artist)} — ${esc(song.title)}</li>`).join('')||'<li class="muted">No songs match this filter.</li>';$('localMusicMore').textContent=`${number(rows.length)} shown of ${number(localMusic.length)} canonical songs.`}
+function spotifyTime(seconds){if(seconds==null)return '';const value=Math.max(0,Math.round(Number(seconds)));return value>=60?` · ~${Math.floor(value/60)}m ${value%60}s remaining`:` · ~${value}s remaining`}
+function renderSpotifyImportProgress(status){const p=status.progress||{};const meta=p.metadata||{};const read=Number(meta.spotify_items_processed||p.spotify_items_processed||0);const total=meta.spotify_items_expected??p.spotify_items_expected;const bar=$('spotifyProgress');bar.hidden=false;if(total!=null){bar.max=Number(total);bar.value=Math.min(read,Number(total))}else bar.removeAttribute('value');$('localHappeningCurrent').textContent=`${p.message||status.message||'Reading selected Spotify music...'} · ${number(read)}${total!=null?` / ${number(total)}`:' items read'}${meta.eta_seconds!=null?spotifyTime(meta.eta_seconds):''}`}
+function renderLocalShell(j){if(!j||!j.combined)return;const c=j.combined,s=j.sources||{},v=j.visualization||{},status=j.matching_status||'empty';$('yourMusicHeading').textContent=`YOUR MUSIC — ${number(c.canonical_count)} unique songs`;$('localSourceBreakdown').innerHTML=`<div class="card"><span>SoundCloud unique songs</span><strong>${number(c.soundcloud_count)}</strong><small>${s.soundcloud?.state==='not_imported'?'Not imported':`${number(s.soundcloud.raw_rows)} raw rows · ${number(s.soundcloud.accepted_rows)} accepted · ${number(s.soundcloud.skipped)} skipped · ${number(s.soundcloud.duplicates)} duplicates merged`}</small></div><div class="card"><span>Spotify unique songs</span><strong>${number(c.spotify_count)}</strong><small>${s.spotify?.state==='not_connected'?'Not connected':s.spotify?.imported?'Imported':'Connected, not imported'}</small></div><div class="card"><span>In both</span><strong>${number(c.shared_count)}</strong></div><div class="card"><span>Duplicates merged within sources</span><strong>${number(c.duplicates_merged)}</strong></div><div class="card"><span>Canonical unique songs</span><strong>${number(c.canonical_count)}</strong></div>`;localMusic=j.music||[];renderLocalMusic();const history=[];if(s.soundcloud?.state==='imported')history.push(`<li>✓ SoundCloud import complete<br><small>${number(s.soundcloud.raw_rows)} raw rows · ${number(s.soundcloud.accepted_rows)} accepted · ${number(s.soundcloud.skipped)} skipped · ${number(s.soundcloud.duplicates)} duplicates merged</small></li>`);else history.push('<li>○ SoundCloud<br><small>Not imported</small></li>');history.push(s.spotify?.state==='not_connected'?'<li>○ Spotify<br><small>Not connected</small></li>':`<li>${s.spotify?.imported?'✓':'○'} Spotify<br><small>${s.spotify?.imported?number(c.spotify_count)+' songs loaded':'Connected, not imported'}</small></li>`);if(c.canonical_count)history.push(`<li>✓ Your Music ready<br><small>${number(c.canonical_count)} unique songs · ${number(c.duplicates_merged)} duplicates merged</small></li>`);if(v.catalog_chart_count)history.push(`<li>✓ Enchor catalog ready<br><small>${number(v.catalog_chart_count)} charts</small></li>`);if(status==='running')history.push(`<li>◐ ${esc(j.headline||'Finding chart matches')}<br><small>${number(v.processed_count)} / ${number(c.canonical_count)} songs checked</small></li>`);if(status==='complete')history.push(`<li>✓ Matching complete<br><small>${number(j.counts?.chart_options)} chartable · ${number(j.counts?.strong_matches)} strong · ${number(j.counts?.needs_review)} review</small></li>`);if(['failed','incomplete'].includes(status))history.push(`<li>× ${esc(j.headline||'Matching stopped')}<br><small>${esc(j.message||'Run matching again; existing work is preserved.')}</small></li>`);if(status==='cancelled')history.push('<li>× Matching canceled<br><small>Existing imported music is preserved.</small></li>');$('localHappeningCurrent').textContent=status==='running'?'The application is working. Progress is saved and safe to refresh.':j.message||'Your music is ready for the next step.';$('localHappeningList').innerHTML=history.concat((j.activity||[]).slice(-8).map(row=>`<li>${row.classification==='strong'?'✓':row.classification==='review'?'•':row.classification==='not_playable'?'!':row.classification==='checking'?'◐':'×'} ${esc(row.artist)} — ${esc(row.title)}<br><small>${esc(row.classification||row.status||'Waiting')}</small></li>`)).join('');$('localVisual').dataset.contract=JSON.stringify(v)}
+ function renderMatchingSurface(j){if(!j)return;const c=j.counts||{},p=j.progress||{},status=j.matching_status||'ready',total=Number(p.total||c.imported_songs||0),done=Number(p.processed||0),active=status==='running';$('matchingStateHeading').textContent=status==='complete'?'MATCHING COMPLETE':status==='failed'?'MATCHING STOPPED':status==='incomplete'?'MATCHING INCOMPLETE':status==='cancelled'?'MATCHING CANCELED':active?'FINDING PLAYABLE CHARTS':'READY TO FIND CHARTS';$('matchingStateDetail').textContent=status==='complete'?`${number(done||total)} songs checked against ${number(j.catalog_chart_count||0)} Enchor charts.`:status==='failed'?`Could not continue: ${j.message||'the matching job stopped.'}`:status==='cancelled'?`${number(done)} / ${number(total)} songs checked. Results from this incomplete run are not final.`:active?'The current matching run is saved and safe to refresh.':'Your Music and the Enchor catalog are ready.';$('matchingProgressBar').max=Math.max(1,total);$('matchingProgressBar').value=Math.min(done,total);$('matchingProgressText').textContent=`${number(done)} / ${number(total)} songs checked${p.elapsed_seconds!=null?` · Elapsed ${Math.floor(p.elapsed_seconds/60).toString().padStart(2,'0')}:${Math.round(p.elapsed_seconds%60).toString().padStart(2,'0')}`:''}${p.eta_seconds!=null?` · About ${Math.floor(p.eta_seconds/60)}m ${Math.round(p.eta_seconds%60)}s remaining`:''}`;const current=p.current_song;$('matchingCurrent').textContent=current?`Currently checking: ${current.artist} — ${current.title}`:'';$('matchingCounters').innerHTML=[['Strong',c.strong_matches],['Needs review',c.needs_review],['No suitable',c.no_suitable_songs],['Not playable',c.not_playable_songs],['No candidate',c.no_candidate_songs]].map(([label,value])=>`<div class="card"><span>${label}</span><strong>${number(value)}</strong></div>`).join('');const activity=p.recent||[];$('matchingRecent').innerHTML=activity.slice(0,30).map(row=>{const mark=row.classification==='strong'?'✓':row.classification==='review'?'•':row.classification==='not_playable'?'!':'×';return `<li>${mark} ${esc(row.artist)} — ${esc(row.title)}<br><small>${esc(row.classification||row.status||'Waiting')}</small></li>`}).join('')||'<li class="muted">No current-run song activity yet.</li>';}
+ function render(d){workspaceId=d.workspace_id||workspaceId;const sources=d.sources||[];const combined=d.combined||{};$('summary').innerHTML=(sources.length?sources.map(source=>{const details=[];if(source.skipped_rows)details.push(`${number(source.skipped_rows)} skipped`);if(source.duplicate_rows)details.push(`${number(source.duplicate_rows)} duplicates`);return `<div><b>${esc(sourceLabel(source.provider))}</b>: ${number(source.tracks)} songs imported${details.length?` · ${esc(details.join(' · '))}`:''}</div>`}).join(''):'No music imported yet.')+`<p><b>Your music:</b> ${number(combined.tracks)} songs from ${number(combined.artists)} artists</p>`;$('find').disabled=!combined.tracks;showDiagnostics(d);if(d.journey){renderJourney(d.journey);renderMatchingSurface(d.journey)}}
+ function journeyDetails(journey){const counts=journey.counts||{};if(journey.matching_status==='complete'&&journey.catalog_available===false)return 'Your music was imported, but no charts could be checked because the local chart catalog is unavailable.';if(journey.matching_status==='complete')return `${number(counts.imported_songs)} songs checked. ${number(counts.chart_options)} songs have eligible chart options across ${number(counts.candidate_charts)} chart versions. ${number(Math.max(0,counts.imported_songs-counts.no_candidate_songs))} songs had at least one catalog candidate evaluated. ${number(counts.strong_matches)} strong matches and ${number(counts.needs_review)} that need review. ${number(counts.no_suitable_songs)} songs have no suitable match.`;if(journey.matching_status==='incomplete')return `${number(counts.imported_songs)} songs were imported. ${number(counts.chart_options)} have eligible chart options, but matching did not finish for everything.`;if(journey.matching_status==='failed')return `${number(counts.imported_songs)} songs were imported, but matching stopped before it finished.`;return journey.message||''}
+ function renderJourney(journey){if(!journey)return;renderLocalShell(journey);const counts=journey.counts||{};const review=$('review');const status=journey.matching_status||'empty';const active=status==='running';$('find').disabled=!counts.imported_songs||active;$('progress').textContent=active?journey.message||'Matching your songs...':status==='ready'?journey.message||'Your music is ready to match.':'';if(['complete','incomplete','failed'].includes(status)){review.hidden=false;$('outcomeHeadline').textContent=journey.headline||'Matching complete';$('outcomeDetails').textContent=journeyDetails(journey);$('reviewLink').hidden=!journey.review_available;$('reviewLink').href=journey.review_url||'/advanced';review.classList.toggle('journey-status--success',status==='complete'&&journey.catalog_available!==false);review.classList.toggle('journey-status--warning',status!=='complete'||journey.catalog_available===false)}else{review.hidden=true}}
+ const baseRenderJourney=renderJourney;renderJourney=function(journey){baseRenderJourney(journey);renderMatchingSurface(journey)};
+ function importMessage(s){const p=s.progress||{};if(s.phase==='persist'&&p.total_tracks)return `${s.message||'Saving tracks...'} ${number(p.persisted_tracks)} / ${number(p.total_tracks)}`;return s.message||s.phase||'Importing SoundCloud export...'}
 function pollImport(runId){if(importTimer)clearTimeout(importTimer);const poll=async()=>{try{const s=await api('/api/sources/soundcloud/import/status?run_id='+encodeURIComponent(runId));workspaceId=s.workspace_id||workspaceId;$('soundcloudMsg').textContent=importMessage(s);showDiagnostics(s);if(s.running){$('find').disabled=true;importTimer=setTimeout(poll,500);return}importTimer=null;$('soundcloudImport').disabled=false;if(s.status==='complete'||s.status==='partial'){const d=await api('/api/sources');render(d);$('soundcloudMsg').textContent=s.result?.message||`Imported ${number(s.result?.source?.tracks)} SoundCloud songs.`}else{$('find').disabled=true;$('soundcloudMsg').textContent=s.error||'SoundCloud import failed.'}}catch(e){importTimer=null;$('soundcloudImport').disabled=false;$('find').disabled=true;$('soundcloudMsg').textContent=e.message}};poll()}
 async function refresh(){try{const d=await api('/api/sources');render(d);const status=await api('/api/discovery/status?workspace_id='+encodeURIComponent(d.workspace_id));showDiagnostics(status);if(status.journey)renderJourney(status.journey);if(status.running)pollMatching(d.workspace_id);const imported=await api('/api/sources/soundcloud/import/status');if(imported.running&&imported.run_id){workspaceId=imported.workspace_id||workspaceId;$('soundcloudImport').disabled=true;$('find').disabled=true;pollImport(imported.run_id)}}catch(e){$('summary').textContent=e.message}}
 async function pollMatching(workspace){if(matchingTimer)clearTimeout(matchingTimer);const poll=async()=>{try{const status=await api('/api/discovery/status?workspace_id='+encodeURIComponent(workspace));showDiagnostics(status);if(status.journey)renderJourney(status.journey);if(status.running){matchingTimer=setTimeout(poll,700);return}matchingTimer=null;const d=await api('/api/sources');render(d)}catch(e){matchingTimer=null;$('progress').textContent=e.message}};poll()}
 $('soundcloudImport').onclick=async()=>{const file=$('soundcloudFile').files[0];if(!file){$('soundcloudMsg').textContent='Choose a CSV or JSON export first.';return}$('soundcloudImport').disabled=true;$('find').disabled=true;$('soundcloudMsg').textContent='Uploading export...';try{const body=new FormData;body.append('file',file);const d=await api('/api/sources/soundcloud/import',{method:'POST',body});workspaceId=d.workspace_id;$('soundcloudMsg').textContent='Upload accepted; importing in the background...';showDiagnostics(d);pollImport(d.run_id)}catch(e){$('soundcloudMsg').textContent=e.message;$('soundcloudImport').disabled=false}};
-$('spotifyConnect').onclick=async()=>{try{const d=await api('/api/auth/spotify/start');location.href=d.authorization_url}catch(e){$('soundcloudMsg').textContent=e.message}};$('find').onclick=async()=>{if(!workspaceId)return;$('find').disabled=true;$('progress').textContent='Starting chart matching...';try{const d=await api('/api/discovery/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({source:'combined',workspace_id:workspaceId})});workspaceId=d.workspace_id||workspaceId;pollMatching(workspaceId)}catch(e){$('find').disabled=false;$('progress').textContent=e.message}};refresh();
+  document.querySelectorAll('[data-source-filter]').forEach(button=>button.onclick=()=>{localFilter=button.dataset.sourceFilter;document.querySelectorAll('[data-source-filter]').forEach(item=>item.setAttribute('aria-pressed',String(item===button)));renderLocalMusic()});$('musicSearch').oninput=e=>{localSearch=e.target.value.trim().toLowerCase();renderLocalMusic()};$('spotifyConnect').onclick=async()=>{try{const d=await api('/api/auth/spotify/start');location.href=d.authorization_url}catch(e){$('soundcloudMsg').textContent=e.message}};$('spotifySync').onclick=syncSpotify;$('spotifyAdd').onclick=addSpotify; $('spotifySelectAll').onclick=()=>{document.querySelectorAll('#spotifyPlaylists input').forEach(input=>{input.checked=true});updateSpotifyAdd()};$('find').onclick=async()=>{if(!workspaceId)return;$('find').disabled=true;$('progress').textContent='Starting chart matching...';try{const d=await api('/api/discovery/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({source:'combined',workspace_id:workspaceId})});workspaceId=d.workspace_id||workspaceId;pollMatching(workspaceId)}catch(e){$('find').disabled=false;$('progress').textContent=e.message}};api('/api/auth/status').then(a=>{if(a.authenticated){$('spotifyConnect').hidden=true;$('spotifySync').hidden=false;$('spotifyDescription').textContent='Spotify is connected. Sync to choose music to add.'}}).catch(()=>{});refresh();
 </script></body></html>'''
 
 

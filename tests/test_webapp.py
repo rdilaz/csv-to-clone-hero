@@ -175,6 +175,40 @@ def test_index_serves_source_neutral_workflow(client):
     assert len(ids) == len(set(ids))
 
 
+def test_local_home_exposes_spotify_sync_scope_and_import_controls(client):
+    html = client.get("/").get_data(as_text=True)
+    for text in ("Sync Spotify", "spotifySync", "spotifyLiked", "spotifyPlaylists", "Add selected to Your Music"):
+        assert text in html
+    assert client.post("/api/spotify/import", json={}).status_code == 401
+
+
+def test_local_home_exposes_provenance_filters_and_activity_shell(client):
+    html = client.get("/").get_data(as_text=True)
+    for text in ("YOUR MUSIC", "SoundCloud", "Spotify", "In both", "Duplicates merged", "WHAT'S HAPPENING", "READY TO FIND CHARTS", "View all song activity"):
+        assert text in html
+    for source in ("all", "soundcloud", "spotify", "both"):
+        assert f'data-source-filter="{source}"' in html
+
+    payload = client.get("/api/sources").get_json()["journey"]
+    assert payload["sources"]["soundcloud"]["state"] == "not_imported"
+    assert payload["visualization"]["complete"] is False
+    assert {key for key in payload["visualization"] if key.endswith("_count") or key in {"phase", "complete"}} >= {
+        "spotify_count", "soundcloud_count", "shared_count", "canonical_count", "catalog_chart_count",
+        "processed_count", "chartable_count", "strong_count", "review_count", "phase", "complete",
+    }
+
+
+def test_local_journey_persists_import_provenance_and_counts(client, config):
+    initial = client.get("/api/sources").get_json()
+    seed_local_workspace(config, initial["workspace_id"], charts=False)
+    journey = client.get("/api/sources").get_json()["journey"]
+    assert journey["sources"]["soundcloud"]["state"] == "imported"
+    assert journey["sources"]["soundcloud"]["count"] == 2
+    assert journey["combined"]["canonical_count"] == 2
+    assert journey["music"][0]["source_label"] == "soundcloud"
+    assert all(song["sources"] == ["soundcloud"] for song in journey["music"])
+
+
 def test_home_inline_script_parses_in_javascript_engine(client, tmp_path):
     if shutil.which("node") is None:
         pytest.skip("Node.js is not installed")
