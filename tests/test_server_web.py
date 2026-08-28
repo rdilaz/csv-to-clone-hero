@@ -5,6 +5,11 @@ from __future__ import annotations
 import time
 import io
 import json
+import re
+import shutil
+import subprocess
+import tempfile
+from pathlib import Path
 
 import pytest
 
@@ -102,6 +107,35 @@ def test_authenticated_review_shell_prioritizes_human_decisions(client):
     assert "eligibility" not in html
 
 
+def test_authenticated_shell_contains_bounded_matching_activity(client):
+    _sign_in(client)
+    html = client.get("/").get_data(as_text=True)
+    assert 'id="matchingProgress"' in html
+    assert 'id="activityList"' in html
+    assert 'id="reviewMatchesBtn"' in html
+    assert 'class="review-card"' not in html
+
+
+def test_matching_template_javascript_parses():
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node.js is not installed")
+    template = Path(__file__).parents[1] / "src/csv_to_clonehero/server/templates/index.html"
+    source = template.read_text(encoding="utf-8")
+    match = re.search(r"\{% else %\}.*?\{% endif %\}{% endblock %}", source, re.DOTALL)
+    assert match is not None
+    script = re.search(r"<script>(.*?)</script>", match.group(0), re.DOTALL)
+    assert script is not None
+    with tempfile.NamedTemporaryFile("w", suffix=".js", encoding="utf-8", delete=False) as handle:
+        handle.write(script.group(1))
+        path = handle.name
+    try:
+        result = subprocess.run([node, "--check", path], capture_output=True, text=True)
+        assert result.returncode == 0, result.stderr
+    finally:
+        Path(path).unlink(missing_ok=True)
+
+
 def test_anonymous_soundcloud_export_import_is_available_without_spotify_login(client):
     response = client.post(
         "/api/sources/soundcloud/import",
@@ -193,6 +227,30 @@ def test_create_and_poll_job(client, config, monkeypatch):
         time.sleep(0.05)
     row = client.get(f"/api/jobs/{job_id}").get_json()["job"]
     assert row["status"] == "complete"
+
+
+def test_matching_activity_endpoint_is_bounded_and_searchable(client, config):
+    _sign_in(client)
+    _prepare_discovery(client, config)
+    from csv_to_clonehero.database import Database
+    from csv_to_clonehero.server.auth import user_workspace_key
+    from tests.conftest import make_track
+
+    db = Database(config.database_path)
+    try:
+        workspace = db.get_workspace(user_workspace_key("user-1"))
+        track = db.upsert_spotify_tracks([make_track("Song", "Artist", "activity-1")])[0]
+        db.initialize_discovery_song_progress(workspace["id"], [track])
+        job = db.create_job(1, "discovery", workspace_key=workspace["workspace_key"])
+        job_id = int(job["id"])
+    finally:
+        db.close()
+    response = client.get(f"/api/jobs/{job_id}/songs?limit=999&search=Artist")
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload["limit"] == 100
+    assert payload["total"] == 1
+    assert payload["songs"][0]["status"] == "waiting"
 
 
 def test_create_job_requires_scope_and_fresh_authoritative_preflight(client, config):

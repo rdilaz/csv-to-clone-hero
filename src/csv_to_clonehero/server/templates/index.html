@@ -53,6 +53,22 @@
   .advanced-review { margin-top:14px; }
   .advanced-review summary { cursor:pointer; font-weight:600; }
   .advanced-review-body { border-left:2px solid var(--border); margin:10px 0 0 4px; padding:4px 0 4px 14px; }
+  .matching-progress { margin-top:18px; }
+  .progress-bar { background:var(--border); border-radius:6px; height:12px; overflow:hidden; }
+  .progress-bar span { background:var(--accent); display:block; height:100%; transition:width .2s ease; }
+  .progress-counters { display:grid; grid-template-columns:repeat(5,minmax(0,1fr)); gap:8px; margin:14px 0; }
+  .progress-counter { border:1px solid var(--border); border-radius:7px; padding:9px; }
+  .progress-counter strong { display:block; font-size:1.2rem; }
+  .activity-toolbar { align-items:center; display:flex; gap:10px; justify-content:space-between; margin-top:14px; }
+  .activity-list { border:1px solid var(--border); list-style:none; margin:8px 0; max-height:420px; overflow:auto; padding:0; }
+  .activity-row { align-items:center; border-bottom:1px solid var(--border); display:flex; gap:10px; min-height:38px; padding:7px 10px; }
+  .activity-row:last-child { border-bottom:0; }
+  .activity-marker { flex:0 0 1.2em; text-align:center; }
+  .activity-song { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .activity-detail { color:var(--muted); font-size:.9rem; text-align:right; }
+  .activity-pages { display:flex; gap:8px; justify-content:flex-end; }
+  @media (max-width: 700px) { .progress-counters { grid-template-columns:repeat(2,minmax(0,1fr)); } .activity-detail { max-width:38%; } }
+  @media (prefers-reduced-motion: reduce) { .progress-bar span { transition:none; } }
   @media (max-width: 600px) {
     .review-card-header, .recommendation-header, .option-header { align-items:flex-start; flex-direction:column; }
     .option-actions { justify-content:flex-start; }
@@ -131,8 +147,27 @@
   <div id="status" style="display:none">
     <div id="statusMsg"></div>
     <div class="bar"><span id="bar"></span></div>
-    <button class="btn ghost" id="cancelBtn" onclick="cancelJob()" style="display:none">Cancel scan</button>
   </div>
+  <section id="matchingProgress" class="matching-progress card" style="display:none" aria-labelledby="matchingProgressTitle">
+    <h2 id="matchingProgressTitle">Finding charts</h2>
+    <p id="progressPhase" class="muted" role="status" aria-live="polite"></p>
+    <div class="progress-bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" aria-label="Chart matching progress"><span id="matchingBar"></span></div>
+    <p id="progressCount">0 / 0 songs</p>
+    <div id="musicSummary" class="muted"></div>
+    <div class="progress-counters" aria-label="Matching totals">
+      <div class="progress-counter"><span>Strong</span><strong id="countStrong">0</strong></div>
+      <div class="progress-counter"><span>Needs review</span><strong id="countReview">0</strong></div>
+      <div class="progress-counter"><span>No suitable</span><strong id="countNoSuitable">0</strong></div>
+      <div class="progress-counter"><span>Not playable</span><strong id="countNotPlayable">0</strong></div>
+      <div class="progress-counter"><span>No catalog candidate</span><strong id="countNoCatalog">0</strong></div>
+    </div>
+    <div class="activity-toolbar"><label for="activitySearch">Songs</label><input id="activitySearch" type="search" placeholder="Filter artist or title"></div>
+    <ul id="activityList" class="activity-list" aria-label="Song matching activity"></ul>
+    <div class="activity-pages"><button class="btn ghost" id="activityPrev" type="button">Previous</button><span id="activityPage" class="muted"></span><button class="btn ghost" id="activityNext" type="button">Next</button></div>
+    <p id="matchingFinal" class="muted"></p>
+    <button id="reviewMatchesBtn" class="btn" type="button" style="display:none">Review matches</button>
+    <button class="btn ghost" id="cancelBtn" onclick="cancelJob()" style="display:none">Cancel matching</button>
+  </section>
   <div id="error" class="error" style="display:none"></div>
   <div id="review" style="display:none">
     <h2>Review your matches</h2>
@@ -173,6 +208,7 @@
 {% block scripts %}{% if authenticated %}
 <script>
 let jobId = null, pollTimer = null, tracks = [], scopeReady = false, preflightReady = false;
+let activityOffset = 0, activitySearch = '', activityTotal = 0;
 let reviewFeedback = '';
 
 function show(msg, pct) {
@@ -187,7 +223,8 @@ function fail(msg) {
 function renderSourceSummary(data) {
   const host = document.getElementById('sourceSummary'); if (!host) return;
   const sources = data.sources || []; const combined = data.combined || {};
-  host.innerHTML = (sources.length ? sources.map(s => `<div><b>${esc(s.provider)}</b>: ${s.tracks||0} unique songs, ${s.provenance||0} source records, ${s.skipped_rows||0} skipped, ${s.duplicate_rows||0} duplicates</div>`).join('') : 'No imported sources yet.') + `<div><b>Combined:</b> ${combined.tracks||0} songs from ${combined.artists||0} artists</div>`;
+   host.innerHTML = (sources.length ? sources.map(s => `<div><b>${esc(s.provider)}</b>: ${s.tracks||0} unique songs, ${s.provenance||0} source records, ${s.skipped_rows||0} skipped, ${s.duplicate_rows||0} duplicates</div>`).join('') : 'No imported sources yet.') + `<div><b>Combined:</b> ${combined.tracks||0} songs from ${combined.artists||0} artists</div>`;
+   document.getElementById('musicSummary').innerHTML = `<strong>Your music</strong><br>${sources.map(s => `${esc(s.provider)}: ${Number(s.tracks||0).toLocaleString()}`).join(' · ') || 'No sources'}<br>Duplicates merged: ${Math.max(0, sources.reduce((n,s)=>n+Number(s.tracks||0),0)-Number(combined.tracks||0)).toLocaleString()} · Canonical unique songs: ${Number(combined.tracks||0).toLocaleString()}`;
   scopeReady = Boolean(combined.tracks) || scopeReady; updateStartState();
 }
 async function importSoundcloudExport() {
@@ -266,6 +303,7 @@ function renderPreflight(p) {
 
 async function startJob() {
   document.getElementById('startBtn').disabled = true;
+  document.getElementById('matchingProgress').style.display = 'block';
   try {
     const d = await api('/api/jobs', {method:'POST', body: JSON.stringify({kind:'discovery'})});
     jobId = d.job.id; pollTimer = setInterval(poll, 1500); poll();
@@ -282,6 +320,7 @@ function attachJob(job) {
   if (pollTimer) clearInterval(pollTimer);
   pollTimer = setInterval(poll, 1500);
   document.getElementById('cancelBtn').style.display = '';
+  document.getElementById('matchingProgress').style.display = 'block';
   poll();
 }
 async function cancelJob() {
@@ -300,17 +339,19 @@ async function poll() {
   const d = await api('/api/jobs/' + jobId);
   const j = d.job;
   const prog = j.progress || {};
-  const total = prog.total_work || prog.scoring_tasks_total || 1;
-  const done = prog.completed_work || prog.scoring_tasks_completed || 0;
-  const pct = Math.min(100, Math.round(done/total*100));
+  const total = Number(prog.total_tracks || prog.total_work || prog.scoring_tasks_total || 0);
+  const done = Math.min(total, Number(prog.processed_tracks || prog.completed_work || prog.scoring_tasks_completed || 0));
+  const pct = total ? Math.min(100, Math.round(done/total*100)) : 0;
   show(j.message || j.phase, pct);
+  renderMatchingProgress(j, prog, total, done, pct);
+  await loadActivity();
   document.getElementById('startBtn').textContent = 'Searching… ' + pct + '%';
   if (['complete','partial','failed','cancelled','interrupted'].includes(j.status)) {
     clearInterval(pollTimer);
     document.getElementById('cancelBtn').style.display = 'none';
     document.getElementById('startBtn').textContent = j.status === 'failed' ? 'Search again' : 'Search again';
     document.getElementById('startBtn').disabled = false;
-    if (j.status === 'failed') { fail(j.error || 'Search failed'); }
+    if (j.status === 'failed') { fail(`Matching failed during ${j.phase || 'discovery'} after ${done} of ${total} songs: ${j.error || 'The server reported an error.'}`); }
     if (j.status === 'partial') {
       setReviewFeedback('Some songs could not be checked. Review the results, then run the search again for the missing checks.');
     } else if (j.status === 'interrupted' || j.status === 'cancelled') {
@@ -318,6 +359,47 @@ async function poll() {
     }
     if (j.status !== 'failed') { await loadWorkspace(); }
   }
+}
+function renderMatchingProgress(job, prog, total, done, pct) {
+  const phaseNames = {catalog_prepare:'Preparing chart catalog locally', finding_charts:'Finding possible charts and scoring matches', complete:'Matching complete', cancelled:'Matching canceled', failed:'Matching failed'};
+  const phase = phaseNames[job.phase] || job.message || job.phase || 'Starting matching';
+  document.getElementById('progressPhase').textContent = phase;
+  document.getElementById('matchingBar').style.width = pct + '%';
+  const bar = document.querySelector('[aria-label="Chart matching progress"]');
+  bar.setAttribute('aria-valuenow', pct);
+  document.getElementById('progressCount').textContent = `${done.toLocaleString()} / ${total.toLocaleString()} songs · ${pct}%`;
+  document.getElementById('countStrong').textContent = Number(prog.strong_matches||0).toLocaleString();
+  document.getElementById('countReview').textContent = Number(prog.review_matches||0).toLocaleString();
+  document.getElementById('countNoSuitable').textContent = Number(prog.no_suitable_matches||0).toLocaleString();
+  document.getElementById('countNotPlayable').textContent = Number(prog.not_playable_matches||0).toLocaleString();
+  document.getElementById('countNoCatalog').textContent = Number(prog.no_catalog_candidates||0).toLocaleString();
+  const catalog = Number(prog.catalog_chart_count||0);
+  document.getElementById('matchingFinal').textContent = catalog ? `${catalog.toLocaleString()} Enchor charts in the local catalog.` : '';
+  if (job.status === 'cancelled' || job.status === 'interrupted') document.getElementById('matchingFinal').textContent = `Matching canceled — ${done.toLocaleString()} of ${total.toLocaleString()} songs processed.`;
+  if (job.status === 'complete') {
+    const options = Number(prog.songs_with_options || 0);
+    document.getElementById('matchingFinal').textContent = `${done.toLocaleString()} songs checked${options ? ` · ${options.toLocaleString()} songs have chart options` : ''}. Review the accepted funnel below.`;
+    document.getElementById('reviewMatchesBtn').style.display = '';
+    document.getElementById('reviewMatchesBtn').onclick = () => document.getElementById('review').scrollIntoView({behavior:'smooth'});
+  }
+}
+async function loadActivity() {
+  if (!jobId) return;
+  const query = new URLSearchParams({limit:'100', offset:String(activityOffset)});
+  if (activitySearch) query.set('search', activitySearch);
+  const data = await api('/api/jobs/' + jobId + '/songs?' + query.toString());
+  activityTotal = Number(data.total || 0);
+  document.getElementById('activityList').innerHTML = (data.songs || []).map(song => {
+    const state = song.classification || song.status || 'waiting';
+    const marker = {strong:'✓',review:'•',no_suitable:'×',not_playable:'!',no_catalog_candidate:'×',checking:'◐',waiting:'·'}[state] || '·';
+    const detail = state === 'complete' ? 'Complete' : state === 'checking' ? 'Checking…' : ({strong:'Strong',review:'Review',no_suitable:'No suitable chart',not_playable:'Charts found, not playable',no_catalog_candidate:'No catalog candidate'}[state] || state);
+    const count = Number(song.candidate_count || 0);
+    return `<li class="activity-row"><span class="activity-marker" aria-hidden="true">${marker}</span><span class="activity-song">${esc(song.artist)} — ${esc(song.title)}</span><span class="activity-detail">${esc(detail)}${count ? ` · ${count} possible charts` : ''}</span></li>`;
+  }).join('') || '<li class="activity-row muted">No songs in this view.</li>';
+  const page = Math.floor(activityOffset / 100) + 1;
+  document.getElementById('activityPage').textContent = `${page} / ${Math.max(1, Math.ceil(activityTotal/100))}`;
+  document.getElementById('activityPrev').disabled = activityOffset === 0;
+  document.getElementById('activityNext').disabled = activityOffset + 100 >= activityTotal;
 }
 async function loadWorkspace() {
   const d = await api('/api/workspace');
@@ -491,5 +573,14 @@ loadPreflight();
 resumeActiveJob();
 document.getElementById('soundcloudImportBtn')?.addEventListener('click', importSoundcloudExport);
 api('/api/sources').then(renderSourceSummary).catch(() => {});
+document.getElementById('activitySearch')?.addEventListener('input', (event) => {
+  activitySearch = event.target.value.trim(); activityOffset = 0; loadActivity().catch(() => {});
+});
+document.getElementById('activityPrev')?.addEventListener('click', () => {
+  activityOffset = Math.max(0, activityOffset - 100); loadActivity().catch(() => {});
+});
+document.getElementById('activityNext')?.addEventListener('click', () => {
+  if (activityOffset + 100 < activityTotal) { activityOffset += 100; loadActivity().catch(() => {}); }
+});
 </script>
 {% endif %}{% endblock %}

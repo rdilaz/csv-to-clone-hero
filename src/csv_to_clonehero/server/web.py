@@ -571,6 +571,34 @@ def create_app(
             abort(404)
         return jsonify({"job": _job_public(job)})
 
+    @app.get("/api/jobs/<int:job_id>/songs")
+    def job_songs(job_id):
+        """Return a bounded, card-free page of matching activity rows."""
+        user = _require_user()
+        job = jobs.get(job_id)
+        if job is None or job.user_id != int(user["id"]):
+            abort(404)
+        db = _user_db()
+        try:
+            workspace = db.get_workspace(job.workspace_key)
+            if workspace is None:
+                return jsonify({"songs": [], "total": 0, "offset": 0, "limit": 0})
+            limit = min(100, max(1, int(request.args.get("limit", 50))))
+            offset = max(0, int(request.args.get("offset", 0)))
+            search = str(request.args.get("search", ""))[:200]
+            rows = db.get_discovery_song_progress(
+                workspace["id"], limit=limit, offset=offset, search=search
+            )
+            return jsonify({
+                "songs": [dict(row) for row in rows],
+                "total": db.count_discovery_song_progress(workspace["id"], search=search),
+                "offset": offset, "limit": limit,
+            })
+        except (TypeError, ValueError):
+            return jsonify({"error": "invalid song list parameters"}), 400
+        finally:
+            db.close()
+
     @app.post("/api/jobs/<int:job_id>/cancel")
     def cancel_job(job_id):
         user = _require_user()

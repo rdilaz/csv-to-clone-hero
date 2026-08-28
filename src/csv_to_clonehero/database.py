@@ -16,7 +16,7 @@ from typing import Any
 
 from csv_to_clonehero.models import ChartCandidate, Track
 
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 13
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);
@@ -411,6 +411,21 @@ CREATE TABLE IF NOT EXISTS workspace_expansion_artists (
     metadata_json TEXT NOT NULL DEFAULT '{}',
     UNIQUE (workspace_id, artist_norm)
 );
+
+CREATE TABLE IF NOT EXISTS discovery_song_progress (
+    workspace_id INTEGER NOT NULL REFERENCES discovery_workspaces(id) ON DELETE CASCADE,
+    track_key TEXT NOT NULL,
+    artist TEXT NOT NULL DEFAULT '',
+    title TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'waiting',
+    candidate_count INTEGER NOT NULL DEFAULT 0,
+    provenance TEXT NOT NULL DEFAULT '',
+    classification TEXT NOT NULL DEFAULT '',
+    updated_at REAL NOT NULL,
+    PRIMARY KEY (workspace_id, track_key)
+);
+CREATE INDEX IF NOT EXISTS idx_discovery_song_progress_lookup
+    ON discovery_song_progress(workspace_id, artist, title);
 
 CREATE TABLE IF NOT EXISTS library_sources (
     id INTEGER PRIMARY KEY,
@@ -3925,6 +3940,72 @@ class Database:
                WHERE workspace_id = ? ORDER BY id DESC LIMIT 1""",
             (db_id,),
         ).fetchone()
+
+    def initialize_discovery_song_progress(
+        self, workspace_id: int | str, tracks: Iterable[Any]
+    ) -> None:
+        """Create compact activity rows without storing candidate payloads."""
+        db_id = self._workspace_db_id(workspace_id)
+        now = time.time()
+        rows = [
+            (db_id, str(track.track_key), str(track.artist_full), str(track.title), now)
+            for track in tracks
+        ]
+        with self._conn:
+            self._conn.execute(
+                "DELETE FROM discovery_song_progress WHERE workspace_id = ?", (db_id,)
+            )
+            self._conn.executemany(
+                """INSERT INTO discovery_song_progress
+                   (workspace_id,track_key,artist,title,status,updated_at)
+                   VALUES (?,?,?,?, 'waiting', ?)""",
+                rows,
+            )
+
+    def update_discovery_song_progress(
+        self, workspace_id: int | str, track_key: str, **values: Any
+    ) -> None:
+        db_id = self._workspace_db_id(workspace_id)
+        allowed = {"status", "candidate_count", "provenance", "classification"}
+        assignments = [f"{key} = ?" for key in values if key in allowed]
+        params = [values[key] for key in values if key in allowed]
+        assignments.append("updated_at = ?")
+        params.extend([time.time(), db_id, str(track_key)])
+        with self._conn:
+            self._conn.execute(
+                "UPDATE discovery_song_progress SET " + ", ".join(assignments)
+                + " WHERE workspace_id = ? AND track_key = ?",
+                params,
+            )
+
+    def get_discovery_song_progress(
+        self, workspace_id: int | str, *, limit: int = 100, offset: int = 0,
+        search: str = ""
+    ) -> list[sqlite3.Row]:
+        db_id = self._workspace_db_id(workspace_id)
+        limit = min(200, max(1, int(limit)))
+        offset = max(0, int(offset))
+        query = "SELECT * FROM discovery_song_progress WHERE workspace_id = ?"
+        params: list[Any] = [db_id]
+        if search.strip():
+            query += " AND (artist LIKE ? OR title LIKE ?)"
+            value = f"%{search.strip()}%"
+            params.extend([value, value])
+        query += " ORDER BY artist COLLATE NOCASE, title COLLATE NOCASE LIMIT ? OFFSET ?"
+        params.extend([limit, offset])
+        return list(self._conn.execute(query, params))
+
+    def count_discovery_song_progress(
+        self, workspace_id: int | str, *, search: str = ""
+    ) -> int:
+        db_id = self._workspace_db_id(workspace_id)
+        query = "SELECT COUNT(*) AS count FROM discovery_song_progress WHERE workspace_id = ?"
+        params: list[Any] = [db_id]
+        if search.strip():
+            query += " AND (artist LIKE ? OR title LIKE ?)"
+            value = f"%{search.strip()}%"
+            params.extend([value, value])
+        return int(self._conn.execute(query, params).fetchone()["count"])
 
     load_expansion_batch = get_expansion_batch
 

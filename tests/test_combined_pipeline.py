@@ -41,6 +41,33 @@ def test_combined_discovery_deduplicates_provenance_and_scores(config):
         db.close()
 
 
+def test_combined_progress_reports_full_retrieval_and_final_song_state(config):
+    from tests.conftest import make_chart
+
+    chart = make_chart("Song", "Artist", chart_id=13)
+    events = []
+    db = Database(config.database_path)
+    try:
+        result = discover_combined(
+            config, db,
+            [LibrarySnapshot("soundcloud", [
+                ProviderTrack("soundcloud", "sc-1", "Song", "Artist"),
+                ProviderTrack("soundcloud", "sc-2", "Missing", "Nobody"),
+            ])],
+            workspace_key="combined:progress", catalog=FakeCatalog(chart),
+            on_progress=events.append,
+        )
+        assert result.tracks == 2
+        assert events[0]["phase"] == "catalog_prepare"
+        assert events[-1]["status"] == "complete"
+        assert events[-1]["processed_tracks"] == 2
+        rows = db.get_discovery_song_progress(1, limit=10)
+        assert {row["classification"] for row in rows} == {"strong", "no_catalog_candidate"}
+        assert max(len(json.dumps(event)) for event in events) < 2000
+    finally:
+        db.close()
+
+
 def test_expansion_artist_ranking_only_uses_imported_artists():
     class Catalog:
         available = True

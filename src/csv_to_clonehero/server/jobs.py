@@ -293,7 +293,10 @@ class JobManager:
                 self._execute(job)
         except Exception as exc:  # noqa: BLE001 - surfaced per-job
             log.exception("job %s failed", job.id)
-            self._mark(job.id, status="failed", error=str(exc)[:1000])
+            if self._cancelled(job.id):
+                self._mark(job.id, status="cancelled", phase="cancelled", message="Job cancelled")
+            else:
+                self._mark(job.id, status="failed", error=str(exc)[:1000])
         finally:
             self._maybe_notify(job.id)
             self._cancel_events.pop(job.id, None)
@@ -328,6 +331,20 @@ class JobManager:
         client: Any | None = None
         soundcloud_client: Any | None = None
         try:
+            def on_combined_progress(payload: Mapping[str, Any]) -> None:
+                data = dict(payload)
+                message = str(data.pop("message", "") or data.get("phase", "")).strip()
+                # The song row is already durable. Avoid a second SQLite write
+                # for the transient "checking" notification; the next poll
+                # observes the row and the current_song field remains in the
+                # last job snapshot when a terminal song update is emitted.
+                if data.get("phase") == "finding_charts" and "song_status" not in data:
+                    return
+                self._mark(
+                    job.id, status="running", phase=str(data.get("phase") or "matching"),
+                    message=message, progress=data, heartbeat_at=time.time(),
+                )
+
             validation = validate_discovery_start(
                 db,
                 self.config,
@@ -357,6 +374,8 @@ class JobManager:
                 combined = discover_combined(
                     self.config, db, [LibrarySnapshot(name, tracks) for name, tracks in grouped.items()],
                     workspace_key=job.workspace_key, workspace_name="Combined library",
+                    on_progress=on_combined_progress,
+                    cancellation_event=self._cancel_events[job.id],
                 )
                 self._mark(job.id, status=combined.status, phase=combined.phase, message="Combined catalog discovery complete.", result=vars(combined))
                 return
@@ -385,6 +404,8 @@ class JobManager:
                 combined = discover_combined(
                     self.config, db, [spotify_snapshot, soundcloud_snapshot],
                     workspace_key=job.workspace_key, workspace_name=user["spotify_user_id"],
+                    on_progress=on_combined_progress,
+                    cancellation_event=self._cancel_events[job.id],
                 )
                 self._mark(job.id, status="complete", phase="complete", message="Combined catalog discovery complete.", result=vars(combined))
                 return

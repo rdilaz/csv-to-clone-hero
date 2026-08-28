@@ -106,6 +106,8 @@ def discover_combined(
     catalog: EnchorCatalog | None = None,
     expansion_artists: Iterable[str] = (),
     diagnostics: Any = None,
+    on_progress: Any = None,
+    cancellation_event: Any = None,
 ) -> CombinedDiscoveryResult:
     """Import provider snapshots, match them locally, and persist candidates.
 
@@ -131,6 +133,21 @@ def discover_combined(
         catalog_snapshot_id=str(getattr(catalog, "snapshot_id", "") or ""),
         catalog_chart_count=int(getattr(catalog, "chart_count", 0) or 0),
         catalog_load_seconds=float(getattr(catalog, "load_seconds", 0.0) or 0.0),
+    )
+    db.initialize_discovery_song_progress(workspace_id, normalized)
+
+    def emit(**payload: Any) -> None:
+        if on_progress is not None:
+            on_progress({
+                "total_tracks": len(normalized),
+                "catalog_chart_count": result.catalog_chart_count,
+                **payload,
+            })
+
+    emit(
+        phase="catalog_prepare", message="Preparing local Enchor search index",
+        catalog_chart_count=result.catalog_chart_count, processed_tracks=0,
+        scoring_tasks_completed=0,
     )
     if diagnostics:
         diagnostics.update("combine", counters={"unique_imported_tracks": len(normalized), "unique_imported_artists": len({track.artist_norm for track in tracks})})
@@ -170,7 +187,14 @@ def discover_combined(
             getattr(search_config, "catalog_min_title_similarity", 20.0) or 20.0
         )
         evaluated_chart_ids: set[tuple[str, int]] = set()
+        emit(phase="finding_charts", message="Finding possible charts", processed_tracks=0)
         for position, track in enumerate(normalized, start=1):
+            if cancellation_event is not None and cancellation_event.is_set():
+                from csv_to_clonehero.spotify_pipeline import DiscoveryCancelled
+                raise DiscoveryCancelled("matching cancelled")
+            db.update_discovery_song_progress(
+                workspace_id, track.track_key, status="checking"
+            )
             retrieval_started = time.perf_counter()
             lookup_method = getattr(catalog, "high_recall_candidates", None)
             if callable(lookup_method):
@@ -324,12 +348,53 @@ def discover_combined(
                     result.rejection_reasons[reason] = result.rejection_reasons.get(reason, 0) + 1
                 else:
                     result.eligible_candidates += 1
+            if matches and strong:
+                classification = "strong"
+            elif matches and review:
+                classification = "review"
+            elif matches and scored and all(
+                bool(getattr(breakdown, "gate_factors", {}).get("hard_gate", False))
+                for _, breakdown in scored
+            ):
+                classification = "not_playable"
+            elif matches:
+                classification = "no_suitable"
+            else:
+                classification = "no_catalog_candidate"
+            db.update_discovery_song_progress(
+                workspace_id, track.track_key, status="complete",
+                candidate_count=len(matches), provenance=", ".join(lookup.methods),
+                classification=classification,
+            )
+            emit(
+                phase="finding_charts", message="Finding possible charts",
+                current_song={"artist": track.artist_full, "title": track.title},
+                processed_tracks=position, scoring_tasks_completed=position,
+                song_status=classification, candidate_count=len(matches),
+                provenance=list(lookup.methods),
+                strong_matches=result.strong_match_tracks,
+                review_matches=result.review_match_tracks,
+                no_suitable_matches=result.soft_rejected_only_tracks,
+                not_playable_matches=result.hard_rejected_only_tracks,
+                no_catalog_candidates=result.zero_candidate_tracks,
+                songs_with_options=result.plausible_match_tracks,
+            )
         result.unique_charts_evaluated = len(evaluated_chart_ids)
         result.discovery_seconds = time.perf_counter() - discovery_started
         _persist_expansion(db, workspace_id, catalog, normalized, expansion_artists, config, result)
     if not result.discovery_seconds:
         result.discovery_seconds = time.perf_counter() - discovery_started
     result.expansion_artists = rank_expansion_artists(catalog, normalized)
+    emit(
+        phase="complete", status="complete", message="Chart matching complete",
+        processed_tracks=len(normalized), scoring_tasks_completed=len(normalized),
+        strong_matches=result.strong_match_tracks,
+        review_matches=result.review_match_tracks,
+        no_suitable_matches=result.soft_rejected_only_tracks,
+        not_playable_matches=result.hard_rejected_only_tracks,
+        no_catalog_candidates=result.zero_candidate_tracks,
+        songs_with_options=result.plausible_match_tracks,
+    )
     if diagnostics:
         diagnostics.update(
             "score",
