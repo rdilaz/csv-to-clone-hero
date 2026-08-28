@@ -279,6 +279,63 @@ def test_local_journey_summary_and_review_rehydrate_after_fresh_app(client, conf
     assert "provenance" not in home
 
 
+def test_bulk_selection_defaults_to_strong_and_explicit_eligible_scope(client, config):
+    initial = client.get("/api/sources").get_json()
+    seed_local_workspace(config, initial["workspace_id"])
+    db = Database(config.database_path)
+    try:
+        missing = next(
+            track for track in db.get_spotify_tracks(True) if track.title == "Missing Song"
+        )
+        review = make_chart("Missing Song", "Artist", chart_id=304)
+        db.upsert_candidate(review)
+        db.upsert_workspace_candidate(
+            initial["workspace_id"],
+            missing.track_key,
+            review,
+            score=82,
+            eligibility="ELIGIBLE_REVIEW",
+            decision="REVIEW",
+            breakdown_json=json.dumps({
+                "eligibility": "ELIGIBLE_REVIEW",
+                "factors": {
+                    "gates": {
+                        "hard_gate": False,
+                        "playable_content": True,
+                        "required_five_fret_guitar": True,
+                    },
+                },
+            }),
+            kind="exact",
+        )
+    finally:
+        db.close()
+
+    strong = client.post(
+        "/api/spotify/select-all",
+        json={"workspace_id": initial["workspace_id"], "scope": "strong"},
+    )
+    assert strong.status_code == 200
+    assert strong.get_json()["selected"] == 1
+    assert strong.get_json()["scope"] == "strong"
+
+    client.post(
+        "/api/spotify/select-all",
+        json={"workspace_id": initial["workspace_id"], "action": "clear"},
+    )
+    eligible = client.post(
+        "/api/spotify/select-all",
+        json={
+            "workspace_id": initial["workspace_id"],
+            "scope": "eligible",
+            "search": "Missing Song",
+        },
+    )
+    assert eligible.status_code == 200
+    assert eligible.get_json()["selected"] == 1
+    assert eligible.get_json()["items"][0]["chart_id"] == 304
+
+
 def test_local_export_reports_one_human_readable_success(config):
     archive = io.BytesIO()
     with zipfile.ZipFile(archive, "w") as chart_zip:
@@ -333,6 +390,18 @@ def test_local_export_reports_one_human_readable_success(config):
             },
         )
         assert selected.status_code == 200
+        preview = http.post(
+            "/api/spotify/export/preview",
+            json={
+                "kind": "folder",
+                "workspace_id": workspace_id,
+                "path": str(config.base_dir / "Songs"),
+            },
+        )
+        assert preview.status_code == 200
+        assert preview.get_json()["selected_chart_count"] == 1
+        assert preview.get_json()["eligible_chart_count"] == 1
+        assert preview.get_json()["estimated_bytes"] > 0
         started = http.post(
             "/api/spotify/export/start",
             json={"kind": "folder", "workspace_id": workspace_id, "path": str(config.base_dir / "Songs")},
@@ -349,6 +418,15 @@ def test_local_export_reports_one_human_readable_success(config):
         assert status["result"]["success"] is True
         assert status["result"]["published"] == 1
         assert status["result"]["failed"] == 0
+        assert status["result"]["ready"] == 1
+        db = Database(config.database_path)
+        try:
+            records = db.list_export_records(workspace_id)
+            assert records and records[0]["status"] == "success"
+            items = db.get_export_items(records[0]["id"])
+            assert items and items[0]["status"] == "published"
+        finally:
+            db.close()
         assert "exported successfully" in http.get("/advanced").get_data(as_text=True)
 
 

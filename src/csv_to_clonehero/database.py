@@ -4846,6 +4846,39 @@ class Database:
 
     get_export_records = list_export_records
 
+    def recover_running_exports(self) -> int:
+        """Mark exports left active by a stopped process as interrupted.
+
+        Per-item rows intentionally remain in place. They are the durable
+        inspection trail used by the next build to distinguish completed work
+        from charts that still need a download or validation attempt.
+        """
+        now = time.time()
+        with self._conn:
+            rows = list(
+                self._conn.execute(
+                    "SELECT id FROM export_records WHERE status = 'running'"
+                )
+            )
+            if not rows:
+                return 0
+            ids = [int(row["id"]) for row in rows]
+            placeholders = ",".join("?" for _ in ids)
+            self._conn.execute(
+                f"UPDATE export_records SET status = 'interrupted', completed_at = ? "
+                f"WHERE id IN ({placeholders})",
+                [now, *ids],
+            )
+            self._conn.execute(
+                f"UPDATE export_items SET status = 'interrupted', "
+                "error = CASE WHEN COALESCE(error, '') = '' "
+                "THEN 'export interrupted; retry to resume' ELSE error END "
+                f"WHERE export_id IN ({placeholders}) "
+                "AND status IN ('pending', 'downloading', 'retrying', 'validated')",
+                ids,
+            )
+        return len(ids)
+
     def get_export_items(self, export_id: int | str) -> list[sqlite3.Row]:
         try:
             db_id = self._export_db_id(export_id)
@@ -4922,7 +4955,17 @@ class Database:
                 value = int(bool(value))
             assignments.append(f"{key} = ?")
             params.append(value)
-        if "status" in data and data["status"] in {"complete", "completed", "success", "published", "failed", "error"}:
+        if "status" in data and data["status"] in {
+            "complete",
+            "completed",
+            "success",
+            "published",
+            "failed",
+            "error",
+            "cancelled",
+            "interrupted",
+            "partial",
+        }:
             if "completed_at" not in data:
                 assignments.append("completed_at = ?")
                 params.append(time.time())
@@ -4946,11 +4989,13 @@ class Database:
     ) -> sqlite3.Row:
         data = _as_mapping(result)
         items = data.get("items") or data.get("records") or []
-        row = self.update_export_record(
-            export_id,
-            status=data.get("status") or ("success" if data.get("success") else "failed"),
-            metadata=data.get("metadata", {}),
-        )
+        updates: dict[str, Any] = {
+            "status": data.get("status")
+            or ("success" if data.get("success") else "failed")
+        }
+        if "metadata" in data:
+            updates["metadata"] = data.get("metadata")
+        row = self.update_export_record(export_id, **updates)
         for item in items:
             self.record_export_item(export_id, item)
         return row

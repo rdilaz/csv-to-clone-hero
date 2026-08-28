@@ -31,6 +31,7 @@ import time
 import uuid
 import zipfile
 from collections.abc import Callable, Iterable, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass, field, fields, is_dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -86,6 +87,7 @@ _CHART_BASENAMES = {
 # Modern .sng packages (served by Enchor) use the SNGPKG binary container
 # instead of a ZIP archive; both formats must validate.
 SNGPKG_MAGIC = b"SNGPKG"
+MAX_EXPORT_WORKERS = 16
 
 
 class ExportError(Exception):
@@ -94,6 +96,14 @@ class ExportError(Exception):
 
 class ManifestError(ExportError):
     """A manifest exists but cannot be trusted as app-owned state."""
+
+
+class ExportCancelled(ExportError):
+    """The caller requested cancellation before publication completed."""
+
+
+class ArtifactInvalidError(ExportError):
+    """Downloaded bytes were present but failed artifact integrity checks."""
 
 
 @dataclass(frozen=True)
@@ -164,6 +174,7 @@ class VerifiedArtifact:
     size_bytes: int
     source_hash: str = ""
     source_hash_algorithm: str = ""
+    playable_note_count: int = 0
 
 
 @dataclass
@@ -243,6 +254,7 @@ class PreflightResult:
     available_bytes: int | None = None
     current_bytes: int = 0
     budget_bytes: int | None = None
+    reusable_count: int = 0
 
     @property
     def errors(self) -> list[PreflightIssue]:
@@ -258,9 +270,12 @@ class PreflightResult:
 
     @property
     def eligible_items(self) -> list[PreflightItem]:
-        if self.errors:
-            return []
         return [item for item in self.items if item.eligible]
+
+    @property
+    def already_present_count(self) -> int:
+        """Compatibility name used by build-preview consumers."""
+        return self.reusable_count
 
 
 @dataclass
@@ -281,6 +296,7 @@ class ExportItemResult:
     source_hash_algorithm: str = ""
     artifact_key: str = ""
     failure: str = ""
+    playable_note_count: int = 0
     warnings: list[str] = field(default_factory=list)
 
     @property
@@ -454,13 +470,21 @@ class ExportOptions:
     max_compression_ratio: float = 10_000.0
     # When a single chart fails to download/verify, keep exporting the rest and
     # report the failures instead of aborting the whole batch.
-    continue_on_error: bool = False
+    continue_on_error: bool = True
     # Retry a chart's download+verification this many extra times before
     # recording it as failed (transient rate-limits/corrupt responses).
     artifact_retries: int = 2
     # Concurrent download workers. 1 is serial; higher hides per-request
     # latency. The source adapter still throttles global request rate.
     download_workers: int = 1
+    # Optional cooperative cancellation shared by a web job or CLI caller.
+    cancellation_event: threading.Event | None = None
+    # Keep the retry delay injectable/configurable so offline callers do not
+    # need to sleep through deterministic failure tests.
+    retry_backoff_seconds: float = 2.0
+    # Match the normal library safety gate when the default validator is used.
+    # ``None`` means inherit config.instruments.require_five_fret_guitar.
+    require_five_fret_guitar: bool | None = None
 
 
 @dataclass
@@ -477,6 +501,7 @@ class ExportResult:
     sync: SyncResult | None = None
     output_bytes: int = 0
     errors: list[str] = field(default_factory=list)
+    cancelled: bool = False
 
     @property
     def published(self) -> list[ExportItemResult]:
@@ -484,7 +509,12 @@ class ExportResult:
 
     @property
     def failed(self) -> list[ExportItemResult]:
-        return [item for item in self.items if item.failure or item.status in {"failed", "preflight_failed"}]
+        return [
+            item
+            for item in self.items
+            if item.status != "cancelled"
+            and (item.failure or item.status in {"failed", "preflight_failed"})
+        ]
 
     @property
     def bytes_count(self) -> int:
@@ -513,6 +543,76 @@ class ExportResult:
     @property
     def duplicate_count(self) -> int:
         return sum(item.status == "duplicate" for item in self.items)
+
+    @property
+    def invalid(self) -> list[ExportItemResult]:
+        return [
+            item
+            for item in self.items
+            if item.status == "invalid" or item.result in {
+                "artifact_invalid",
+                "validation_failed",
+                "unsafe_existing_target",
+                "target_exists",
+                "target_exists_unowned",
+            }
+        ]
+
+    @property
+    def invalid_count(self) -> int:
+        return len(self.invalid)
+
+    @property
+    def download_failures(self) -> list[ExportItemResult]:
+        return [
+            item
+            for item in self.items
+            if item.status == "failed" and item.result in {
+                "artifact_failed",
+                "download_failed",
+                "source_unavailable",
+            }
+        ]
+
+    @property
+    def download_failure_count(self) -> int:
+        return len(self.download_failures)
+
+    @property
+    def cancelled_items(self) -> list[ExportItemResult]:
+        return [item for item in self.items if item.status == "cancelled"]
+
+    @property
+    def ready_count(self) -> int:
+        """Count selections represented by a published or collapsed artifact."""
+        return self.published_count + self.duplicate_count
+
+    @property
+    def remaining_count(self) -> int:
+        # ``failed`` already includes invalid/preflight-failed items; cancelled
+        # items are deliberately excluded so they remain retryable.
+        return max(0, len(self.items) - self.ready_count - self.failed_count)
+
+    @property
+    def summary(self) -> dict[str, int | bool]:
+        """Stable counters for CLI/web completion summaries."""
+        return {
+            "selected": len(self.items),
+            "added": sum(
+                item.status == "published" and item.result != "already_present"
+                for item in self.items
+            ),
+            "already_present": sum(
+                item.status == "published" and item.result == "already_present"
+                for item in self.items
+            ),
+            "ready": self.ready_count,
+            "invalid": self.invalid_count,
+            "download_failures": self.download_failure_count,
+            "failed": self.failed_count,
+            "remaining": self.remaining_count,
+            "cancelled": self.cancelled,
+        }
 
 
 @runtime_checkable
@@ -547,7 +647,7 @@ class FileArtifactCache:
 
     def get(self, key: str) -> Path | None:
         path = self._path(key)
-        return path if path.is_file() else None
+        return path if path.is_file() and not path.is_symlink() else None
 
     def put(self, key: str, source: Path) -> Path:
         target = self._path(key)
@@ -563,6 +663,21 @@ class FileArtifactCache:
 
     def delete(self, key: str) -> None:
         self._path(key).unlink(missing_ok=True)
+
+
+_ARTIFACT_LOCKS: dict[str, threading.RLock] = {}
+_ARTIFACT_LOCKS_GUARD = threading.Lock()
+
+
+@contextmanager
+def _artifact_lock(cache: Any, key: str):
+    """Serialize materialization of one artifact across service instances."""
+    root = str(getattr(cache, "root", "")).casefold()
+    lock_key = f"{root}\x00{key}"
+    with _ARTIFACT_LOCKS_GUARD:
+        lock = _ARTIFACT_LOCKS.setdefault(lock_key, threading.RLock())
+    with lock:
+        yield
 
 
 def _utc_now() -> str:
@@ -1626,7 +1741,20 @@ class ExportService:
             issues.append(PreflightIssue("selection_not_selected", f"selection status is {status!r}", selection_index=index))
         explicit = _field(selection, "eligible", None)
         if explicit is False:
-            issues.append(PreflightIssue("selection_ineligible", "persisted selection is marked ineligible", selection_index=index))
+            issues.append(
+                PreflightIssue(
+                    "selection_ineligible",
+                    str(
+                        _field(
+                            selection,
+                            "selection_error",
+                            "persisted selection is marked ineligible",
+                        )
+                        or "persisted selection is marked ineligible"
+                    ),
+                    selection_index=index,
+                )
+            )
         eligibility = _field(selection, "eligibility", None)
         if eligibility is None:
             eligibility = _field(selection, "eligibility_state", None)
@@ -1677,9 +1805,25 @@ class ExportService:
     def _source_hash(self, candidate: ChartCandidate, source: ChartSource, info: Any) -> SourceHash | None:
         return _source_hash(candidate, source, info)
 
-    def _artifact_key(self, source_name: str, chart_id: Any, source_hash: SourceHash | None) -> str:
+    def _artifact_key(
+        self,
+        source_name: str,
+        chart_id: Any,
+        source_hash: SourceHash | None,
+        authoritative_id: str = "",
+    ) -> str:
         suffix = source_hash.label() if source_hash is not None else ""
-        identity = f"{source_name}\x00{chart_id}\x00{suffix}".encode("utf-8", "surrogatepass")
+        if authoritative_id:
+            # Enchor's md5 identifies the chart even though it is not the hash
+            # of the repacked bytes served by the file CDN. It is still the
+            # authoritative URL identity for duplicate-download prevention.
+            suffix = f"source-id:{authoritative_id.casefold()}"
+            identity = f"{source_name}\x00{suffix}"
+        elif source_hash is not None:
+            identity = f"{source_name}\x00{source_hash.label()}"
+        else:
+            identity = f"{source_name}\x00chart:{chart_id}"
+        identity = identity.encode("utf-8", "surrogatepass")
         return hashlib.sha256(identity).hexdigest()
 
     def _estimated_bytes(self, selection: Any, info: Any, options: ExportOptions) -> int:
@@ -1713,11 +1857,19 @@ class ExportService:
             raise ValueError("mode must be 'folder' or 'zip'")
         root = Path(destination_root).expanduser().resolve()
         result = PreflightResult(mode=mode, destination_root=root)
+        values = list(selections)
+        if not values:
+            result.issues.append(
+                PreflightIssue(
+                    "empty_selection",
+                    "no persisted charts are selected",
+                )
+            )
+            return result
         if root.exists() and not root.is_dir():
             result.issues.append(PreflightIssue("destination_not_directory", f"destination is not a directory: {root}"))
 
         prepared: list[PreflightItem] = []
-        values = list(selections)
         preflight_total = len(values)
         for index, selection in enumerate(values):
             _report_progress(progress, index, preflight_total, "Checking download sizes")
@@ -1791,9 +1943,19 @@ class ExportService:
                     item.issues.append(PreflightIssue("source_protocol_incomplete", "source has no download method or download info", selection_index=index))
                 item.source_hash = self._source_hash(candidate, item.source, item.download_info)
             if item.source is not None and item.source_hash is not None:
-                item.artifact_key = self._artifact_key(item.source_name, item.chart_id, item.source_hash)
+                item.artifact_key = self._artifact_key(
+                    item.source_name,
+                    item.chart_id,
+                    item.source_hash,
+                    str(getattr(candidate, "md5", "") or ""),
+                )
             elif item.source_name:
-                item.artifact_key = self._artifact_key(item.source_name, item.chart_id, None)
+                item.artifact_key = self._artifact_key(
+                    item.source_name,
+                    item.chart_id,
+                    None,
+                    str(getattr(candidate, "md5", "") or ""),
+                )
             item.estimated_bytes = self._estimated_bytes(selection, item.download_info, options)
             prepared.append(item)
 
@@ -1811,6 +1973,11 @@ class ExportService:
                 # A verified source checksum is content identity even when
                 # two persisted selections refer to different chart rows.
                 identity = f"hash\x00{item.source_hash.label()}"
+            elif item.candidate is not None and str(getattr(item.candidate, "md5", "") or ""):
+                identity = (
+                    f"source-md5\x00{item.source_name.casefold()}\x00"
+                    f"{str(item.candidate.md5).casefold()}"
+                )
             else:
                 identity = f"{item.source_name.casefold()}\x00{item.chart_id!r}"
             prior_identity = by_identity.get(identity)
@@ -1838,6 +2005,35 @@ class ExportService:
             for item in unique
             if item.target_path is not None and item.target_path.is_file()
         )
+        # This is a no-write estimate. The materializer repeats validation
+        # immediately before use, so a changed or corrupt cache entry can never
+        # cross the publication boundary merely because it was counted here.
+        reusable = 0
+        for item in unique:
+            cached = next(
+                (
+                    path
+                    for key in self._cache_keys(item)
+                    if (path := self._cache_get(key)) is not None
+                ),
+                None,
+            )
+            reusable_path = cached if cached is not None and cached.is_file() else None
+            if (
+                reusable_path is None
+                and item.target_path is not None
+                and item.target_path.is_file()
+                and not item.target_path.is_symlink()
+            ):
+                reusable_path = item.target_path
+            if reusable_path is None:
+                continue
+            try:
+                self._verify_artifact(reusable_path, item, options)
+            except (ExportError, OSError, ValueError):
+                continue
+            reusable += 1
+        result.reusable_count = reusable
         projected_bytes = max(0, result.current_bytes + result.estimated_bytes - existing_targets)
         if result.budget_bytes is not None and result.estimated_bytes and projected_bytes > result.budget_bytes:
             result.issues.append(PreflightIssue(
@@ -1891,10 +2087,26 @@ class ExportService:
             if callable(method):
                 try:
                     value = method(key)
-                    return Path(value) if value else None
+                    path = Path(value) if value else None
+                    return path if path is not None and path.is_file() and not path.is_symlink() else None
                 except (OSError, KeyError, ValueError):
                     return None
         return None
+
+    @staticmethod
+    def _legacy_artifact_key(item: PreflightItem) -> str:
+        """Return the pre-bulk-build cache key for persisted artifacts."""
+        source_hash = item.source_hash.label() if item.source_hash is not None else ""
+        identity = (
+            f"{item.source_name}\x00{item.chart_id}\x00{source_hash}"
+        ).encode("utf-8", "surrogatepass")
+        return hashlib.sha256(identity).hexdigest()
+
+    def _cache_keys(self, item: PreflightItem) -> tuple[str, ...]:
+        legacy = self._legacy_artifact_key(item)
+        if legacy == item.artifact_key:
+            return (item.artifact_key,)
+        return (item.artifact_key, legacy)
 
     def _cache_delete(self, key: str) -> None:
         method = getattr(self.artifact_cache, "delete", None)
@@ -1947,10 +2159,18 @@ class ExportService:
         except OSError as exc:
             raise ExportError(f"artifact cannot be read: {exc}") from exc
         if size <= 0:
-            raise ExportError("downloaded chart is empty")
-        validation = _invoke_validator(self.validator, path, options)
+            raise ArtifactInvalidError("downloaded chart is empty")
+        validation = _invoke_validator(self.validator, path, options, self.config)
         if not validation:
-            raise ExportError(validation.error or "downloaded chart failed .sng validation")
+            raise ArtifactInvalidError(
+                getattr(validation, "error", "")
+                or "downloaded chart failed .sng validation"
+            )
+        playable_note_count = int(
+            getattr(validation, "playable_note_count", 0) or 0
+        )
+        if playable_note_count <= 0:
+            raise ArtifactInvalidError("chart contains no playable notes")
         expected = provider_hash or item.source_hash
         source_hash = expected.value if expected is not None else ""
         source_algorithm = expected.algorithm if expected is not None else ""
@@ -1963,14 +2183,20 @@ class ExportService:
         for expected_hash in expected_hashes:
             actual_source_hash = _hash_file(path, expected_hash.algorithm)
             if not hmac.compare_digest(actual_source_hash.lower(), expected_hash.value.lower()):
-                raise ExportError(
+                raise ArtifactInvalidError(
                     f"source checksum mismatch (expected {expected_hash.value}, got {actual_source_hash})"
                 )
         sha256 = _hash_file(path, "sha256")
         identity = ArtifactIdentity(
             source=item.source_name,
             chart_id=item.chart_id,
-            cache_key=item.artifact_key or self._artifact_key(item.source_name, item.chart_id, expected),
+            cache_key=item.artifact_key
+            or self._artifact_key(
+                item.source_name,
+                item.chart_id,
+                expected,
+                str(getattr(item.candidate, "md5", "") or ""),
+            ),
             source_hash=expected.label() if expected is not None else "",
         )
         return VerifiedArtifact(
@@ -1980,59 +2206,90 @@ class ExportService:
             size_bytes=size,
             source_hash=source_hash,
             source_hash_algorithm=source_algorithm,
+            playable_note_count=playable_note_count,
         )
 
     def _materialize(self, item: PreflightItem, options: ExportOptions) -> VerifiedArtifact:
         if item.candidate is None or item.source is None:
             raise ExportError("item was not eligible for materialization")
-        cached = self._cache_get(item.artifact_key)
-        if cached is not None and cached.is_file():
-            try:
-                return self._verify_artifact(cached, item, options)
-            except ExportError:
-                self._cache_delete(item.artifact_key)
+        with _artifact_lock(self.artifact_cache, item.artifact_key):
+            for key in self._cache_keys(item):
+                cached = self._cache_get(key)
+                if cached is None or not cached.is_file():
+                    continue
+                try:
+                    verified = self._verify_artifact(cached, item, options)
+                    if key != item.artifact_key:
+                        try:
+                            stored = self._cache_put(item.artifact_key, cached)
+                            return self._verify_artifact(stored, item, options)
+                        except (OSError, ExportError):
+                            pass
+                    return verified
+                except ExportError:
+                    self._cache_delete(key)
 
-        part = self._staging_root / f"{item.artifact_key or uuid.uuid4().hex}.sng.part"
-        part.unlink(missing_ok=True)
-        provider_hash: SourceHash | None = None
-        try:
-            outcome = self._provider_result(item.candidate, item.source, part)
-            if isinstance(outcome, ArtifactDownload):
-                provider_hash = _source_hash_from_value(
-                    outcome.source_hash,
-                    default_algorithm=outcome.hash_algorithm,
-                    verified=outcome.hash_verified,
-                )
-                outcome = outcome.payload
-            elif isinstance(outcome, VerifiedArtifact):
-                outcome = outcome.path
-            elif isinstance(outcome, Mapping):
-                payload = outcome.get("payload", outcome.get("path", outcome.get("artifact")))
-                provider_hash = _source_hash_from_value(
-                    outcome.get("source_hash", outcome.get("sha256", "")),
-                    default_algorithm=str(outcome.get("hash_algorithm", "sha256")),
-                    verified=bool(outcome.get("hash_verified", True)),
-                )
-                outcome = payload
-            elif isinstance(outcome, (tuple, list)) and len(outcome) >= 1:
-                if len(outcome) >= 2:
-                    provider_hash = _source_hash_from_value(outcome[1], default_algorithm="sha256", verified=True)
-                outcome = outcome[0]
-            if outcome is not None and not part.exists():
-                _write_payload(outcome, part)
-            if not part.is_file():
-                raise ExportError("artifact provider did not produce a file")
-            verified = self._verify_artifact(part, item, options, provider_hash=provider_hash)
-            stored = self._cache_put(item.artifact_key, part)
-            try:
-                return self._verify_artifact(stored, item, options, provider_hash=provider_hash)
-            except ExportError:
-                self._cache_delete(item.artifact_key)
-                raise
-        finally:
+            part = self._staging_root / f"{item.artifact_key or uuid.uuid4().hex}.sng.part"
             part.unlink(missing_ok=True)
+            provider_hash: SourceHash | None = None
+            try:
+                outcome = self._provider_result(item.candidate, item.source, part)
+                if isinstance(outcome, ArtifactDownload):
+                    provider_hash = _source_hash_from_value(
+                        outcome.source_hash,
+                        default_algorithm=outcome.hash_algorithm,
+                        verified=outcome.hash_verified,
+                    )
+                    outcome = outcome.payload
+                elif isinstance(outcome, VerifiedArtifact):
+                    outcome = outcome.path
+                elif isinstance(outcome, Mapping):
+                    payload = outcome.get("payload", outcome.get("path", outcome.get("artifact")))
+                    provider_hash = _source_hash_from_value(
+                        outcome.get("source_hash", outcome.get("sha256", "")),
+                        default_algorithm=str(outcome.get("hash_algorithm", "sha256")),
+                        verified=bool(outcome.get("hash_verified", True)),
+                    )
+                    outcome = payload
+                elif isinstance(outcome, (tuple, list)) and len(outcome) >= 1:
+                    if len(outcome) >= 2:
+                        provider_hash = _source_hash_from_value(outcome[1], default_algorithm="sha256", verified=True)
+                    outcome = outcome[0]
+                if outcome is not None and not part.exists():
+                    _write_payload(outcome, part)
+                if not part.is_file():
+                    raise ExportError("artifact provider did not produce a file")
+                self._verify_artifact(part, item, options, provider_hash=provider_hash)
+                stored = self._cache_put(item.artifact_key, part)
+                try:
+                    return self._verify_artifact(stored, item, options, provider_hash=provider_hash)
+                except ExportError:
+                    self._cache_delete(item.artifact_key)
+                    raise
+            finally:
+                part.unlink(missing_ok=True)
 
-    def _materialize_with_retry(self, item: PreflightItem, options: ExportOptions) -> VerifiedArtifact:
+    @staticmethod
+    def _cancel_requested(event: threading.Event | None) -> bool:
+        return bool(event is not None and event.is_set())
+
+    @staticmethod
+    def _wait_for_retry(event: threading.Event | None, seconds: float) -> None:
+        if seconds <= 0:
+            return
+        if event is not None:
+            if event.wait(seconds):
+                raise ExportCancelled("export cancelled")
+        else:
+            time.sleep(seconds)
+
+    def _materialize_with_retry(
+        self,
+        item: PreflightItem,
+        options: ExportOptions,
+        cancellation_event: threading.Event | None = None,
+        on_retry: Callable[[int], None] | None = None,
+    ) -> VerifiedArtifact:
         """Materialize a chart, retrying transient download/verify failures.
 
         Raises the last failure when all retries are exhausted; the export loop
@@ -2041,12 +2298,23 @@ class ExportService:
         attempts = 1 + max(0, int(options.artifact_retries))
         last_exc: Exception | None = None
         for attempt in range(attempts):
+            if self._cancel_requested(cancellation_event):
+                raise ExportCancelled("export cancelled")
             try:
                 return self._materialize(item, options)
+            except ExportCancelled:
+                raise
             except Exception as exc:  # noqa: BLE001 - retried at the export level
                 last_exc = exc
                 if attempt + 1 < attempts:
-                    time.sleep(min(2.0 * (2 ** attempt), 8.0))
+                    retry_number = attempt + 1
+                    if on_retry is not None:
+                        on_retry(retry_number)
+                    delay = min(
+                        max(0.0, float(options.retry_backoff_seconds)) * (2 ** attempt),
+                        8.0,
+                    )
+                    self._wait_for_retry(cancellation_event, delay)
         if last_exc is not None:
             raise last_exc
         raise ExportError("download failed")
@@ -2057,6 +2325,9 @@ class ExportService:
         results: list[ExportItemResult],
         options: ExportOptions,
         progress: Callable[[int, int, str], None] | None,
+        *,
+        cancellation_event: threading.Event | None = None,
+        item_progress: Callable[[ExportItemResult], None] | None = None,
     ) -> tuple[dict[int, VerifiedArtifact], list[str]]:
         """Materialize every eligible chart, optionally in parallel.
 
@@ -2065,30 +2336,106 @@ class ExportService:
         ``continue_on_error``.
         """
         total = len(eligible)
-        workers = max(1, int(options.download_workers))
+        workers = min(MAX_EXPORT_WORKERS, max(1, int(options.download_workers)))
         artifacts: dict[int, VerifiedArtifact] = {}
         errors: list[str] = []
         progress_lock = threading.Lock()
         completed = 0
 
+        def notify(item_result: ExportItemResult) -> None:
+            _report_item_progress(item_progress, item_result)
+
+        def mark(
+            item: PreflightItem,
+            *,
+            status: str,
+            result: str,
+            failure: str = "",
+        ) -> ExportItemResult:
+            item_result = self._result_for(results, item.index)
+            item_result.status = status
+            item_result.result = result
+            item_result.failure = failure
+            notify(item_result)
+            return item_result
+
         def materialize_one(item: PreflightItem) -> tuple[int, VerifiedArtifact | None, str | None]:
             nonlocal completed
             label = item.target_relpath or f"chart {item.index}"
+            if self._cancel_requested(cancellation_event):
+                item_result = mark(
+                    item,
+                    status="cancelled",
+                    result="cancelled",
+                    failure="export cancelled",
+                )
+                with progress_lock:
+                    completed += 1
+                    _report_progress(progress, completed, total, label)
+                return item.index, None, item_result.failure
+            mark(item, status="downloading", result="downloading")
             try:
-                artifact = self._materialize_with_retry(item, options)
+                artifact = self._materialize_with_retry(
+                    item,
+                    options,
+                    cancellation_event,
+                    on_retry=lambda retry: mark(
+                        item,
+                        status="retrying",
+                        result="retrying",
+                        failure=f"retry {retry}",
+                    ),
+                )
+            except ExportCancelled as exc:
+                item_result = mark(
+                    item,
+                    status="cancelled",
+                    result="cancelled",
+                    failure=str(exc) or "export cancelled",
+                )
+                message = f"selection {item.index}: {item_result.failure}"
+                with progress_lock:
+                    completed += 1
+                    _report_progress(progress, completed, total, label)
+                return item.index, None, message
+            except ArtifactInvalidError as exc:
+                item_result = mark(
+                    item,
+                    status="invalid",
+                    # Keep the historical result code for API consumers; the
+                    # terminal status is the authoritative invalid marker.
+                    result="artifact_failed",
+                    failure=str(exc) or "downloaded chart failed validation",
+                )
+                message = f"selection {item.index}: {item_result.failure}"
+                with progress_lock:
+                    completed += 1
+                    _report_progress(progress, completed, total, label)
+                return item.index, None, message
             except Exception as exc:  # noqa: BLE001 - reported per item
-                item_result = self._result_for(results, item.index)
-                item_result.status = "failed"
-                item_result.result = "artifact_failed"
-                item_result.failure = str(exc)
+                item_result = mark(
+                    item,
+                    status="failed",
+                    result="artifact_failed",
+                    failure=str(exc) or "download failed",
+                )
                 message = f"selection {item.index}: {item_result.failure or 'download failed'}"
                 with progress_lock:
                     completed += 1
                     _report_progress(progress, completed, total, label)
                 return item.index, None, message
+            item_result = self._result_for(results, item.index)
+            item_result.status = "validated"
+            item_result.result = "validated"
+            item_result.bytes_count = artifact.size_bytes
+            item_result.sha256 = artifact.sha256
+            item_result.source_hash = artifact.source_hash
+            item_result.source_hash_algorithm = artifact.source_hash_algorithm
+            item_result.playable_note_count = artifact.playable_note_count
+            notify(item_result)
             with progress_lock:
                 completed += 1
-                _report_progress(progress, completed, total, label)
+                _report_progress(progress, completed, total, f"Validated {label}")
             return item.index, artifact, None
 
         if workers <= 1 or total <= 1:
@@ -2294,19 +2641,17 @@ class ExportService:
                 except OSError as exc:
                     existing_hash = ""
                     item_result.failure = str(exc)
-                if existing_hash == artifact.sha256 and _path_key(item_result.target_relpath) in owned:
+                if existing_hash == artifact.sha256:
+                    # Identical verified bytes are safe to reuse even when a
+                    # process stopped before its manifest checkpoint. We do
+                    # not overwrite or delete the untracked file.
                     item_result.status = "published"
                     item_result.result = "already_present"
                     item_result.bytes_count = artifact.size_bytes
                     item_result.sha256 = artifact.sha256
                     item_result.source_hash = artifact.source_hash
                     item_result.source_hash_algorithm = artifact.source_hash_algorithm
-                    continue
-                if existing_hash == artifact.sha256:
-                    item_result.status = "failed"
-                    item_result.result = "target_exists_unowned"
-                    item_result.failure = "identical target exists but is not listed in an app-owned manifest"
-                    errors.append(f"{item_result.target_relpath}: {item_result.failure}")
+                    item_result.playable_note_count = artifact.playable_note_count
                     continue
                 if _path_key(item_result.target_relpath) not in owned or not options.overwrite_owned:
                     item_result.status = "failed"
@@ -2326,15 +2671,11 @@ class ExportService:
                 item_result.failure = str(exc)
                 errors.append(f"{item_result.target_relpath}: {exc}")
 
-        if errors:
-            for _index, part, _target in parts:
-                part.unlink(missing_ok=True)
-            for index, artifact in artifacts.items():
-                item_result = self._result_for(results, index)
-                if item_result.status == "pending":
-                    item_result.status = "failed"
-                    item_result.result = "publication_aborted"
-                    item_result.failure = "publication aborted because another target failed"
+        if errors and not parts and not any(
+            item_result.status == "published" for item_result in results
+        ):
+            # There is nothing safe to publish. Do not create a manifest that
+            # could make an empty or failed build look complete.
             return False, errors
 
         for index, part, target in parts:
@@ -2347,31 +2688,18 @@ class ExportService:
                 item_result.status = "failed"
                 item_result.result = "publish_failed"
                 item_result.failure = str(exc)
-                for _other_index, other_part, _other_target in parts:
-                    other_part.unlink(missing_ok=True)
-                for other_index in artifacts:
-                    other_result = self._result_for(results, other_index)
-                    if other_result.status == "pending":
-                        other_result.status = "failed"
-                        other_result.result = "publication_aborted"
-                        other_result.failure = "publication aborted because another target failed"
-                return False, errors
+                continue
             item_result.status = "published"
             item_result.result = "published"
             item_result.bytes_count = artifacts[index].size_bytes
             item_result.sha256 = artifacts[index].sha256
             item_result.source_hash = artifacts[index].source_hash
             item_result.source_hash_algorithm = artifacts[index].source_hash_algorithm
-        for index, artifact in artifacts.items():
-            item_result = self._result_for(results, index)
-            if item_result.status == "pending":
-                item_result.status = "published"
-                item_result.result = "already_present"
-                item_result.bytes_count = artifact.size_bytes
-                item_result.sha256 = artifact.sha256
-                item_result.source_hash = artifact.source_hash
-                item_result.source_hash_algorithm = artifact.source_hash_algorithm
-        return True, errors
+            item_result.playable_note_count = artifacts[index].playable_note_count
+        return bool(
+            not errors
+            or any(item_result.status == "published" for item_result in results)
+        ), errors
 
     def _publish_zip(
         self,
@@ -2429,6 +2757,7 @@ class ExportService:
                     item_result.sha256 = artifact.sha256
                     item_result.source_hash = artifact.source_hash
                     item_result.source_hash_algorithm = artifact.source_hash_algorithm
+                    item_result.playable_note_count = artifact.playable_note_count
                 manifest.records = self._make_manifest(
                     results,
                     root=Path(preflight.destination_root),
@@ -2505,6 +2834,7 @@ class ExportService:
         manifest_path: Path | None = None,
         sync: SyncResult | None = None,
         output_bytes: int = 0,
+        cancelled: bool = False,
     ) -> ExportResult:
         return ExportResult(
             kind=kind,
@@ -2517,6 +2847,7 @@ class ExportService:
             sync=sync,
             output_bytes=output_bytes,
             errors=list(errors or ()),
+            cancelled=cancelled,
         )
 
     def export_folder(
@@ -2530,6 +2861,10 @@ class ExportService:
         options: ExportOptions | None = None,
         eligibility_checker: Callable[..., Any] | None = None,
         progress: Callable[[int, int, str], None] | None = None,
+        cancellation_event: threading.Event | None = None,
+        cancel_event: threading.Event | None = None,
+        item_progress: Callable[[ExportItemResult], None] | None = None,
+        on_item: Callable[[ExportItemResult], None] | None = None,
     ) -> ExportResult:
         """Export selected charts to a Songs folder with atomic file moves."""
         opts = options or ExportOptions()
@@ -2537,13 +2872,18 @@ class ExportService:
             managed = managed_sync
         if managed is not None:
             opts.managed_sync = managed
+        cancellation_event = cancellation_event or cancel_event or opts.cancellation_event
+        item_progress = item_progress or on_item
         values = _consume_selections(selections)
         root = Path(destination_root).expanduser().resolve()
         manifest_file = self._manifest_path(root, opts, manifest_path)
         preflight = self._prepare(values, root, mode="folder", options=opts, eligibility_checker=eligibility_checker, progress=progress)
         results = self._initial_results(preflight)
-        if not preflight.ok:
-            return self._result("folder", root, preflight, results, success=False, errors=[issue.message for issue in preflight.errors], manifest_path=manifest_file)
+        _emit_item_progress(results, item_progress)
+        preflight_errors = [issue.message for issue in preflight.errors]
+        global_errors = [issue for issue in preflight.errors if issue.selection_index is None]
+        if global_errors:
+            return self._result("folder", root, preflight, results, success=False, errors=preflight_errors, manifest_path=manifest_file, cancelled=self._cancel_requested(cancellation_event))
 
         prior, manifest_error = self._prior_manifest(manifest_file, root)
         if manifest_error is not None and "belongs to another destination" in manifest_error and not opts.managed_sync:
@@ -2557,15 +2897,41 @@ class ExportService:
 
         eligible = preflight.eligible_items
         total = len(eligible)
-        artifacts, errors = self._materialize_all(eligible, results, opts, progress)
-        if errors and not opts.continue_on_error:
+        if preflight_errors and not opts.continue_on_error:
+            return self._result("folder", root, preflight, results, success=False, errors=preflight_errors, manifest_path=manifest_file)
+        artifacts, errors = self._materialize_all(
+            eligible,
+            results,
+            opts,
+            progress,
+            cancellation_event=cancellation_event,
+            item_progress=item_progress,
+        )
+        cancelled = self._cancel_requested(cancellation_event) or any(
+            item.status == "cancelled" for item in results
+        )
+        if errors and not opts.continue_on_error and not cancelled:
             for item in preflight.eligible_items:
                 item_result = self._result_for(results, item.index)
                 if item_result.status == "pending":
                     item_result.status = "failed"
                     item_result.result = "export_aborted"
                     item_result.failure = "export aborted because another artifact failed"
-            return self._result("folder", root, preflight, results, success=False, errors=errors, manifest_path=manifest_file)
+            _emit_item_progress(results, item_progress)
+            return self._result("folder", root, preflight, results, success=False, errors=preflight_errors + errors, manifest_path=manifest_file, cancelled=cancelled)
+
+        if not artifacts:
+            _emit_item_progress(results, item_progress)
+            return self._result(
+                "folder",
+                root,
+                preflight,
+                results,
+                success=False,
+                errors=preflight_errors + errors or ["no validated charts are available to publish"],
+                manifest_path=manifest_file,
+                cancelled=cancelled,
+            )
 
         # A provider may reveal a duplicate only after actual bytes are
         # available.  Collapse it before any destination file is touched.
@@ -2581,6 +2947,8 @@ class ExportService:
                 duplicate_result.sha256 = artifact.sha256
                 duplicate_result.source_hash = artifact.source_hash
                 duplicate_result.source_hash_algorithm = artifact.source_hash_algorithm
+                duplicate_result.playable_note_count = artifact.playable_note_count
+                _emit_item_progress([duplicate_result], item_progress)
                 del artifacts[index]
             else:
                 by_hash[artifact.sha256] = index
@@ -2599,29 +2967,48 @@ class ExportService:
                 result="publication_failed",
                 failure=publish_errors[0] if publish_errors else "folder publication failed",
             )
-            return self._result("folder", root, preflight, results, success=False, errors=publish_errors, manifest_path=manifest_file)
+            _emit_item_progress(results, item_progress)
+            return self._result("folder", root, preflight, results, success=False, errors=preflight_errors + errors + publish_errors, manifest_path=manifest_file, cancelled=cancelled)
 
         manifest = self._make_manifest(results, root=root, kind="folder")
+        if (preflight_errors or errors or publish_errors) and prior is not None:
+            current_targets = {
+                _path_key(item.target_relpath)
+                for item in preflight.items
+                if item.target_relpath
+            }
+            existing_paths = {_path_key(record.target_relpath) for record in manifest.records}
+            manifest.records.extend(
+                record
+                for record in prior.records
+                if _path_key(record.target_relpath) in current_targets
+                and _path_key(record.target_relpath) not in existing_paths
+            )
         try:
             write_manifest(manifest, manifest_file)
         except Exception as exc:
-            return self._result("folder", root, preflight, results, success=False, errors=[str(exc)], manifest_path=manifest_file)
+            _emit_item_progress(results, item_progress)
+            return self._result("folder", root, preflight, results, success=False, errors=[str(exc)], manifest_path=manifest_file, cancelled=cancelled)
 
         sync = None
-        if opts.managed_sync:
+        all_errors = preflight_errors + errors + publish_errors
+        if opts.managed_sync and not all_errors and not cancelled:
             sync = self._remove_stale(root, prior, (record.target_relpath for record in manifest.records))
             if sync.errors:
-                return self._result("folder", root, preflight, results, success=False, errors=list(sync.errors), manifest=manifest, manifest_path=manifest_file, sync=sync)
+                _emit_item_progress(results, item_progress)
+                return self._result("folder", root, preflight, results, success=False, errors=list(sync.errors), manifest=manifest, manifest_path=manifest_file, sync=sync, cancelled=cancelled)
+        _emit_item_progress(results, item_progress)
         return self._result(
             "folder",
             root,
             preflight,
             results,
             success=True,
-            errors=errors if opts.continue_on_error else None,
+            errors=all_errors if opts.continue_on_error else None,
             manifest=manifest,
             manifest_path=manifest_file,
             sync=sync,
+            cancelled=cancelled,
         )
 
     export_to_folder = export_folder
@@ -2638,6 +3025,10 @@ class ExportService:
         archive_root: Path | str | None = None,
         eligibility_checker: Callable[..., Any] | None = None,
         progress: Callable[[int, int, str], None] | None = None,
+        cancellation_event: threading.Event | None = None,
+        cancel_event: threading.Event | None = None,
+        item_progress: Callable[[ExportItemResult], None] | None = None,
+        on_item: Callable[[ExportItemResult], None] | None = None,
     ) -> ExportResult:
         """Export selected charts and the manifest into one atomic ZIP."""
         opts = options or ExportOptions()
@@ -2645,6 +3036,8 @@ class ExportService:
             managed = managed_sync
         if managed is not None:
             opts.managed_sync = managed
+        cancellation_event = cancellation_event or cancel_event or opts.cancellation_event
+        item_progress = item_progress or on_item
         values = _consume_selections(selections)
         archive = Path(archive_path).expanduser().resolve()
         root = Path(archive_root).expanduser().resolve() if archive_root is not None else archive.parent
@@ -2652,23 +3045,51 @@ class ExportService:
         external_manifest = Path(external_spec).expanduser() if external_spec is not None else None
         preflight = self._prepare(values, root, mode="zip", options=opts, eligibility_checker=eligibility_checker, progress=progress)
         results = self._initial_results(preflight)
-        if not preflight.ok:
-            return self._result("zip", archive, preflight, results, success=False, errors=[issue.message for issue in preflight.errors], manifest_path=external_manifest)
+        _emit_item_progress(results, item_progress)
+        preflight_errors = [issue.message for issue in preflight.errors]
+        global_errors = [issue for issue in preflight.errors if issue.selection_index is None]
+        if global_errors:
+            return self._result("zip", archive, preflight, results, success=False, errors=preflight_errors, manifest_path=external_manifest, cancelled=self._cancel_requested(cancellation_event))
 
         if external_manifest is not None and external_manifest.exists() and load_manifest(external_manifest) is None:
             return self._result("zip", archive, preflight, results, success=False, errors=[f"manifest exists but is not a trusted app-owned manifest: {external_manifest}"], manifest_path=external_manifest)
 
         eligible = preflight.eligible_items
         total = len(eligible)
-        artifacts, errors = self._materialize_all(eligible, results, opts, progress)
-        if errors and not opts.continue_on_error:
+        if preflight_errors and not opts.continue_on_error:
+            return self._result("zip", archive, preflight, results, success=False, errors=preflight_errors, manifest_path=external_manifest)
+        artifacts, errors = self._materialize_all(
+            eligible,
+            results,
+            opts,
+            progress,
+            cancellation_event=cancellation_event,
+            item_progress=item_progress,
+        )
+        cancelled = self._cancel_requested(cancellation_event) or any(
+            item.status == "cancelled" for item in results
+        )
+        if errors and not opts.continue_on_error and not cancelled:
             for item in preflight.eligible_items:
                 item_result = self._result_for(results, item.index)
                 if item_result.status == "pending":
                     item_result.status = "failed"
                     item_result.result = "export_aborted"
                     item_result.failure = "export aborted because another artifact failed"
-            return self._result("zip", archive, preflight, results, success=False, errors=errors, manifest_path=external_manifest)
+            _emit_item_progress(results, item_progress)
+            return self._result("zip", archive, preflight, results, success=False, errors=preflight_errors + errors, manifest_path=external_manifest, cancelled=cancelled)
+        if not artifacts:
+            _emit_item_progress(results, item_progress)
+            return self._result(
+                "zip",
+                archive,
+                preflight,
+                results,
+                success=False,
+                errors=preflight_errors + errors or ["no validated charts are available to archive"],
+                manifest_path=external_manifest,
+                cancelled=cancelled,
+            )
 
         by_hash: dict[str, int] = {}
         for index in list(artifacts):
@@ -2681,6 +3102,8 @@ class ExportService:
                 duplicate_result.sha256 = artifact.sha256
                 duplicate_result.source_hash = artifact.source_hash
                 duplicate_result.source_hash_algorithm = artifact.source_hash_algorithm
+                duplicate_result.playable_note_count = artifact.playable_note_count
+                _emit_item_progress([duplicate_result], item_progress)
                 del artifacts[index]
             else:
                 by_hash[artifact.sha256] = index
@@ -2700,13 +3123,16 @@ class ExportService:
                 result="publication_failed",
                 failure=publish_errors[0] if publish_errors else "ZIP publication failed",
             )
-            return self._result("zip", archive, preflight, results, success=False, errors=publish_errors, manifest=manifest, manifest_path=external_manifest, output_bytes=output_bytes)
+            _emit_item_progress(results, item_progress)
+            return self._result("zip", archive, preflight, results, success=False, errors=preflight_errors + errors + publish_errors, manifest=manifest, manifest_path=external_manifest, output_bytes=output_bytes, cancelled=cancelled)
         if external_manifest is not None:
             try:
                 write_manifest(manifest, external_manifest)
             except Exception as exc:
-                return self._result("zip", archive, preflight, results, success=False, errors=[str(exc)], manifest=manifest, manifest_path=external_manifest, output_bytes=output_bytes)
-        return self._result("zip", archive, preflight, results, success=True, errors=errors if opts.continue_on_error else None, manifest=manifest, manifest_path=external_manifest, output_bytes=output_bytes)
+                _emit_item_progress(results, item_progress)
+                return self._result("zip", archive, preflight, results, success=False, errors=[str(exc)], manifest=manifest, manifest_path=external_manifest, output_bytes=output_bytes, cancelled=cancelled)
+        _emit_item_progress(results, item_progress)
+        return self._result("zip", archive, preflight, results, success=True, errors=(preflight_errors + errors) if opts.continue_on_error else None, manifest=manifest, manifest_path=external_manifest, output_bytes=output_bytes, cancelled=cancelled)
 
     export_to_zip = export_zip
 
@@ -2780,6 +3206,27 @@ def _report_progress(progress: Callable[..., Any] | None, done: int, total: int,
         pass
 
 
+def _report_item_progress(
+    callback: Callable[[ExportItemResult], None] | None,
+    item: ExportItemResult,
+) -> None:
+    """Best-effort durable checkpoint hook; observers cannot break an export."""
+    if callback is None:
+        return
+    try:
+        callback(item)
+    except Exception:
+        log.debug("item progress observer failed", exc_info=True)
+
+
+def _emit_item_progress(
+    items: Iterable[ExportItemResult],
+    callback: Callable[[ExportItemResult], None] | None,
+) -> None:
+    for item in items:
+        _report_item_progress(callback, item)
+
+
 def _consume_selections(selections: Iterable[Any] | Callable[[], Iterable[Any]]) -> list[Any]:
     values = selections() if callable(selections) else selections
     if values is None:
@@ -2828,7 +3275,12 @@ def _invoke_checker(checker: Callable[..., Any], selection: Any, candidate: Char
     return checker(candidate)
 
 
-def _invoke_validator(validator: Callable[..., SngValidation], path: Path, options: ExportOptions) -> SngValidation:
+def _invoke_validator(
+    validator: Callable[..., SngValidation],
+    path: Path,
+    options: ExportOptions,
+    config: AppConfig | None = None,
+) -> SngValidation:
     """Allow compact injected validators as well as the full validator API."""
     kwargs = {
         "max_members": options.max_archive_members,
@@ -2836,6 +3288,13 @@ def _invoke_validator(validator: Callable[..., SngValidation], path: Path, optio
         "max_archive_bytes": options.max_archive_bytes,
         "max_compression_ratio": options.max_compression_ratio,
     }
+    require_guitar = options.require_five_fret_guitar
+    if require_guitar is None and config is not None:
+        require_guitar = bool(
+            getattr(getattr(config, "instruments", None), "require_five_fret_guitar", False)
+        )
+    if require_guitar is not None:
+        kwargs["require_five_fret_guitar"] = bool(require_guitar)
     try:
         signature = inspect.signature(validator)
     except (TypeError, ValueError):
@@ -2919,6 +3378,7 @@ def _write_payload(payload: Any, destination: Path) -> int:
 
 __all__ = [
     "APP_ID",
+    "MAX_EXPORT_WORKERS",
     "MANIFEST_FILENAME",
     "ArtifactCache",
     "Artifact",
@@ -2927,6 +3387,8 @@ __all__ = [
     "ArtifactProvider",
     "ArtifactStore",
     "ExportError",
+    "ExportCancelled",
+    "ArtifactInvalidError",
     "ExportConfig",
     "ExportItem",
     "ExportItemResult",

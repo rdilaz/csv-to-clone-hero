@@ -150,7 +150,8 @@
         <span id="minimumScoreHelp" class="muted">Charts below this cutoff stay unavailable to select.</span>
         <div class="review-toolbar">
           <button class="btn ghost" onclick="saveMinimumScore()">Apply cutoff</button>
-          <button class="btn ghost" onclick="bulkSelect('select')">Select charts meeting cutoff</button>
+           <button class="btn ghost" onclick="bulkSelect('strong')">Select all Strong matches</button>
+           <button class="btn ghost" onclick="bulkSelect('eligible')">Select charts meeting cutoff</button>
           <button class="btn ghost" onclick="bulkSelect('clear')">Clear all choices</button>
         </div>
       </div>
@@ -473,12 +474,14 @@ async function saveMinimumScore() {
     await loadWorkspace();
   } catch (e) { setReviewFeedback(e.message || 'Could not save the selection cutoff.', true); }
 }
-async function bulkSelect(action) {
+async function bulkSelect(scope) {
   try {
-    const result = await api('/api/selection/bulk', {method:'POST', body:JSON.stringify({action})});
-    setReviewFeedback(action === 'select'
-      ? `Saved ${result.changed || 0} chart choices meeting the cutoff.`
-      : 'All chart choices cleared.');
+    const result = await api('/api/selection/bulk', {method:'POST', body:JSON.stringify({action:scope === 'clear' ? 'clear' : 'select', scope})});
+    setReviewFeedback(scope === 'clear'
+      ? 'All chart choices cleared.'
+      : scope === 'strong'
+      ? `Saved ${result.changed || 0} Strong chart choices.`
+      : `Saved ${result.changed || 0} chart choices meeting the cutoff.`);
     await loadWorkspace();
   } catch (e) { setReviewFeedback(e.message || 'Could not update chart choices.', true); }
 }

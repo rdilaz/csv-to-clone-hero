@@ -447,6 +447,9 @@ class ExportConfig(BaseModel):
     # Number of concurrent download workers; 1 is serial. Enchor's file CDN
     # tolerates a handful of parallel streams, which hides per-request latency.
     download_workers: int = 3
+    continue_on_error: bool = True
+    artifact_retries: int = 2
+    retry_backoff_seconds: float = 2.0
 
 
 class SongsFolderDetectionConfig(BaseModel):

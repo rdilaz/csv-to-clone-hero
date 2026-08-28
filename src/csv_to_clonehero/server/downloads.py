@@ -221,11 +221,12 @@ def build_archive(
     """
     selections = _validated_selections(db, workspace_id)
     source_map = {str(getattr(s, "name", "") or ""): s for s in (sources or ())}
+    owned_sources: list[ChartSource] = []
     if not source_map:
         from csv_to_clonehero.sources import build_sources
 
-        built = build_sources(config)
-        source_map = {str(getattr(s, "name", "") or ""): s for s in built}
+        owned_sources = build_sources(config)
+        source_map = {str(getattr(s, "name", "") or ""): s for s in owned_sources}
     tracks = db.get_spotify_tracks(True)
     track_map: dict[Any, ChartCandidate] = {}
     for track in tracks:
@@ -242,7 +243,14 @@ def build_archive(
         managed_sync=False,
         continue_on_error=True,
         include_manifest_in_zip=True,
-        download_workers=config.export.download_workers if hasattr(config.export, "download_workers") else 3,
+        download_workers=min(
+            16,
+            max(1, int(getattr(config.export, "download_workers", 3) or 3)),
+        ),
+        artifact_retries=int(getattr(config.export, "artifact_retries", 2) or 0),
+        retry_backoff_seconds=float(
+            getattr(config.export, "retry_backoff_seconds", 2.0) or 0
+        ),
     )
 
     def checker(selection: Any, _candidate: ChartCandidate | None) -> bool:
@@ -255,6 +263,7 @@ def build_archive(
     service = ExportService(
         config,
         source_map,
+        artifact_cache_dir=getattr(config, "artifact_cache_path", None),
         track_resolver=track_map,
     )
     try:
@@ -269,6 +278,15 @@ def build_archive(
             "success": bool(result.success),
             "published": result.published_count,
             "failed": result.failed_count,
+            "invalid": result.invalid_count,
+            "download_failures": result.download_failure_count,
+            "already_present": sum(
+                item.result == "already_present" for item in result.items
+            ),
+            "ready": result.ready_count,
+            "selected": len(result.items),
+            "remaining": result.remaining_count,
+            "status": "cancelled" if result.cancelled else "success" if result.success else "failed",
             "bytes": result.output_bytes,
             "errors": [str(e) for e in result.errors or ()],
         }
@@ -280,6 +298,11 @@ def build_archive(
         return archive, summary
     finally:
         service.close()
+        for source in owned_sources:
+            try:
+                source.close()
+            except Exception:
+                pass
 
 
 def _validated_selections(db: Database, workspace_id: int) -> list[dict[str, Any]]:

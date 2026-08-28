@@ -342,6 +342,58 @@ def test_score_threshold_controls_selection_but_never_overrides_hard_gate(client
     assert "hard compatibility gate" in gated.get_json()["error"]
 
 
+def test_bulk_selection_defaults_to_strong_and_can_explicitly_include_review(client, config):
+    from csv_to_clonehero.database import Database
+    from tests.conftest import make_chart, make_track
+
+    _sign_in(client)
+    assert client.post("/api/spotify/scope", json={"include_liked": True}).status_code == 200
+    db = Database(config.database_path)
+    try:
+        workspace = db.get_workspace(Database.workspace_key_for_user("user-1"))
+        track = db.upsert_spotify_tracks([make_track("Song", "Artist", "bulk-track")])[0]
+        db.replace_workspace_library_tracks(workspace["id"], [track])
+        strong = make_chart("Song", "Artist", chart_id=811)
+        review = make_chart("Song (Live)", "Artist", chart_id=812)
+        db.upsert_workspace_candidate(
+            workspace["id"], track.track_key, strong, score=95,
+            eligibility="RECOMMENDED", decision="AUTO_ACCEPT", kind="exact",
+        )
+        db.upsert_workspace_candidate(
+            workspace["id"], track.track_key, review, score=82,
+            eligibility="ELIGIBLE_REVIEW", decision="REVIEW", kind="exact",
+        )
+        strong_id, review_id = strong.db_id, review.db_id
+    finally:
+        db.close()
+
+    default = client.post("/api/selection/bulk", json={})
+    assert default.status_code == 200
+    assert default.get_json()["scope"] == "strong"
+    db = Database(config.database_path)
+    try:
+        selected = db.list_workspace_selections(workspace["id"])
+        assert len(selected) == 1
+        assert selected[0]["candidate_id"] == strong_id
+    finally:
+        db.close()
+
+    explicit = client.post(
+        "/api/selection/bulk",
+        json={"scope": "eligible", "track_ids": [track.track_key]},
+    )
+    assert explicit.status_code == 200
+    assert explicit.get_json()["scope"] == "eligible"
+    db = Database(config.database_path)
+    try:
+        selected = db.list_workspace_selections(workspace["id"])
+        assert len(selected) == 1
+        assert selected[0]["candidate_id"] == strong_id
+        assert selected[0]["candidate_id"] != review_id
+    finally:
+        db.close()
+
+
 def test_duplicate_start_returns_existing_job(client, app, config):
     _sign_in(client)
     _prepare_discovery(client, config)

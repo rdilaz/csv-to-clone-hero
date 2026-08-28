@@ -792,9 +792,11 @@ class _ExportJobState:
             self.error = ""
             self.browser_download = False
             self.destination = ""
+            self.workspace_id: int | str | None = None
             self.started_at: float | None = None
             self.result: dict[str, Any] | None = None
             self.events: deque = deque(maxlen=200)
+            self.item_states: dict[int, dict[str, Any]] = {}
             self._last_logged = 0
             self._last_label = ""
 
@@ -817,6 +819,39 @@ class _ExportJobState:
                 message = f"{done}/{total} · {self.current}" if total else self.current
                 self.events.append({"ts": time.time(), "message": message})
             self._last_label = self.current
+
+    def update_item(self, item: Any) -> None:
+        """Persist an item-level view for live recovery/progress displays."""
+        with self.lock:
+            index = int(getattr(item, "selection_index", 0) or 0)
+            self.item_states[index] = {
+                "selection_index": index,
+                "selection_id": getattr(item, "selection_id", None),
+                "source": str(getattr(item, "source", "") or ""),
+                "chart_id": getattr(item, "chart_id", None),
+                "target_relpath": str(getattr(item, "target_relpath", "") or ""),
+                "status": str(getattr(item, "status", "") or ""),
+                "result": str(getattr(item, "result", "") or ""),
+                "error": _safe_message(getattr(item, "failure", "") or ""),
+                "bytes": int(getattr(item, "bytes_count", 0) or 0),
+                "playable_note_count": int(getattr(item, "playable_note_count", 0) or 0),
+            }
+
+    def item_snapshot(self) -> dict[str, Any]:
+        with self.lock:
+            states = list(self.item_states.values())
+            terminal = {"published", "duplicate", "failed", "invalid", "preflight_failed"}
+            return {
+                "selected": len(states),
+                "completed": sum(item["status"] in {"published", "duplicate"} for item in states),
+                "downloading": sum(item["status"] == "downloading" for item in states),
+                "retrying": sum(item["status"] == "retrying" for item in states),
+                "failed": sum(item["status"] in {"failed", "preflight_failed"} for item in states),
+                "invalid": sum(item["status"] == "invalid" for item in states),
+                "cancelled": sum(item["status"] == "cancelled" for item in states),
+                "remaining": sum(item["status"] not in terminal for item in states),
+                "items": states,
+            }
 
 
 _SECRET_QUERY_RE = re.compile(
@@ -1865,6 +1900,7 @@ def create_app(
     try:
         recovery_db.recover_interrupted_discovery()
         recovery_db.mark_active_expansion_batches_interrupted()
+        recovery_db.recover_running_exports()
         recovery_db.delete_workspace_by_key("spotify-demo")
     finally:
         recovery_db.close()
@@ -1880,6 +1916,7 @@ def create_app(
     soundcloud_oauth: Any = None
     auth_authenticated = False
     spotify_cancel_event: threading.Event | None = None
+    export_cancel_event = threading.Event()
     secure_store = keyring if keyring is not None else _default_keyring()
     browser_exports: dict[int, Path] = {}
 
@@ -1887,6 +1924,8 @@ def create_app(
     # integration tests.  Tokens are deliberately absent from this mapping.
     app.extensions["spotify_job"] = spotify_job
     app.extensions["soundcloud_import_job"] = soundcloud_import_job
+    app.extensions["export_job"] = export_job
+    app.extensions["export_cancel_event"] = export_cancel_event
     app.extensions["spotify_oauth_factory"] = oauth_factory
     app.extensions["spotify_client_factory"] = spotify_factory
 
@@ -2947,12 +2986,14 @@ def create_app(
         row: Any,
         kind: str,
         force: bool = False,
+        catalog_sources: list[ChartSource] | None = None,
     ) -> tuple[bool, str]:
         data = _row_dict(row)
         if kind == "exact":
-            catalog_sources: list[ChartSource] = []
-            try:
+            owns_catalog_sources = catalog_sources is None
+            if owns_catalog_sources:
                 catalog_sources = list(source_factory(config))
+            try:
                 relevant = [
                     source
                     for source in catalog_sources
@@ -2983,11 +3024,12 @@ def create_app(
                     if memberships and all(value is False for value in memberships):
                         return False, "song is unavailable in the local chart catalog"
             finally:
-                for source in catalog_sources:
-                    try:
-                        source.close()
-                    except Exception:
-                        pass
+                if owns_catalog_sources:
+                    for source in catalog_sources or ():
+                        try:
+                            source.close()
+                        except Exception:
+                            pass
         persisted = str(data.get("eligibility") or "").upper()
         breakdown = _json_object(data.get("breakdown_json"), {})
         if not isinstance(breakdown, Mapping):
@@ -5374,11 +5416,29 @@ def create_app(
         kind: str = "exact",
         track_ids: Iterable[Any] | None = None,
         minimum_score: float | None = None,
+        scope: str = "strong",
+        search_text: str = "",
     ) -> list[int]:
-        """Select only rows that pass the same eligibility boundary as export."""
+        """Select one safe chart per song for an explicit bulk action.
+
+        Strong recommendations are the default. Review-tier rows are included
+        only when the caller explicitly asks for the eligible/current result
+        scope; merely being eligible never opts a review chart into a build.
+        """
+        scope = str(scope or "strong").casefold()
+        if scope in {"recommended", "auto", "auto_accept", "strong"}:
+            allowed_states = {"strong"}
+            scope = "strong"
+        elif scope in {"eligible", "current", "filter", "all_eligible"}:
+            allowed_states = {"strong", "needs_review"}
+            scope = "eligible"
+        else:
+            raise ValueError("bulk selection scope must be strong or eligible")
         requested = None
         if track_ids is not None:
             requested = {str(value) for value in track_ids}
+        needle = str(search_text or "").strip().casefold()
+        catalog_sources = list(source_factory(config)) if kind == "exact" else None
         rows = db.get_workspace_candidates(workspace, kind=kind, include_rejected=True)
         grouped: dict[Any, Any] = {}
         blocked = {EXCLUDED, INCOMPATIBLE, "REJECT", "REJECTED", "NOT_EXPORTABLE"}
@@ -5398,7 +5458,26 @@ def create_app(
                 continue
             if str(data.get("eligibility") or "").upper() in blocked:
                 continue
-            valid, _error = _validate_candidate_eligibility(db, workspace, row, kind)
+            if _review_row_state(row) not in allowed_states:
+                continue
+            if needle and needle not in " ".join(
+                str(data.get(key) or "")
+                for key in ("track_artist", "track_title", "source", "chart_id")
+            ).casefold():
+                candidate_text = _json_object(data.get("candidate_json"), {})
+                candidate_text = candidate_text if isinstance(candidate_text, Mapping) else {}
+                if needle not in " ".join(
+                    str(candidate_text.get(key) or "")
+                    for key in ("artist", "name", "charter", "url")
+                ).casefold():
+                    continue
+            valid, _error = _validate_candidate_eligibility(
+                db,
+                workspace,
+                row,
+                kind,
+                catalog_sources=catalog_sources,
+            )
             if not valid:
                 continue
             key = (
@@ -5432,6 +5511,11 @@ def create_app(
                     eligibility=data.get("eligibility") or "",
                 )
             )
+        for source in catalog_sources or ():
+            try:
+                source.close()
+            except Exception:
+                pass
         return selected
 
     @app.get("/api/spotify/selections")
@@ -5560,6 +5644,8 @@ def create_app(
         try:
             workspace = _workspace_id(payload.get("workspace_id"))
             kind = str(payload.get("kind") or "exact").casefold()
+            if kind != "exact":
+                return {"error": "bulk selection currently supports exact songs only"}, 400
             clear = bool(payload.get("clear")) or str(payload.get("action", "")).casefold() in {
                 "clear", "deselect", "remove"
             }
@@ -5579,28 +5665,59 @@ def create_app(
                     return jsonify({"ok": True, "cleared": cleared, **_tray_payload(db, workspace)})
                 minimum = payload.get("minimum_score")
                 minimum_score = float(minimum) if minimum not in (None, "") else None
-                if kind == "exact" and (folder_id is not None or liked):
+                scope = str(
+                    payload.get("scope")
+                    or payload.get("selection_scope")
+                    or payload.get("filter")
+                    or "strong"
+                ).casefold()
+                if scope in {"current", "filter"}:
+                    scope = "eligible"
+                track_ids = payload.get("track_ids")
+                if isinstance(track_ids, (str, bytes)):
+                    track_ids = [track_ids]
+                if folder_id is not None or liked:
                     track_rows = db.get_library_track_rows(
                         folder_id,
                         liked=liked,
                         workspace_id=workspace,
                     )
+                    folder_track_ids = [row["id"] for row in track_rows]
+                    if track_ids is None:
+                        track_ids = folder_track_ids
+                    else:
+                        requested = {str(value) for value in track_ids}
+                        track_ids = [
+                            track_id
+                            for track_id in folder_track_ids
+                            if str(track_id) in requested
+                        ]
                     selected = _select_recommended_safe(
                         db,
                         workspace,
                         kind=kind,
-                        track_ids=[row["id"] for row in track_rows],
+                        track_ids=track_ids,
                         minimum_score=minimum_score,
+                        scope=scope,
                     )
                 else:
                     selected = _select_recommended_safe(
                         db,
                         workspace,
                         kind=kind,
+                        track_ids=track_ids,
                         minimum_score=minimum_score,
+                        scope=scope,
+                        search_text=str(payload.get("search") or payload.get("query") or ""),
                     )
                 return jsonify(
-                    {"ok": True, "selected": len(selected), "selection_ids": selected, **_tray_payload(db, workspace)}
+                    {
+                        "ok": True,
+                        "selected": len(selected),
+                        "selection_ids": selected,
+                        "scope": scope,
+                        **_tray_payload(db, workspace),
+                    }
                 )
             finally:
                 db.close()
@@ -5679,7 +5796,13 @@ def create_app(
         return jsonify({"selected": True, "path": resolved, "resolved": resolved})
 
     # --------------------------------------------------------------- exporting
-    def _validated_export_selections(db: Database, workspace: int | str) -> list[dict[str, Any]]:
+    def _validated_export_selections(
+        db: Database,
+        workspace: int | str,
+        *,
+        strict: bool = True,
+        catalog_sources: list[ChartSource] | None = None,
+    ) -> list[dict[str, Any]]:
         rows = db.list_workspace_selections(workspace)
         if not rows:
             raise ValueError("select at least one eligible chart before exporting")
@@ -5708,10 +5831,42 @@ def create_app(
                 None,
             )
             if matching_row is None:
-                raise ValueError("a persisted selection is no longer part of this discovery workspace")
-            valid, error = _validate_candidate_eligibility(db, workspace, matching_row, kind)
+                message = "a persisted selection is no longer part of this discovery workspace"
+                if strict:
+                    raise ValueError(message)
+                selection = dict(data)
+                selection["status"] = "selected"
+                selection["eligible"] = False
+                selection["eligibility"] = "NOT_EXPORTABLE"
+                selection["selection_error"] = message
+                selections.append(selection)
+                continue
+            valid, error = _validate_candidate_eligibility(
+                db,
+                workspace,
+                matching_row,
+                kind,
+                catalog_sources=catalog_sources,
+            )
             if not valid:
-                raise ValueError(error)
+                if strict:
+                    raise ValueError(error)
+                selection = dict(data)
+                selection["status"] = "selected"
+                selection["eligible"] = False
+                selection["eligibility"] = "NOT_EXPORTABLE"
+                selection["selection_error"] = error
+                candidate = _candidate_from_payload(_json_object(data.get("candidate_json"), {}))
+                if candidate is None:
+                    candidate = db.get_candidate(int(data.get("candidate_id") or 0))
+                if candidate is not None:
+                    selection["candidate_json"] = json.dumps(
+                        {item.name: getattr(candidate, item.name) for item in fields(candidate)},
+                        ensure_ascii=True,
+                        default=str,
+                    )
+                selections.append(selection)
+                continue
             candidate = _candidate_from_payload(_json_object(data.get("candidate_json"), {}))
             if candidate is None:
                 candidate = db.get_candidate(int(data.get("candidate_id") or 0))
@@ -5747,6 +5902,13 @@ def create_app(
                 "source_hash_algorithm": str(getattr(item, "source_hash_algorithm", "") or ""),
                 "artifact_key": str(getattr(item, "artifact_key", "") or ""),
                 "error": _safe_message(getattr(item, "failure", "") or ""),
+                "playable_note_count": int(getattr(item, "playable_note_count", 0) or 0),
+                "metadata": {
+                    "result": str(getattr(item, "result", "") or ""),
+                    "playable_note_count": int(
+                        getattr(item, "playable_note_count", 0) or 0
+                    ),
+                },
             }
 
         preflight = getattr(result, "preflight", None)
@@ -5756,9 +5918,30 @@ def create_app(
             "kind": str(getattr(result, "kind", "") or ""),
             "destination": str(getattr(result, "destination", "") or ""),
             "success": bool(getattr(result, "success", False)),
-            "status": "success" if bool(getattr(result, "success", False)) else "failed",
+            "status": (
+                "cancelled"
+                if bool(getattr(result, "cancelled", False))
+                else "success" if bool(getattr(result, "success", False)) else "failed"
+            ),
             "published": int(getattr(result, "published_count", 0) or 0),
             "failed": int(getattr(result, "failed_count", 0) or 0),
+            "added": sum(
+                1
+                for item in getattr(result, "items", ())
+                if getattr(item, "status", "") == "published"
+                and getattr(item, "result", "") != "already_present"
+            ),
+            "already_present": sum(
+                1
+                for item in getattr(result, "items", ())
+                if getattr(item, "result", "") == "already_present"
+            ),
+            "invalid": int(getattr(result, "invalid_count", 0) or 0),
+            "download_failures": int(getattr(result, "download_failure_count", 0) or 0),
+            "cancelled_items": len(getattr(result, "cancelled_items", ()) or ()),
+            "ready": int(getattr(result, "ready_count", 0) or 0),
+            "selected": len(getattr(result, "items", ()) or ()),
+            "remaining": int(getattr(result, "remaining_count", 0) or 0),
             "bytes": int(
                 getattr(result, "output_bytes", 0)
                 or getattr(result, "bytes_count", 0)
@@ -5767,10 +5950,16 @@ def create_app(
             "errors": [_safe_message(error) for error in getattr(result, "errors", ())],
             "items": [item_payload(item) for item in getattr(result, "items", ())],
         }
+        if payload["status"] == "success" and (
+            payload["failed"] or payload["invalid"] or payload["cancelled_items"]
+        ):
+            payload["status"] = "partial"
         if preflight is not None:
             payload["preflight"] = {
                 "ok": bool(getattr(preflight, "ok", False)),
                 "estimated_bytes": int(getattr(preflight, "estimated_bytes", 0) or 0),
+                "reusable_count": int(getattr(preflight, "reusable_count", 0) or 0),
+                "already_present_count": int(getattr(preflight, "already_present_count", 0) or 0),
                 "available_bytes": getattr(preflight, "available_bytes", None),
                 "errors": [
                     _safe_message(getattr(issue, "message", issue))
@@ -5814,6 +6003,7 @@ def create_app(
                 payload.get("path")
                 or payload.get("destination")
                 or payload.get("output_dir")
+                or _linked_library_root()
                 or config.library_root
             )
             ok, error, destination = _validate_spotify_folder(raw_destination)
@@ -5853,6 +6043,7 @@ def create_app(
         destination: str,
         *,
         progress: Callable[[int, int, str], None] | None = None,
+        cancellation_event: threading.Event | None = None,
     ) -> tuple[dict[str, Any], int]:
 
         db = Database(config.database_path)
@@ -5861,8 +6052,13 @@ def create_app(
         export_id: int | None = None
         export_key = f"web-{secrets.token_hex(12)}"
         try:
-            selections = _validated_export_selections(db, workspace)
             sources = list(source_factory(config))
+            selections = _validated_export_selections(
+                db,
+                workspace,
+                strict=False,
+                catalog_sources=sources,
+            )
             source_map = {
                 str(getattr(source, "name", "") or ""): source for source in sources
             }
@@ -5915,6 +6111,14 @@ def create_app(
                     )
                     or 1
                 ),
+                retry_backoff_seconds=float(
+                    payload.get(
+                        "retry_backoff_seconds",
+                        getattr(getattr(config, "export", None), "retry_backoff_seconds", 2.0),
+                    )
+                    or 0
+                ),
+                cancellation_event=cancellation_event,
             )
             provider = app.config.get("SPOTIFY_ARTIFACT_PROVIDER")
             service = ExportService(
@@ -5934,6 +6138,82 @@ def create_app(
                 metadata={"workflow": "spotify_workspace"},
             )
 
+            checkpoint_lock = threading.Lock()
+
+            def checkpoint(item: Any) -> None:
+                """Write item progress through a short-lived DB connection.
+
+                Materialization may run in several worker threads, while the
+                owning export connection belongs to the web worker thread.
+                Separate connections keep every checkpoint durable and SQLite
+                thread-safe without allowing a failed checkpoint to interrupt
+                the build.
+                """
+                item_data = {
+                    "selection_id": getattr(item, "selection_id", None),
+                    "source": str(getattr(item, "source", "") or ""),
+                    "chart_id": getattr(item, "chart_id", None),
+                    "target_relpath": str(getattr(item, "target_relpath", "") or ""),
+                    "path": str(getattr(item, "target_path", "") or "")
+                    if getattr(item, "target_path", None) is not None
+                    else "",
+                    "status": str(getattr(item, "status", "") or "pending"),
+                    "result": str(getattr(item, "result", "") or ""),
+                    "bytes": int(getattr(item, "bytes_count", 0) or 0),
+                    "sha256": str(getattr(item, "sha256", "") or ""),
+                    "source_hash": str(getattr(item, "source_hash", "") or ""),
+                    "source_hash_algorithm": str(getattr(item, "source_hash_algorithm", "") or ""),
+                    "artifact_key": str(getattr(item, "artifact_key", "") or ""),
+                    "error": _safe_message(getattr(item, "failure", "") or ""),
+                    "metadata": {
+                        "result": str(getattr(item, "result", "") or ""),
+                        "playable_note_count": int(
+                            getattr(item, "playable_note_count", 0) or 0
+                        )
+                    },
+                }
+                with checkpoint_lock:
+                    try:
+                        checkpoint_db = Database(config.database_path)
+                        try:
+                            checkpoint_db.record_export_item(export_id, item_data)
+                            item_rows = checkpoint_db.get_export_items(export_id)
+                            progress_data = {
+                                "selected": len(item_rows),
+                                "completed": sum(
+                                    row["status"] in {"published", "duplicate"}
+                                    for row in item_rows
+                                ),
+                                "downloading": sum(row["status"] == "downloading" for row in item_rows),
+                                "retrying": sum(row["status"] == "retrying" for row in item_rows),
+                                "invalid": sum(row["status"] == "invalid" for row in item_rows),
+                                "failed": sum(row["status"] in {"failed", "preflight_failed"} for row in item_rows),
+                                "cancelled": sum(row["status"] == "cancelled" for row in item_rows),
+                                "remaining": sum(
+                                    row["status"] not in {
+                                        "published",
+                                        "duplicate",
+                                        "failed",
+                                        "preflight_failed",
+                                        "invalid",
+                                    }
+                                    for row in item_rows
+                                ),
+                            }
+                            checkpoint_db.update_export_record(
+                                export_id,
+                                status="running",
+                                metadata={
+                                    "workflow": "spotify_workspace",
+                                    "progress": progress_data,
+                                },
+                            )
+                        finally:
+                            checkpoint_db.close()
+                    except Exception:
+                        log.debug("Could not persist export item checkpoint", exc_info=True)
+                export_job.update_item(item)
+
             def eligibility_checker(selection: Any, _candidate: ChartCandidate) -> bool:
                 value = _row_dict(selection)
                 return str(value.get("eligibility") or "").upper() in {
@@ -5949,6 +6229,8 @@ def create_app(
                     options=options,
                     eligibility_checker=eligibility_checker,
                     progress=progress,
+                    cancellation_event=cancellation_event,
+                    item_progress=checkpoint,
                 )
             else:
                 result = service.export_zip(
@@ -5957,6 +6239,8 @@ def create_app(
                     options=options,
                     eligibility_checker=eligibility_checker,
                     progress=progress,
+                    cancellation_event=cancellation_event,
+                    item_progress=checkpoint,
                 )
             result_payload = _export_result_payload(result)
             result_payload["export_id"] = export_id
@@ -5971,7 +6255,7 @@ def create_app(
                 generate_spotify_reports(config, db, workspace)
             except Exception:
                 log.debug("Could not refresh Spotify export reports", exc_info=True)
-            return result_payload, 200 if result_payload["success"] else 400
+            return result_payload, 200 if result_payload["success"] or result_payload.get("status") == "cancelled" else 400
         except (OSError, ValueError, TypeError, SpotifyError) as exc:
             message = _safe_message(exc, _oauth_secret_values())
             if export_id is not None:
@@ -5989,6 +6273,123 @@ def create_app(
                 except Exception:
                     pass
             db.close()
+
+    def _preview_export(
+        kind: str,
+        payload: Mapping[str, Any],
+        workspace: int | str,
+        destination: str,
+    ) -> tuple[dict[str, Any], int]:
+        """Build a no-write preview from the persisted selection set."""
+        db = Database(config.database_path)
+        sources: list[ChartSource] = []
+        service: ExportService | None = None
+        try:
+            sources = list(source_factory(config))
+            selections = _validated_export_selections(
+                db,
+                workspace,
+                strict=False,
+                catalog_sources=sources,
+            )
+            if not selections:
+                raise ValueError("select at least one eligible chart before building the library")
+            source_map = {
+                str(getattr(source, "name", "") or ""): source for source in sources
+            }
+            track_map: dict[Any, Track] = {}
+            for track in db.get_spotify_tracks(True):
+                if track.db_id is not None:
+                    track_map[track.db_id] = track
+                if track.spotify_id:
+                    track_map[track.spotify_id] = track
+                if track.track_key:
+                    track_map[track.track_key] = track
+            options = ExportOptions(
+                managed_sync=bool(payload.get("managed_sync", False)),
+                overwrite_owned=bool(payload.get("overwrite_owned", True)),
+                include_manifest_in_zip=bool(payload.get("include_manifest", True)),
+                minimum_free_bytes=int(payload.get("minimum_free_bytes", 0) or 0),
+                continue_on_error=True,
+                artifact_retries=int(payload.get("artifact_retries", 2) or 0),
+                download_workers=int(payload.get("download_workers", 3) or 1),
+            )
+            service = ExportService(
+                config,
+                source_map,
+                artifact_cache_dir=getattr(config, "artifact_cache_path", None),
+                track_resolver=track_map,
+            )
+
+            def eligibility_checker(selection: Any, _candidate: ChartCandidate) -> bool:
+                value = _row_dict(selection)
+                return str(value.get("eligibility") or "").upper() in {
+                    RECOMMENDED,
+                    ELIGIBLE_REVIEW,
+                }
+
+            root = Path(destination).parent if kind == "zip" else Path(destination)
+            preflight = service.preflight(
+                selections,
+                root,
+                mode=kind,
+                options=options,
+                eligibility_checker=eligibility_checker,
+            )
+            items = []
+            for item in preflight.items:
+                issues = [issue.message for issue in item.issues if issue.fatal]
+                items.append({
+                    "selection_index": item.index,
+                    "source": item.source_name,
+                    "chart_id": item.chart_id,
+                    "target_relpath": item.target_relpath,
+                    "status": "invalid" if issues else "duplicate" if item.duplicate_of is not None else "ready",
+                    "error": "; ".join(issues),
+                })
+            return {
+                "ok": bool(preflight.eligible_items) and not any(
+                    issue.selection_index is None for issue in preflight.errors
+                ),
+                "kind": kind,
+                "destination": str(Path(destination).expanduser().resolve()),
+                "selected_chart_count": len(selections),
+                "selected": len(selections),
+                "eligible_chart_count": len(preflight.eligible_items),
+                "reusable_count": preflight.reusable_count,
+                "already_present_count": preflight.already_present_count,
+                "estimated_bytes": preflight.estimated_bytes,
+                "estimated_size_bytes": preflight.estimated_bytes,
+                "errors": [_safe_message(issue.message) for issue in preflight.errors],
+                "items": items,
+            }, 200
+        finally:
+            if service is not None:
+                service.close()
+            for source in sources:
+                try:
+                    source.close()
+                except Exception:
+                    pass
+            db.close()
+
+    @app.post("/api/spotify/export/preview")
+    @app.post("/api/export/preview")
+    def spotify_export_preview():
+        busy = _busy_response()
+        if busy is not None:
+            return busy
+        payload = request.get_json(silent=True) or {}
+        kind = str(payload.get("kind") or payload.get("mode") or "folder").casefold()
+        if kind not in {"folder", "zip"}:
+            return {"error": "kind must be folder or zip"}, 400
+        workspace, destination, error = _prepare_export(kind, payload)
+        if error is not None:
+            return error
+        try:
+            return jsonify(_preview_export(kind, payload, workspace, destination)[0])
+        except (OSError, ValueError, TypeError, SpotifyError) as exc:
+            return {"error": _safe_message(exc)}, 400
 
     @app.post("/api/spotify/export/folder")
     @app.post("/api/export/folder")
@@ -6029,11 +6430,13 @@ def create_app(
             if export_job.running:
                 return {"error": "an export is already running"}, 409
             export_job.reset()
+            export_cancel_event.clear()
             export_job.running = True
             export_job.status = "starting"
             export_job.kind = kind
             export_job.browser_download = browser_download
             export_job.destination = destination
+            export_job.workspace_id = workspace
             export_job.started_at = time.time()
         threading.Thread(
             target=_export_worker,
@@ -6047,7 +6450,12 @@ def create_app(
         export_job.log("Validating selections and preparing export...")
         try:
             result, status = _perform_export(
-                kind, payload, workspace, destination, progress=export_job.update
+                kind,
+                payload,
+                workspace,
+                destination,
+                progress=export_job.update,
+                cancellation_event=export_cancel_event,
             )
             with export_job.lock:
                 if status == 200:
@@ -6060,8 +6468,15 @@ def create_app(
                                 f"?access_token={app.config.get('LAN_ACCESS_TOKEN', '')}"
                             )
                     export_job.result = result
-                    export_job.status = "complete" if result.get("success") else "failed"
-                    if not result.get("success"):
+                    result_status = str(result.get("status") or "")
+                    export_job.status = (
+                        "partial"
+                        if result.get("success") and result_status == "partial"
+                        else "complete"
+                        if result.get("success")
+                        else result_status or "failed"
+                    )
+                    if not result.get("success") and result_status != "cancelled":
                         errors = result.get("errors") or []
                         export_job.error = result.get("error") or (errors[0] if errors else "export failed")
                 else:
@@ -6075,13 +6490,102 @@ def create_app(
         finally:
             with export_job.lock:
                 export_job.running = False
-                if export_job.status == "complete":
+                if export_job.status in {"complete", "success", "partial"}:
                     published = int((export_job.result or {}).get("published") or 0)
                     export_job.events.append({"ts": time.time(), "message": f"Export complete: {published} charts published"})
+                elif export_job.status == "cancelled":
+                    export_job.events.append({"ts": time.time(), "message": "Export cancelled; validated charts were kept and remaining items can be retried"})
                 else:
                     export_job.events.append({"ts": time.time(), "message": f"Export failed: {export_job.error}"})
 
+    def _latest_export_history() -> dict[str, Any] | None:
+        """Rehydrate the last durable export for a fresh web process."""
+        db = Database(config.database_path)
+        try:
+            workspace = export_job.workspace_id
+            records = db.list_export_records(workspace_id=workspace) if workspace is not None else db.list_export_records()
+            if not records:
+                return None
+            record = records[0]
+            rows = db.get_export_items(record["id"])
+            items: list[dict[str, Any]] = []
+            for index, row in enumerate(rows):
+                metadata = _json_object(row["metadata_json"], {})
+                if not isinstance(metadata, Mapping):
+                    metadata = {}
+                items.append({
+                    "selection_index": index,
+                    "selection_id": row["selection_id"],
+                    "source": row["source"],
+                    "chart_id": row["chart_id"],
+                    "target_relpath": row["target_relpath"],
+                    "path": row["path"],
+                    "status": row["status"],
+                    "result": metadata.get("result", ""),
+                    "error": _safe_message(row["error"] or ""),
+                    "bytes": int(row["bytes"] or 0),
+                    "playable_note_count": int(metadata.get("playable_note_count", 0) or 0),
+                })
+            terminal = {"published", "duplicate", "failed", "invalid", "preflight_failed"}
+            published = [item for item in items if item["status"] == "published"]
+            duplicates = [item for item in items if item["status"] == "duplicate"]
+            invalid = [item for item in items if item["status"] == "invalid"]
+            failed = [item for item in items if item["status"] in {"failed", "preflight_failed"}]
+            cancelled = [item for item in items if item["status"] == "cancelled"]
+            ready = len(published) + len(duplicates)
+            record_status = str(record["status"] or "interrupted")
+            result = {
+                "export_id": int(record["id"]),
+                "kind": record["kind"],
+                "destination": record["destination"],
+                "success": record_status in {"success", "complete", "completed", "partial"} and bool(ready),
+                "status": "cancelled" if record_status == "cancelled" else "partial" if record_status == "partial" else "success" if record_status in {"success", "complete", "completed"} else record_status,
+                "published": len(published),
+                "added": sum(
+                    item["status"] == "published" and item["result"] != "already_present"
+                    for item in items
+                ),
+                "already_present": sum(item["result"] == "already_present" for item in items),
+                "failed": len(failed) + len(invalid),
+                "invalid": len(invalid),
+                "download_failures": len(failed),
+                "cancelled_items": len(cancelled),
+                "ready": ready,
+                "selected": len(items),
+                "remaining": sum(item["status"] not in terminal for item in items),
+                "bytes": sum(item["bytes"] for item in published),
+                "errors": [item["error"] for item in items if item["error"]],
+                "items": items,
+            }
+            return {
+                "export_id": int(record["id"]),
+                "status": "complete" if result["success"] else record_status,
+                "kind": record["kind"],
+                "destination": record["destination"],
+                "items": {
+                    "selected": len(items),
+                    "completed": ready,
+                    "downloading": sum(item["status"] == "downloading" for item in items),
+                    "retrying": sum(item["status"] == "retrying" for item in items),
+                    "failed": len(failed),
+                    "invalid": len(invalid),
+                    "cancelled": len(cancelled),
+                    "remaining": result["remaining"],
+                    "items": items,
+                },
+                "result": result,
+                "resume_available": bool(
+                    result["remaining"]
+                    or result["failed"]
+                    or result["invalid"]
+                    or result["cancelled_items"]
+                ),
+            }
+        finally:
+            db.close()
+
     @app.get("/api/spotify/export/status")
+    @app.get("/api/export/status")
     def spotify_export_status():
         with export_job.lock:
             payload = {
@@ -6095,9 +6599,22 @@ def create_app(
                 "destination": export_job.destination,
                 "started_at": export_job.started_at,
                 "recent_events": list(export_job.events)[-8:],
+                "items": export_job.item_snapshot(),
             }
             if not export_job.running and export_job.result is not None:
                 payload["result"] = export_job.result
+            elif not export_job.running:
+                history = _latest_export_history()
+                if history is not None:
+                    payload.update({
+                        "status": history["status"],
+                        "kind": history["kind"],
+                        "destination": history["destination"],
+                        "export_id": history["export_id"],
+                        "items": history["items"],
+                        "result": history["result"],
+                        "resume_available": history["resume_available"],
+                    })
         return jsonify(payload)
 
     @app.post("/api/spotify/export/download")
@@ -6156,7 +6673,12 @@ def create_app(
         try:
             workspace = _workspace_id(payload.get("workspace_id"))
             ok, error, destination = _validate_spotify_folder(
-                str(payload.get("path") or payload.get("destination") or config.library_root)
+                str(
+                    payload.get("path")
+                    or payload.get("destination")
+                    or _linked_library_root()
+                    or config.library_root
+                )
             )
             if not ok:
                 return {"error": error}, 400
@@ -6164,7 +6686,12 @@ def create_app(
             service: ExportService | None = None
             sources: list[ChartSource] = []
             try:
-                selections = _validated_export_selections(db, workspace)
+                sources = list(source_factory(config))
+                selections = _validated_export_selections(
+                    db,
+                    workspace,
+                    catalog_sources=sources,
+                )
                 track_map = {
                     track.db_id: track
                     for track in db.get_spotify_tracks(True)
@@ -6189,7 +6716,6 @@ def create_app(
                     if not relative.casefold().endswith(".sng"):
                         return {"error": "a persisted selection has an unsafe target path"}, 400
                     current_paths.append(relative.replace("\\", "/"))
-                sources = list(source_factory(config))
                 service = ExportService(config, sources, track_resolver=track_map)
                 result = service.sync_managed(destination, current_paths)
                 response = {
@@ -6496,7 +7022,8 @@ def create_app(
 
     @app.get("/advanced")
     def advanced():
-        return _ADVANCED_PAGE.replace("__LIBRARY_ROOT__", str(config.library_root))
+        linked = _linked_library_root() or config.library_root
+        return _ADVANCED_PAGE.replace("__LIBRARY_ROOT__", str(linked))
 
     # -------------------------------------------------------------- files
     @app.get("/browser-exporter.js")
@@ -6803,6 +7330,18 @@ def create_app(
             except (OSError, ValueError, json.JSONDecodeError, TypeError):
                 pass
         return jsonify(payload)
+
+    @app.post("/api/spotify/export/cancel")
+    @app.post("/api/export/cancel")
+    def spotify_export_cancel():
+        with export_job.lock:
+            if not export_job.running:
+                return jsonify({"ok": True, "cancelled": False, "status": export_job.status})
+            export_cancel_event.set()
+            export_job.status = "cancelling"
+            export_job.current = "Cancellation requested; finishing the active chart safely"
+            export_job.events.append({"ts": time.time(), "message": export_job.current})
+        return jsonify({"ok": True, "cancelled": True, "status": "cancelling"})
 
     @app.get("/api/diagnostics/<run_id>")
     def download_diagnostics(run_id: str):
@@ -7342,6 +7881,7 @@ def create_app(
                         db,
                         workspace,
                         kind="exact",
+                        scope="eligible",
                     )
                     return jsonify({
                         "ok": True,
@@ -7595,7 +8135,7 @@ _ADVANCED_PAGE = """<!doctype html>
      <div id="estimate" class="muted">Calculating search estimate...</div>
       <p id="matchingIntro" class="muted">Preview searches your imported songs without downloading. Review choices before downloading selected charts.</p>
       <button id="exactDry" class="primary">Preview chart matches</button>
-      <button id="exactBuild">Download selected charts</button>
+     <button id="exactBuild" title="Download selected charts into the library">Build library</button>
       <details id="advancedSearchOptions" style="margin-top:14px"><summary class="muted">Advanced search options</summary><div style="margin-top:10px"><p class="muted">Artist expansion is optional and runs in a separate pass.</p><button id="expansionDry">Preview artist expansion</button><button id="expansionBuild">Download artist expansion charts</button></div></details>
     <div id="jobStatus" class="job-status" aria-live="polite">
       <div class="job-status-head">
@@ -7617,6 +8157,8 @@ _ADVANCED_PAGE = """<!doctype html>
      <div id="reviewProgress" class="muted"></div>
       <div class="review-toolbar">
         <button id="acceptAll" class="primary">Choose best review matches</button>
+        <button id="selectStrong" type="button">Select all Strong matches</button>
+        <button id="selectEligible" type="button">Select current eligible results</button>
         <span class="muted">Use this only when the recommended chart for every song looks right.</span>
       </div>
       <div class="review-toolbar">
@@ -7649,9 +8191,14 @@ _ADVANCED_PAGE = """<!doctype html>
       <div id="review" style="margin-top:10px"></div>
   </div>
 
-   <h2>5 · Export your choices</h2>
+   <h2>5 · Build your library</h2>
    <div class="card">
      <div id="summary" class="muted">No results yet — run a dry run first.</div>
+     <div id="buildPreview" class="local-journey" hidden>
+       <p id="buildPreviewText" class="muted"></p>
+       <button id="cancelExport" type="button" hidden>Cancel build</button>
+       <button id="retryFailed" type="button" hidden>Retry failed</button>
+     </div>
      <p id="exportFeedback" class="export-feedback" role="status" aria-live="polite"></p>
      <div class="reports" id="reports" style="margin-top:10px"></div>
   </div>
@@ -7670,6 +8217,14 @@ function formatDuration(seconds) {
   seconds = Math.max(0, Math.floor(Number(seconds) || 0));
   const minutes = Math.floor(seconds / 60);
   return minutes ? `${minutes}m ${String(seconds % 60).padStart(2, '0')}s` : `${seconds}s`;
+}
+
+function formatBytes(value) {
+  let bytes = Math.max(0, Number(value) || 0);
+  const units = ['B', 'KiB', 'MiB', 'GiB'];
+  let unit = 0;
+  while (bytes >= 1024 && unit < units.length - 1) { bytes /= 1024; unit++; }
+  return `${bytes.toFixed(unit ? 1 : 0)} ${units[unit]}`;
 }
 
 function setExportFeedback(message, isError = false) {
@@ -7721,27 +8276,44 @@ function renderJobStatus(status) {
   if (localExport) {
     const published = Number(exportResult.published || 0);
     const failed = Number(exportResult.failed || 0);
+    const invalid = Number(exportResult.invalid || 0);
+    const itemProgress = status.items || {};
+    const selected = Number(exportResult.selected || itemProgress.selected || 0);
+    const completed = Number(exportResult.ready || itemProgress.completed || 0);
     if (status.running) {
-      headline = 'Exporting selected charts';
-      activity = status.activity || 'Writing your selected charts into the library.';
-      userDetail = '';
+      headline = status.status === 'cancelling' ? 'Cancelling library build' : 'Building library';
+      activity = status.current || status.activity || 'Writing your selected charts into the library.';
+      userDetail = `${completed} / ${selected} ready · ${Number(itemProgress.downloading || 0)} downloading · ${Number(itemProgress.retrying || 0)} retrying · ${Number(itemProgress.failed || 0)} failed · ${Number(itemProgress.invalid || 0)} invalid · ${Number(itemProgress.remaining || 0)} remaining`;
       setExportFeedback('Export is in progress...');
-    } else if (status.status === 'complete' && exportResult.success) {
-      headline = `${published} chart${published === 1 ? '' : 's'} exported successfully`;
-      activity = published
-        ? 'Your selected charts are now in the library.'
-        : 'No charts were exported.';
-      userDetail = failed ? `${failed} chart${failed === 1 ? '' : 's'} failed.` : '';
-      setExportFeedback(
-        failed
-          ? `${published} chart${published === 1 ? '' : 's'} exported successfully; ${failed} failed.`
-          : `${published} chart${published === 1 ? '' : 's'} exported successfully.`,
-      );
+    } else if (['complete', 'partial'].includes(status.status) && exportResult.success) {
+      const added = Number(exportResult.added || 0);
+      const already = Number(exportResult.already_present || 0);
+      const ready = Number(exportResult.ready || published || 0);
+      const total = Number(exportResult.selected || selected || 0);
+      headline = 'Library ready';
+      activity = `${added} added · ${already} already present · ${invalid} invalid · ${Number(exportResult.download_failures || failed)} download failures`;
+      userDetail = `${ready} / ${total} selected charts ready`;
+      setExportFeedback(`${activity}. ${userDetail}. Selected charts exported successfully.`);
+      $('retryFailed').hidden = !(invalid || failed || Number(exportResult.cancelled_items || 0));
+      $('cancelExport').hidden = true;
+    } else if (status.status === 'cancelled' && exportResult) {
+      headline = 'Build cancelled';
+      activity = 'Validated charts were kept in the library.';
+      userDetail = `${Number(exportResult.ready || completed || 0)} / ${Number(exportResult.selected || selected || 0)} selected charts ready; remaining charts can be retried.`;
+      setExportFeedback(`${activity} ${userDetail}`);
+      $('retryFailed').hidden = false;
+      $('cancelExport').hidden = true;
     } else if (!status.running) {
       headline = 'Export could not complete';
       activity = status.error || 'No charts were exported.';
       userDetail = failed ? `${failed} chart${failed === 1 ? '' : 's'} failed.` : '';
       setExportFeedback(activity, true);
+      $('retryFailed').hidden = false;
+      $('cancelExport').hidden = true;
+    }
+    if (status.running) {
+      $('cancelExport').hidden = false;
+      $('retryFailed').hidden = true;
     }
   }
   $('jobHeadline').textContent = headline;
@@ -7804,6 +8376,8 @@ const runButtons = ['exactDry', 'exactBuild', 'expansionDry', 'expansionBuild'];
 function setRunButtons(disabled) {
   runButtons.forEach(id => $(id).disabled = disabled);
   $('acceptAll').disabled = disabled;
+  $('selectStrong').disabled = disabled;
+  $('selectEligible').disabled = disabled;
 }
 
 async function run(action) {
@@ -7854,16 +8428,16 @@ async function poll() {
   }
 }
 
-async function runNeutralExport() {
+async function runNeutralExport(retryOnly = false) {
   jobRunning = true;
   setRunButtons(true);
-  setExportFeedback('Preparing your selected charts...');
+  setExportFeedback(retryOnly ? 'Retrying incomplete charts...' : 'Preparing your selected charts...');
   renderJobStatus({running: true, action: 'exact-build', activity: 'Exporting selected charts...', stages: [], search_progress: {}});
   try {
     const response = await fetch('/api/spotify/export/start', {method: 'POST',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({kind: 'folder', workspace_id: reviewData.workspace_id || reviewData.journey?.workspace_id,
-        path: $('libraryRoot').textContent.trim()})});
+        path: $('libraryRoot').textContent.trim(), retry_failed: Boolean(retryOnly)})});
     const result = await response.json().catch(() => ({}));
     if (!response.ok) throw Error(result.error || 'Could not start the export.');
     await pollNeutralExport();
@@ -7872,6 +8446,18 @@ async function runNeutralExport() {
     setRunButtons(false);
     setExportFeedback(err.message || 'Could not start the export.', true);
     renderJobStatus({running: false, error: err.message, activity: err.message, stages: [], search_progress: {}});
+  }
+}
+
+async function cancelNeutralExport() {
+  if (!jobRunning) return;
+  try {
+    $('cancelExport').disabled = true;
+    await api('/api/spotify/export/cancel', {method: 'POST'});
+    setExportFeedback('Cancellation requested. The active chart will finish safely.');
+  } catch (error) {
+    setExportFeedback(error.message || 'Could not cancel the build.', true);
+    $('cancelExport').disabled = false;
   }
 }
 
@@ -7886,6 +8472,7 @@ async function pollNeutralExport() {
       error: status.error,
       status: status.status,
       result: status.result,
+      items: status.items,
       started_at: status.started_at,
       finished_at: status.running ? null : (Date.now() / 1000),
       elapsed_seconds: 0,
@@ -7904,6 +8491,33 @@ async function pollNeutralExport() {
     setRunButtons(false);
     setExportFeedback(err.message || 'Export status is unavailable.', true);
     renderJobStatus({running: false, error: err.message, activity: err.message, stages: [], search_progress: {}});
+  }
+}
+
+async function refreshNeutralExportStatus() {
+  try {
+    const response = await fetch('/api/spotify/export/status');
+    const status = await response.json();
+    if (!status.running && !status.result && status.status === 'idle') return;
+    jobRunning = Boolean(status.running);
+    setRunButtons(jobRunning);
+    renderJobStatus({
+      running: status.running,
+      action: 'exact-build',
+      activity: status.current || (status.running ? 'Exporting selected charts...' : status.error || 'Export complete.'),
+      error: status.error,
+      status: status.status,
+      result: status.result,
+      items: status.items,
+      started_at: status.started_at,
+      finished_at: status.running ? null : (Date.now() / 1000),
+      elapsed_seconds: 0,
+      stages: [],
+      search_progress: {},
+    });
+    if (status.running) setTimeout(pollNeutralExport, 700);
+  } catch (error) {
+    // The export status is supplementary; the review page remains usable.
   }
 }
 
@@ -7930,7 +8544,7 @@ function renderLocalJourney(journey) {
   panel.hidden = false;
   $('localJourneyHeadline').textContent = journey.headline || 'Your music is ready';
   $('localJourneyMessage').textContent = journey.message || '';
-  const selected = Number(counts.selected_charts || 0);
+     const selected = Number(counts.selected_charts || 0);
   $('localJourneyCounts').textContent = `${Number(counts.imported_songs || 0).toLocaleString()} songs checked · ${Number(counts.chart_options || 0).toLocaleString()} songs with chart options across ${Number(counts.candidate_charts || 0).toLocaleString()} chart versions · ${Number(counts.strong_matches || 0).toLocaleString()} strong matches · ${Number(counts.needs_review || 0).toLocaleString()} need review · ${Number(counts.no_suitable_songs || 0).toLocaleString()} without a safe recommendation · ${selected.toLocaleString()} selected for export`;
   $('importStepHeading').hidden = true;
   $('legacyImportSources').hidden = true;
@@ -7948,7 +8562,7 @@ function renderLocalJourney(journey) {
       ? 'Find chart matches on the home page'
       : 'Matching complete';
   $('exactDry').disabled = true;
-  $('exactBuild').textContent = 'Export selected charts';
+   $('exactBuild').textContent = 'Build library';
   updateLocalExportState();
 }
 
@@ -7961,6 +8575,28 @@ function updateLocalExportState() {
   $('exactBuild').title = selected
     ? 'Export the charts currently selected below.'
     : 'Choose at least one chart below before exporting.';
+  refreshExportPreview();
+}
+
+async function refreshExportPreview() {
+  const panel = $('buildPreview');
+  if (!panel || !isLocalJourney()) return;
+  const selected = Number(reviewData.journey?.counts?.selected_charts || 0);
+  if (!selected) {
+    panel.hidden = true;
+    return;
+  }
+  try {
+    const data = await api('/api/spotify/export/preview', {method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({kind: 'folder', workspace_id: reviewData.workspace_id || reviewData.journey.workspace_id,
+        path: $('libraryRoot').textContent.trim()})});
+    $('buildPreviewText').textContent = `${Number(data.selected_chart_count || selected).toLocaleString()} selected charts · ${Number(data.reusable_count || 0).toLocaleString()} already present/reusable · estimated ${formatBytes(data.estimated_bytes)} · destination ${data.destination}`;
+    panel.hidden = false;
+  } catch (error) {
+    $('buildPreviewText').textContent = error.message || 'Build preview unavailable.';
+    panel.hidden = false;
+  }
 }
 
 async function refreshEstimate() {
@@ -7993,8 +8629,9 @@ async function refreshSummary() {
     const counts = s.journey.counts || {};
     const selected = Number(counts.selected_charts || 0);
     $('summary').innerHTML = `<p><b>${selected.toLocaleString()} chart${selected === 1 ? '' : 's'} selected</b> for export.</p><p>${Number(counts.chart_options || 0).toLocaleString()} songs have chart options across ${Number(counts.candidate_charts || 0).toLocaleString()} chart versions: ${Number(counts.strong_matches || 0).toLocaleString()} strong matches and ${Number(counts.needs_review || 0).toLocaleString()} that need review. ${selected ? 'Export is ready when you are.' : 'Choose a chart above to make export available.'}</p>`;
-    updateLocalExportState();
-    return;
+     updateLocalExportState();
+     refreshNeutralExportStatus();
+     return;
   }
   renderLocalJourney(null);
   const exact = s.exact || {};
@@ -8089,6 +8726,10 @@ function renderReview() {
   const local = isLocalJourney();
   if (local) renderLocalJourney(reviewData.journey);
   $('acceptAll').disabled = jobRunning;
+  $('selectStrong').hidden = !local;
+  $('selectEligible').hidden = !local;
+  $('selectStrong').disabled = jobRunning;
+  $('selectEligible').disabled = jobRunning;
   const items = allTracks;
   const page = reviewData.page || {};
   renderReviewPager();
@@ -8245,6 +8886,25 @@ async function acceptAllReview() {
   }
 }
 
+async function selectBulkScope(scope) {
+  if (jobRunning || !isLocalJourney()) return;
+  const label = scope === 'strong' ? 'all Strong matches' : 'the current eligible result';
+  if (!confirm(`Select ${label}? Existing choices for those songs will be replaced.`)) return;
+  try {
+    const result = await api('/api/spotify/select-all', {method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({workspace_id: reviewData.workspace_id || reviewData.journey?.workspace_id,
+        scope, search: $('reviewFilter').value.trim()})});
+    lastSaved = `Selected ${result.selected || 0} charts.`;
+    await loadReview(false);
+    await refreshSummary();
+    setTimeout(() => { lastSaved = ''; renderReview(); }, 5000);
+  } catch (error) {
+    lastSaved = error.message || 'Bulk selection failed.';
+    renderReview();
+  }
+}
+
 function resetReviewPage() {
   reviewOffset = 0;
   loadReview();
@@ -8272,6 +8932,10 @@ $('reviewNext').addEventListener('click', () => {
   loadReview(false);
 });
 $('acceptAll').addEventListener('click', acceptAllReview);
+$('selectStrong').addEventListener('click', () => selectBulkScope('strong'));
+$('selectEligible').addEventListener('click', () => selectBulkScope('eligible'));
+$('cancelExport').addEventListener('click', cancelNeutralExport);
+$('retryFailed').addEventListener('click', () => runNeutralExport(true));
 
 $('exactDry').addEventListener('click', () => run('exact-dry-run'));
 $('exactBuild').addEventListener('click', () => {

@@ -190,6 +190,9 @@ export:
   overwrite_owned: true
   include_manifest_in_zip: true
   minimum_free_bytes: 0
+  continue_on_error: true
+  artifact_retries: 2
+  retry_backoff_seconds: 2.0
   download_workers: 3
 
 songs_folder_detection:

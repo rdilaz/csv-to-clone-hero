@@ -804,17 +804,74 @@ def create_app(
             threshold = db.get_workspace_minimum_score(workspace)
             changed = 0
             if action == "select":
+                scope = str(
+                    payload.get("scope")
+                    or payload.get("selection_scope")
+                    or payload.get("filter")
+                    or "strong"
+                ).casefold()
+                if scope in {"recommended", "auto", "auto_accept", "strong"}:
+                    allowed = {"RECOMMENDED"}
+                    scope = "strong"
+                elif scope in {"eligible", "current", "filter", "all_eligible"}:
+                    allowed = {"RECOMMENDED", "ELIGIBLE_REVIEW"}
+                    scope = "eligible"
+                else:
+                    return jsonify({"error": "bulk selection scope must be strong or eligible"}), 400
+                requested = payload.get("track_ids")
+                if isinstance(requested, (str, bytes)):
+                    requested = [requested]
+                requested_ids = {str(value) for value in requested} if requested is not None else None
+                needle = str(payload.get("search") or payload.get("query") or "").strip().casefold()
+                grouped: dict[Any, Any] = {}
                 rows = db.get_workspace_candidates(workspace, kind="exact", include_rejected=True)
                 for row in rows:
-                    if float(row["score"] or 0) < threshold or bool(row["selected"]):
+                    data = dict(row)
+                    if requested_ids is not None and not {
+                        str(data.get("track_id")),
+                        str(data.get("spotify_id")),
+                        str(data.get("track_key")),
+                    } & requested_ids:
                         continue
+                    eligibility = str(data.get("eligibility") or "").upper()
+                    if eligibility not in allowed:
+                        continue
+                    try:
+                        score = float(data.get("score") or 0)
+                    except (TypeError, ValueError):
+                        score = 0.0
+                    if scope == "eligible" and score < threshold:
+                        continue
+                    if needle and needle not in " ".join(
+                        str(data.get(key) or "")
+                        for key in ("track_artist", "track_title", "source", "chart_id")
+                    ).casefold():
+                        candidate = _json_object(data.get("candidate_json"), {})
+                        if needle not in " ".join(
+                            str(candidate.get(key) or "")
+                            for key in ("artist", "name", "charter", "url")
+                        ).casefold():
+                            continue
+                    key = data.get("track_id")
+                    prior = grouped.get(key)
+                    if prior is None or (
+                        score,
+                        float(data.get("quality") or 0),
+                        -int(data.get("candidate_id") or 0),
+                    ) > (
+                        float(prior["score"] or 0),
+                        float(prior["quality"] or 0),
+                        -int(prior["candidate_id"] or 0),
+                    ):
+                        grouped[key] = row
+                for row in grouped.values():
                     try:
                         db.select_workspace_candidate(
                             workspace,
                             row["track_id"],
                             int(row["candidate_id"]),
                             kind="exact",
-                            force=True,
+                            force=False,
                             require_workspace_candidate=True,
                         )
                         changed += 1
@@ -822,7 +879,7 @@ def create_app(
                         continue
             else:
                 changed = db.clear_workspace_selection(workspace, kind="exact")
-            return jsonify({"ok": True, "changed": changed, "minimum_score": threshold})
+            return jsonify({"ok": True, "changed": changed, "minimum_score": threshold, "scope": scope if action == "select" else "all"})
         finally:
             db.close()
 
