@@ -433,6 +433,73 @@ def test_bulk_selection_defaults_to_strong_and_explicit_eligible_scope(client, c
     assert eligible.get_json()["items"][0]["chart_id"] == 304
 
 
+def test_review_bulk_actions_are_explicit_scoped_and_preserve_manual_alternatives(client, config):
+    initial = client.get("/api/sources").get_json()
+    workspace = initial["workspace_id"]
+    track = seed_local_workspace(config, workspace)
+    db = Database(config.database_path)
+    try:
+        task_id = db._conn.execute("SELECT id FROM discovery_tasks WHERE workspace_id=? ORDER BY id DESC LIMIT 1", (workspace,)).fetchone()["id"]
+        missing = next(item for item in db.get_spotify_tracks(True) if item.title == "Missing Song")
+        chart = make_chart("Missing Song", "Artist", chart_id=305)
+        db.upsert_candidate(chart)
+        db.upsert_workspace_candidate(workspace, missing.track_key, chart, score=82, eligibility="ELIGIBLE_REVIEW", decision="REVIEW", kind="exact", task_id=task_id)
+    finally:
+        db.close()
+
+    alternative = client.post("/api/review/decide", json={"workspace_id": workspace, "track_key": track.track_key, "source": "test", "chart_id": 302, "decision": "accept"})
+    assert alternative.status_code == 200
+    strong = client.post("/api/spotify/select-all", json={"workspace_id": workspace, "scope": "strong"}).get_json()
+    assert strong["selected"] == 0
+    assert strong["selected_count"] == 1
+    assert client.post("/api/spotify/select-all", json={"workspace_id": workspace, "scope": "review"}).get_json()["selected"] == 1
+    assert client.post("/api/spotify/select-all", json={"workspace_id": workspace, "scope": "review"}).get_json()["selected"] == 0
+    selected = client.get(f"/api/review?workspace_id={workspace}").get_json()
+    song = next(card for card in selected["tracks"] if card["track_key"] == track.track_key)
+    assert next(item for item in song["candidates"] if item["selected"])["chart_id"] == 302
+    assert song["selection_state"] == "alternative_selected"
+    assert song["recommendation_candidate_id"] == song["best_candidate_id"]
+
+
+def test_review_skip_and_source_provenance_filters_survive_reload(client, config):
+    from csv_to_clonehero.providers.base import LibrarySnapshot, ProviderTrack
+
+    workspace = client.get("/api/sources").get_json()["workspace_id"]
+    seed_local_workspace(config, workspace)
+    db = Database(config.database_path)
+    try:
+        db.upsert_library_snapshot(workspace, LibrarySnapshot("spotify", [
+            ProviderTrack("spotify", "sp-song", "Song", "Artist"),
+            ProviderTrack("spotify", "sp-only", "Spotify Only", "Artist"),
+        ]))
+        task_id = db._conn.execute("SELECT id FROM discovery_tasks WHERE workspace_id=? ORDER BY id DESC LIMIT 1", (workspace,)).fetchone()["id"]
+        missing = next(item for item in db.get_spotify_tracks(True) if item.title == "Missing Song")
+        missing_chart = make_chart("Missing Song", "Artist", chart_id=307)
+        db.upsert_candidate(missing_chart)
+        db.upsert_workspace_candidate(workspace, missing.track_key, missing_chart, score=82, eligibility="ELIGIBLE_REVIEW", decision="REVIEW", kind="exact", task_id=task_id)
+        spotify_only = next(item for item in db.get_spotify_tracks(True) if item.title == "Spotify Only")
+        chart = make_chart("Spotify Only", "Artist", chart_id=306)
+        db.upsert_candidate(chart)
+        db.upsert_workspace_candidate(workspace, spotify_only.track_key, chart, score=94, eligibility="RECOMMENDED", decision="AUTO_ACCEPT", kind="exact", task_id=task_id)
+    finally:
+        db.close()
+
+    skipped = client.post("/api/review/decide", json={"workspace_id": workspace, "track_key": "artist|song", "source": "test", "chart_id": 301, "decision": "reject"})
+    assert skipped.status_code == 200
+    reloaded = client.get(f"/api/review?workspace_id={workspace}").get_json()
+    song = next(card for card in reloaded["tracks"] if card["title"] == "Song")
+    assert song["selection_state"] == "skipped"
+    assert not client.get(f"/api/spotify/selections?workspace_id={workspace}").get_json()["items"]
+
+    all_cards = client.get(f"/api/review?workspace_id={workspace}&state=all").get_json()["tracks"]
+    assert {card["title"] for card in all_cards} == {"Song", "Missing Song", "Spotify Only"}
+    assert len([card for card in all_cards if card["title"] == "Song"]) == 1
+    assert len(client.get(f"/api/review?workspace_id={workspace}&source=both&state=all").get_json()["tracks"]) == 1
+    assert {card["title"] for card in client.get(f"/api/review?workspace_id={workspace}&source=spotify&state=all").get_json()["tracks"]} == {"Song", "Spotify Only"}
+    assert {card["title"] for card in client.get(f"/api/review?workspace_id={workspace}&source=soundcloud&state=all").get_json()["tracks"]} == {"Song", "Missing Song"}
+    assert client.get(f"/api/review?workspace_id={workspace}&source=spotify&state=strong&search=Spotify&sort=score&limit=1").get_json()["page"]["returned"] == 1
+
+
 def test_local_export_reports_one_human_readable_success(config):
     archive = io.BytesIO()
     with zipfile.ZipFile(archive, "w") as chart_zip:

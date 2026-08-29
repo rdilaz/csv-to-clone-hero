@@ -1408,6 +1408,7 @@ def _review_page_options(args: Mapping[str, Any]) -> dict[str, Any]:
         "search": str(args.get("search", "") or "").strip(),
         "state": str(args.get("state", "all") or "all").strip().casefold(),
         "sort": str(args.get("sort", "artist") or "artist").strip().casefold(),
+        "source": str(args.get("source", "all") or "all").strip().casefold(),
     }
 
 
@@ -1551,6 +1552,7 @@ def _review_payload(
     search: str = "",
     state: str = "all",
     sort: str = "artist",
+    source: str = "all",
 ) -> dict:
     """Build one review card per Spotify track from persisted score rows."""
     tracks = {track.db_id: track for track in db.get_tracks(include_ignored=True)}
@@ -5565,7 +5567,11 @@ def create_app(
         if scope in {"recommended", "auto", "auto_accept", "strong"}:
             allowed_states = {"strong"}
             scope = "strong"
+        elif scope in {"review", "needs_review"}:
+            allowed_states = {"needs_review"}
+            scope = "review"
         elif scope in {"eligible", "current", "filter", "all_eligible"}:
+            # Retain the old API alias for callers outside the local UI.
             allowed_states = {"strong", "needs_review"}
             scope = "eligible"
         else:
@@ -5582,6 +5588,11 @@ def create_app(
             current_only=kind == "exact",
         )
         grouped: dict[Any, Any] = {}
+        selected_tracks: set[Any] = {
+            _row_dict(row).get("track_id")
+            for row in rows
+            if _row_dict(row).get("selected")
+        }
         blocked = {EXCLUDED, INCOMPATIBLE, "REJECT", "REJECTED", "NOT_EXPORTABLE"}
         for row in rows:
             data = _row_dict(row)
@@ -5640,6 +5651,8 @@ def create_app(
         selected: list[int] = []
         for row in grouped.values():
             data = _row_dict(row)
+            if data.get("track_id") in selected_tracks:
+                continue
             selected.append(
                 db.select_workspace_candidate(
                     workspace,
@@ -7841,6 +7854,7 @@ def create_app(
         search: str = "",
         state: str = "all",
         sort: str = "artist",
+        source: str = "all",
     ) -> dict[str, Any]:
         """Expose source-neutral catalog candidates on the existing review page."""
         journey = _local_journey_payload(db, workspace)
@@ -7852,6 +7866,10 @@ def create_app(
             and (not workspace_track_ids or int(track.db_id) in workspace_track_ids)
         }
         manual_decisions = db.get_manual_decisions()
+        provenance_by_key: dict[tuple[str, str], set[str]] = {}
+        for provenance in db.get_track_provenance(workspace):
+            key = (str(provenance["normalized_artist"]), str(provenance["normalized_title"]))
+            provenance_by_key.setdefault(key, set()).add(str(provenance["provider"] or "").casefold())
         rows = db.get_workspace_candidates(
             workspace,
             kind="exact",
@@ -7881,6 +7899,13 @@ def create_app(
         summaries: list[dict[str, Any]] = []
         for track_id, row_group in grouped_rows.items():
             track = tracks[track_id]
+            sources = provenance_by_key.get((track.artist_norm, track.title_norm), set())
+            if source not in {"", "all"} and (
+                source not in {"spotify", "soundcloud", "both"}
+                or (source == "both" and sources != {"spotify", "soundcloud"})
+                or (source != "both" and source not in sources)
+            ):
+                continue
             states = {_review_row_state(row) for row in row_group}
             selected = any(
                 bool(_row_dict(row).get("selected"))
@@ -7895,6 +7920,27 @@ def create_app(
                 == "accept"
                 for row in row_group
             )
+            recommended_row = max(
+                (
+                    row for row in row_group
+                    if _review_row_state(row) in {"strong", "needs_review"}
+                ),
+                key=lambda row: (
+                    float(_row_dict(row).get("score") or 0),
+                    float(_row_dict(row).get("quality") or 0),
+                    -int(_row_dict(row).get("candidate_id") or 0),
+                ),
+                default=None,
+            )
+            recommended_id = int(_row_dict(recommended_row).get("candidate_id") or 0) if recommended_row else 0
+            selection_state = "recommended_selected" if selected and any(
+                bool(_row_dict(row).get("selected"))
+                and int(_row_dict(row).get("candidate_id") or 0) == recommended_id
+                for row in row_group
+            ) else "alternative_selected" if selected else "skipped" if any(
+                manual_decisions.get((track.track_key, str(_row_dict(row).get("source") or ""), int(_row_dict(row).get("chart_id") or 0))) == "reject"
+                for row in row_group
+            ) else "unselected"
             best_score = max(
                 (float(_row_dict(row).get("score") or 0) for row in row_group),
                 default=0.0,
@@ -7907,7 +7953,10 @@ def create_app(
                 "title": track.title,
                 "album": track.album,
                 "playlists": list(track.playlists),
+                "sources": sorted(sources),
+                "source_label": "Both" if sources == {"spotify", "soundcloud"} else "Spotify" if "spotify" in sources else "SoundCloud" if "soundcloud" in sources else "Unknown",
                 "selected": selected,
+                "selection_state": selection_state,
                 "status": "ACCEPTED" if selected else "AUTO_ACCEPT" if "strong" in states else "REVIEW" if "needs_review" in states else "REJECT",
                 "review_state": "strong" if "strong" in states else "needs_review" if "needs_review" in states else "not_playable" if "not_playable" in states else "not_recommended",
                 "has_eligible_match": bool(states & {"strong", "needs_review"}),
@@ -7997,10 +8046,20 @@ def create_app(
                 "artist": track.artist_full,
                 "title": track.title,
                 "album": track.album,
-                "playlists": list(track.playlists),
-                "spotify_artist": track.artist_full,
-                "spotify_title": track.title,
-                "status": "selected" if selected else "matched",
+                 "playlists": list(track.playlists),
+                 "sources": sorted(provenance_by_key.get((track.artist_norm, track.title_norm), set())),
+                 "source_label": summary.get("source_label", "Unknown"),
+             "spotify_artist": track.artist_full,
+             "spotify_title": track.title,
+             "status": "selected" if selected else "matched",
+             "selection_state": summary["selection_state"],
+             "recommendation_candidate_id": best["candidate_id"],
+             "selection_label": {
+                 "recommended_selected": "Recommended chart selected",
+                 "alternative_selected": "Alternative selected",
+                 "skipped": "Skipped",
+                 "unselected": "Unselected",
+             }[selection_state],
                 "review_status": primary["review_label"],
                 "candidates": candidates,
                 "best_candidate_id": best["candidate_id"],
@@ -8012,7 +8071,9 @@ def create_app(
                 "review_summary": primary["review_summary"],
                 "has_eligible_match": summary["has_eligible_match"],
                 "has_strong_match": summary["has_strong_match"],
-                "has_review_match": summary["has_review_match"],
+             "has_review_match": summary["has_review_match"],
+             "sources": summary["sources"],
+             "source_label": summary["source_label"],
             })
         total_tracks = len(tracks)
         candidate_count = sum(len(row_group) for row_group in grouped_rows.values())
@@ -8173,7 +8234,7 @@ def create_app(
                         db,
                         workspace,
                         kind="exact",
-                        scope="eligible",
+                        scope="review",
                     )
                     return jsonify({
                         "ok": True,
@@ -8467,9 +8528,8 @@ _ADVANCED_PAGE = """<!doctype html>
      <p class="muted">One card represents one song from your music list. Start with the best chart and its short explanation; open other versions only when you need to compare them. Choices save immediately and apply to the next download build.</p>
      <div id="reviewProgress" class="muted"></div>
       <div class="review-toolbar">
-        <button id="acceptAll" class="primary">Choose best review matches</button>
+         <button id="acceptAll" class="primary">Accept recommended Review matches</button>
         <button id="selectStrong" type="button">Select all Strong matches</button>
-        <button id="selectEligible" type="button">Select current eligible results</button>
         <span class="muted">Use this only when the recommended chart for every song looks right.</span>
       </div>
       <div class="review-toolbar">
@@ -8489,8 +8549,13 @@ _ADVANCED_PAGE = """<!doctype html>
             <option value="artist" selected>Artist and title</option>
             <option value="score">Best score</option>
           </select>
-        </label>
-        <label class="muted" style="margin-left:12px">
+         </label>
+         <label class="muted">Source
+           <select id="reviewSource" aria-label="Filter matches by source">
+             <option value="all" selected>All</option><option value="spotify">Spotify</option><option value="soundcloud">SoundCloud</option><option value="both">Both</option>
+           </select>
+         </label>
+         <label class="muted" style="margin-left:12px">
           <input type="checkbox" id="showRejected"> also show charts the app did not recommend</label>
         <input type="text" id="reviewFilter" placeholder="Search artist, title, chart, or charter" aria-label="Search matches" style="background:#0d1017; border:1px solid #2a3247; color:#e6e9ef; border-radius:6px; padding:6px 10px; min-width:220px;">
       </div>
@@ -8688,7 +8753,6 @@ function setRunButtons(disabled) {
   runButtons.forEach(id => $(id).disabled = disabled);
   $('acceptAll').disabled = disabled;
   $('selectStrong').disabled = disabled;
-  $('selectEligible').disabled = disabled;
 }
 
 async function run(action) {
@@ -8990,6 +9054,7 @@ function reviewQueryUrl() {
   const sort = $('reviewSort').value || 'artist';
   const search = $('reviewFilter').value.trim();
   params.set('state', state);
+  params.set('source', $('reviewSource').value || 'all');
   params.set('sort', sort);
   if (search) params.set('search', search);
   if ($('showRejected').checked) params.set('include_rejected', '1');
@@ -9038,9 +9103,7 @@ function renderReview() {
   if (local) renderLocalJourney(reviewData.journey);
   $('acceptAll').disabled = jobRunning;
   $('selectStrong').hidden = !local;
-  $('selectEligible').hidden = !local;
   $('selectStrong').disabled = jobRunning;
-  $('selectEligible').disabled = jobRunning;
   const items = allTracks;
   const page = reviewData.page || {};
   renderReviewPager();
@@ -9082,9 +9145,9 @@ function renderReview() {
     const stateClass = reviewStatusClass(review);
     const selected = candidates.find(candidate => candidate.selected || candidate.manual === 'accept');
     const selectedIsAlternative = Boolean(selected && selected !== best);
-    const selectedNote = selected
-      ? `<p class="review-selection-note"><b>Already selected:</b> ${esc(selected.candidate_artist)} — ${esc(selected.candidate_title)}. Choosing another chart will replace this choice.</p>`
-      : '';
+    const selectionState = track.selection_state || (selected ? (selected === best ? 'recommended_selected' : 'alternative_selected') : 'unselected');
+    const selectionLabel = selectionState === 'recommended_selected' ? 'Recommended chart selected' : selectionState === 'alternative_selected' ? 'Alternative selected' : selectionState === 'skipped' ? 'Skipped' : 'Unselected';
+    const selectedNote = `<p class="review-selection-note"><b>Recommended:</b> ${best ? `${esc(best.candidate_artist)} — ${esc(best.candidate_title)}` : 'None'}<br><b>Selected:</b> ${selected ? `${esc(selected.candidate_artist)} — ${esc(selected.candidate_title)}` : selectionState === 'skipped' ? 'None, skipped' : 'None'} <span class="muted">(${selectionLabel})</span></p>`;
     const playlists = (track.playlists || []).length ? ` · ${esc(track.playlists.join(', '))}` : '';
     return `<article class="card review-card" data-review-state="${esc(review.state)}">
       <header class="review-card-head">
@@ -9123,7 +9186,7 @@ function candidateHtml(track, candidate, best) {
   const selectedClass = candidate.selected || manual === 'accept' ? ' review-option-selected' : '';
   const blockedClass = review.state === 'not_playable' ? ' review-option-blocked' : '';
   const marker = best ? '<span class="review-selected">Best match</span>' : '';
-  const selectedBadge = candidate.selected || manual === 'accept' ? '<span class="review-selected">Already selected</span>' : manual === 'reject' ? '<span class="review-status review-status-not-recommended">Skipped</span>' : '';
+  const selectedBadge = candidate.selected || manual === 'accept' ? '<span class="review-selected">Selected</span>' : manual === 'reject' ? '<span class="review-status review-status-not-recommended">Skipped</span>' : '';
   const instruments = (candidate.instruments || []).join(', ');
   const meta = [candidate.charter ? `Charter: ${candidate.charter}` : '', instruments ? `Instruments: ${instruments}` : '', candidate.pack_name ? `Pack: ${candidate.pack_name}` : ''].filter(Boolean).join(' · ');
   const link = candidate.url ? ` <a href="${esc(candidate.url)}" target="_blank" rel="noopener">View chart</a>` : '';
@@ -9176,7 +9239,7 @@ async function decide(trackKey, source, chartId, decision) {
 
 async function acceptAllReview() {
   if (jobRunning) return;
-  const count = reviewData.progress?.review_track_count || 0;
+  const count = reviewData.journey?.counts?.needs_review || reviewData.progress?.review_track_count || 0;
   if (!count) {
     lastSaved = 'There are no review matches to accept.';
     renderReview();
@@ -9199,13 +9262,13 @@ async function acceptAllReview() {
 
 async function selectBulkScope(scope) {
   if (jobRunning || !isLocalJourney()) return;
-  const label = scope === 'strong' ? 'all Strong matches' : 'the current eligible result';
-  if (!confirm(`Select ${label}? Existing choices for those songs will be replaced.`)) return;
+   const label = scope === 'strong' ? 'all Strong matches' : 'all recommended Review matches';
+   if (!confirm(`Select ${label}? Existing choices will be preserved.`)) return;
   try {
     const result = await api('/api/spotify/select-all', {method: 'POST',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({workspace_id: reviewData.workspace_id || reviewData.journey?.workspace_id,
-        scope, search: $('reviewFilter').value.trim()})});
+         scope})});
     lastSaved = `Selected ${result.selected || 0} charts.`;
     await loadReview(false);
     await refreshSummary();
@@ -9231,6 +9294,7 @@ function scheduleReviewSearch() {
 $('showRejected').addEventListener('change', resetReviewPage);
 $('reviewState').addEventListener('change', resetReviewPage);
 $('reviewSort').addEventListener('change', resetReviewPage);
+$('reviewSource').addEventListener('change', resetReviewPage);
 $('reviewFilter').addEventListener('input', scheduleReviewSearch);
 $('reviewPrevious').addEventListener('click', () => {
   if (reviewOffset <= 0) return;
@@ -9244,7 +9308,6 @@ $('reviewNext').addEventListener('click', () => {
 });
 $('acceptAll').addEventListener('click', acceptAllReview);
 $('selectStrong').addEventListener('click', () => selectBulkScope('strong'));
-$('selectEligible').addEventListener('click', () => selectBulkScope('eligible'));
 $('cancelExport').addEventListener('click', cancelNeutralExport);
 $('retryFailed').addEventListener('click', () => runNeutralExport(true));
 
