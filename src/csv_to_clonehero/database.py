@@ -2931,6 +2931,24 @@ class Database:
     get_scans = get_discovery_scans
     create_scan = create_discovery_scan
 
+    def get_latest_combined_generation(self, workspace_id: int | str) -> sqlite3.Row | None:
+        """Return the newest local combined generation, regardless of status."""
+        db_id = self._workspace_db_id(workspace_id)
+        return self._conn.execute(
+            """SELECT * FROM discovery_scans
+               WHERE workspace_id = ? AND kind = 'exact'
+                 AND json_extract(metadata_json, '$.workflow') = 'combined_catalog'
+               ORDER BY id DESC LIMIT 1""",
+            (db_id,),
+        ).fetchone()
+
+    def get_current_combined_generation(self, workspace_id: int | str) -> sqlite3.Row | None:
+        """Return the current generation only when the newest one completed."""
+        row = self.get_latest_combined_generation(workspace_id)
+        if row is None or str(row["status"] or "").lower() not in {"complete", "completed"}:
+            return None
+        return row
+
     def upsert_discovery_task(
         self,
         workspace_id: int | str,
@@ -3250,6 +3268,20 @@ class Database:
     record_workspace_match = upsert_workspace_candidate
     persist_workspace_candidate = upsert_workspace_candidate
 
+    def assign_workspace_track_candidates_to_task(
+        self, workspace_id: int | str, track_id: Any, task_id: int
+    ) -> int:
+        """Attach every persisted relationship for a track to one run task."""
+        db_id = self._workspace_db_id(workspace_id)
+        resolved = self._resolve_track_value(track_id)
+        with self._conn:
+            cur = self._conn.execute(
+                "UPDATE workspace_candidates SET task_id = ? "
+                "WHERE workspace_id = ? AND track_id = ? AND kind = 'exact'",
+                (int(task_id), db_id, resolved),
+            )
+        return int(cur.rowcount)
+
     def clear_workspace_candidates(
         self,
         workspace_id: int | str,
@@ -3334,6 +3366,7 @@ class Database:
         kind: str | None = None,
         include_rejected: bool = True,
         include_candidate_data: bool = True,
+        current_only: bool = False,
     ) -> list[sqlite3.Row]:
         db_id = self._workspace_db_id(workspace_id)
         clauses = ["wc.workspace_id = ?"]
@@ -3345,6 +3378,15 @@ class Database:
         if kind:
             clauses.append("wc.kind = ?")
             params.append(kind)
+        if current_only:
+            generation = self.get_current_combined_generation(db_id)
+            clauses.append(
+                "EXISTS (SELECT 1 FROM discovery_tasks dt "
+                "JOIN discovery_scans ds ON ds.id = dt.scan_id "
+                "WHERE dt.id = wc.task_id AND ds.workspace_id = wc.workspace_id "
+                "AND ds.kind = 'exact' AND ds.id = ?)"
+            )
+            params.append(int(generation["id"]) if generation is not None else -1)
         if not include_rejected:
             clauses.append("COALESCE(LOWER(wc.decision), '') NOT IN ('reject', 'rejected', 'incompatible')")
         candidate_json = "c.data_json AS candidate_json" if include_candidate_data else "'' AS candidate_json"
@@ -3376,10 +3418,12 @@ class Database:
         *,
         kind: str = "exact",
         include_rejected: bool = True,
+        current_only: bool = False,
     ) -> dict[str, list[sqlite3.Row]]:
         groups: dict[str, list[sqlite3.Row]] = {}
         for row in self.get_workspace_candidates(
-            workspace_id, kind=kind, include_rejected=include_rejected
+            workspace_id, kind=kind, include_rejected=include_rejected,
+            current_only=current_only,
         ):
             key = row["spotify_id"] or row["track_key"] or str(row["track_id"])
             groups.setdefault(str(key), []).append(row)
@@ -3392,6 +3436,7 @@ class Database:
         *,
         kind: str = "exact",
         include_rejected: bool = False,
+        current_only: bool = False,
     ) -> dict[int, list[sqlite3.Row]]:
         """Load candidates for one rendered track page in a single query."""
         ids = sorted({int(value) for value in track_ids})
@@ -3403,6 +3448,14 @@ class Database:
         params: list[Any] = [db_id, *ids, kind]
         if not include_rejected:
             clauses.append("COALESCE(LOWER(wc.decision), '') NOT IN ('reject', 'rejected', 'incompatible')")
+        if current_only:
+            generation = self.get_current_combined_generation(db_id)
+            clauses.append(
+                "EXISTS (SELECT 1 FROM discovery_tasks dt JOIN discovery_scans ds ON ds.id = dt.scan_id "
+                "WHERE dt.id = wc.task_id AND ds.workspace_id = wc.workspace_id AND ds.kind = 'exact' "
+                "AND ds.id = ?)"
+            )
+            params.append(int(generation["id"]) if generation is not None else -1)
         rows = self._conn.execute(
             """SELECT wc.*, c.source, c.chart_id, c.data_json AS candidate_json,
                       t.track_key, t.spotify_id, t.title AS track_title,
@@ -3909,6 +3962,23 @@ class Database:
             count += 1
             ids.add(int(row["candidate_id"]))
         return count, digest.hexdigest(), ids
+
+    def assign_current_progress_candidates_to_task(self, workspace_id: int | str, task_id: int) -> int:
+        """Attach only exact relationships covered by current song progress."""
+        db_id = self._workspace_db_id(workspace_id)
+        with self._conn:
+            cur = self._conn.execute(
+                """UPDATE workspace_candidates SET task_id = ?
+                   WHERE id IN (
+                     SELECT wc.id FROM workspace_candidates wc
+                     JOIN spotify_tracks t ON t.id = wc.track_id
+                     JOIN discovery_song_progress dsp
+                       ON dsp.workspace_id = wc.workspace_id AND dsp.track_key = t.track_key
+                     WHERE wc.workspace_id = ? AND wc.kind = 'exact'
+                   )""",
+                (int(task_id), db_id),
+            )
+        return int(cur.rowcount)
 
     def get_matching_song_cache(self, fingerprint: str) -> sqlite3.Row | None:
         return self._conn.execute(

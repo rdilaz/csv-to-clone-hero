@@ -69,6 +69,14 @@ def seed_local_workspace(config, workspace_id, charts=True):
         )
         db.upsert_library_snapshot(workspace_id, snapshot)
         tracks = {track.title: track for track in db.get_spotify_tracks(True)}
+        scan_id = db.create_discovery_scan(
+            workspace_id, scan_key="seed-current", kind="exact", status="complete",
+            metadata={"workflow": "combined_catalog"}
+        )
+        task_id = db.upsert_discovery_task(
+            workspace_id, scan_id=scan_id, source="seed", kind="song",
+            query_key="seed-current-song", status="complete", total=1, completed=1,
+        )
         if charts:
             good = make_chart("Song", "Artist", chart_id=301)
             review = make_chart("Song (Live)", "Artist", chart_id=302)
@@ -133,6 +141,7 @@ def seed_local_workspace(config, workspace_id, charts=True):
                     decision=decision,
                     breakdown_json=json.dumps(breakdown),
                     kind="exact",
+                    task_id=task_id,
                 )
         db.update_workspace(
             workspace_id,
@@ -214,6 +223,48 @@ def test_local_journey_persists_import_provenance_and_counts(client, config):
     assert journey["combined"]["canonical_count"] == 2
     assert journey["music"][0]["source_label"] == "soundcloud"
     assert all(song["sources"] == ["soundcloud"] for song in journey["music"])
+
+
+def test_current_matching_generation_is_the_candidate_boundary(client, config, tmp_path):
+    initial = client.get("/api/sources").get_json()
+    workspace = initial["workspace_id"]
+    track = seed_local_workspace(config, workspace)
+    db = Database(config.database_path)
+    try:
+        old_scan = db.create_discovery_scan(workspace, scan_key="old", kind="exact", status="complete", metadata={"workflow": "combined_catalog"})
+        old_task = db.upsert_discovery_task(workspace, scan_id=old_scan, source="fake", kind="song", query_key="old")
+        current_scan = db.create_discovery_scan(workspace, scan_key="current", kind="exact", status="complete", metadata={"workflow": "combined_catalog"})
+        current_task = db.upsert_discovery_task(workspace, scan_id=current_scan, source="fake", kind="song", query_key="current")
+        current = db._conn.execute("SELECT id FROM candidate_charts WHERE chart_id = 301").fetchone()["id"]
+        db._conn.execute("UPDATE workspace_candidates SET task_id = ? WHERE workspace_id = ? AND candidate_id = ?", (current_task, workspace, current))
+        stale_chart = make_chart("Song", "Artist", chart_id=399)
+        db.upsert_candidate(stale_chart)
+        stale = db._conn.execute("SELECT id FROM candidate_charts WHERE chart_id = 399").fetchone()["id"]
+        db.upsert_workspace_candidate(workspace, track.track_key, stale_chart, score=98, eligibility="RECOMMENDED", decision="AUTO_ACCEPT", kind="exact", task_id=old_task)
+        db._conn.commit()
+    finally:
+        db.close()
+
+    review = client.get("/api/review").get_json()
+    candidates = [item for card in review["tracks"] for item in card["candidates"]]
+    assert 301 in [item["chart_id"] for item in candidates]
+    assert 399 not in [item["chart_id"] for item in candidates]
+    assert client.post("/api/spotify/select", json={"workspace_id": workspace, "track_id": track.db_id, "source": "fake", "chart_id": 399}).status_code == 404
+    bulk = client.post("/api/spotify/select-all", json={"workspace_id": workspace, "scope": "eligible"})
+    assert bulk.status_code == 200
+    assert bulk.get_json()["selected"] == 1
+
+    db = Database(config.database_path)
+    try:
+        now = time.time()
+        db._conn.execute("INSERT INTO workspace_selections (workspace_id, kind, track_id, candidate_id, score, eligibility, status, selected_at, updated_at) VALUES (?, 'exact', ?, ?, 98, 'RECOMMENDED', 'selected', ?, ?)", (workspace, track.db_id, stale, now, now))
+        db._conn.commit()
+    finally:
+        db.close()
+    preview = client.post("/api/spotify/export/preview", json={"workspace_id": workspace, "kind": "folder", "path": str(tmp_path / "songs")})
+    assert preview.status_code == 200
+    assert preview.get_json()["ok"] is False
+    assert client.post("/api/spotify/export/start", json={"workspace_id": workspace, "kind": "folder", "path": str(tmp_path / "songs")}).status_code == 400
 
 
 def test_home_inline_script_parses_in_javascript_engine(client, tmp_path):
@@ -325,6 +376,10 @@ def test_bulk_selection_defaults_to_strong_and_explicit_eligible_scope(client, c
     seed_local_workspace(config, initial["workspace_id"])
     db = Database(config.database_path)
     try:
+        task_id = db._conn.execute(
+            "SELECT id FROM discovery_tasks WHERE workspace_id = ? ORDER BY id DESC LIMIT 1",
+            (initial["workspace_id"],),
+        ).fetchone()["id"]
         missing = next(
             track for track in db.get_spotify_tracks(True) if track.title == "Missing Song"
         )
@@ -348,6 +403,7 @@ def test_bulk_selection_defaults_to_strong_and_explicit_eligible_scope(client, c
                 },
             }),
             kind="exact",
+            task_id=task_id,
         )
     finally:
         db.close()
@@ -398,6 +454,10 @@ def test_local_export_reports_one_human_readable_success(config):
         chart = make_chart("Song", "Artist", chart_id=401, md5=md5)
         db = Database(config.database_path)
         try:
+            task_id = db._conn.execute(
+                "SELECT id FROM discovery_tasks WHERE workspace_id = ? ORDER BY id DESC LIMIT 1",
+                (workspace_id,),
+            ).fetchone()["id"]
             db.upsert_candidate(chart)
             db.upsert_workspace_candidate(
                 workspace_id,
@@ -417,6 +477,7 @@ def test_local_export_reports_one_human_readable_success(config):
                     },
                 }),
                 kind="exact",
+                task_id=task_id,
             )
         finally:
             db.close()

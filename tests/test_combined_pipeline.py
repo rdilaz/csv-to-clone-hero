@@ -35,6 +35,11 @@ def test_combined_discovery_deduplicates_provenance_and_scores(config):
         assert result.exact_hits == 1
         assert result.candidates == 1
         track = db.get_spotify_tracks(True)[0]
+        current = db.get_workspace_candidates(
+            "combined:test", track_id=track.db_id, kind="exact", current_only=True
+        )
+        assert [row["chart_id"] for row in current] == [12]
+        assert current[0]["task_id"] is not None
         providers = track.origin_metadata["provenance"]
         assert {entry["provider"] for entry in providers} == {"spotify", "soundcloud"}
     finally:
@@ -117,10 +122,21 @@ def test_completed_scan_fast_path_skips_per_song_iteration(config, monkeypatch):
     db = Database(config.database_path)
     try:
         discover_combined(config, db, snapshot, workspace_key="combined:fast", on_progress=events.append)
+        scan_count = db._conn.execute(
+            "SELECT COUNT(*) FROM discovery_scans WHERE workspace_id = "
+            "(SELECT id FROM discovery_workspaces WHERE workspace_key = 'combined:fast')"
+        ).fetchone()[0]
         second = discover_combined(config, db, snapshot, workspace_key="combined:fast", on_progress=events.append)
         assert calls == 1
         assert second.cached_tracks == 1
         assert second.recomputed_tracks == 0
+        assert db._conn.execute(
+            "SELECT COUNT(*) FROM discovery_scans WHERE workspace_id = "
+            "(SELECT id FROM discovery_workspaces WHERE workspace_key = 'combined:fast')"
+        ).fetchone()[0] == scan_count
+        assert db.get_workspace_candidates(
+            "combined:fast", kind="exact", current_only=True
+        )
         assert any(event.get("message") == "Reusing 1 existing matches" for event in events)
     finally:
         db.close()
@@ -146,6 +162,78 @@ def test_completed_fast_path_ignores_stale_candidate_rows(config, monkeypatch):
         db.upsert_candidate(stale)
         db.upsert_workspace_candidate(db.get_workspace("combined:stale")["id"], "artist|stale", stale, kind="exact")
         assert completed_scan_fast_path(config, db, db.get_workspace("combined:stale")["id"], library_fp) is not None
+    finally:
+        db.close()
+
+
+def test_completed_fast_path_materializes_legacy_combined_generation(config, monkeypatch):
+    from tests.conftest import make_chart
+    import csv_to_clonehero.combined_pipeline as pipeline
+
+    chart = make_chart("Song", "Artist", chart_id=22)
+    manifest = {"snapshot_id": "fixture", "sha256": "fixture-sha", "chart_count": 1}
+    monkeypatch.setattr(pipeline, "read_catalog_manifest", lambda _path: manifest)
+    db = Database(config.database_path)
+    try:
+        workspace_key = "combined:migration"
+        discover_combined(
+            config, db,
+            [LibrarySnapshot("soundcloud", [ProviderTrack("soundcloud", "sc-1", "Song", "Artist")])],
+            workspace_key=workspace_key, catalog=FakeCatalog(chart),
+        )
+        workspace_id = db.get_workspace(workspace_key)["id"]
+        library_fp = db.refresh_library_matching_fingerprint(workspace_id)
+        old_key = db._conn.execute("SELECT fingerprint FROM matching_scan_cache").fetchone()[0]
+        new_key = matching_scan_fingerprint((), manifest, config, library_fingerprint=library_fp)
+        db._conn.execute("UPDATE matching_scan_cache SET fingerprint=? WHERE fingerprint=?", (new_key, old_key))
+        from csv_to_clonehero.providers.base import provider_track_to_track
+        db.upsert_spotify_tracks([provider_track_to_track(ProviderTrack("soundcloud", "sc-removed", "Removed", "Artist"))])
+        removed = next(track for track in db.get_spotify_tracks(True) if track.title == "Removed")
+        removed_chart = make_chart("Removed", "Artist", chart_id=24)
+        db.upsert_candidate(removed_chart)
+        db.upsert_workspace_candidate(workspace_id, removed.track_key, removed_chart, kind="exact")
+        db._conn.execute("DELETE FROM discovery_scans WHERE workspace_id=?", (workspace_id,))
+        db._conn.execute("DELETE FROM discovery_tasks WHERE workspace_id=?", (workspace_id,))
+        db._conn.commit()
+
+        first = completed_scan_fast_path(config, db, workspace_id, library_fp)
+        assert first is not None and first.cached_tracks == 1 and first.recomputed_tracks == 0
+        generation = db.get_current_combined_generation(workspace_id)
+        assert generation is not None
+        generation_id = generation["id"]
+        assert db.get_workspace_candidates(workspace_id, kind="exact", current_only=True)
+        assert db.get_workspace_candidates(workspace_id, track_id=removed.db_id, kind="exact")
+        assert db.get_workspace_candidates(workspace_id, track_id=removed.db_id, kind="exact", current_only=True) == []
+        second = completed_scan_fast_path(config, db, workspace_id, library_fp)
+        assert second is not None and db.get_current_combined_generation(workspace_id)["id"] == generation_id
+        assert db._conn.execute("SELECT COUNT(*) FROM discovery_scans WHERE workspace_id=?", (workspace_id,)).fetchone()[0] == 1
+    finally:
+        db.close()
+
+
+def test_current_generation_ignores_other_exact_scans_and_newer_incomplete_combined(config):
+    from tests.conftest import make_chart, make_track
+
+    db = Database(config.database_path)
+    try:
+        workspace = db.create_workspace(workspace_key="combined:authority", name="Authority", kind="exact")
+        track = make_track("Song", "Artist")
+        db.replace_tracks([track], {"test.csv": 1})
+        chart = make_chart("Song", "Artist", chart_id=23)
+        db.upsert_candidate(chart)
+        exact_scan = db.create_discovery_scan(workspace, scan_key="legacy", kind="exact", status="complete")
+        task = db.upsert_discovery_task(workspace, scan_id=exact_scan, source="legacy", query_key="legacy", status="complete")
+        db.upsert_workspace_candidate(workspace, track.track_key, chart, task_id=task, kind="exact")
+        assert db.get_workspace_candidates(workspace, kind="exact", current_only=True) == []
+        combined = db.create_discovery_scan(workspace, scan_key="combined", kind="exact", status="complete", metadata={"workflow": "combined_catalog"})
+        task = db.upsert_discovery_task(workspace, scan_id=combined, source="combined", query_key="combined", status="complete")
+        db.assign_workspace_track_candidates_to_task(workspace, track.track_key, task)
+        assert db.get_workspace_candidates(workspace, kind="exact", current_only=True)
+        running = db.create_discovery_scan(workspace, scan_key="combined-running", kind="exact", status="running", metadata={"workflow": "combined_catalog"})
+        db.upsert_discovery_task(workspace, scan_id=running, source="combined", query_key="running", status="complete")
+        assert db.get_current_combined_generation(workspace) is None
+        db.create_discovery_scan(workspace, scan_key="combined-new", kind="exact", status="partial", metadata={"workflow": "combined_catalog"})
+        assert db.get_current_combined_generation(workspace) is None
     finally:
         db.close()
 

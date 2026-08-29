@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import time
+import uuid
 from collections import Counter
 from dataclasses import asdict, dataclass, field, is_dataclass
 from typing import Any, Iterable, Mapping
@@ -182,6 +183,36 @@ def completed_scan_fast_path(config: AppConfig, db: Database, workspace_id: int 
                 miss("current candidate relationship mismatch")
                 return None
             db.update_matching_scan_cache_revision(workspace_id, current_revision)
+        latest_generation = db.get_latest_combined_generation(workspace_id)
+        if latest_generation is not None and str(latest_generation["status"] or "").lower() not in {"complete", "completed"}:
+            miss("latest combined generation is not complete")
+            return None
+        if latest_generation is None:
+            expected_digest = str(result_data.get("candidate_relationship_digest") or "")
+            current_count, current_digest, _ = db.workspace_current_candidate_digest(workspace_id)
+            if (
+                not expected_digest
+                or current_count != int(result_data.get("persisted_candidates", -1))
+                or current_digest != expected_digest
+            ):
+                miss("cannot materialize combined generation")
+                return None
+            generation_key = f"combined-migration-{uuid.uuid4().hex}"
+            scan_id = db.create_discovery_scan(
+                workspace_id, scan_key=generation_key, kind="exact", status="running",
+                metadata={"workflow": "combined_catalog", "generation": generation_key, "migration": True},
+            )
+            task_id = db.upsert_discovery_task(
+                workspace_id, source="combined", kind="generation",
+                query_key=generation_key, query_text="validated persisted combined result",
+                scan_id=scan_id, status="complete", total=int(result_data["tracks"]),
+                completed=int(result_data["tracks"]),
+            )
+            db.assign_current_progress_candidates_to_task(workspace_id, task_id)
+            db.create_discovery_scan(
+                workspace_id, scan_key=generation_key, kind="exact", status="complete",
+                metadata={"workflow": "combined_catalog", "generation": generation_key, "migration": True},
+            )
         timings["result_validation_seconds"] = time.perf_counter() - validation_started
         result = CombinedDiscoveryResult(**result_data)
         result.cached_tracks = int(row["track_count"])
@@ -262,7 +293,8 @@ def discover_combined(
             scan_fingerprint = matching_scan_fingerprint(normalized, catalog_manifest, config, library_fingerprint=library_fingerprint)
             scan_cache = db.get_matching_scan_cache(workspace_id, scan_fingerprint)
             progress_state = db.get_discovery_song_progress_summary(workspace_id)
-            if scan_cache is not None and int(scan_cache["track_count"]) == len(normalized) and progress_state["total"] == len(normalized) and progress_state["completed"] == len(normalized):
+            current_generation = db.get_current_combined_generation(workspace_id)
+            if scan_cache is not None and current_generation is not None and int(scan_cache["track_count"]) == len(normalized) and progress_state["total"] == len(normalized) and progress_state["completed"] == len(normalized):
                 cached_result = CombinedDiscoveryResult(**json.loads(scan_cache["result_json"]))
                 cached_result.cached_tracks = len(normalized)
                 cached_result.recomputed_tracks = 0
@@ -285,6 +317,17 @@ def discover_combined(
         catalog_chart_count=int(getattr(catalog, "chart_count", 0) or 0),
         catalog_load_seconds=float(getattr(catalog, "load_seconds", 0.0) or 0.0),
     )
+    generation_key = f"combined-{uuid.uuid4().hex}"
+    scan_id = db.create_discovery_scan(
+        workspace_id, scan_key=generation_key, kind="exact", status="running",
+        metadata={"workflow": "combined_catalog", "generation": generation_key},
+    )
+    generation_task_id = db.upsert_discovery_task(
+        workspace_id, source="combined", kind="generation", query_key=generation_key,
+        query_text="combined candidate generation", scan_id=scan_id,
+        status="running", total=len(normalized),
+    )
+    task_ids = {track.track_key: generation_task_id for track in normalized}
     db.initialize_discovery_song_progress(workspace_id, normalized)
 
     def emit(**payload: Any) -> None:
@@ -360,7 +403,9 @@ def discover_combined(
                             chart = ChartCandidate(**dict(entry["candidate"]))
                             evaluated_chart_ids.add((str(chart.source), int(chart.chart_id)))
                             db.upsert_candidate(chart)
-                            db.upsert_workspace_candidate(workspace_id, track.track_key, chart, score=float(entry["score"]), quality=float(entry["quality"]), decision=str(entry["decision"]), eligibility=str(entry["eligibility"]), breakdown_json=str(entry["breakdown_json"]), kind="exact", metadata=dict(entry.get("metadata") or {}))
+                            db.upsert_workspace_candidate(workspace_id, track.track_key, chart, score=float(entry["score"]), quality=float(entry["quality"]), decision=str(entry["decision"]), eligibility=str(entry["eligibility"]), breakdown_json=str(entry["breakdown_json"]), kind="exact", task_id=task_ids[track.track_key], metadata=dict(entry.get("metadata") or {}))
+                    else:
+                        db.assign_workspace_track_candidates_to_task(workspace_id, track.track_key, task_ids[track.track_key])
                     result.cached_tracks += 1
                     result.candidates += candidate_count
                     result.eligible_candidates += int(cached_result.get("eligible_count", 0))
@@ -514,6 +559,7 @@ def discover_combined(
                     eligibility=breakdown.eligibility,
                     breakdown_json=json.dumps(breakdown.to_dict(), sort_keys=True),
                     kind="exact",
+                    task_id=task_ids[track.track_key],
                     metadata={
                         "provenance": track.origin_metadata.get("provenance", []),
                         "catalog_retrieval": {
@@ -601,6 +647,23 @@ def discover_combined(
     if scan_fingerprint:
         _, result.candidate_relationship_digest, _ = db.workspace_current_candidate_digest(workspace_id)
         db.save_matching_scan_cache(workspace_id, scan_fingerprint, len(normalized), asdict(result))
+    else:
+        _, result.candidate_relationship_digest, _ = db.workspace_current_candidate_digest(workspace_id)
+    db.update_discovery_task(
+        generation_task_id, status="complete", completed=len(normalized), total=len(normalized)
+    )
+    # The scan transition is the final commit marker for this generation.
+    db.create_discovery_scan(
+        workspace_id,
+        scan_key=generation_key,
+        kind="exact",
+        status="complete",
+        metadata={
+            "workflow": "combined_catalog",
+            "generation": generation_key,
+            "candidate_relationship_digest": result.candidate_relationship_digest,
+        },
+    )
     emit(
         phase="complete", status="complete", message="Chart matching complete",
         processed_tracks=len(normalized), scoring_tasks_completed=len(normalized),

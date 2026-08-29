@@ -2747,6 +2747,7 @@ def create_app(
             track_id=data.get("id") or data.get("spotify_id"),
             kind="exact",
             include_rejected=False,
+            current_only=True,
         )
         visible_candidates = candidates[:5]
         owned_matches = db.get_inventory_identity_matches(
@@ -2784,6 +2785,7 @@ def create_app(
             [int(row["id"]) for row in rows],
             kind="exact",
             include_rejected=include_rejected,
+            current_only=True,
         )
         return [
             _track_with_candidates(db, workspace, row, grouped.get(int(row["id"]), []))
@@ -2808,24 +2810,20 @@ def create_app(
             placeholders = ",".join("?" for _ in states)
             eligible_ids = {
                 int(row["track_id"])
-                for row in db._conn.execute(
-                    f"""SELECT DISTINCT track_id FROM workspace_candidates
-                        WHERE workspace_id = ? AND kind = 'exact'
-                          AND eligibility IN ({placeholders}) AND track_id IS NOT NULL""",
-                    (workspace, *states),
+                for row in db.get_workspace_candidates(
+                    workspace, kind="exact", include_rejected=True, current_only=True
                 )
+                if row["track_id"] is not None and str(row["eligibility"] or "").upper() in states
             }
         if actual_view == "excluded":
             # Tracks that have chart candidates but none eligible: the rescuable
             # "low-quality only" pool a user may still choose to accept.
             excluded_ids = {
                 int(row["track_id"])
-                for row in db._conn.execute(
-                    """SELECT DISTINCT track_id FROM workspace_candidates
-                       WHERE workspace_id = ? AND kind = 'exact'
-                         AND eligibility = 'EXCLUDED' AND track_id IS NOT NULL""",
-                    (workspace,),
+                for row in db.get_workspace_candidates(
+                    workspace, kind="exact", include_rejected=True, current_only=True
                 )
+                if row["track_id"] is not None and str(row["eligibility"] or "").upper() == "EXCLUDED"
             }
         needle = str(search_text or "").strip().casefold()
         filtered = []
@@ -2893,6 +2891,7 @@ def create_app(
                     workspace,
                     kind="exact",
                     include_rejected=False,
+                    current_only=True,
                 )
                 if item["track_id"] is not None
             }
@@ -2958,6 +2957,7 @@ def create_app(
             track_id=track_value if kind == "exact" else None,
             kind=kind,
             include_rejected=True,
+            current_only=kind == "exact",
         )
         requested_candidate = payload.get("candidate_id")
         source = str(payload.get("source") or "")
@@ -4828,6 +4828,7 @@ def create_app(
                         track_id=track_row["id"],
                         kind=kind,
                         include_rejected=True,
+                        current_only=kind == "exact",
                     )
                 ]
             else:
@@ -4836,6 +4837,7 @@ def create_app(
                     track_id=track_value if track_value not in (None, "") else None,
                     kind=kind,
                     include_rejected=True,
+                    current_only=kind == "exact",
                 )
             groups: dict[str, dict[str, Any]] = {}
             for row in rows:
@@ -5573,7 +5575,12 @@ def create_app(
             requested = {str(value) for value in track_ids}
         needle = str(search_text or "").strip().casefold()
         catalog_sources = list(source_factory(config)) if kind == "exact" else None
-        rows = db.get_workspace_candidates(workspace, kind=kind, include_rejected=True)
+        rows = db.get_workspace_candidates(
+            workspace,
+            kind=kind,
+            include_rejected=True,
+            current_only=kind == "exact",
+        )
         grouped: dict[Any, Any] = {}
         blocked = {EXCLUDED, INCOMPATIBLE, "REJECT", "REJECTED", "NOT_EXPORTABLE"}
         for row in rows:
@@ -5949,6 +5956,7 @@ def create_app(
                 track_id=data.get("track_id") or data.get("spotify_id") if kind == "exact" else None,
                 kind=kind,
                 include_rejected=True,
+                current_only=kind == "exact",
             )
             matching_row = next(
                 (
@@ -6482,9 +6490,9 @@ def create_app(
                     "error": "; ".join(issues),
                 })
             return {
-                "ok": bool(preflight.eligible_items) and not any(
-                    issue.selection_index is None for issue in preflight.errors
-                ),
+                "ok": bool(preflight.eligible_items)
+                and not any(item["status"] == "invalid" for item in items)
+                and not any(issue.selection_index is None for issue in preflight.errors),
                 "kind": kind,
                 "destination": str(Path(destination).expanduser().resolve()),
                 "selected_chart_count": len(selections),
@@ -6560,6 +6568,30 @@ def create_app(
         )
         if error is not None:
             return error
+        # Reject stale persisted selections before creating an asynchronous
+        # export job.  The worker repeats the full validation before writing.
+        start_db = Database(config.database_path)
+        try:
+            for selection in start_db.list_workspace_selections(workspace):
+                data = _row_dict(selection)
+                kind = str(data.get("kind") or "exact").casefold()
+                if kind != "exact":
+                    continue
+                current = start_db.get_workspace_candidates(
+                    workspace,
+                    track_id=data.get("track_id") or data.get("spotify_id"),
+                    kind="exact",
+                    include_rejected=True,
+                    current_only=True,
+                )
+                if not any(
+                    int(_row_dict(row).get("candidate_id") or 0)
+                    == int(data.get("candidate_id") or 0)
+                    for row in current
+                ):
+                    return {"error": "a persisted selection is not part of the current matching result"}, 400
+        finally:
+            start_db.close()
         with export_job.lock:
             if export_job.running:
                 return {"error": "an export is already running"}, 409
@@ -6950,6 +6982,7 @@ def create_app(
             kind="exact",
             include_rejected=True,
             include_candidate_data=False,
+            current_only=True,
         )
         if not workspace_track_ids:
             # Older local snapshots may not have the workspace projection. The
@@ -7827,6 +7860,7 @@ def create_app(
             # behind the explicit rejected-results disclosure.
             include_rejected=True,
             include_candidate_data=bool(search),
+            current_only=True,
         )
         grouped_rows: dict[int, list[Any]] = {}
         for row in rows:
@@ -7908,6 +7942,7 @@ def create_app(
             [int(summary["_track_id"]) for summary in page["tracks"]],
             kind="exact",
             include_rejected=True,
+            current_only=True,
         )
         for summary in page["tracks"]:
             track_id = int(summary["_track_id"])
