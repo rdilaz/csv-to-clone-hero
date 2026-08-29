@@ -1,6 +1,6 @@
 import json
 
-from csv_to_clonehero.combined_pipeline import discover_combined, rank_expansion_artists
+from csv_to_clonehero.combined_pipeline import completed_scan_fast_path, discover_combined, matching_cache_fingerprint, matching_scan_fingerprint, rank_expansion_artists
 from csv_to_clonehero.catalog import CatalogLookup
 from csv_to_clonehero.database import Database
 from csv_to_clonehero.providers.base import LibrarySnapshot, ProviderTrack
@@ -64,6 +64,153 @@ def test_combined_progress_reports_full_retrieval_and_final_song_state(config):
         rows = db.get_discovery_song_progress(1, limit=10)
         assert {row["classification"] for row in rows} == {"strong", "no_catalog_candidate"}
         assert max(len(json.dumps(event)) for event in events) < 2000
+    finally:
+        db.close()
+
+
+def test_identical_discovery_reuses_cached_scored_relationships(config, monkeypatch):
+    from tests.conftest import make_chart, make_track
+    import csv_to_clonehero.combined_pipeline as pipeline
+
+    chart = make_chart("Song", "Artist", chart_id=14)
+    snapshot = [LibrarySnapshot("soundcloud", [ProviderTrack("soundcloud", "sc-1", "Song", "Artist")])]
+    calls = 0
+    original = pipeline.score_candidate
+
+    def counted(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(pipeline, "score_candidate", counted)
+    db = Database(config.database_path)
+    try:
+        first = discover_combined(config, db, snapshot, workspace_key="combined:cache", catalog=FakeCatalog(chart))
+        first_calls = calls
+        second = discover_combined(config, db, snapshot, workspace_key="combined:cache", catalog=FakeCatalog(chart))
+        assert first_calls == 1
+        assert calls == first_calls
+        assert second.strong_match_tracks == first.strong_match_tracks
+        assert second.review_match_tracks == first.review_match_tracks
+        assert db._conn.execute("SELECT COUNT(*) FROM matching_song_cache").fetchone()[0] == 1
+    finally:
+        db.close()
+
+
+def test_completed_scan_fast_path_skips_per_song_iteration(config, monkeypatch):
+    from tests.conftest import make_chart
+    import csv_to_clonehero.combined_pipeline as pipeline
+
+    chart = make_chart("Song", "Artist", chart_id=19)
+    snapshot = [LibrarySnapshot("soundcloud", [ProviderTrack("soundcloud", "sc-1", "Song", "Artist")])]
+    catalog = FakeCatalog(chart)
+    monkeypatch.setattr(pipeline, "read_catalog_manifest", lambda _path: {"snapshot_id": "fixture", "sha256": "fixture-sha", "chart_count": 1})
+    monkeypatch.setattr(pipeline, "load_enchor_catalog", lambda _path: catalog)
+    calls = 0
+    original = pipeline.score_candidate
+    def counted(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+    monkeypatch.setattr(pipeline, "score_candidate", counted)
+    events = []
+    db = Database(config.database_path)
+    try:
+        discover_combined(config, db, snapshot, workspace_key="combined:fast", on_progress=events.append)
+        second = discover_combined(config, db, snapshot, workspace_key="combined:fast", on_progress=events.append)
+        assert calls == 1
+        assert second.cached_tracks == 1
+        assert second.recomputed_tracks == 0
+        assert any(event.get("message") == "Reusing 1 existing matches" for event in events)
+    finally:
+        db.close()
+
+
+def test_completed_fast_path_ignores_stale_candidate_rows(config, monkeypatch):
+    from tests.conftest import make_chart
+    import csv_to_clonehero.combined_pipeline as pipeline
+    chart = make_chart("Song", "Artist", chart_id=20)
+    snapshot = [LibrarySnapshot("soundcloud", [ProviderTrack("soundcloud", "sc-1", "Song", "Artist")])]
+    catalog = FakeCatalog(chart)
+    manifest = {"snapshot_id": "fixture", "sha256": "fixture-sha", "chart_count": 1}
+    monkeypatch.setattr(pipeline, "read_catalog_manifest", lambda _path: manifest)
+    db = Database(config.database_path)
+    try:
+        discover_combined(config, db, snapshot, workspace_key="combined:stale", catalog=catalog)
+        library_fp = db.refresh_library_matching_fingerprint(db.get_workspace("combined:stale")["id"])
+        old_key = db._conn.execute("SELECT fingerprint FROM matching_scan_cache").fetchone()[0]
+        new_key = matching_scan_fingerprint((), manifest, config, library_fingerprint=library_fp)
+        db._conn.execute("UPDATE matching_scan_cache SET fingerprint=? WHERE fingerprint=?", (new_key, old_key))
+        stale = make_chart("Stale", "Artist", chart_id=21)
+        db.upsert_spotify_tracks([ProviderTrack("soundcloud", "stale", "Stale", "Artist")])
+        db.upsert_candidate(stale)
+        db.upsert_workspace_candidate(db.get_workspace("combined:stale")["id"], "artist|stale", stale, kind="exact")
+        assert completed_scan_fast_path(config, db, db.get_workspace("combined:stale")["id"], library_fp) is not None
+    finally:
+        db.close()
+
+
+def test_partial_library_change_reuses_unchanged_song_only(config, monkeypatch):
+    from tests.conftest import make_chart
+    import csv_to_clonehero.combined_pipeline as pipeline
+
+    first_chart = make_chart("Song", "Artist", chart_id=17)
+    second_chart = make_chart("New", "Artist", chart_id=18)
+    calls = 0
+    original = pipeline.score_candidate
+    def counted(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+    monkeypatch.setattr(pipeline, "score_candidate", counted)
+    db = Database(config.database_path)
+    try:
+        class PartialCatalog(FakeCatalog):
+            def candidates(self, artist, title):
+                return (first_chart,) if title == "Song" else (second_chart,)
+        catalog = PartialCatalog(first_chart)
+        discover_combined(config, db, [LibrarySnapshot("soundcloud", [ProviderTrack("soundcloud", "one", "Song", "Artist")])], workspace_key="combined:partial", catalog=catalog)
+        catalog.chart = second_chart
+        discover_combined(config, db, [LibrarySnapshot("soundcloud", [ProviderTrack("soundcloud", "one", "Song", "Artist"), ProviderTrack("soundcloud", "two", "New", "Artist")])], workspace_key="combined:partial", catalog=catalog)
+        assert calls == 2
+    finally:
+        db.close()
+
+
+def test_matching_cache_fingerprint_changes_with_track_catalog_and_config(config):
+    from tests.conftest import make_chart, make_track
+    track = make_track("Song", "Artist")
+    catalog = FakeCatalog(make_chart("Song", "Artist", chart_id=15))
+    baseline = matching_cache_fingerprint(track, catalog, config)
+    changed_track = make_track("Changed", "Artist")
+    assert matching_cache_fingerprint(changed_track, catalog, config) != baseline
+    catalog.snapshot_id = "different"
+    assert matching_cache_fingerprint(track, catalog, config) != baseline
+    config.search.catalog_artist_fuzzy_limit += 1
+    assert matching_cache_fingerprint(track, catalog, config) != baseline
+    config.instruments.require_five_fret_guitar = not config.instruments.require_five_fret_guitar
+    assert matching_cache_fingerprint(track, catalog, config) != baseline
+
+
+def test_corrupt_matching_cache_fails_safe_and_recomputes(config, monkeypatch):
+    from tests.conftest import make_chart
+    import csv_to_clonehero.combined_pipeline as pipeline
+
+    chart = make_chart("Song", "Artist", chart_id=16)
+    snapshot = [LibrarySnapshot("soundcloud", [ProviderTrack("soundcloud", "sc-1", "Song", "Artist")])]
+    db = Database(config.database_path)
+    try:
+        discover_combined(config, db, snapshot, workspace_key="combined:corrupt", catalog=FakeCatalog(chart))
+        db._conn.execute("UPDATE matching_song_cache SET result_json = '{bad'")
+        calls = 0
+        original = pipeline.score_candidate
+        def counted(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            return original(*args, **kwargs)
+        monkeypatch.setattr(pipeline, "score_candidate", counted)
+        discover_combined(config, db, snapshot, workspace_key="combined:corrupt", catalog=FakeCatalog(chart))
+        assert calls == 1
     finally:
         db.close()
 

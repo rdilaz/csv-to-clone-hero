@@ -2,16 +2,18 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import time
 from collections import Counter
-from dataclasses import dataclass, field
-from typing import Any, Iterable
+from dataclasses import asdict, dataclass, field, is_dataclass
+from typing import Any, Iterable, Mapping
 
-from csv_to_clonehero.catalog import CatalogLookup, EnchorCatalog, load_enchor_catalog
+from csv_to_clonehero.catalog import CatalogLookup, EnchorCatalog, load_enchor_catalog, read_catalog_manifest
 from csv_to_clonehero.config import AppConfig
 from csv_to_clonehero.database import Database
 from csv_to_clonehero.matching import score_candidate, score_expansion_candidate
+from csv_to_clonehero.models import ChartCandidate
 from csv_to_clonehero.providers.base import LibrarySnapshot, merge_provider_tracks
 
 
@@ -50,6 +52,11 @@ class CombinedDiscoveryResult:
     retrieval_seconds: float = 0.0
     scoring_seconds: float = 0.0
     discovery_seconds: float = 0.0
+    persistence_seconds: float = 0.0
+    fast_path_timings: dict[str, float] = field(default_factory=dict)
+    candidate_relationship_digest: str = ""
+    cached_tracks: int = 0
+    recomputed_tracks: int = 0
 
     @property
     def stats(self) -> "CombinedDiscoveryResult":
@@ -93,7 +100,127 @@ class CombinedDiscoveryResult:
             "average_eligible_candidates_per_matched_song": round(
                 self.average_eligible_candidates_per_matched_song, 3
             ),
+            "cached_tracks": self.cached_tracks,
+            "recomputed_tracks": self.recomputed_tracks,
+            "persistence_seconds": round(self.persistence_seconds, 6),
         }
+
+
+MATCH_CACHE_VERSION = "combined-match-v3"
+
+
+def matching_cache_fingerprint(track: Any, catalog: Any, config: AppConfig, *, config_fingerprint: str = "") -> str:
+    """Fingerprint every input that can affect a song's match result."""
+    def plain(value: Any) -> Any:
+        if is_dataclass(value):
+            return plain(asdict(value))
+        if hasattr(value, "model_dump"):
+            return value.model_dump(mode="json")
+        if isinstance(value, Mapping):
+            return {str(key): plain(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple, set)):
+            return [plain(item) for item in value]
+        if hasattr(value, "__dict__"):
+            return {key: plain(item) for key, item in vars(value).items() if not key.startswith("_")}
+        return value
+    payload = {"version": MATCH_CACHE_VERSION, "track": plain(track), "catalog_snapshot": getattr(catalog, "snapshot_id", ""), "catalog_chart_count": getattr(catalog, "chart_count", 0), "config": config_fingerprint or matching_config_fingerprint(config)}
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()
+
+
+def matching_scan_fingerprint(tracks: Iterable[Any], manifest: Mapping[str, Any], config: AppConfig, *, library_fingerprint: str = "") -> str:
+    """Fingerprint the complete input for the completed-scan fast path."""
+    track_fingerprints = [] if library_fingerprint else [matching_cache_fingerprint(track, type("Manifest", (), manifest)(), config) for track in tracks]
+    payload = {"version": MATCH_CACHE_VERSION, "library": library_fingerprint, "tracks": track_fingerprints, "catalog": dict(manifest), "config": matching_config_fingerprint(config)}
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+
+
+def matching_config_fingerprint(config: AppConfig) -> str:
+    values = {name: getattr(config, name, None) for name in ("matching", "search", "instruments")}
+    return hashlib.sha256(json.dumps(values, sort_keys=True, default=str).encode()).hexdigest()
+
+
+def completed_scan_fast_path(config: AppConfig, db: Database, workspace_id: int | str, library_fingerprint: str, *, on_progress: Any = None, miss_diagnostic: dict[str, str] | None = None) -> CombinedDiscoveryResult | None:
+    """Reuse a structurally valid completed scan without rebuilding the library."""
+    def miss(reason: str) -> None:
+        if miss_diagnostic is not None:
+            miss_diagnostic["reason"] = reason
+    if not library_fingerprint:
+        miss("missing library fingerprint")
+        return None
+
+
+    started = time.perf_counter()
+    timings: dict[str, float] = {}
+    try:
+        manifest_started = time.perf_counter()
+        manifest = read_catalog_manifest(config.catalog_path)
+        timings["catalog_manifest_seconds"] = time.perf_counter() - manifest_started
+        config_started = time.perf_counter()
+        fingerprint = matching_scan_fingerprint((), manifest, config, library_fingerprint=library_fingerprint)
+        timings["config_fingerprint_seconds"] = time.perf_counter() - config_started
+        lookup_started = time.perf_counter()
+        row = db.get_matching_scan_cache(workspace_id, fingerprint)
+        timings["scan_cache_lookup_seconds"] = time.perf_counter() - lookup_started
+        validation_started = time.perf_counter()
+        progress = db.get_discovery_song_progress_summary(workspace_id)
+        if row is None:
+            miss("no scan record")
+            return None
+        if progress["total"] != int(row["track_count"]) or progress["completed"] != progress["total"]:
+            miss("progress incomplete")
+            return None
+        result_data = json.loads(row["result_json"])
+        current_revision = db.get_workspace_candidate_revision(workspace_id)
+        cached_revision = int(row["candidate_revision"] or 0)
+        if int(result_data.get("tracks", -1)) != int(row["track_count"]):
+            miss("current candidate relationship mismatch")
+            return None
+        if cached_revision != current_revision:
+            expected_digest = str(result_data.get("candidate_relationship_digest") or "")
+            current_count, current_digest, _ = db.workspace_current_candidate_digest(workspace_id)
+            if current_count != int(result_data.get("persisted_candidates", -1)) or not expected_digest or current_digest != expected_digest:
+                miss("current candidate relationship mismatch")
+                return None
+            db.update_matching_scan_cache_revision(workspace_id, current_revision)
+        timings["result_validation_seconds"] = time.perf_counter() - validation_started
+        result = CombinedDiscoveryResult(**result_data)
+        result.cached_tracks = int(row["track_count"])
+        result.recomputed_tracks = 0
+        result.discovery_seconds = 0.0
+        timings["total_seconds"] = time.perf_counter() - started
+        result.fast_path_timings = timings
+        if on_progress is not None:
+            on_progress({"total_tracks": result.tracks, "catalog_chart_count": manifest["chart_count"], "phase": "complete", "status": "complete", "message": f"Reusing {result.tracks:,} existing matches", "processed_tracks": result.tracks, "cached_tracks": result.tracks, "recomputed_tracks": 0, "fast_path_timings": timings})
+        return result
+    except json.JSONDecodeError:
+        miss("corrupt result JSON")
+        return None
+    except (OSError, TypeError, ValueError, KeyError):
+        miss("cache validation error")
+        return None
+
+
+def materialize_completed_scan_cache(config: AppConfig, db: Database, workspace_id: int | str) -> tuple[CombinedDiscoveryResult, dict[str, Any]]:
+    """Backfill a v3 scan record from proven completed persisted state only."""
+    workspace = db.get_workspace(workspace_id)
+    progress_row = db.get_workspace_progress(workspace_id)
+    if workspace is None or progress_row is None or str(workspace["status"]) != "complete" or str(progress_row["status"]) != "complete":
+        raise ValueError("workspace is not complete")
+    progress = db.get_discovery_song_progress_summary(workspace_id)
+    classified = sum(progress[key] for key in ("strong", "review", "no_suitable", "not_playable", "no_catalog_candidate"))
+    if progress["total"] <= 0 or progress["completed"] != progress["total"]:
+        raise ValueError("progress is incomplete")
+    if classified != progress["total"]:
+        raise ValueError(f"classification total {classified} does not equal {progress['total']}")
+    library_fingerprint = db.get_library_matching_fingerprint(workspace_id)
+    if not library_fingerprint:
+        raise ValueError("missing canonical library fingerprint")
+    manifest = read_catalog_manifest(config.catalog_path)
+    candidate_count, candidate_digest, _ = db.workspace_current_candidate_digest(workspace_id)
+    result = CombinedDiscoveryResult(status="complete", phase="complete", tracks=progress["total"], catalog_available=True, catalog_snapshot_id=str(manifest["snapshot_id"]), catalog_chart_count=int(manifest["chart_count"]), candidate_charts_evaluated=candidate_count, unique_charts_evaluated=candidate_count, tracks_with_candidates=progress["total"] - progress["no_catalog_candidate"], strong_match_tracks=progress["strong"], review_match_tracks=progress["review"], soft_rejected_only_tracks=progress["no_suitable"], hard_rejected_only_tracks=progress["not_playable"], no_plausible_tracks=progress["no_catalog_candidate"], persisted_candidates=candidate_count, candidate_relationship_digest=candidate_digest)
+    scan_fingerprint = matching_scan_fingerprint((), manifest, config, library_fingerprint=library_fingerprint)
+    db.save_matching_scan_cache(workspace_id, scan_fingerprint, result.tracks, asdict(result))
+    return result, {"library_fingerprint": library_fingerprint, "catalog_manifest": manifest, "scan_fingerprint": scan_fingerprint, "candidate_count": candidate_count, "candidate_digest": candidate_digest}
 
 
 def discover_combined(
@@ -125,7 +252,31 @@ def discover_combined(
         workspace_key=workspace_key, name=workspace_name, kind="exact", status="complete", phase="catalog_match",
         metadata={"workflow": "combined_catalog"},
     )
-    catalog = catalog or load_enchor_catalog(config.catalog_path)
+    catalog_manifest = None
+    scan_fingerprint = ""
+    config_fingerprint = matching_config_fingerprint(config)
+    if catalog is None:
+        try:
+            catalog_manifest = read_catalog_manifest(config.catalog_path)
+            library_fingerprint = db.get_library_matching_fingerprint(workspace_id)
+            scan_fingerprint = matching_scan_fingerprint(normalized, catalog_manifest, config, library_fingerprint=library_fingerprint)
+            scan_cache = db.get_matching_scan_cache(workspace_id, scan_fingerprint)
+            progress_state = db.get_discovery_song_progress_summary(workspace_id)
+            if scan_cache is not None and int(scan_cache["track_count"]) == len(normalized) and progress_state["total"] == len(normalized) and progress_state["completed"] == len(normalized):
+                cached_result = CombinedDiscoveryResult(**json.loads(scan_cache["result_json"]))
+                cached_result.cached_tracks = len(normalized)
+                cached_result.recomputed_tracks = 0
+                cached_result.discovery_seconds = 0.0
+                if on_progress is not None:
+                    on_progress({"total_tracks": len(normalized), "catalog_chart_count": int(catalog_manifest["chart_count"]), "phase": "complete", "status": "complete", "message": f"Reusing {len(normalized):,} existing matches", "processed_tracks": len(normalized), "cached_tracks": len(normalized), "recomputed_tracks": 0, "strong_matches": cached_result.strong_match_tracks, "review_matches": cached_result.review_match_tracks, "songs_with_options": cached_result.plausible_match_tracks})
+                return cached_result
+        except (OSError, TypeError, ValueError, KeyError, json.JSONDecodeError):
+            catalog_manifest = None
+            scan_fingerprint = ""
+        catalog = load_enchor_catalog(config.catalog_path)
+    else:
+        catalog_manifest = {"snapshot_id": getattr(catalog, "snapshot_id", ""), "chart_count": getattr(catalog, "chart_count", 0), "sha256": ""}
+        scan_fingerprint = matching_scan_fingerprint(normalized, catalog_manifest, config)
     result = CombinedDiscoveryResult(
         tracks=len(normalized),
         catalog_available=catalog.available,
@@ -187,14 +338,55 @@ def discover_combined(
             getattr(search_config, "catalog_min_title_similarity", 20.0) or 20.0
         )
         evaluated_chart_ids: set[tuple[str, int]] = set()
+        cached_progress: list[tuple[str, Mapping[str, Any]]] = []
         emit(phase="finding_charts", message="Finding possible charts", processed_tracks=0)
         for position, track in enumerate(normalized, start=1):
             if cancellation_event is not None and cancellation_event.is_set():
                 from csv_to_clonehero.spotify_pipeline import DiscoveryCancelled
                 raise DiscoveryCancelled("matching cancelled")
-            db.update_discovery_song_progress(
-                workspace_id, track.track_key, status="checking"
-            )
+            fingerprint = matching_cache_fingerprint(track, catalog, config, config_fingerprint=config_fingerprint)
+            cached = db.get_matching_song_cache(fingerprint)
+            if cached is not None:
+                try:
+                    cached_result = json.loads(cached["result_json"])
+                    classification = str(cached_result["classification"])
+                    entries = cached_result.get("candidates", [])
+                    candidate_count = int(cached_result.get("candidate_count", len(entries)))
+                    expected_ids = {int(entry["candidate"].get("chart_id", 0)) for entry in entries}
+                    _, _, existing_ids = db.workspace_current_candidate_digest(workspace_id, track.track_key)
+                    if existing_ids != expected_ids:
+                        db.clear_workspace_track_candidates(workspace_id, track.track_key)
+                        for entry in entries:
+                            chart = ChartCandidate(**dict(entry["candidate"]))
+                            evaluated_chart_ids.add((str(chart.source), int(chart.chart_id)))
+                            db.upsert_candidate(chart)
+                            db.upsert_workspace_candidate(workspace_id, track.track_key, chart, score=float(entry["score"]), quality=float(entry["quality"]), decision=str(entry["decision"]), eligibility=str(entry["eligibility"]), breakdown_json=str(entry["breakdown_json"]), kind="exact", metadata=dict(entry.get("metadata") or {}))
+                    result.cached_tracks += 1
+                    result.candidates += candidate_count
+                    result.eligible_candidates += int(cached_result.get("eligible_count", 0))
+                    result.candidate_charts_evaluated += candidate_count
+                    if candidate_count > 0:
+                        result.tracks_with_candidates += 1
+                    else:
+                        result.zero_candidate_tracks += 1
+                    if classification == "strong": result.strong_match_tracks += 1
+                    elif classification == "review": result.review_match_tracks += 1
+                    elif classification == "not_playable": result.hard_rejected_only_tracks += 1
+                    elif classification == "no_suitable": result.soft_rejected_only_tracks += 1
+                    else: result.no_plausible_tracks += 1
+                    result.persisted_candidates += len(entries)
+                    cached_progress.append((track.track_key, {"status": "complete", "candidate_count": int(cached_result.get("candidate_count", len(entries))), "provenance": ", ".join(cached_result.get("provenance", [])), "classification": classification}))
+                    if len(cached_progress) >= 50:
+                        db.update_discovery_song_progress_batch(workspace_id, cached_progress)
+                        cached_progress.clear()
+                    if position <= 10 or position % 25 == 0 or position == len(normalized):
+                        emit(phase="finding_charts", message="Reusing cached match", current_song={"artist": track.artist_full, "title": track.title}, processed_tracks=position, scoring_tasks_completed=position, cached_tracks=result.cached_tracks, recomputed_tracks=result.recomputed_tracks, strong_matches=result.strong_match_tracks, review_matches=result.review_match_tracks, songs_with_options=result.plausible_match_tracks)
+                    continue
+                except (TypeError, ValueError, KeyError, json.JSONDecodeError):
+                    pass
+            result.recomputed_tracks += 1
+            db.update_discovery_song_progress(workspace_id, track.track_key, status="checking")
+            db.clear_workspace_track_candidates(workspace_id, track.track_key)
             retrieval_started = time.perf_counter()
             lookup_method = getattr(catalog, "high_recall_candidates", None)
             if callable(lookup_method):
@@ -309,6 +501,7 @@ def discover_combined(
                     to_persist = [
                         max(hard, key=lambda item: (item[1].final_score, item[1].quality))
                     ]
+            persistence_started = time.perf_counter()
             for chart, breakdown in to_persist:
                 db.upsert_candidate(chart)
                 db.upsert_workspace_candidate(
@@ -337,6 +530,7 @@ def discover_combined(
                     },
                 )
                 result.persisted_candidates += 1
+            result.persistence_seconds += time.perf_counter() - persistence_started
             result.candidates += len(matches)
             for _, breakdown in scored:
                 if str(getattr(breakdown, "eligibility", "")).upper() not in {
@@ -361,6 +555,21 @@ def discover_combined(
                 classification = "no_suitable"
             else:
                 classification = "no_catalog_candidate"
+            db.save_matching_song_cache(
+                fingerprint,
+                track.track_key,
+                classification,
+                {
+                    "classification": classification,
+                    "candidate_count": len(matches),
+                    "eligible_count": len(eligible),
+                    "provenance": list(lookup.methods),
+                    "candidates": [
+                        {"candidate": asdict(chart), "score": breakdown.final_score, "quality": breakdown.quality, "decision": breakdown.decision, "eligibility": breakdown.eligibility, "breakdown_json": json.dumps(breakdown.to_dict(), sort_keys=True), "metadata": {"provenance": track.origin_metadata.get("provenance", []), "catalog_retrieval": {"strict_exact": lookup.strict_exact, "methods": list(lookup.methods), "retrieved_song_keys": lookup.retrieved_song_keys, "candidate_methods": list(lookup.candidate_methods.get((str(chart.source), int(chart.chart_id)), lookup.methods))}}}
+                        for chart, breakdown in to_persist
+                    ],
+                },
+            )
             db.update_discovery_song_progress(
                 workspace_id, track.track_key, status="complete",
                 candidate_count=len(matches), provenance=", ".join(lookup.methods),
@@ -378,13 +587,20 @@ def discover_combined(
                 not_playable_matches=result.hard_rejected_only_tracks,
                 no_catalog_candidates=result.zero_candidate_tracks,
                 songs_with_options=result.plausible_match_tracks,
+                cached_tracks=result.cached_tracks,
+                recomputed_tracks=result.recomputed_tracks,
             )
+        if cached_progress:
+            db.update_discovery_song_progress_batch(workspace_id, cached_progress)
         result.unique_charts_evaluated = len(evaluated_chart_ids)
         result.discovery_seconds = time.perf_counter() - discovery_started
         _persist_expansion(db, workspace_id, catalog, normalized, expansion_artists, config, result)
     if not result.discovery_seconds:
         result.discovery_seconds = time.perf_counter() - discovery_started
     result.expansion_artists = rank_expansion_artists(catalog, normalized)
+    if scan_fingerprint:
+        _, result.candidate_relationship_digest, _ = db.workspace_current_candidate_digest(workspace_id)
+        db.save_matching_scan_cache(workspace_id, scan_fingerprint, len(normalized), asdict(result))
     emit(
         phase="complete", status="complete", message="Chart matching complete",
         processed_tracks=len(normalized), scoring_tasks_completed=len(normalized),
@@ -394,6 +610,12 @@ def discover_combined(
         not_playable_matches=result.hard_rejected_only_tracks,
         no_catalog_candidates=result.zero_candidate_tracks,
         songs_with_options=result.plausible_match_tracks,
+        cached_tracks=result.cached_tracks,
+        recomputed_tracks=result.recomputed_tracks,
+        retrieval_seconds=round(result.retrieval_seconds, 3),
+        scoring_seconds=round(result.scoring_seconds, 3),
+        persistence_seconds=round(result.persistence_seconds, 3),
+        discovery_seconds=round(result.discovery_seconds, 3),
     )
     if diagnostics:
         diagnostics.update(

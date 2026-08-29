@@ -16,7 +16,7 @@ from typing import Any
 
 from csv_to_clonehero.models import ChartCandidate, Track
 
-SCHEMA_VERSION = 13
+SCHEMA_VERSION = 17
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);
@@ -302,7 +302,9 @@ CREATE TABLE IF NOT EXISTS discovery_workspaces (
     metadata_json TEXT NOT NULL DEFAULT '{}',
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL,
-    completed_at REAL
+    completed_at REAL,
+    library_matching_fingerprint TEXT NOT NULL DEFAULT '',
+    candidate_revision INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS discovery_scans (
@@ -410,6 +412,25 @@ CREATE TABLE IF NOT EXISTS workspace_expansion_artists (
     selected INTEGER NOT NULL DEFAULT 0,
     metadata_json TEXT NOT NULL DEFAULT '{}',
     UNIQUE (workspace_id, artist_norm)
+);
+
+CREATE TABLE IF NOT EXISTS matching_song_cache (
+    fingerprint TEXT PRIMARY KEY,
+    track_key TEXT NOT NULL,
+    classification TEXT NOT NULL,
+    result_json TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_matching_song_cache_track ON matching_song_cache(track_key);
+CREATE TABLE IF NOT EXISTS matching_scan_cache (
+    workspace_id INTEGER PRIMARY KEY REFERENCES discovery_workspaces(id) ON DELETE CASCADE,
+    fingerprint TEXT NOT NULL,
+    result_json TEXT NOT NULL,
+    track_count INTEGER NOT NULL,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    candidate_revision INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS discovery_song_progress (
@@ -1152,6 +1173,9 @@ class Database:
                 ("background_jobs", "heartbeat_at", "REAL"),
                 ("downloads", "sha256", "TEXT"),
                 ("downloads", "validation_json", "TEXT NOT NULL DEFAULT '{}'"),
+                ("discovery_workspaces", "library_matching_fingerprint", "TEXT NOT NULL DEFAULT ''"),
+                ("discovery_workspaces", "candidate_revision", "INTEGER NOT NULL DEFAULT 0"),
+                ("matching_scan_cache", "candidate_revision", "INTEGER NOT NULL DEFAULT 0"),
             ):
                 self._ensure_column(table, column, definition)
             # Older query rows predate the explicit returned-count field.  This
@@ -1190,6 +1214,27 @@ class Database:
             self._conn.execute(
                 f"ALTER TABLE {table} ADD COLUMN {column} {definition}"
             )
+
+    def refresh_library_matching_fingerprint(self, workspace_id: int | str) -> str:
+        """Persist the canonical fields consumed by matching as one identity."""
+        db_id = self._workspace_db_id(workspace_id)
+        rows = self._conn.execute(
+            "SELECT normalized_artist,normalized_title,title,artist,album,duration_ms,isrc,url,liked,metadata_json FROM library_tracks WHERE workspace_id=? ORDER BY normalized_artist,normalized_title",
+            (db_id,),
+        )
+        digest = hashlib.sha256()
+        for row in rows:
+            digest.update(json.dumps(tuple(row), sort_keys=True, default=str).encode("utf-8"))
+            digest.update(b"\n")
+        fingerprint = digest.hexdigest()
+        with self._conn:
+            self._conn.execute("UPDATE discovery_workspaces SET library_matching_fingerprint=?, updated_at=? WHERE id=?", (fingerprint, time.time(), db_id))
+        return fingerprint
+
+    def get_library_matching_fingerprint(self, workspace_id: int | str) -> str:
+        db_id = self._workspace_db_id(workspace_id)
+        row = self._conn.execute("SELECT library_matching_fingerprint FROM discovery_workspaces WHERE id=?", (db_id,)).fetchone()
+        return str(row["library_matching_fingerprint"] or "") if row else ""
 
     # ------------------------------------------------------------------ meta
     def set_meta(self, key: str, value: str) -> None:
@@ -1297,7 +1342,8 @@ class Database:
                         "INSERT OR IGNORE INTO workspace_library_tracks(workspace_id,track_id,already_owned,owned_count,membership_json) VALUES(?,?,?,?,?)",
                         (db_id, track.db_id, 0, 0, "{}"),
                     )
-        return {"provider": provider, "source_id": source_id, "import_id": import_id, "tracks": len(snapshot.tracks), "report": report}
+        library_fingerprint = self.refresh_library_matching_fingerprint(db_id)
+        return {"provider": provider, "source_id": source_id, "import_id": import_id, "tracks": len(snapshot.tracks), "report": report, "library_matching_fingerprint": library_fingerprint}
 
     def get_neutral_library_tracks(self, workspace_id: int | str, *, provider: str | None = None) -> list[sqlite3.Row]:
         db_id = self._workspace_db_id(workspace_id)
@@ -3197,6 +3243,7 @@ class Database:
                     "INSERT OR IGNORE INTO workspace_task_candidates (task_id, candidate_id) VALUES (?, ?)",
                     (task_id, candidate_id),
                 )
+            self._conn.execute("UPDATE discovery_workspaces SET candidate_revision=candidate_revision+1, updated_at=? WHERE id=?", (time.time(), db_id))
         return int(row["id"])
 
     record_workspace_candidate = upsert_workspace_candidate
@@ -3233,6 +3280,8 @@ class Database:
                     "DELETE FROM workspace_candidates WHERE workspace_id = ?",
                     (db_id,),
                 )
+            if cur.rowcount:
+                self._conn.execute("UPDATE discovery_workspaces SET candidate_revision=candidate_revision+1, updated_at=? WHERE id=?", (time.time(), db_id))
         return int(cur.rowcount)
 
     def clear_workspace_expansion_candidates(self, workspace_id: int | str) -> int:
@@ -3810,6 +3859,97 @@ class Database:
             )
         return int(cur.rowcount)
 
+    def clear_workspace_track_candidates(self, workspace_id: int | str, track_key: str) -> int:
+        """Remove stale exact results for one changed track before recomputing it."""
+        db_id = self._workspace_db_id(workspace_id)
+        with self._conn:
+            self._conn.execute(
+                "DELETE FROM workspace_selections WHERE workspace_id=? AND kind='exact' AND track_id=(SELECT id FROM spotify_tracks WHERE track_key=?)",
+                (db_id, str(track_key)),
+            )
+            cur = self._conn.execute(
+                "DELETE FROM workspace_candidates WHERE workspace_id=? AND kind='exact' AND track_id=(SELECT id FROM spotify_tracks WHERE track_key=?)",
+                (db_id, str(track_key)),
+            )
+            if cur.rowcount:
+                self._conn.execute("UPDATE discovery_workspaces SET candidate_revision=candidate_revision+1, updated_at=? WHERE id=?", (time.time(), db_id))
+        return int(cur.rowcount)
+
+    def workspace_has_track_candidates(self, workspace_id: int | str, track_key: str) -> bool:
+        db_id = self._workspace_db_id(workspace_id)
+        return self._conn.execute(
+            "SELECT 1 FROM workspace_candidates WHERE workspace_id=? AND kind='exact' AND track_id=(SELECT id FROM spotify_tracks WHERE track_key=?) LIMIT 1",
+            (db_id, str(track_key)),
+        ).fetchone() is not None
+
+    def workspace_exact_candidate_count(self, workspace_id: int | str) -> int:
+        db_id = self._workspace_db_id(workspace_id)
+        row = self._conn.execute("SELECT COUNT(*) AS count FROM workspace_candidates WHERE workspace_id=? AND kind='exact'", (db_id,)).fetchone()
+        return int(row["count"] or 0)
+
+    def workspace_current_candidate_digest(self, workspace_id: int | str, track_key: str | None = None) -> tuple[int, str, set[int]]:
+        """Digest exact relationships limited to the current progress tracks."""
+        db_id = self._workspace_db_id(workspace_id)
+        params: list[Any] = [db_id]
+        clause = ""
+        if track_key is not None:
+            clause = " AND t.track_key=?"
+            params.append(str(track_key))
+        rows = self._conn.execute(
+            """SELECT t.track_key,wc.candidate_id,wc.score,wc.quality,wc.decision,wc.eligibility,wc.breakdown_json,wc.metadata_json
+               FROM workspace_candidates wc JOIN spotify_tracks t ON t.id=wc.track_id
+               JOIN discovery_song_progress dsp ON dsp.workspace_id=wc.workspace_id AND dsp.track_key=t.track_key
+               WHERE wc.workspace_id=? AND wc.kind='exact'""" + clause + " ORDER BY t.track_key,wc.candidate_id,wc.score,wc.quality,wc.decision,wc.eligibility,wc.breakdown_json,wc.metadata_json", params)
+        digest = hashlib.sha256()
+        ids: set[int] = set()
+        count = 0
+        for row in rows:
+            digest.update(json.dumps(tuple(row), sort_keys=True, default=str).encode("utf-8"))
+            digest.update(b"\n")
+            count += 1
+            ids.add(int(row["candidate_id"]))
+        return count, digest.hexdigest(), ids
+
+    def get_matching_song_cache(self, fingerprint: str) -> sqlite3.Row | None:
+        return self._conn.execute(
+            "SELECT * FROM matching_song_cache WHERE fingerprint = ?", (str(fingerprint),)
+        ).fetchone()
+
+    def get_matching_scan_cache(self, workspace_id: int | str, fingerprint: str) -> sqlite3.Row | None:
+        db_id = self._workspace_db_id(workspace_id)
+        return self._conn.execute("SELECT * FROM matching_scan_cache WHERE workspace_id=? AND fingerprint=?", (db_id, str(fingerprint))).fetchone()
+
+    def save_matching_scan_cache(self, workspace_id: int | str, fingerprint: str, track_count: int, result: Mapping[str, Any]) -> None:
+        db_id = self._workspace_db_id(workspace_id)
+        now = time.time()
+        with self._conn:
+            revision = self._conn.execute("SELECT candidate_revision FROM discovery_workspaces WHERE id=?", (db_id,)).fetchone()["candidate_revision"]
+            self._conn.execute("""INSERT INTO matching_scan_cache(workspace_id,fingerprint,result_json,track_count,created_at,updated_at,candidate_revision)
+                VALUES(?,?,?,?,?,?,?) ON CONFLICT(workspace_id) DO UPDATE SET fingerprint=excluded.fingerprint,result_json=excluded.result_json,track_count=excluded.track_count,updated_at=excluded.updated_at,candidate_revision=excluded.candidate_revision""", (db_id, str(fingerprint), json.dumps(dict(result), sort_keys=True, default=str), int(track_count), now, now, revision))
+
+    def get_workspace_candidate_revision(self, workspace_id: int | str) -> int:
+        db_id = self._workspace_db_id(workspace_id)
+        row = self._conn.execute("SELECT candidate_revision FROM discovery_workspaces WHERE id=?", (db_id,)).fetchone()
+        return int(row["candidate_revision"] or 0) if row else 0
+
+    def update_matching_scan_cache_revision(self, workspace_id: int | str, revision: int) -> None:
+        db_id = self._workspace_db_id(workspace_id)
+        with self._conn:
+            self._conn.execute("UPDATE matching_scan_cache SET candidate_revision=?, updated_at=? WHERE workspace_id=?", (int(revision), time.time(), db_id))
+
+    def save_matching_song_cache(
+        self, fingerprint: str, track_key: str, classification: str, result: Mapping[str, Any]
+    ) -> None:
+        now = time.time()
+        with self._conn:
+            self._conn.execute(
+                """INSERT INTO matching_song_cache(fingerprint,track_key,classification,result_json,created_at,updated_at)
+                   VALUES(?,?,?,?,?,?) ON CONFLICT(fingerprint) DO UPDATE SET
+                   track_key=excluded.track_key,classification=excluded.classification,
+                   result_json=excluded.result_json,updated_at=excluded.updated_at""",
+                (str(fingerprint), str(track_key), str(classification), json.dumps(dict(result), sort_keys=True, default=str), now, now),
+            )
+
     def update_workspace_expansion_artist_metadata(
         self,
         workspace_id: int | str,
@@ -3987,6 +4127,20 @@ class Database:
                 + " WHERE workspace_id = ? AND track_key = ?",
                 params,
             )
+
+    def update_discovery_song_progress_batch(
+        self, workspace_id: int | str, rows: Iterable[tuple[str, Mapping[str, Any]]]
+    ) -> None:
+        """Apply many song classifications in one transaction."""
+        db_id = self._workspace_db_id(workspace_id)
+        now = time.time()
+        with self._conn:
+            for track_key, values in rows:
+                assignments = [f"{key} = ?" for key in values if key in {"status", "candidate_count", "provenance", "classification"}]
+                params = [values[key] for key in values if key in {"status", "candidate_count", "provenance", "classification"}]
+                assignments.append("updated_at = ?")
+                params.extend([now, db_id, str(track_key)])
+                self._conn.execute("UPDATE discovery_song_progress SET " + ", ".join(assignments) + " WHERE workspace_id = ? AND track_key = ?", params)
 
     def get_discovery_song_progress(
         self, workspace_id: int | str, *, limit: int = 100, offset: int = 0,

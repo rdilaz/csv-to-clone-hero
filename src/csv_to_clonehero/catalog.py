@@ -426,6 +426,16 @@ def load_enchor_catalog(path: Path | str = DEFAULT_CATALOG_PATH) -> EnchorCatalo
     return EnchorCatalog(Path(path).resolve())
 
 
+def read_catalog_manifest(path: Path | str = DEFAULT_CATALOG_PATH) -> dict[str, Any]:
+    """Read only the immutable catalog header for cheap identity checks."""
+    catalog_path = Path(path)
+    with catalog_path.open("rb") as stream:
+        header = json.loads(stream.readline())
+    if not isinstance(header, Mapping) or header.get("type") != "enchor-catalog" or header.get("complete") is not True:
+        raise CatalogLoadError("catalog manifest is incomplete or invalid")
+    return {"snapshot_id": str(header.get("snapshot_id") or header.get("sha256", "")[:16]), "sha256": str(header.get("sha256") or ""), "chart_count": int(header.get("chart_count") or header.get("out_of") or 0), "format_version": header.get("format_version")}
+
+
 def export_catalog(
     source: Any,
     destination: Path | str,

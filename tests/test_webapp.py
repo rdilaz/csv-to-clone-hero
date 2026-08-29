@@ -182,6 +182,13 @@ def test_local_home_exposes_spotify_sync_scope_and_import_controls(client):
     assert client.post("/api/spotify/import", json={}).status_code == 401
 
 
+def test_matching_loading_state_has_accessible_immediate_feedback(client):
+    html = client.get("/").get_data(as_text=True)
+    assert 'id="matchingLoading"' in html
+    assert "CHECKING YOUR LIBRARY" in html
+    assert "prefers-reduced-motion" in html
+
+
 def test_local_home_exposes_provenance_filters_and_activity_shell(client):
     html = client.get("/").get_data(as_text=True)
     for text in ("YOUR MUSIC", "SoundCloud", "Spotify", "In both", "Duplicates merged", "WHAT'S HAPPENING", "READY TO FIND CHARTS", "View all song activity"):
