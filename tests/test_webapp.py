@@ -1766,6 +1766,449 @@ def test_open_folder_404_when_missing(client):
     assert response.status_code == 404
 
 
+def test_build_busy_state_blocks_mutations_but_keeps_review_readable(client, config):
+    export_job = client.application.extensions["export_job"]
+    with export_job.lock:
+        export_job.running = True
+        export_job.status = "running"
+        export_job.current = "Downloading Artist - Song"
+        export_job.total = 2
+        export_job.done = 1
+    try:
+        status = client.get("/api/status").get_json()
+        assert status["operation"]["state"] == "building"
+        assert status["operation"]["progress"]["completed"] == 1
+        assert client.post("/api/upload").status_code == 409
+        assert client.post("/api/spotify/select-all", json={}).status_code == 409
+        assert client.post("/api/review/decide", json={}).status_code == 409
+        assert client.get("/api/review").status_code == 200
+    finally:
+        with export_job.lock:
+            export_job.running = False
+            export_job.status = "idle"
+
+
+def test_open_folder_is_loopback_only(client):
+    response = client.post("/api/open-folder", environ_base={"REMOTE_ADDR": "192.0.2.10"})
+    assert response.status_code == 403
+
+
+def _set_active_export(app, *, status="running", done=1, total=3):
+    job = app.extensions["export_job"]
+    with job.lock:
+        job.running = status in {"running", "cancelling"}
+        job.status = status
+        job.done = done
+        job.total = total
+        job.current = "Downloading Artist - Song"
+        job.destination = str(app.config.get("TEST_BUILD_DESTINATION", ""))
+    return job
+
+
+def test_build_start_rejects_zero_selection_with_user_reason(client, config):
+    workspace = client.get("/api/sources").get_json()["workspace_id"]
+    response = client.post(
+        "/api/spotify/export/start",
+        json={"kind": "folder", "workspace_id": workspace, "path": str(config.base_dir / "Songs")},
+    )
+    assert response.status_code == 400
+    assert "Select at least one chart first" in response.get_json()["error"]
+
+
+def test_build_preview_exposes_all_truthful_buckets(client, config):
+    workspace = client.get("/api/sources").get_json()["workspace_id"]
+    track = seed_local_workspace(config, workspace)
+    db = Database(config.database_path)
+    try:
+        candidates = db.get_workspace_candidates(workspace, track_id=track.db_id, kind="exact", include_rejected=True)
+        good = next(row for row in candidates if int(row["chart_id"]) == 301)
+        blocked = next(row for row in candidates if int(row["chart_id"]) == 303)
+        db.select_workspace_candidate(workspace, track.db_id, good["candidate_id"], kind="exact", force=True, eligibility="RECOMMENDED")
+        now = time.time()
+        db._conn.execute(
+            "INSERT INTO workspace_selections (workspace_id, kind, track_id, candidate_id, score, eligibility, status, selected_at, updated_at) VALUES (?, 'exact', ?, ?, 99, 'INCOMPATIBLE', 'selected', ?, ?)",
+            (workspace, track.db_id, blocked["candidate_id"], now, now),
+        )
+        db._conn.commit()
+    finally:
+        db.close()
+    data = client.post(
+        "/api/spotify/export/preview",
+        json={"kind": "folder", "workspace_id": workspace, "path": str(config.base_dir / "Songs")},
+    ).get_json()
+    assert data["selected_chart_count"] == 2
+    assert data["reusable_count"] >= 0
+    assert data["download_required_count"] >= 0
+    assert data["invalid_count"] >= 1
+    assert data["estimated_bytes"] >= 0
+    assert data["destination"] == str((config.base_dir / "Songs").resolve())
+    cleared = client.post(
+        "/api/spotify/select",
+        json={"workspace_id": workspace, "track_id": track.db_id, "candidate_id": good["candidate_id"], "clear": True},
+    )
+    assert cleared.status_code == 200
+    assert cleared.get_json()["selection_count"] == 1
+
+
+def test_duplicate_build_request_preserves_active_build(client):
+    job = _set_active_export(client.application, done=2, total=4)
+    try:
+        response = client.post("/api/spotify/export/start", json={"kind": "folder"})
+        assert response.status_code == 409
+        assert response.get_json()["busy"] is True
+        assert job.running is True
+        assert job.done == 2
+        assert job.total == 4
+    finally:
+        with job.lock:
+            job.running = False
+            job.status = "idle"
+
+
+def test_all_conflicting_mutations_are_backend_locked_during_build(client):
+    job = _set_active_export(client.application)
+    try:
+        requests = [
+            ("/api/upload", {"data": {}}),
+            ("/api/sources/soundcloud/import", {"data": {}}),
+            ("/api/discovery/start", {"json": {"source": "combined"}}),
+            ("/api/spotify/select", {"json": {}}),
+            ("/api/spotify/select-all", {"json": {}}),
+            ("/api/spotify/select-recommended", {"json": {}}),
+            ("/api/review/decide", {"json": {}}),
+            ("/api/review/accept-all", {"json": {}}),
+        ]
+        for route, kwargs in requests:
+            response = client.post(route, **kwargs)
+            assert response.status_code == 409, route
+            assert response.get_json()["busy"] is True
+        assert client.get("/api/review").status_code == 200
+    finally:
+        with job.lock:
+            job.running = False
+            job.status = "idle"
+
+
+def test_build_status_reports_real_counters_and_cross_page_state(client):
+    job = _set_active_export(client.application, done=2, total=5)
+    try:
+        with job.lock:
+            job.destination = "C:\\Songs"
+            job.item_states = {
+                0: {"status": "published", "result": "downloaded"},
+                1: {"status": "duplicate", "result": "already_present"},
+                2: {"status": "failed", "result": "failed"},
+                3: {"status": "invalid", "result": "invalid"},
+                4: {"status": "pending", "result": ""},
+            }
+        status = client.get("/api/status").get_json()
+        export = client.get("/api/spotify/export/status").get_json()
+        assert status["operation"]["state"] == "building"
+        assert status["operation"]["progress"]["completed"] == 2
+        assert status["operation"]["progress"]["total"] == 5
+        assert status["operation"]["detail"] == "Downloading Artist - Song"
+        assert export["operation"]["state"] == "building"
+        assert export["operation"]["progress"]["completed"] == 2
+        assert export["items"]["failed"] == 1
+        assert export["items"]["invalid"] == 1
+        assert export["items"]["remaining"] == 1
+        assert "Building library" in client.get("/advanced").get_data(as_text=True)
+        assert "globalOperation" in client.get("/").get_data(as_text=True)
+    finally:
+        with job.lock:
+            job.running = False
+            job.status = "idle"
+
+
+def test_terminal_success_is_library_ready_and_retains_destination(client, tmp_path):
+    destination = tmp_path / "Songs"
+    job = _set_active_export(client.application, done=2, total=2)
+    with job.lock:
+        job.running = False
+        job.status = "complete"
+        job.destination = str(destination)
+        job.result = {
+            "success": True, "status": "success", "selected": 2,
+            "ready": 2, "published": 2, "added": 1, "already_present": 1,
+            "invalid": 0, "failed": 0, "destination": str(destination),
+        }
+    status = client.get("/api/spotify/export/status").get_json()
+    assert status["operation"]["state"] == "complete"
+    assert status["operation"]["label"] == "LIBRARY READY"
+    assert status["destination"] == str(destination)
+    assert status["result"]["ready"] == 2
+
+
+def test_matching_busy_state_blocks_review_mutation_but_allows_read(client):
+    matching = client.application.extensions["spotify_job"]
+    with matching.lock:
+        matching.running = True
+        matching.status = "running"
+        matching.message = "Matching Artist - Song"
+    try:
+        status = client.get("/api/status").get_json()
+        assert status["operation"]["state"] == "matching"
+        response = client.post("/api/review/accept-all", json={})
+        assert response.status_code == 409
+        assert "Spotify discovery" in response.get_json()["error"]
+        assert client.get("/api/review").status_code == 200
+        assert "Selections cannot be changed while chart matching is running." in client.get("/advanced").get_data(as_text=True)
+    finally:
+        with matching.lock:
+            matching.running = False
+            matching.status = "created"
+
+
+def test_unknown_export_progress_has_no_fake_eta_or_percentage(client):
+    job = _set_active_export(client.application, done=0, total=0)
+    try:
+        payload = client.get("/api/spotify/export/status").get_json()
+        assert payload["operation"]["state"] == "building"
+        assert payload["operation"]["progress"]["total"] == 0
+        assert "eta" not in payload["operation"]
+        assert "percent" not in payload["operation"]
+    finally:
+        with job.lock:
+            job.running = False
+            job.status = "idle"
+
+
+def test_export_cancelling_survives_subsequent_progress_then_settles(client):
+    job = _set_active_export(client.application, done=0, total=2)
+    try:
+        assert client.post("/api/spotify/export/cancel").get_json()["status"] == "cancelling"
+        job.update(1, 2, "Publishing Artist - Song")
+        assert job.snapshot()["status"] == "cancelling"
+        with job.lock:
+            job.running = False
+            job.status = "cancelled"
+            job.result = {"status": "cancelled", "success": False, "selected": 2, "ready": 1, "cancelled_items": 1}
+        assert client.get("/api/spotify/export/status").get_json()["operation"]["state"] == "cancelled"
+    finally:
+        with job.lock:
+            job.running = False
+            job.status = "idle"
+
+
+@pytest.mark.parametrize(
+    ("status", "expected", "label"),
+    [
+        ("complete", "complete", "LIBRARY READY"),
+        ("partial", "partial", "LIBRARY READY — WITH ISSUES"),
+        ("failed", "failed", "BUILD FAILED"),
+        ("cancelled", "cancelled", "BUILD CANCELLED"),
+        ("interrupted", "interrupted", "BUILD INTERRUPTED"),
+    ],
+)
+def test_export_operation_states_are_consistent(client, status, expected, label):
+    job = client.application.extensions["export_job"]
+    with job.lock:
+        job.running = False
+        job.status = status
+        job.result = {"success": status in {"complete", "partial"}, "ready": 1, "failed": 1, "invalid": 1}
+    export = client.get("/api/spotify/export/status").get_json()["operation"]
+    app_status = client.get("/api/status").get_json()["operation"]
+    assert export["state"] == expected
+    assert export["label"] == label
+    assert app_status["state"] == expected
+
+
+def test_newer_matching_failure_beats_completed_export_history(client):
+    job = client.application.extensions["export_job"]
+    with job.lock:
+        job.running = False
+        job.status = "complete"
+        job.result = {"success": True, "ready": 1}
+    matching = client.application.extensions["spotify_job"]
+    with matching.lock:
+        matching.running = False
+        matching.status = "failed"
+        matching.error = "catalog stopped"
+    try:
+        operation = client.get("/api/status").get_json()["operation"]
+        assert operation["state"] == "failed"
+        assert operation["detail"] == "catalog stopped"
+    finally:
+        with matching.lock:
+            matching.status = "created"
+            matching.error = ""
+
+
+def test_open_folder_prefers_actual_completed_export_destination(client, config, monkeypatch, tmp_path):
+    opened = []
+    monkeypatch.setattr(os, "startfile", lambda path: opened.append(path), raising=False)
+    actual = tmp_path / "actual-build-destination"
+    actual.mkdir()
+    job = client.application.extensions["export_job"]
+    with job.lock:
+        job.running = False
+        job.kind = "folder"
+        job.status = "complete"
+        job.destination = str(actual)
+        job.result = {"success": True, "status": "success"}
+    response = client.post("/api/open-folder")
+    assert response.status_code == 200
+    assert opened == [str(actual.resolve())]
+    assert str(actual.resolve()) != str(config.library_root.resolve())
+
+
+def test_advanced_script_wires_real_progress_preview_and_operation_lock(client):
+    html = client.get("/advanced").get_data(as_text=True)
+    assert "done: status.done" in html
+    assert "total: status.total" in html
+    assert "Selections cannot be changed while your library is building." in html
+    assert "Calculating build preview" in html
+    assert "Build ${selected.toLocaleString()} selected charts" in html
+    assert "LIBRARY READY — WITH ISSUES" in html
+
+
+def test_advanced_preview_uses_generation_not_just_selection_count(client):
+    html = client.get("/advanced").get_data(as_text=True)
+    assert "let previewGeneration = 0" in html
+    assert "function invalidateBuildPreview()" in html
+    assert "previewGeneration += 1" in html
+    assert "const generation = previewGeneration" in html
+    assert "generation !== previewGeneration" in html
+    # Every persisted review selection mutation invalidates the prior preview.
+    assert html.count("invalidateBuildPreview();") >= 3
+    assert "if (!preview || Number(preview.selected_chart_count) !== count)" in html
+
+
+def test_build_confirmation_uses_full_current_preview_and_import_copy(client):
+    advanced = client.get("/advanced").get_data(as_text=True)
+    home = client.get("/").get_data(as_text=True)
+    assert "Estimated download: ${estimated}" in advanced
+    assert "are unavailable and will not be added" in advanced
+    assert "preview.destination" in advanced
+    assert "Selections cannot be changed while your music is importing." in advanced
+    assert "operation.busy?'Status is being prepared...':''" in home
+
+
+def test_retry_reuses_completed_chart_and_retries_only_incomplete(config):
+    good_bytes = _sng_bytes()
+    good_md5 = hashlib.md5(good_bytes).hexdigest()
+    bad_md5 = "f" * 32
+    class CountingSource(FakeSource):
+        def __init__(self):
+            super().__init__(files={good_md5: good_bytes})
+            self.attempts = []
+
+        def download_chart(self, candidate, destination):
+            self.attempts.append(candidate.md5)
+            return super().download_chart(candidate, destination)
+
+    source = CountingSource()
+    app = create_app(config, source_factory=lambda cfg: [source])
+    app.config["TESTING"] = True
+    destination = config.base_dir / "Songs"
+    with app.test_client() as client:
+        workspace = client.get("/api/sources").get_json()["workspace_id"]
+        seed_local_workspace(config, workspace, charts=False)
+        db = Database(config.database_path)
+        try:
+            task_id = db._conn.execute("SELECT id FROM discovery_tasks WHERE workspace_id = ? ORDER BY id DESC LIMIT 1", (workspace,)).fetchone()["id"]
+            tracks = {item.title: item for item in db.get_spotify_tracks(True)}
+            for chart, track in ((make_chart("Song", "Artist", chart_id=801, md5=good_md5), tracks["Song"]), (make_chart("Missing Song", "Artist", chart_id=802, md5=bad_md5), tracks["Missing Song"])):
+                db.upsert_candidate(chart)
+                db.upsert_workspace_candidate(workspace, track.track_key, chart, score=94, eligibility="RECOMMENDED", decision="AUTO_ACCEPT", kind="exact", task_id=task_id)
+                candidate_id = db._conn.execute("SELECT id FROM candidate_charts WHERE chart_id = ?", (chart.chart_id,)).fetchone()["id"]
+                db.select_workspace_candidate(workspace, track.db_id, candidate_id, kind="exact", force=True, eligibility="RECOMMENDED")
+        finally:
+            db.close()
+        response = client.post("/api/spotify/export/folder", json={"workspace_id": workspace, "path": str(destination)})
+        assert response.status_code == 200
+        assert source.downloads.count(good_md5) == 1
+        retry = client.post("/api/spotify/export/folder", json={"workspace_id": workspace, "path": str(destination), "retry_failed": True})
+        assert retry.status_code == 200
+        assert source.downloads.count(good_md5) == 1
+        assert source.attempts.count(bad_md5) >= 2
+
+
+def test_cancellation_is_explicit_and_completed_files_are_preserved(client, tmp_path):
+    job = _set_active_export(client.application, done=1, total=2)
+    completed = tmp_path / "Artist" / "Song.sng"
+    completed.parent.mkdir(parents=True)
+    completed.write_bytes(b"completed")
+    try:
+        cancelled = client.post("/api/spotify/export/cancel")
+        assert cancelled.status_code == 200
+        assert cancelled.get_json()["status"] == "cancelling"
+        with job.lock:
+            job.running = False
+            job.status = "cancelled"
+            job.result = {"success": False, "status": "cancelled", "ready": 1, "selected": 2, "cancelled_items": 1}
+        terminal = client.get("/api/spotify/export/status").get_json()
+        assert terminal["status"] == "cancelled"
+        assert terminal["result"]["ready"] == 1
+        assert terminal["result"]["cancelled_items"] == 1
+        assert completed.read_bytes() == b"completed"
+    finally:
+        with job.lock:
+            job.running = False
+            job.status = "idle"
+
+
+def test_stale_running_export_becomes_interrupted_without_auto_resume(config):
+    db = Database(config.database_path)
+    try:
+        db.create_export_record(export_key="stale-run", kind="folder", destination=str(config.base_dir / "Songs"), status="running")
+    finally:
+        db.close()
+    app = create_app(config, source_factory=lambda cfg: [FakeSource()])
+    app.config["TESTING"] = True
+    with app.test_client() as client:
+        status = client.get("/api/spotify/export/status").get_json()
+        assert status["status"] == "interrupted"
+        assert status["operation"]["state"] == "interrupted"
+        assert status["running"] is False
+        assert app.extensions["export_job"].worker is None
+
+
+def test_partial_export_survives_fresh_app_as_partial(config):
+    db = Database(config.database_path)
+    try:
+        export_id = db.create_export_record(export_key="partial-run", kind="folder", destination=str(config.base_dir / "Songs"), status="partial")
+        db.record_export_item(export_id, {"source": "test", "chart_id": 1, "target_relpath": "Artist/Song.sng", "status": "published", "result": "downloaded"})
+        db.record_export_item(export_id, {"source": "test", "chart_id": 2, "target_relpath": "Artist/Bad.sng", "status": "failed", "error": "download failed"})
+    finally:
+        db.close()
+    app = create_app(config, source_factory=lambda cfg: [FakeSource()])
+    app.config["TESTING"] = True
+    with app.test_client() as client:
+        payload = client.get("/api/spotify/export/status").get_json()
+        assert payload["status"] == "partial"
+        assert payload["operation"]["state"] == "partial"
+        assert payload["operation"]["label"] == "LIBRARY READY — WITH ISSUES"
+
+
+def test_open_folder_rejects_arbitrary_path_and_accepts_validated_destination(client, config, monkeypatch, tmp_path):
+    opened = []
+    monkeypatch.setattr(os, "startfile", lambda path: opened.append(path), raising=False)
+    unrelated = tmp_path / "unrelated"
+    unrelated.mkdir()
+    response = client.post("/api/open-folder", json={"path": str(unrelated)})
+    assert response.status_code == 404
+    destination = config.library_root
+    destination.mkdir()
+    job = client.application.extensions["export_job"]
+    with job.lock:
+        job.destination = str(destination.resolve())
+        job.status = "complete"
+        job.result = {"success": True}
+    # The opener uses the configured destination, never a request-supplied path.
+    response = client.post("/api/open-folder", json={"path": str(unrelated)})
+    assert response.status_code == 200
+    assert opened == [str(destination.resolve())]
+
+
+def test_build_ui_has_reduced_motion_and_no_fake_export_eta(client):
+    html = client.get("/advanced").get_data(as_text=True)
+    assert "prefers-reduced-motion" in client.get("/").get_data(as_text=True)
+    assert "estimated download size" in html.lower()
+    assert "No fake ETA" not in html
+    assert "eta_seconds" not in html
+
+
 def test_simple_run_end_to_end(config, monkeypatch):
     content = _sng_bytes()
     md5 = hashlib.md5(content).hexdigest()
@@ -2185,20 +2628,10 @@ def test_export_start_status_reports_job_progress_and_failure(config, tmp_path):
     app.config["TESTING"] = True
     with app.test_client() as http:
         started = http.post("/api/spotify/export/start", json={"kind": "folder", "path": str(songs)})
-        assert started.status_code == 200
-        assert started.get_json()["started"] is True
+        assert started.status_code == 400
+        assert "Select at least one chart first" in started.get_json()["error"]
+        assert http.get("/api/spotify/export/status").get_json()["running"] is False
 
-        deadline = time.time() + 10
-        status = None
-        while time.time() < deadline:
-            status = http.get("/api/spotify/export/status").get_json()
-            if not status["running"]:
-                break
-            time.sleep(0.05)
-        assert status is not None and not status["running"]
-        assert status["status"] == "failed"
-        assert "select at least one" in status["error"]
-
-        # A second job can start once the first one settled.
+        # A second empty request is also refused without creating a worker.
         again = http.post("/api/spotify/export/start", json={"kind": "folder", "path": str(songs)})
-        assert again.status_code == 200
+        assert again.status_code == 400
