@@ -25,6 +25,10 @@ dependencies = [
 dev = [
     "pytest>=8.0,<9.0",
 ]
+browser-e2e = [
+    "pytest>=8.0,<9.0",
+    "playwright>=1.49,<2.0",
+]
 gunicorn = [
     "gunicorn>=22.0,<24.0",
 ]
@@ -41,11 +45,13 @@ csv-to-clonehero = "csv_to_clonehero.cli:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-csv_to_clonehero = ["default_config.yaml", "server/templates/*.html"]
+csv_to_clonehero = ["default_config.yaml", "server/templates/*.html", "templates/*.html", "static/*.css", "static/*.js"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 markers = [
     "integration: tests that hit the live Enchor API (skipped by default, run with: pytest -m integration)",
+    "browser: optional Python Playwright browser coverage",
+    "music_ready: browser fixture seed marker",
 ]
 addopts = "-m 'not integration'"

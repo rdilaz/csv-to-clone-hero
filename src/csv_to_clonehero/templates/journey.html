@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Riff | Music to Clone Hero</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="{{ url_for('static', filename='journey.css', access_token=request.args.get('access_token')) }}">
+</head>
+<body>
+  <a class="skip-link" href="#main-content">Skip to content</a>
+  <div id="app" aria-busy="true">
+    <header class="topbar">
+      <div class="brand"><span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span><span class="brand-name">Riff</span><span class="brand-divider" aria-hidden="true"></span><span class="brand-context">music to Clone Hero</span></div>
+      <div class="stage-label"><span class="stage-pip" aria-hidden="true"></span><span id="stage-label">Add music</span></div>
+    </header>
+    <main id="main-content" class="main-content" tabindex="-1">
+      <section class="loading-stage stage-section" aria-labelledby="loading-heading">
+        <p class="overline">Your music</p>
+        <h1 id="loading-heading">Loading your library.</h1>
+      </section>
+    </main>
+  </div>
+  <div id="announcer" class="sr-only" aria-live="polite" aria-atomic="true"></div>
+  <script src="{{ url_for('static', filename='journey.js', access_token=request.args.get('access_token')) }}"></script>
+</body>
+</html>

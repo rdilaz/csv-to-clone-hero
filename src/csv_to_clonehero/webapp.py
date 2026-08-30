@@ -15,6 +15,8 @@ from __future__ import annotations
 import hmac
 import hashlib
 import inspect
+import csv
+import io
 import json
 import logging
 import os
@@ -28,12 +30,13 @@ import time
 import uuid
 from collections import deque
 from dataclasses import fields, is_dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
 from urllib.parse import parse_qs, urlsplit
 
 import httpx
-from flask import Flask, abort, jsonify, redirect, request, send_file
+from flask import Flask, abort, jsonify, redirect, render_template, request, send_file, Response
 
 from csv_to_clonehero.config import AppConfig
 from csv_to_clonehero.csv_import import (
@@ -7451,6 +7454,266 @@ def create_app(
             },
         }
 
+    def _journey_records(db: Database, workspace: int | str) -> list[dict[str, Any]]:
+        """Return the complete, source-neutral library without internal IDs."""
+        tracks = db.get_neutral_library_tracks(workspace)
+        provenance = db.get_track_provenance(workspace)
+        source_sets: dict[tuple[str, str], set[str]] = {}
+        for row in provenance:
+            key = (str(row["normalized_artist"]), str(row["normalized_title"]))
+            source_sets.setdefault(key, set()).add(str(row["provider"]).casefold())
+        records = []
+        for track in tracks:
+            key = (str(track["normalized_artist"]), str(track["normalized_title"]))
+            records.append({
+                "artist": str(track["artist"]),
+                "title": str(track["title"]),
+                "sources": [
+                    source for source in ("spotify", "soundcloud")
+                    if source in source_sets.get(key, set())
+                ],
+                "_sort": (key[0], key[1], str(track["artist"]), str(track["title"])),
+            })
+        records.sort(key=lambda item: item.pop("_sort"))
+        return records
+
+    def _journey_payload(db: Database, workspace: int | str) -> dict[str, Any]:
+        """Project all local source facts into one authoritative read model."""
+        source_rows = {
+            str(row["provider"]).casefold(): dict(row)
+            for row in db.get_source_summary(workspace)
+        }
+        records = _journey_records(db, workspace)
+        spotify = source_rows.get("spotify", {})
+        soundcloud = source_rows.get("soundcloud", {})
+        spotify_connected = _is_authenticated()
+        spotify_job_state = spotify_job.snapshot()
+        soundcloud_job_state = soundcloud_import_job.snapshot()
+        progress = db.get_workspace_progress(workspace)
+        progress_data = dict(progress) if progress is not None else {}
+        progress_metadata = _json_object(progress_data.get("metadata_json", "{}"), {})
+        spotify_import_active = bool(
+            spotify_job_state.get("running")
+            and str(spotify_job_state.get("scan_key") or "") in {"inventory", "spotify_import"}
+        ) or bool(
+            str(progress_metadata.get("scan_key") or "") == "spotify_import"
+            and str(progress_data.get("status") or "") == "running"
+        )
+        soundcloud_import_active = bool(soundcloud_job_state.get("running"))
+        soundcloud_failed = str(soundcloud_job_state.get("status") or "") == "failed"
+        spotify_imported = bool(spotify)
+        soundcloud_imported = bool(soundcloud)
+        spotify_count = int(spotify.get("tracks", 0) or 0)
+        soundcloud_count = int(soundcloud.get("tracks", 0) or 0)
+        source_keys = {
+            source
+            for record in records
+            for source in record["sources"]
+        }
+        shared_count = sum(len(record["sources"]) > 1 for record in records)
+        attention = soundcloud_failed or (spotify_imported and not spotify_connected)
+
+        def updated_at(row: Mapping[str, Any]) -> str | None:
+            value = row.get("updated_at") or row.get("completed_at")
+            if not value:
+                return None
+            try:
+                return datetime.fromtimestamp(float(value), timezone.utc).isoformat()
+            except (TypeError, ValueError, OverflowError):
+                return None
+
+        spotify_state = (
+            "working" if spotify_import_active else
+            "attention" if spotify_imported and not spotify_connected else
+            "added" if spotify_imported else "not_added"
+        )
+        soundcloud_state = (
+            "working" if soundcloud_import_active else
+            "attention" if soundcloud_failed else
+            "added" if soundcloud_imported else "not_added"
+        )
+
+        def source_payload(
+            key: str,
+            label: str,
+            row: Mapping[str, Any],
+            state: str,
+            count: int,
+            *,
+            connected: bool | None = None,
+            imported: bool = False,
+            active: bool = False,
+            reason: str = "",
+        ) -> dict[str, Any]:
+            actions = {
+                "update_music": bool(imported and key == "spotify" and connected),
+                "reconnect": bool(key == "spotify" and not connected),
+                "view_imported_music": bool(imported),
+                # Source removal is deliberately not exposed until its safe
+                # destructive operation has a complete product contract.
+                "remove_music": False,
+                "import_music": bool(key == "soundcloud"),
+            }
+            return {
+                "source_key": key,
+                "label": label,
+                "availability": "available",
+                "state": state,
+                "song_count": count,
+                "updated_at": updated_at(row),
+                "attention_reason": reason,
+                "connected": connected,
+                "imported": imported,
+                "allowed_actions": actions,
+                "operation": {"active": active},
+            }
+
+        sources = {
+            "spotify": source_payload(
+                "spotify", "Spotify", spotify, spotify_state, spotify_count,
+                connected=spotify_connected, imported=spotify_imported,
+                active=spotify_import_active,
+                reason="Reconnect to update" if spotify_imported and not spotify_connected else "",
+            ),
+            "soundcloud": source_payload(
+                "soundcloud", "SoundCloud", soundcloud, soundcloud_state,
+                soundcloud_count, imported=soundcloud_imported,
+                active=soundcloud_import_active,
+                reason=("Update failed. Your previous music is still available."
+                        if soundcloud_failed else ""),
+            ),
+        }
+        for key, label in (
+            ("apple", "Apple Music / iTunes"),
+            ("youtube", "YouTube Music"),
+            ("tidal", "Tidal"),
+            ("local", "Local audio"),
+        ):
+            sources[key] = {
+                "source_key": key,
+                "label": label,
+                "availability": "coming_soon",
+                "state": "coming_soon",
+                "song_count": 0,
+                "updated_at": None,
+                "attention_reason": "",
+                "connected": False,
+                "imported": False,
+                "allowed_actions": {},
+                "operation": {"active": False},
+            }
+
+        operation = {"state": "idle", "source_key": None, "message": ""}
+        if soundcloud_import_active:
+            operation = {
+                "state": "importing", "source_key": "soundcloud",
+                "message": str(soundcloud_job_state.get("message") or "Updating SoundCloud music..."),
+            }
+        elif spotify_import_active:
+            operation = {
+                "state": "importing", "source_key": "spotify",
+                "message": str(spotify_job_state.get("message") or "Updating Spotify music..."),
+            }
+        elif soundcloud_failed:
+            operation = {
+                "state": "attention", "source_key": "soundcloud",
+                "message": "The SoundCloud update failed. Your previous music is still available.",
+            }
+
+        screen = (
+            "importing" if operation["state"] == "importing" else
+            "attention" if attention else
+            "music_ready" if records else "add_music"
+        )
+        revision_input = json.dumps({
+            "workspace": int(workspace),
+            "sources": sources,
+            "records": records,
+            "operation": operation,
+        }, sort_keys=True, default=str).encode("utf-8")
+        revision = hashlib.sha256(revision_input).hexdigest()[:16]
+        return {
+            "schema_version": 1,
+            "revision": revision,
+            "screen": screen,
+            "workspace_id": int(workspace),
+            "sources": sources,
+            "music": {
+                "canonical_count": len(records),
+                "spotify_count": spotify_count,
+                "soundcloud_count": soundcloud_count,
+                "shared_count": shared_count,
+                "songs": records,
+            },
+            "operation": operation,
+            "allowed_actions": {
+                "find_charts": False,
+                "download_song_list": True,
+                "manage_sources": True,
+            },
+            "error": None,
+        }
+
+    @app.get("/journey")
+    def journey_page():
+        """Temporary Slice 1 route for the production-intended journey UI."""
+        return render_template("journey.html")
+
+    @app.get("/api/journey")
+    def journey_read_model():
+        """Return one server-authoritative snapshot for the journey UI."""
+        workspace, _ = _get_local_library_workspace()
+        db = Database(config.database_path)
+        try:
+            return jsonify(_journey_payload(db, workspace))
+        finally:
+            db.close()
+
+    def _spreadsheet_value(value: str) -> str:
+        text = str(value or "")
+        return "'" + text if text[:1] in {"=", "+", "-", "@"} else text
+
+    @app.get("/api/library/export")
+    def library_song_list_export():
+        """Download the complete canonical source-neutral music library."""
+        format_name = str(request.args.get("format") or "").casefold()
+        if format_name not in {"txt", "csv", "json"}:
+            return {"error": "format must be txt, csv, or json"}, 400
+        workspace, _ = _get_local_library_workspace()
+        db = Database(config.database_path)
+        try:
+            records = _journey_records(db, workspace)
+        finally:
+            db.close()
+        today = datetime.now(timezone.utc).date().isoformat()
+        filename = f"my-music-{today}.{format_name}"
+        if format_name == "txt":
+            body = "".join(f"{item['artist']} - {item['title']}\n" for item in records)
+            mimetype = "text/plain"
+        elif format_name == "csv":
+            output = io.StringIO(newline="")
+            writer = csv.writer(output, lineterminator="\r\n")
+            writer.writerow(("artist", "title", "sources"))
+            for item in records:
+                writer.writerow((
+                    _spreadsheet_value(item["artist"]),
+                    _spreadsheet_value(item["title"]),
+                    _spreadsheet_value(",".join(item["sources"])),
+                ))
+            body = "\ufeff" + output.getvalue()
+            mimetype = "text/csv"
+        else:
+            body = json.dumps({
+                "schema_version": 1,
+                "generated_at": datetime.now(timezone.utc).isoformat(),
+                "canonical_count": len(records),
+                "songs": records,
+            }, ensure_ascii=False, indent=2) + "\n"
+            mimetype = "application/json"
+        response = Response(body, content_type=f"{mimetype}; charset=utf-8")
+        response.headers["Content-Disposition"] = f'attachment; filename="{filename}"'
+        return response
+
     @app.get("/")
     def index():
         workspace, _ = _get_local_library_workspace()
@@ -7664,15 +7927,19 @@ def create_app(
                         on_progress=progress,
                     )
                     provider = None  # run_library_import closes each provider.
-                    # A new source snapshot invalidates old exact results and
-                    # selections; otherwise a fresh import could display a
-                    # recommendation for a song no longer in the export.
-                    db.clear_workspace_candidates(workspace, kind="exact")
                     source_result = imported.sources.get("soundcloud")
                     source_payload = source_result.__dict__ if source_result else {}
                     combined = imported.combined_summary
                     sources = [dict(row) for row in db.get_source_summary(workspace)]
-                    db.set_meta("local_current_run_id", run_id)
+                    source_succeeded = bool(
+                        source_result is not None
+                        and source_result.status == "complete"
+                    )
+                    if source_succeeded:
+                        # A successful replacement changes the canonical song
+                        # set, so old exact results cannot be reused safely.
+                        db.clear_workspace_candidates(workspace, kind="exact")
+                        db.set_meta("local_current_run_id", run_id)
                     diagnostics.update(
                         "combine",
                         counters={
@@ -7681,16 +7948,22 @@ def create_app(
                         },
                     )
                     diagnostics.finish(
-                        imported.status,
+                        imported.status if source_succeeded else "failed",
                         workspace_id=workspace,
                         workspace_key=key,
                         counters={"combined_tracks": combined.get("tracks", 0)},
                     )
                     terminal = {
-                        "ok": imported.status in {"complete", "partial"},
-                        "status": imported.status,
-                        "phase": "complete",
-                        "message": f"Imported {source_result.tracks if source_result else 0} SoundCloud songs.",
+                        "ok": source_succeeded,
+                        "status": imported.status if source_succeeded else "failed",
+                        "phase": "complete" if source_succeeded else "failed",
+                        "message": (
+                            f"Imported {source_result.tracks if source_result else 0} SoundCloud songs."
+                            if source_succeeded
+                            else "SoundCloud update failed; your previous music was retained."
+                        ),
+                        "retained_previous": not source_succeeded,
+                        "error": "" if source_succeeded else (source_result.error if source_result else "SoundCloud update failed"),
                         "workspace_id": workspace,
                         "workspace_key": key,
                         "run_id": run_id,
@@ -7699,21 +7972,22 @@ def create_app(
                         "sources": sources,
                         "combined": combined,
                     }
-                    db.update_workspace(
-                        workspace,
-                        status="ready_for_matching",
-                        phase="ready_for_matching",
-                        message="Music imported; ready to find charts.",
-                        error="",
-                    )
-                    db.update_workspace_progress(
-                        workspace,
-                        status="ready_for_matching",
-                        phase="ready_for_matching",
-                        message="Music imported; ready to find charts.",
-                        error="",
-                        metadata={"run_id": run_id, "scan_key": "import"},
-                    )
+                    if source_succeeded:
+                        db.update_workspace(
+                            workspace,
+                            status="ready_for_matching",
+                            phase="ready_for_matching",
+                            message="Music imported; ready to find charts.",
+                            error="",
+                        )
+                        db.update_workspace_progress(
+                            workspace,
+                            status="ready_for_matching",
+                            phase="ready_for_matching",
+                            message="Music imported; ready to find charts.",
+                            error="",
+                            metadata={"run_id": run_id, "scan_key": "import"},
+                        )
                 except (UnicodeDecodeError, ValueError, json.JSONDecodeError) as exc:
                     message = _safe_message(exc)
                     diagnostics.finish("failed", error=message)
