@@ -371,6 +371,33 @@ def test_local_journey_summary_and_review_rehydrate_after_fresh_app(client, conf
     assert "provenance" not in home
 
 
+def test_home_review_handoff_preserves_local_workspace(client, config):
+    initial = client.get("/api/sources").get_json()
+    seed_local_workspace(config, initial["workspace_id"])
+
+    home = client.get("/").get_data(as_text=True)
+    href = re.search(r'id="reviewLink"[^>]+href="([^"]+)"', home).group(1)
+    assert href == f"/advanced?workspace_id={initial['workspace_id']}"
+
+    advanced = client.get(href)
+    assert advanced.status_code == 200
+    advanced_html = advanced.get_data(as_text=True)
+    assert 'class="source-neutral-mode"' in advanced_html
+    assert "Matching is complete. Review the recommended charts" in advanced_html
+    assert "body.source-neutral-mode #exactDry" in advanced_html
+
+    review = client.get(
+        f"/api/review?workspace_id={initial['workspace_id']}&state=eligible&limit=50&offset=0"
+    ).get_json()
+    assert review["workspace_id"] == initial["workspace_id"]
+    assert review["source_neutral"] is True
+    assert review["journey"]["matching_complete"] is True
+    assert review["tracks"]
+
+    scripts = re.findall(r"<script>\s*(.*?)\s*</script>", advanced_html, flags=re.DOTALL)
+    assert "params.set('workspace_id', reviewWorkspaceId)" in scripts[0]
+
+
 def test_bulk_selection_defaults_to_strong_and_explicit_eligible_scope(client, config):
     initial = client.get("/api/sources").get_json()
     seed_local_workspace(config, initial["workspace_id"])
@@ -2072,6 +2099,73 @@ def test_advanced_preview_uses_generation_not_just_selection_count(client):
     # Every persisted review selection mutation invalidates the prior preview.
     assert html.count("invalidateBuildPreview();") >= 3
     assert "if (!preview || Number(preview.selected_chart_count) !== count)" in html
+
+
+def test_newer_import_operation_outweighs_historical_export(client):
+    export = client.application.extensions["export_job"]
+    with export.lock:
+        export.status = "complete"
+        export.finished_at = time.time() - 30
+        export.result = {"success": True, "ready": 5}
+    imported = client.application.extensions["soundcloud_import_job"]
+    with imported.lock:
+        imported.running = False
+        imported.status = "complete"
+        imported.finished_at = time.time()
+        imported.result = {"source": {"tracks": 5031}}
+    try:
+        operation = client.get("/api/status").get_json()["operation"]
+        assert operation["label"] == "SOUNDCLOUD IMPORT COMPLETE"
+        assert "5,031 SoundCloud songs imported" in operation["detail"]
+    finally:
+        with imported.lock:
+            imported.status = "idle"
+            imported.result = None
+
+
+def test_restoring_matching_payload_hides_unauthoritative_partition(client):
+    matching = client.application.extensions["spotify_job"]
+    with matching.lock:
+        matching.running = True
+        matching.status = "running"
+        matching.phase = "restoring"
+        matching.message = "Checking saved match results..."
+    try:
+        status = client.get("/api/status").get_json()["operation"]
+        assert status["state"] == "matching"
+        assert "Checking saved match results" in status["detail"]
+    finally:
+        with matching.lock:
+            matching.running = False
+            matching.status = "created"
+            matching.phase = ""
+            matching.message = ""
+
+
+def test_spotify_disconnected_copy_preserves_imported_library_contract(client):
+    html = client.get("/").get_data(as_text=True)
+    assert "Spotify songs already imported" in html or "connection_copy" in client.get("/api/sources").get_data(as_text=True)
+
+
+def test_real_home_path_does_not_reuse_old_progress_after_import(client, config):
+    workspace = client.get("/api/sources").get_json()["workspace_id"]
+    seed_local_workspace(config, workspace, charts=False)
+    db = Database(config.database_path)
+    try:
+        tracks = db.get_spotify_tracks(True)
+        db.initialize_discovery_song_progress(workspace, tracks)
+        db.update_discovery_song_progress(workspace, tracks[0].track_key, status="complete", classification="review")
+        db.update_workspace(workspace, status="ready_for_matching", phase="ready_for_matching")
+    finally:
+        db.close()
+    payload = client.get("/api/sources").get_json()
+    journey = payload["journey"]
+    assert journey["matching_status"] == "ready"
+    assert journey["progress"]["processed"] == 0
+    assert journey["progress"]["total"] == 0
+    assert journey["progress"]["recent"] == []
+    assert journey["counts"]["no_candidate_songs"] == 0
+    assert journey["counts"]["no_suitable_songs"] == 0
 
 
 def test_build_confirmation_uses_full_current_preview_and_import_copy(client):
