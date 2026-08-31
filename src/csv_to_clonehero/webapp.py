@@ -1549,7 +1549,7 @@ def _review_card_matches(card: Mapping[str, Any], state: str) -> bool:
     if state in {"eligible", "matched"}:
         return bool(card.get("has_eligible_match")) or review_state in {"strong", "needs_review"}
     if state in {"strong", "recommended", "auto_accept"}:
-        return bool(card.get("has_strong_match")) or review_state == "strong" or status in {"accepted", "auto_accept"}
+        return bool(card.get("has_strong_match")) or review_state == "strong" or status == "auto_accept"
     if state in {"review", "needs_review"}:
         return bool(card.get("has_review_match")) or review_state == "needs_review" or status == "review"
     if state in {"selected", "chosen"}:
@@ -9408,19 +9408,7 @@ def create_app(
             ):
                 continue
             states = {_review_row_state(row) for row in row_group}
-            selected = any(
-                bool(_row_dict(row).get("selected"))
-                or manual_decisions.get(
-                    (
-                        track.track_key,
-                        str(_row_dict(row).get("source") or ""),
-                        int(_row_dict(row).get("chart_id") or 0),
-                    ),
-                    "",
-                )
-                == "accept"
-                for row in row_group
-            )
+            selected = any(bool(_row_dict(row).get("selected")) for row in row_group)
             recommended_row = max(
                 (
                     row for row in row_group

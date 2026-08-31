@@ -198,6 +198,16 @@ def test_browser_charts_found_selects_and_rehydrates_best_cohort(matching_browse
     page.get_by_text("1 selected", exact=True).wait_for()
     best_card = page.locator(".cohort-card").filter(has_text="Best matches")
     assert "is-selected" in (best_card.get_attribute("class") or "").split()
+    page.get_by_role("heading", name="A few representative charts").wait_for()
+    checkbox = page.get_by_role("checkbox", name="Use Song by Artist")
+    assert checkbox.is_checked()
+
+    checkbox.uncheck()
+    page.get_by_text("Nothing selected yet", exact=True).wait_for()
+    assert page.get_by_role("checkbox", name="Use Song by Artist").is_checked() is False
+    page.get_by_role("checkbox", name="Use Song by Artist").check()
+    page.get_by_text("1 selected", exact=True).wait_for()
+    assert page.get_by_role("checkbox", name="Use Song by Artist").is_checked()
 
     all_recommendations.click()
     page.locator(".cohort-card.is-selected").filter(has_text="recommendations").wait_for()
@@ -208,6 +218,8 @@ def test_browser_charts_found_selects_and_rehydrates_best_cohort(matching_browse
     page.get_by_text("1 selected", exact=True).wait_for()
     best_card = page.locator(".cohort-card").filter(has_text="Best matches")
     assert "is-selected" in (best_card.get_attribute("class") or "").split()
+    assert page.get_by_role("checkbox", name="Use Song by Artist").is_checked()
+    assert page.evaluate("document.documentElement.scrollWidth <= document.documentElement.clientWidth")
     assert "/advanced" not in page.content()
 
 
@@ -230,6 +242,30 @@ def test_browser_failed_cohort_mutation_keeps_truthful_state(matching_browser_pa
     assert page.get_by_text("Nothing selected yet", exact=True).is_visible()
     assert page.locator(".cohort-card.is-selected").count() == 0
     assert page.get_by_role("button", name="Use 1 best matches").is_enabled()
+
+
+@pytest.mark.parametrize("matching_browser_page", ["charts_found"], indirect=True)
+def test_browser_failed_row_mutation_rehydrates_saved_checkbox(matching_browser_page):
+    page = matching_browser_page
+    page.get_by_role("button", name="Use 1 best matches").click()
+    checkbox = page.get_by_role("checkbox", name="Use Song by Artist")
+    checkbox.wait_for()
+    assert checkbox.is_checked()
+    page.route(
+        "**/api/discovery/select",
+        lambda route: route.fulfill(
+            status=503,
+            content_type="application/json",
+            body='{"error":"Temporary row failure"}',
+        ),
+    )
+
+    checkbox.uncheck()
+    alert = page.get_by_role("alert")
+    alert.wait_for()
+    assert "saved choice was restored" in alert.inner_text()
+    assert page.get_by_role("checkbox", name="Use Song by Artist").is_checked()
+    assert page.get_by_text("1 selected", exact=True).is_visible()
 
 
 @pytest.mark.parametrize("matching_browser_page", ["interrupted"], indirect=True)

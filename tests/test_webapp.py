@@ -238,7 +238,8 @@ def test_current_matching_generation_is_the_candidate_boundary(client, config, t
         current_scan = db.create_discovery_scan(workspace, scan_key="current", kind="exact", status="complete", metadata={"workflow": "combined_catalog"})
         current_task = db.upsert_discovery_task(workspace, scan_id=current_scan, source="fake", kind="song", query_key="current")
         current = db._conn.execute("SELECT id FROM candidate_charts WHERE chart_id = 301").fetchone()["id"]
-        db._conn.execute("UPDATE workspace_candidates SET task_id = ? WHERE workspace_id = ? AND candidate_id = ?", (current_task, workspace, current))
+        blocked = db._conn.execute("SELECT id FROM candidate_charts WHERE chart_id = 303").fetchone()["id"]
+        db._conn.execute("UPDATE workspace_candidates SET task_id = ? WHERE workspace_id = ? AND candidate_id IN (?, ?)", (current_task, workspace, current, blocked))
         stale_chart = make_chart("Song", "Artist", chart_id=399)
         db.upsert_candidate(stale_chart)
         stale = db._conn.execute("SELECT id FROM candidate_charts WHERE chart_id = 399").fetchone()["id"]
@@ -247,15 +248,21 @@ def test_current_matching_generation_is_the_candidate_boundary(client, config, t
     finally:
         db.close()
 
-    review = client.get("/api/review").get_json()
+    review = client.get(f"/api/review?workspace_id={workspace}&state=eligible").get_json()
     candidates = [item for card in review["tracks"] for item in card["candidates"]]
     assert 301 in [item["chart_id"] for item in candidates]
     assert 399 not in [item["chart_id"] for item in candidates]
+    assert review["tracks"][0]["recommendation_candidate_id"] == current
     assert client.post("/api/spotify/select", json={"workspace_id": workspace, "track_id": track.db_id, "source": "fake", "chart_id": 399}).status_code == 404
+    assert client.post("/api/discovery/select", json={"workspace_id": workspace, "track_id": track.track_key, "candidate_id": stale}).status_code == 404
+    assert client.post("/api/discovery/select", json={"workspace_id": workspace, "track_id": track.track_key, "candidate_id": blocked}).status_code == 400
     bulk = client.post("/api/spotify/select-all", json={"workspace_id": workspace, "scope": "eligible"})
     assert bulk.status_code == 200
     assert bulk.get_json()["selected"] == 1
     assert [item["chart_id"] for item in bulk.get_json()["items"]] == [301]
+    persisted = client.get(f"/api/discovery/selections?workspace_id={workspace}").get_json()
+    assert persisted["selected_count"] == 1
+    assert [item["chart_id"] for item in persisted["items"]] == [301]
 
     db = Database(config.database_path)
     try:
@@ -463,6 +470,146 @@ def test_charts_found_cohort_scopes_replace_and_rehydrate(client, config):
         ).get_json()
         assert persisted["selected_count"] == 1
         assert [item["chart_id"] for item in persisted["items"]] == [301]
+
+
+def test_confirmation_review_is_paged_searchable_mutable_and_persistent(client, config):
+    from csv_to_clonehero.providers.base import LibrarySnapshot, ProviderTrack
+
+    workspace = client.get("/api/sources").get_json()["workspace_id"]
+    library = [
+        ProviderTrack(
+            provider="soundcloud",
+            provider_id=f"confirmation-{index:03d}",
+            artist=f"Artist {index:03d}",
+            title=f"Song {index:03d}",
+        )
+        for index in range(60)
+    ]
+    db = Database(config.database_path)
+    try:
+        db.upsert_library_snapshot(workspace, LibrarySnapshot("soundcloud", library))
+        tracks = sorted(db.get_spotify_tracks(True), key=lambda track: track.title)
+        scan_id = db.create_discovery_scan(
+            workspace,
+            scan_key="confirmation-current",
+            kind="exact",
+            status="complete",
+            metadata={"workflow": "combined_catalog"},
+        )
+        task_id = db.upsert_discovery_task(
+            workspace,
+            scan_id=scan_id,
+            source="test",
+            kind="generation",
+            query_key="confirmation-current",
+            status="complete",
+            total=len(tracks),
+            completed=len(tracks),
+        )
+        for index, track in enumerate(tracks):
+            review_tier = index >= 30
+            chart = make_chart(
+                track.title + (" (Live)" if review_tier else ""),
+                track.primary_artist,
+                chart_id=1000 + index,
+            )
+            db.upsert_candidate(chart)
+            db.upsert_workspace_candidate(
+                workspace,
+                track.track_key,
+                chart,
+                score=82 if review_tier else 95,
+                eligibility="ELIGIBLE_REVIEW" if review_tier else "RECOMMENDED",
+                decision="REVIEW" if review_tier else "AUTO_ACCEPT",
+                kind="exact",
+                task_id=task_id,
+            )
+        db.update_workspace(workspace, status="complete", phase="complete")
+        db.update_workspace_progress(
+            workspace,
+            status="complete",
+            phase="complete",
+            total_tracks=len(tracks),
+            completed_tracks=len(tracks),
+        )
+    finally:
+        db.close()
+
+    first = client.get(
+        f"/api/review?workspace_id={workspace}&state=eligible&limit=25&offset=0"
+    ).get_json()
+    assert first["page"]["returned"] == 25
+    assert first["page"]["total"] == 60
+    assert first["page"]["has_more"] is True
+    assert client.get(
+        f"/api/review?workspace_id={workspace}&state=strong&limit=25"
+    ).get_json()["page"]["total"] == 30
+    assert client.get(
+        f"/api/review?workspace_id={workspace}&state=review&limit=25"
+    ).get_json()["page"]["total"] == 30
+
+    searched = client.get(
+        f"/api/review?workspace_id={workspace}&state=eligible&limit=25&search=Artist%20055"
+    ).get_json()
+    assert searched["page"]["total"] == 1
+    outside = searched["tracks"][0]
+    assert outside["title"] == "Song 055"
+    first_card = first["tracks"][0]
+
+    def select(card):
+        return client.post(
+            "/api/discovery/select",
+            json={
+                "workspace_id": workspace,
+                "kind": "exact",
+                "track_id": card["track_key"],
+                "candidate_id": card["recommendation_candidate_id"],
+            },
+        )
+
+    assert select(first_card).get_json()["selected_count"] == 1
+    assert select(outside).get_json()["selected_count"] == 2
+    assert client.get(
+        f"/api/review?workspace_id={workspace}&state=strong&limit=25"
+    ).get_json()["page"]["total"] == 30
+    assert client.get(
+        f"/api/review?workspace_id={workspace}&state=review&limit=25"
+    ).get_json()["page"]["total"] == 30
+    selected = client.get(
+        f"/api/review?workspace_id={workspace}&state=selected&limit=25"
+    ).get_json()
+    assert selected["page"]["total"] == 2
+    assert {card["track_key"] for card in selected["tracks"]} == {
+        first_card["track_key"], outside["track_key"]
+    }
+
+    cleared = client.post(
+        "/api/discovery/select",
+        json={
+            "workspace_id": workspace,
+            "kind": "exact",
+            "track_id": outside["track_key"],
+            "action": "clear",
+        },
+    ).get_json()
+    assert cleared["selected_count"] == 1
+    after_clear = client.get(
+        f"/api/review?workspace_id={workspace}&state=selected&limit=25"
+    ).get_json()
+    assert [card["track_key"] for card in after_clear["tracks"]] == [first_card["track_key"]]
+    assert select(outside).get_json()["selected_count"] == 2
+
+    fresh_app = create_app(config, source_factory=lambda cfg: [FakeSource()])
+    fresh_app.config["TESTING"] = True
+    with fresh_app.test_client() as fresh:
+        tray = fresh.get(f"/api/discovery/selections?workspace_id={workspace}").get_json()
+        rehydrated = fresh.get(
+            f"/api/review?workspace_id={workspace}&state=selected&limit=25"
+        ).get_json()
+        assert tray["selected_count"] == 2
+        assert {card["track_key"] for card in rehydrated["tracks"]} == {
+            first_card["track_key"], outside["track_key"]
+        }
 
 
 def test_review_bulk_actions_are_explicit_scoped_and_preserve_manual_alternatives(client, config):

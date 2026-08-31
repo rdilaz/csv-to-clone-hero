@@ -19,7 +19,21 @@
     spotifyScope: null,
     selections: null,
     selectionError: "",
-    cohortPreference: ""
+    cohortPreference: "",
+    confirmationVisible: false,
+    pendingRow: "",
+    reviewRevision: 0,
+    reviewController: null,
+    reviewTimer: null,
+    review: {
+      tracks: [],
+      page: null,
+      filter: "all",
+      search: "",
+      loading: false,
+      loaded: false,
+      error: ""
+    }
   };
 
   const icons = {
@@ -27,6 +41,7 @@
     check: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12 4 4L19 6"/></svg>',
     close: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"/></svg>',
     download: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12m0 0 5-5m-5 5-5-5M5 20h14"/></svg>',
+    search: '<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="6.5"/><path d="m16 16 4 4"/></svg>',
     sparkle: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m12 3 1.6 5.4L19 10l-5.4 1.6L12 17l-1.6-5.4L5 10l5.4-1.6L12 3Z"/></svg>',
     vinyl: '<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8.5"/><circle cx="12" cy="12" r="2"/><path d="M12 3.5v3M20.5 12h-3M12 20.5v-3M3.5 12h3"/></svg>'
   };
@@ -227,11 +242,15 @@
     return shell('<section class="matching-stage stage-section" data-test="' + escapeHtml(state) + '"><div class="matching-visual"><div class="matching-glow"></div>' + ring + '<div class="matching-record" aria-hidden="true"></div></div><div class="matching-copy">' + copy + '</div></section>', "Find charts");
   }
 
-  function exactSelectionState(snapshot) {
-    const result = snapshot.matching.results || {};
-    const items = model.selections && Array.isArray(model.selections.items)
+  function exactSelectionItems() {
+    return model.selections && Array.isArray(model.selections.items)
       ? model.selections.items.filter(function (item) { return String(item.kind || "exact").toLowerCase() === "exact"; })
       : [];
+  }
+
+  function exactSelectionState(snapshot) {
+    const result = snapshot.matching.results || {};
+    const items = exactSelectionItems();
     const strong = items.filter(function (item) {
       return ["RECOMMENDED", "AUTO_ACCEPT"].includes(String(item.eligibility || "").toUpperCase());
     }).length;
@@ -257,18 +276,85 @@
     return '<article class="cohort-card' + (selected ? " is-selected" : "") + '"><div class="cohort-card-head"><div class="cohort-index" aria-hidden="true">' + (selected ? icons.check : "") + '</div><div><p class="cohort-label">' + (kind === "best" ? "Option A" : "Option B") + '</p><h2><strong>' + number(count) + '</strong> ' + title + '</h2></div>' + (selected ? '<span class="selected-badge">Selected</span>' : '') + '</div><p>' + description + '</p><button class="cohort-action" data-action="select-cohort" data-cohort="' + kind + '" aria-pressed="' + (selected ? "true" : "false") + '"' + (disabled ? ' disabled aria-disabled="true"' : '') + '>' + buttonCopy + (selected ? icons.check : icons.arrow) + '</button></article>';
   }
 
+  function selectionMatchesCard(card) {
+    return exactSelectionItems().some(function (item) {
+      return String(item.track_key || "") === String(card.track_key || "") || (
+        item.spotify_track_id && card.spotify_id && String(item.spotify_track_id) === String(card.spotify_id)
+      );
+    });
+  }
+
+  function recommendationCandidate(card) {
+    const candidates = Array.isArray(card.candidates) ? card.candidates : [];
+    const wanted = String(card.recommendation_candidate_id || card.best_candidate_id || "");
+    return candidates.find(function (candidate) { return String(candidate.candidate_id || "") === wanted; })
+      || candidates.find(function (candidate) { return Boolean(candidate.best); })
+      || candidates[0]
+      || null;
+  }
+
+  function displayedCandidate(card) {
+    const candidates = Array.isArray(card.candidates) ? card.candidates : [];
+    return candidates.find(function (candidate) { return Boolean(candidate.selected); })
+      || recommendationCandidate(card);
+  }
+
+  function sourceLabel(value) {
+    return String(value || "Chart").replace(/[_-]+/g, " ").replace(/\b\w/g, function (letter) { return letter.toUpperCase(); });
+  }
+
+  function chartRows() {
+    return model.review.tracks.map(function (card) {
+      const selected = selectionMatchesCard(card);
+      const recommended = recommendationCandidate(card);
+      const candidate = displayedCandidate(card) || recommended || {};
+      const pending = model.pendingRow === String(card.track_key || "");
+      const disabled = Boolean(model.pendingRow) || model.pendingAction === "cohort" || model.selections === null;
+      const tierState = String(recommended && recommended.review_state || card.review_state || "");
+      const tier = tierState === "strong" ? "Best match" : "Best available";
+      const chartTitle = candidate.candidate_title || candidate.title || candidate.name || "Recommended chart";
+      const charter = String(candidate.charter || "").trim();
+      const concerns = candidate.review && Array.isArray(candidate.review.concerns) ? candidate.review.concerns : [];
+      const concern = concerns.length ? String(concerns[0]) : "";
+      const source = sourceLabel(candidate.source);
+      const accessible = "Use " + String(card.title || "this song") + " by " + String(card.artist || "unknown artist");
+      return '<div class="chart-row' + (selected ? " is-row-selected" : "") + '" data-track-key="' + escapeHtml(card.track_key) + '" aria-busy="' + (pending ? "true" : "false") + '"><label class="row-check"><input type="checkbox" data-row-selection data-track-key="' + escapeHtml(card.track_key) + '" aria-label="' + escapeHtml(accessible) + '"' + (selected ? " checked" : "") + (disabled ? ' disabled aria-disabled="true"' : '') + '><span class="custom-check" aria-hidden="true">' + icons.check + '</span></label><span class="chart-art" aria-hidden="true">' + escapeHtml(source.charAt(0)) + '</span><div class="chart-song"><strong>' + escapeHtml(card.title) + '</strong><small>' + escapeHtml(card.artist) + '</small></div><div class="chart-tags"><span class="source-tag">' + escapeHtml(source) + '</span><span class="tier-tag ' + (tierState === "strong" ? "tier-best" : "tier-available") + '">' + tier + '</span></div><div class="chart-version"><span>' + escapeHtml(chartTitle) + '</span>' + (charter ? '<small>Chart by ' + escapeHtml(charter) + '</small>' : '') + (concern ? '<em class="concern-label"><span aria-hidden="true">!</span>' + escapeHtml(concern) + '</em>' : '') + (pending ? '<strong class="row-pending" role="status">Saving...</strong>' : '') + '</div></div>';
+    }).join("");
+  }
+
+  function confirmationList() {
+    const filters = [
+      ["all", "All"],
+      ["strong", "Best matches"],
+      ["review", "Best available"],
+      ["selected", "Selected"]
+    ].map(function (item) {
+      return '<button class="filter-button' + (model.review.filter === item[0] ? " is-active" : "") + '" data-action="set-review-filter" data-review-filter="' + item[0] + '" aria-pressed="' + (model.review.filter === item[0] ? "true" : "false") + '"' + (model.review.loading ? " disabled" : "") + '>' + item[1] + '</button>';
+    }).join("");
+    const rows = chartRows();
+    const page = model.review.page || {};
+    const shown = model.review.tracks.length;
+    const total = Number(page.total || 0);
+    let list = rows;
+    if (!rows && model.review.loading) list = '<p class="empty-filter">Loading charts...</p>';
+    else if (!rows) list = '<p class="empty-filter">No charts match that search or filter.</p>';
+    const status = model.review.loading ? "Updating charts..." : "Showing " + number(shown) + " of " + number(total);
+    const more = page.has_more ? '<button class="load-more" data-action="load-more-review"' + (model.review.loading ? " disabled" : "") + '>Load more charts</button>' : "";
+    return '<section class="confirmation-list" aria-labelledby="confirmation-heading" aria-busy="' + (model.review.loading ? "true" : "false") + '"><div class="list-head"><div><p class="overline">A quick check</p><h2 id="confirmation-heading">A few representative charts</h2></div><span class="list-note">Optional adjustment</span></div><div class="list-toolbar"><label class="search-field">' + icons.search + '<span class="sr-only">Search charts</span><input id="chart-search" type="search" placeholder="Search songs" value="' + escapeHtml(model.review.search) + '" autocomplete="off"></label><div class="filter-group" aria-label="Filter chart choices">' + filters + '</div></div>' + (model.review.error ? '<p class="confirmation-error" role="alert">' + escapeHtml(model.review.error) + '</p>' : '') + '<div class="list-status" role="status">' + status + '</div><div class="chart-list">' + list + '</div><div class="list-footer"><span>' + (total ? number(shown) + " of " + number(total) + " charts" : "") + '</span>' + more + '</div></section>';
+  }
+
   function chartsFound(snapshot) {
     const result = snapshot.matching.results || {};
     const selection = exactSelectionState(snapshot);
     const activeCohort = selection.cohort;
     const selectionKnown = model.selections !== null;
     const pending = model.pendingAction === "cohort";
-    const enabled = Boolean(snapshot.matching.authoritative);
+    const enabled = Boolean(snapshot.matching.authoritative) && !model.pendingRow;
     let status = '<span class="empty-status-mark" aria-hidden="true"></span><span>Nothing selected yet</span>';
     if (!selectionKnown) status = '<span class="empty-status-mark" aria-hidden="true"></span><span>Selection unavailable</span>';
     else if (selection.count > 0) status = '<span class="status-check">' + icons.check + '</span><strong>' + number(selection.count) + ' selected</strong>';
     const details = '<details class="details"><summary>Details</summary><p>' + number(result.no_suitable) + ' no suitable, ' + number(result.not_playable) + ' not playable, and ' + number(result.no_candidate) + ' had no candidate.</p></details>';
-    return shell('<section class="found-stage stage-section" data-test="charts-found"><header class="found-head"><div><p class="overline">Confirm charts</p><h1>We found charts for <span>' + number(result.recommendations) + '</span> of your songs.</h1></div><div class="selection-status' + (selection.count > 0 ? " has-selection" : "") + '">' + status + '</div></header><div class="cohort-grid">' + cohortCard("best", result.best_matches, "Best matches", "Most reliable. Artist, title, version, and playability all look right.", "Use " + number(result.best_matches) + " best matches", activeCohort === "best", pending, enabled) + cohortCard("all", result.recommendations, "recommendations", "Includes " + number(result.best_available) + " Best available suggestions. Some may be live, remastered, alternate, or otherwise imperfect versions.", "Use all " + number(result.recommendations) + " recommendations", activeCohort === "all", pending, enabled) + '</div>' + (model.selectionError ? '<p class="cohort-error" role="alert">' + escapeHtml(model.selectionError) + '</p>' : '') + '<footer class="found-footer"><div class="found-gaps"><span><strong>' + number(result.no_suitable) + '</strong> no suitable</span><span><strong>' + number(result.not_playable) + '</strong> not playable</span><span><strong>' + number(result.no_candidate) + '</strong> no candidate</span></div>' + details + '</footer></section>', "Confirm charts");
+    return shell('<section class="found-stage stage-section" data-test="charts-found"><header class="found-head"><div><p class="overline">Confirm charts</p><h1>We found charts for <span>' + number(result.recommendations) + '</span> of your songs.</h1></div><div class="selection-status' + (selection.count > 0 ? " has-selection" : "") + '">' + status + '</div></header><div class="cohort-grid">' + cohortCard("best", result.best_matches, "Best matches", "Most reliable. Artist, title, version, and playability all look right.", "Use " + number(result.best_matches) + " best matches", activeCohort === "best", pending, enabled) + cohortCard("all", result.recommendations, "recommendations", "Includes " + number(result.best_available) + " Best available suggestions. Some may be live, remastered, alternate, or otherwise imperfect versions.", "Use all " + number(result.recommendations) + " recommendations", activeCohort === "all", pending, enabled) + '</div>' + (model.selectionError ? '<p class="cohort-error" role="alert">' + escapeHtml(model.selectionError) + '</p>' : '') + (model.confirmationVisible ? confirmationList() : "") + '<footer class="found-footer"><div class="found-gaps"><span><strong>' + number(result.no_suitable) + '</strong> no suitable</span><span><strong>' + number(result.not_playable) + '</strong> not playable</span><span><strong>' + number(result.no_candidate) + '</strong> no candidate</span></div>' + details + '</footer></section>', "Confirm charts");
   }
 
   function formatChooser() {
@@ -344,9 +430,134 @@
     return Array.from(container.querySelectorAll("button:not(:disabled), input:not(:disabled), [href], [tabindex]:not([tabindex='-1'])"));
   }
 
+  function cancelReviewRequest() {
+    if (model.reviewTimer !== null) {
+      window.clearTimeout(model.reviewTimer);
+      model.reviewTimer = null;
+    }
+    if (model.reviewController) {
+      model.reviewController.abort();
+      model.reviewController = null;
+    }
+    model.reviewRevision += 1;
+    model.review.loading = false;
+  }
+
+  function reviewState() {
+    return {
+      all: "eligible",
+      strong: "strong",
+      review: "review",
+      selected: "selected"
+    }[model.review.filter] || "eligible";
+  }
+
+  function reviewFocus() {
+    const active = document.activeElement;
+    if (!active) return null;
+    if (active.id === "chart-search") {
+      return { type: "search", start: active.selectionStart, end: active.selectionEnd };
+    }
+    if (active.dataset && active.dataset.reviewFilter) {
+      return { type: "filter", value: active.dataset.reviewFilter };
+    }
+    if (active.dataset && active.dataset.action === "load-more-review") return { type: "more" };
+    return null;
+  }
+
+  function restoreReviewFocus(focus) {
+    if (!focus) return;
+    let target = null;
+    if (focus.type === "search") target = document.getElementById("chart-search");
+    else if (focus.type === "filter") {
+      target = Array.from(app.querySelectorAll("[data-review-filter]")).find(function (button) {
+        return button.dataset.reviewFilter === focus.value;
+      });
+    } else if (focus.type === "more") target = app.querySelector("[data-action='load-more-review']");
+    if (!target) return;
+    target.focus();
+    if (focus.type === "search" && typeof target.setSelectionRange === "function") {
+      const length = target.value.length;
+      target.setSelectionRange(Math.min(focus.start == null ? length : focus.start, length), Math.min(focus.end == null ? length : focus.end, length));
+    }
+  }
+
+  async function loadReview(reset, options) {
+    const settings = options || {};
+    const snapshot = model.snapshot;
+    if (!snapshot || !snapshot.matching || !snapshot.matching.authoritative || !model.confirmationVisible) return false;
+    if (model.reviewTimer !== null) {
+      window.clearTimeout(model.reviewTimer);
+      model.reviewTimer = null;
+    }
+    if (model.reviewController) model.reviewController.abort();
+    const controller = new AbortController();
+    model.reviewController = controller;
+    const revision = ++model.reviewRevision;
+    const focus = reviewFocus();
+    const offset = reset ? 0 : model.review.tracks.length;
+    if (reset) {
+      model.review.tracks = [];
+      model.review.page = null;
+      model.review.loaded = false;
+    }
+    model.review.loading = true;
+    model.review.error = "";
+    if (settings.renderStart !== false) {
+      render(false);
+      restoreReviewFocus(focus);
+    }
+    let loaded = false;
+    try {
+      const path = "/api/review?workspace_id=" + encodeURIComponent(snapshot.workspace_id)
+        + "&state=" + encodeURIComponent(reviewState())
+        + "&limit=25&offset=" + offset
+        + "&sort=artist&search=" + encodeURIComponent(model.review.search.trim());
+      const payload = await api(path, { signal: controller.signal });
+      if (revision !== model.reviewRevision) return false;
+      const incoming = Array.isArray(payload.tracks) ? payload.tracks : [];
+      if (reset) model.review.tracks = incoming;
+      else {
+        const existing = new Set(model.review.tracks.map(function (card) { return String(card.track_key || ""); }));
+        model.review.tracks = model.review.tracks.concat(incoming.filter(function (card) {
+          return !existing.has(String(card.track_key || ""));
+        }));
+      }
+      model.review.page = payload.page || null;
+      model.review.loaded = true;
+      loaded = true;
+    } catch (error) {
+      if (error.name === "AbortError" || revision !== model.reviewRevision) return false;
+      model.review.error = "We could not load these chart choices. Try the search or filter again.";
+    } finally {
+      if (revision === model.reviewRevision) {
+        model.review.loading = false;
+        model.reviewController = null;
+        if (settings.renderEnd !== false) {
+          render(false);
+          restoreReviewFocus(focus);
+        }
+      }
+    }
+    return loaded;
+  }
+
+  function resetReview() {
+    cancelReviewRequest();
+    model.confirmationVisible = false;
+    model.pendingRow = "";
+    model.review.tracks = [];
+    model.review.page = null;
+    model.review.filter = "all";
+    model.review.search = "";
+    model.review.loaded = false;
+    model.review.error = "";
+  }
+
   async function refresh() {
     const revision = ++model.requestRevision;
     if (model.controller) model.controller.abort();
+    cancelReviewRequest();
     model.controller = new AbortController();
     try {
       const response = await fetch(apiUrl("/api/journey"), { credentials: "same-origin", signal: model.controller.signal });
@@ -367,6 +578,13 @@
       const wasMatching = previous && previous.matching && ["matching_restoring", "matching_running"].includes(previous.matching.state);
       reconcileElapsed(snapshot);
       model.snapshot = snapshot;
+      if (snapshot.matching && snapshot.matching.state === "charts_found" && snapshot.matching.authoritative) {
+        model.confirmationVisible = model.confirmationVisible || exactSelectionItems().length > 0;
+        if (model.confirmationVisible) await loadReview(true, { renderStart: false, renderEnd: false });
+        if (revision !== model.requestRevision) return;
+      } else {
+        resetReview();
+      }
       render(false);
       if (wasImporting && snapshot.operation.state !== "importing") announce("Your music import finished.");
       if (wasMatching && !["matching_restoring", "matching_running"].includes(snapshot.matching && snapshot.matching.state)) announce("Chart finding finished.");
@@ -470,7 +688,7 @@
   }
 
   async function selectCohort(cohort) {
-    if (model.pendingAction || !model.snapshot || !model.snapshot.matching.authoritative) return;
+    if (model.pendingAction || model.pendingRow || !model.snapshot || !model.snapshot.matching.authoritative) return;
     const scope = cohort === "all" ? "eligible" : cohort === "best" ? "strong" : "";
     if (!scope) return;
     const workspace = model.snapshot.workspace_id;
@@ -491,6 +709,8 @@
         body: JSON.stringify({ workspace_id: workspace, kind: "exact", scope: scope })
       });
       model.cohortPreference = cohort;
+      model.confirmationVisible = true;
+      await loadReview(true);
       const persisted = exactSelectionState(model.snapshot);
       if (persisted.cohort === cohort) {
         announce(number(persisted.count) + " charts selected.");
@@ -502,6 +722,7 @@
       model.cohortPreference = "";
       try {
         model.selections = await api("/api/discovery/selections?workspace_id=" + encodeURIComponent(workspace));
+        if (model.confirmationVisible) await loadReview(true);
         model.selectionError = "We could not update your chart choices. Your saved selection is shown. Try again.";
       } catch (_refreshError) {
         model.selections = null;
@@ -511,6 +732,64 @@
     } finally {
       model.pendingAction = "";
       render(false);
+    }
+  }
+
+  function focusReviewRow(trackKey) {
+    const checkbox = Array.from(app.querySelectorAll("[data-row-selection]")).find(function (input) {
+      return String(input.dataset.trackKey || "") === String(trackKey || "");
+    });
+    if (checkbox) checkbox.focus();
+  }
+
+  async function updateRowSelection(trackKey, selected) {
+    if (!trackKey || model.pendingRow || model.pendingAction || !model.snapshot || !model.snapshot.matching.authoritative) return;
+    const card = model.review.tracks.find(function (item) { return String(item.track_key || "") === String(trackKey); });
+    const candidate = card ? recommendationCandidate(card) : null;
+    if (selected && (!candidate || candidate.candidate_id == null)) {
+      model.review.error = "That recommendation is no longer available. Refresh the chart list and try again.";
+      render(false);
+      return;
+    }
+    const workspace = model.snapshot.workspace_id;
+    const payload = {
+      workspace_id: workspace,
+      kind: "exact",
+      track_id: trackKey,
+      action: selected ? "select" : "clear"
+    };
+    if (selected) payload.candidate_id = candidate.candidate_id;
+    model.pendingRow = String(trackKey);
+    model.review.error = "";
+    render(false);
+    try {
+      model.selections = await api("/api/discovery/select", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload)
+      });
+      model.cohortPreference = "";
+      model.confirmationVisible = true;
+      const loaded = await loadReview(true, { renderStart: false, renderEnd: false });
+      if (!loaded && !model.review.error) {
+        model.review.error = "Your choice was saved, but the chart list could not be refreshed. Try the filter again.";
+      }
+      const count = exactSelectionItems().length;
+      announce(selected ? "Chart selected. " + number(count) + " selected." : "Chart unselected. " + number(count) + " selected.");
+    } catch (error) {
+      model.cohortPreference = "";
+      try {
+        model.selections = await api("/api/discovery/selections?workspace_id=" + encodeURIComponent(workspace));
+        await loadReview(true, { renderStart: false, renderEnd: false });
+        model.review.error = "We could not update that chart. Your saved choice was restored. Try again.";
+      } catch (_refreshError) {
+        model.review.error = "We could not update or verify that chart. Reload this page before trying again.";
+      }
+      announce(model.review.error);
+    } finally {
+      model.pendingRow = "";
+      render(false);
+      focusReviewRow(trackKey);
     }
   }
 
@@ -533,7 +812,31 @@
     else if (action === "view-imported") { model.overlay = null; render(false); document.getElementById("main-content").focus(); }
     else if (action === "find-charts" || action === "retry-matching") { startMatching(); }
     else if (action === "select-cohort") { selectCohort(target.dataset.cohort); }
+    else if (action === "set-review-filter") {
+      model.review.filter = target.dataset.reviewFilter || "all";
+      loadReview(true);
+    }
+    else if (action === "load-more-review") { loadReview(false); }
     else if (action === "retry") { refresh(); }
+  });
+
+  app.addEventListener("input", function (event) {
+    if (event.target.id !== "chart-search") return;
+    model.review.search = event.target.value;
+    if (model.reviewTimer !== null) window.clearTimeout(model.reviewTimer);
+    if (model.reviewController) model.reviewController.abort();
+    model.reviewRevision += 1;
+    model.review.loading = false;
+    model.reviewTimer = window.setTimeout(function () {
+      model.reviewTimer = null;
+      loadReview(true);
+    }, 300);
+  });
+
+  app.addEventListener("change", function (event) {
+    const checkbox = event.target.closest("[data-row-selection]");
+    if (!checkbox || !app.contains(checkbox)) return;
+    updateRowSelection(checkbox.dataset.trackKey, checkbox.checked);
   });
 
   document.addEventListener("keydown", function (event) {
