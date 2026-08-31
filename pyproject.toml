@@ -53,5 +53,7 @@ markers = [
     "integration: tests that hit the live Enchor API (skipped by default, run with: pytest -m integration)",
     "browser: optional Python Playwright browser coverage",
     "music_ready: browser fixture seed marker",
+    "mobile: browser coverage at a mobile viewport",
+    "api_failure: browser coverage for failed journey reads",
 ]
 addopts = "-m 'not integration'"

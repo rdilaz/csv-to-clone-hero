@@ -1,13 +1,26 @@
 @echo off
 rem ===========================================================================
-rem  CSV to Clone Hero - web interface (no terminal needed)
-rem  Opens a local web page: sign in, sync Spotify, choose a search scope, and
-rem  find charts. Existing Songs inventory is read-only; /advanced is CSV mode.
+rem  CSV to Clone Hero - local journey web interface (no terminal needed)
+rem  Starts the real Flask app and opens the accepted journey at /
 rem  Same-Wi-Fi mode: WEB_INTERFACE.bat --lan
 rem  Public HTTPS mode: WEB_INTERFACE.bat --public-url https://your-address
+rem  Development reload (not for normal use): .venv\Scripts\python.exe -m csv_to_clonehero web --reload --no-browser
 rem ===========================================================================
 setlocal
 cd /d "%~dp0"
+
+set "REPOSITORY=%CD%"
+set "PORT_PID="
+for /f "usebackq delims=" %%P in (`powershell -NoProfile -ExecutionPolicy Bypass -Command "$listener = Get-NetTCPConnection -LocalPort 8765 -State Listen -ErrorAction SilentlyContinue; if ($listener) { $listener | ForEach-Object { $_.OwningProcess } }"`) do set "PORT_PID=%%P"
+if defined PORT_PID (
+    echo.
+    echo  ERROR: Port 8765 is already in use by process ID %PORT_PID%.
+    tasklist /FI "PID eq %PORT_PID%"
+    echo  Stop that process or use the development command with another port.
+    echo.
+    pause
+    exit /b 2
+)
 
 set "PY="
 where py >nul 2>nul
@@ -38,10 +51,22 @@ if not exist ".venv\Scripts\python.exe" (
     if errorlevel 1 goto :setup_failed
 )
 
-rem The reloader restarts Flask after source changes; refresh the browser to see them.
-".venv\Scripts\python.exe" -m csv_to_clonehero web --reload %*
+set "PY_EXE=%REPOSITORY%\.venv\Scripts\python.exe"
+echo.
+echo  Python: "%PY_EXE%"
+echo  Repository: "%REPOSITORY%"
+echo  Serving real Flask journey app at: http://127.0.0.1:8765/
+echo  Flask auto-reload is disabled for this normal launcher.
+echo.
+"%PY_EXE%" -m csv_to_clonehero web --port 8765 %*
+set "EXIT_CODE=%ERRORLEVEL%"
+if not "%EXIT_CODE%"=="0" (
+    echo.
+    echo  The real journey app stopped with exit code %EXIT_CODE%.
+    echo.
+)
 pause
-exit /b 0
+exit /b %EXIT_CODE%
 
 :setup_failed
 echo.

@@ -198,17 +198,20 @@ def test_spotify_imported_and_connected_state(journey_client):
         assert data["sources"]["spotify"]["allowed_actions"]["update_music"] is True
 
 
-def test_journey_route_is_separate_from_legacy_pages(journey_client):
+def test_root_is_primary_and_legacy_page_routes_redirect(journey_client):
     client, _ = journey_client
     journey = client.get("/journey")
-    assert journey.status_code == 200
-    html = journey.get_data(as_text=True)
+    assert journey.status_code == 302
+    assert journey.headers["Location"] == "/"
+    html = client.get("/").get_data(as_text=True)
     assert "journey.css" in html
     assert "journey.js" in html
     assert "prototype-2" not in html
     assert "/advanced" not in html
     assert client.get("/").status_code == 200
-    assert client.get("/advanced").status_code == 200
+    advanced = client.get("/advanced")
+    assert advanced.status_code == 302
+    assert advanced.headers["Location"] == "/"
 
 
 def test_journey_preserves_lan_access_token_model(config):
@@ -218,10 +221,13 @@ def test_journey_preserves_lan_access_token_model(config):
     with app.test_client() as client:
         assert client.get("/journey", environ_base={"REMOTE_ADDR": "192.168.1.2"}).status_code == 401
         response = client.get("/journey?access_token=private-token", environ_base={"REMOTE_ADDR": "192.168.1.2"})
+        assert response.status_code == 302
+        assert response.headers["Location"] == "/?access_token=private-token"
+        response = client.get("/?access_token=private-token", environ_base={"REMOTE_ADDR": "192.168.1.2"})
         assert response.status_code == 200
         html = response.get_data(as_text=True)
-        assert "static/journey.css?access_token=private-token" in html
-        assert "static/journey.js?access_token=private-token" in html
+        assert "static/journey.css?v=2.5.0&amp;access_token=private-token" in html
+        assert "static/journey.js?v=2.5.0&amp;access_token=private-token" in html
         api = client.get("/api/journey?access_token=private-token", environ_base={"REMOTE_ADDR": "192.168.1.2"})
         assert api.status_code == 200
 

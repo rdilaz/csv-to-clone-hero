@@ -387,6 +387,15 @@ def cmd_web(config, args) -> int:
     if host not in loopback_hosts and not (args.lan or public_mode):
         console.print("[red]Non-loopback hosts require --lan or --public-url.[/red]")
         return 2
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        probe.bind((host, args.port))
+    except OSError as exc:
+        console.print(f"[red]Port {args.port} is already in use or unavailable: {exc}[/red]")
+        return 2
+    finally:
+        probe.close()
     access_token = ""
     if args.lan or public_mode:
         access_token = (
@@ -398,8 +407,10 @@ def cmd_web(config, args) -> int:
         # stable across that handoff instead of generating a second URL.
         os.environ["CSV_TO_CLONEHERO_LAN_TOKEN"] = access_token
     app = create_app(config, lan_access_token=access_token or None)
-    local_url = f"http://127.0.0.1:{args.port}"
+    local_url = f"http://127.0.0.1:{args.port}/"
     console.print(f"[green bold]Web interface running locally at {local_url}[/green bold]")
+    console.print(f"[dim]Python: {sys.executable}[/dim]")
+    console.print(f"[dim]Repository: {Path(__file__).resolve().parents[2]}[/dim]")
     if args.lan:
         addresses = set()
         try:
@@ -429,11 +440,14 @@ def cmd_web(config, args) -> int:
     reloader_child = os.environ.get("WERKZEUG_RUN_MAIN") == "true"
     if not args.no_browser and (not getattr(args, "reload", False) or reloader_child):
         webbrowser.open(local_url)
+    reload_enabled = bool(getattr(args, "reload", False)) and not (args.lan or public_mode)
+    if getattr(args, "reload", False) and not reload_enabled:
+        console.print("[yellow]Reload is disabled in LAN/public mode.[/yellow]")
     app.run(
         host=host,
         port=args.port,
-        debug=bool(getattr(args, "reload", False)),
-        use_reloader=bool(getattr(args, "reload", False)),
+        debug=reload_enabled,
+        use_reloader=reload_enabled,
     )
     return 0
 

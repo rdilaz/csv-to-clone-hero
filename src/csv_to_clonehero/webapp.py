@@ -1,13 +1,8 @@
-"""Browser interface with local, LAN, and authenticated public-URL modes.
+"""Local journey application and compatibility API.
 
-Lets a nontechnical user:
-
-1. get CSVs (links to Chosic / Exportify),
-2. upload them into input_playlists,
-3. run a dry run or a full build with on-screen progress,
-4. read the summary and download reports.
-
-No terminal required.
+The normal browser surface is the server-rendered journey template. The
+older import, review, selection, build, and reporting endpoints remain here
+for CLI and API compatibility, but are not user-facing page routes.
 """
 
 from __future__ import annotations
@@ -36,7 +31,7 @@ from typing import Any, Callable, Iterable, Mapping
 from urllib.parse import parse_qs, urlsplit
 
 import httpx
-from flask import Flask, abort, jsonify, redirect, render_template, request, send_file, Response
+from flask import Flask, abort, jsonify, redirect, render_template, request, send_file, Response, url_for
 
 from csv_to_clonehero.config import AppConfig
 from csv_to_clonehero.csv_import import (
@@ -96,6 +91,8 @@ from csv_to_clonehero.normalization import normalize_artist, normalize_title
 log = logging.getLogger(__name__)
 
 _SPOTIFY_WORKSPACE_KEY = "spotify"
+JOURNEY_SCHEMA_VERSION = 1
+JOURNEY_ASSET_VERSION = "2.5.0"
 
 
 class _OAuthAccessLogFilter(logging.Filter):
@@ -1924,7 +1921,19 @@ def create_app(
     app.config["LAN_MODE"] = bool(lan_access_token)
     app.config["PUBLIC_MODE"] = bool(getattr(getattr(config, "spotify", None), "public_base_url", "").strip())
     app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_BYTES
+    app.config["JOURNEY_SCHEMA_VERSION"] = JOURNEY_SCHEMA_VERSION
+    app.config["JOURNEY_ASSET_VERSION"] = JOURNEY_ASSET_VERSION
     logging.getLogger("werkzeug").addFilter(_OAuthAccessLogFilter())
+
+    @app.after_request
+    def prevent_stale_journey_assets(response: Response) -> Response:
+        """Keep the cutover shell and its assets out of stale browser caches."""
+        if request.path in {"/", "/journey", "/api/journey", "/static/journey.css", "/static/journey.js"}:
+            response.headers["Cache-Control"] = "no-store"
+            response.headers["Pragma"] = "no-cache"
+            response.headers["Expires"] = "0"
+        return response
+
     recovery_db = Database(config.database_path)
     try:
         recovery_db.recover_interrupted_discovery()
@@ -3893,23 +3902,71 @@ def create_app(
 
     # -------------------------------------------------------- Spotify discovery
     def _start_local_catalog_job(payload: Mapping[str, Any]) -> tuple[dict[str, Any], int]:
+        _recover_stale_spotify_job()
         busy = _busy_response()
         if busy is not None:
             return busy
         workspace, workspace_key = _get_local_library_workspace()
-        discovery_run_id = ""
         db = Database(config.database_path)
         try:
-            discovery_run_id = db.get_meta("local_current_run_id")
+            requested_workspace = payload.get("workspace_id")
+            workspace_row = db.get_workspace(workspace)
+            if requested_workspace not in (None, ""):
+                requested_row = db.get_workspace(requested_workspace)
+                if requested_row is None or int(requested_row["id"]) != int(workspace):
+                    return {"error": "the requested workspace is not the local journey workspace"}, 400
+            canonical_count = len(db.get_neutral_library_tracks(workspace))
+            if canonical_count <= 0:
+                return {"error": "add music before finding Clone Hero charts"}, 400
         finally:
             db.close()
         with spotify_job.lock:
             if spotify_job.running:
                 return {"error": "a discovery job is already running"}, 409
-            spotify_job.begin(workspace, workspace_key=workspace_key, scan_key="catalog", run_id=discovery_run_id or None)
+            run_id = uuid.uuid4().hex
+            spotify_job.begin(workspace, workspace_key=workspace_key, scan_key="catalog", run_id=run_id)
             spotify_job.phase = "restoring"
             spotify_job.message = "Checking saved match results..."
-            run_id = spotify_job.run_id
+            started_at = float(spotify_job.started_at or time.time())
+
+        workspace_metadata = _json_object(workspace_row["metadata_json"], {}) if workspace_row is not None else {}
+        if not isinstance(workspace_metadata, Mapping):
+            workspace_metadata = {}
+        generation_key = f"journey-{run_id}"
+        run_metadata = {
+            **workspace_metadata,
+            "workflow": "source_neutral",
+            "run_id": run_id,
+            "scan_key": "catalog",
+            "generation": generation_key,
+            "started_at": started_at,
+        }
+        status_db = Database(config.database_path)
+        try:
+            # Persist identity before the daemon thread starts so a new process
+            # can recover an abandoned run as interrupted.
+            status_db.set_meta("local_current_run_id", run_id)
+            status_db.update_workspace(
+                workspace,
+                status="running",
+                phase="restoring",
+                metadata=run_metadata,
+            )
+            status_db.update_workspace_progress(
+                workspace,
+                status="running",
+                phase="restoring",
+                message="Checking saved match results...",
+                error="",
+                total_tracks=canonical_count,
+                completed_tracks=0,
+                metadata=run_metadata,
+            )
+        except Exception as exc:
+            spotify_job.fail(_safe_message(exc))
+            return {"error": "could not start chart finding"}, 500
+        finally:
+            status_db.close()
 
         def worker() -> None:
             db = Database(config.database_path)
@@ -3924,9 +3981,25 @@ def create_app(
                 cache_miss_diagnostic: dict[str, str] = {}
                 fast_result = completed_scan_fast_path(config, db, workspace, library_fingerprint, on_progress=spotify_job.progress_update, miss_diagnostic=cache_miss_diagnostic)
                 if fast_result is not None:
+                    finished_at = time.time()
+                    result_metadata = {
+                        **run_metadata,
+                        "finished_at": finished_at,
+                        "catalog_available": bool(fast_result.catalog_available),
+                        "catalog_snapshot_id": fast_result.catalog_snapshot_id,
+                        "catalog_chart_count": fast_result.catalog_chart_count,
+                        "candidate_relationship_digest": fast_result.candidate_relationship_digest,
+                    }
+                    db.update_workspace(
+                        workspace,
+                        status="complete",
+                        phase="complete",
+                        message="Reusing existing chart matches.",
+                        error="",
+                        metadata=result_metadata,
+                    )
+                    db.update_workspace_progress(workspace, status="complete", phase="complete", message=f"Reusing {fast_result.tracks:,} existing matches.", error="", total_tracks=fast_result.tracks, completed_tracks=fast_result.tracks, metadata={**result_metadata, "cached_tracks": fast_result.tracks, "recomputed_tracks": 0, "fast_path": True, "fast_path_timings": fast_result.fast_path_timings, "funnel": fast_result.funnel})
                     spotify_job.finish(fast_result)
-                    db.update_workspace(workspace, status="complete", phase="complete", message="Reusing existing chart matches.", error="")
-                    db.update_workspace_progress(workspace, status="complete", phase="complete", message=f"Reusing {fast_result.tracks:,} existing matches.", error="", total_tracks=fast_result.tracks, completed_tracks=fast_result.tracks, metadata={"run_id": spotify_job.run_id, "scan_key": "catalog", "cached_tracks": fast_result.tracks, "recomputed_tracks": 0, "fast_path": True, "fast_path_timings": fast_result.fast_path_timings, "funnel": fast_result.funnel})
                     return
                 grouped: dict[str, list[ProviderTrack]] = {}
                 for row in db.get_track_provenance(workspace):
@@ -3952,28 +4025,36 @@ def create_app(
                             error="",
                             total_tracks=int(payload.get("total_tracks", 0) or 0),
                             completed_tracks=int(payload.get("processed_tracks", 0) or 0),
-                            metadata={"run_id": spotify_job.run_id, "scan_key": "catalog", **payload},
+                            metadata={**run_metadata, **payload},
                         )
                         last_persisted = now
-                on_progress({"phase": "combine", "message": "Combining imported sources locally...", "total_tracks": sum(map(len, grouped.values())), "processed_tracks": 0, "cache_miss_reason": cache_miss_diagnostic.get("reason", "")})
-                run_id = spotify_job.run_id
+                on_progress({"phase": "combine", "message": "Combining imported sources locally...", "total_tracks": canonical_count, "processed_tracks": 0, "cache_miss_reason": cache_miss_diagnostic.get("reason", "")})
                 try:
                     diagnostics = RunDiagnostics(config.state_path, run_id)
                     diagnostics.update("source_setup", workspace_id=workspace, workspace_key=workspace_key)
-                    db.set_meta("local_current_run_id", run_id)
                 except OSError:
                     diagnostics = None
-                result = discover_combined(config, db, [LibrarySnapshot(name, tracks) for name, tracks in grouped.items()], workspace_key=workspace_key, workspace_name="Local combined library", expansion_artists=payload.get("expansion_artists", ()), diagnostics=diagnostics, on_progress=on_progress)
-                spotify_job.finish(result)
-                db.update_workspace(workspace, status=result.status, phase=result.phase, message="Catalog matching complete.", error=result.error)
+                result = discover_combined(config, db, [LibrarySnapshot(name, tracks) for name, tracks in grouped.items()], workspace_key=workspace_key, workspace_name="Local combined library", expansion_artists=(), diagnostics=diagnostics, on_progress=on_progress)
+                finished_at = time.time()
+                result_metadata = {
+                    **run_metadata,
+                    "finished_at": finished_at,
+                    "catalog_available": bool(result.catalog_available),
+                    "catalog_diagnostic": result.catalog_diagnostic,
+                    "catalog_snapshot_id": result.catalog_snapshot_id,
+                    "catalog_chart_count": result.catalog_chart_count,
+                    "candidate_relationship_digest": result.candidate_relationship_digest,
+                }
+                db.update_workspace(workspace, status=result.status, phase=result.phase, message="Catalog matching complete.", error=result.error, metadata=result_metadata)
                 db.update_workspace_progress(
                     workspace,
                     status=result.status,
                     phase=result.phase,
                     message="Catalog matching complete.",
                     error=result.error,
-                    metadata={"run_id": run_id, "scan_key": "catalog", "cached_tracks": result.cached_tracks, "recomputed_tracks": result.recomputed_tracks, "retrieval_seconds": round(result.retrieval_seconds, 3), "scoring_seconds": round(result.scoring_seconds, 3), "persistence_seconds": round(result.persistence_seconds, 3), "discovery_seconds": round(result.discovery_seconds, 3), "funnel": result.funnel},
+                    metadata={**result_metadata, "cached_tracks": result.cached_tracks, "recomputed_tracks": result.recomputed_tracks, "retrieval_seconds": round(result.retrieval_seconds, 3), "scoring_seconds": round(result.scoring_seconds, 3), "persistence_seconds": round(result.persistence_seconds, 3), "discovery_seconds": round(result.discovery_seconds, 3), "funnel": result.funnel},
                 )
+                spotify_job.finish(result)
                 if diagnostics:
                     diagnostics.update("selection", counters={"selected_charts": 0})
                     diagnostics.update("export", counters={"export_attempts": 0, "exported_charts": 0})
@@ -4014,14 +4095,28 @@ def create_app(
                         phase="catalog_match",
                         message="Matching stopped before it finished.",
                         error=message,
+                        metadata={**run_metadata, "error": message, "finished_at": time.time()},
                     )
+                    latest_generation = db.get_latest_combined_generation(workspace)
+                    if latest_generation is not None and str(latest_generation["status"] or "").casefold() in {"running", "pending"}:
+                        generation_metadata = _json_object(latest_generation["metadata_json"], {})
+                        if not isinstance(generation_metadata, dict):
+                            generation_metadata = {}
+                        generation_metadata["error"] = message
+                        db.create_discovery_scan(
+                            workspace,
+                            scan_key=str(latest_generation["scan_key"]),
+                            kind="exact",
+                            status="failed",
+                            metadata=generation_metadata,
+                        )
                     db.update_workspace_progress(
                         workspace,
                         status="failed",
                         phase="catalog_match",
                         message="Matching stopped before it finished.",
                         error=message,
-                        metadata={"run_id": run_id, "scan_key": "catalog"},
+                        metadata={**run_metadata, "error": message, "finished_at": time.time()},
                     )
                 except Exception:
                     log.warning("Could not persist local matching failure", exc_info=True)
@@ -4031,6 +4126,11 @@ def create_app(
                     except OSError:
                         log.warning("Could not persist local matching diagnostics", exc_info=True)
             finally:
+                try:
+                    db.recover_discovery_run(workspace, run_id)
+                except Exception:
+                    log.warning("Could not recover local matching run state", exc_info=True)
+                spotify_job.cleanup(run_id, threading.current_thread())
                 db.close()
 
         thread = threading.Thread(target=worker, daemon=True)
@@ -7389,7 +7489,9 @@ def create_app(
             "catalog_available": catalog_available,
             "catalog_diagnostic": catalog_diagnostic,
             "run_id": run_id,
-            "review_url": f"/advanced?workspace_id={int(workspace)}",
+            # The compatibility read model no longer directs users to the
+            # retired review page. Candidate APIs remain available to callers.
+            "review_url": "/",
                 "counts": {
                     "imported_songs": total,
                     "chart_options": option_count,
@@ -7477,8 +7579,75 @@ def create_app(
         records.sort(key=lambda item: item.pop("_sort"))
         return records
 
+    def _matching_authority(
+        db: Database,
+        workspace: int | str,
+        canonical_count: int,
+        library_fingerprint: str = "",
+    ) -> tuple[bool, dict[str, int]]:
+        """Validate a completed result without loading the catalog or mutating DB state."""
+        latest = db.get_latest_combined_generation(workspace)
+        if latest is None or str(latest["status"] or "").casefold() not in {"complete", "completed"}:
+            return False, {}
+        progress = db.get_discovery_song_progress_summary(workspace)
+        classified = sum(
+            progress[key]
+            for key in ("strong", "review", "no_suitable", "not_playable", "no_catalog_candidate")
+        )
+        if (
+            canonical_count <= 0
+            or progress["total"] != canonical_count
+            or progress["completed"] != canonical_count
+            or classified != canonical_count
+        ):
+            return False, {}
+        try:
+            from csv_to_clonehero.catalog import read_catalog_manifest
+            from csv_to_clonehero.combined_pipeline import matching_scan_fingerprint
+
+            fingerprint = library_fingerprint or db.get_library_matching_fingerprint(workspace)
+            manifest = read_catalog_manifest(config.catalog_path)
+            scan_fingerprint = matching_scan_fingerprint(
+                (), manifest, config, library_fingerprint=fingerprint
+            )
+            cache = db.get_matching_scan_cache(workspace, scan_fingerprint)
+            if cache is None:
+                return False, {}
+            result_data = json.loads(str(cache["result_json"] or "{}"))
+            if int(cache["track_count"] or 0) != canonical_count or int(result_data.get("tracks", -1)) != canonical_count:
+                return False, {}
+            current_count, current_digest, _ = db.workspace_current_candidate_digest(workspace)
+            expected_count = int(result_data.get("persisted_candidates", -1))
+            expected_digest = str(result_data.get("candidate_relationship_digest") or "")
+            if current_count != expected_count or not expected_digest or current_digest != expected_digest:
+                return False, {}
+            generation_metadata = _json_object(latest["metadata_json"], {})
+            if isinstance(generation_metadata, Mapping) and generation_metadata.get("candidate_relationship_digest"):
+                if str(generation_metadata["candidate_relationship_digest"]) != current_digest:
+                    return False, {}
+            for result_key, progress_key in (
+                ("strong_match_tracks", "strong"),
+                ("review_match_tracks", "review"),
+                ("soft_rejected_only_tracks", "no_suitable"),
+                ("hard_rejected_only_tracks", "not_playable"),
+                ("no_plausible_tracks", "no_catalog_candidate"),
+            ):
+                if result_key in result_data and int(result_data[result_key] or 0) != progress[progress_key]:
+                    return False, {}
+        except (OSError, TypeError, ValueError, KeyError, json.JSONDecodeError):
+            return False, {}
+        return True, {
+            "best_matches": progress["strong"],
+            "best_available": progress["review"],
+            "recommendations": progress["strong"] + progress["review"],
+            "no_suitable": progress["no_suitable"],
+            "not_playable": progress["not_playable"],
+            "no_candidate": progress["no_catalog_candidate"],
+        }
+
     def _journey_payload(db: Database, workspace: int | str) -> dict[str, Any]:
         """Project all local source facts into one authoritative read model."""
+        _recover_stale_spotify_job()
         source_rows = {
             str(row["provider"]).casefold(): dict(row)
             for row in db.get_source_summary(workspace)
@@ -7501,17 +7670,184 @@ def create_app(
         )
         soundcloud_import_active = bool(soundcloud_job_state.get("running"))
         soundcloud_failed = str(soundcloud_job_state.get("status") or "") == "failed"
+        matching_active = bool(
+            spotify_job_state.get("running")
+            and str(spotify_job_state.get("scan_key") or "") == "catalog"
+        )
         spotify_imported = bool(spotify)
         soundcloud_imported = bool(soundcloud)
         spotify_count = int(spotify.get("tracks", 0) or 0)
         soundcloud_count = int(soundcloud.get("tracks", 0) or 0)
-        source_keys = {
-            source
-            for record in records
-            for source in record["sources"]
-        }
         shared_count = sum(len(record["sources"]) > 1 for record in records)
         attention = soundcloud_failed or (spotify_imported and not spotify_connected)
+
+        latest_generation = db.get_latest_combined_generation(workspace)
+        latest_status = str(latest_generation["status"] or "").casefold() if latest_generation else ""
+        latest_metadata = _json_object(latest_generation["metadata_json"], {}) if latest_generation is not None else {}
+        if not isinstance(latest_metadata, Mapping):
+            latest_metadata = {}
+        workspace_row = db.get_workspace(workspace)
+        workspace_status = str(workspace_row["status"] or "").casefold() if workspace_row else ""
+        workspace_phase = str(workspace_row["phase"] or "").casefold() if workspace_row else ""
+        progress_status = str(progress_data.get("status") or "").casefold()
+        workspace_metadata = _json_object(workspace_row["metadata_json"], {}) if workspace_row is not None else {}
+        if not isinstance(workspace_metadata, Mapping):
+            workspace_metadata = {}
+        matching_statuses = {
+            "running", "pending", "complete", "completed", "failed", "error",
+            "interrupted", "partial", "cancelled",
+        }
+        matching_run_marker = bool(
+            (
+                str(spotify_job_state.get("scan_key") or "") == "catalog"
+                and (
+                    bool(spotify_job_state.get("running"))
+                    or str(spotify_job_state.get("status") or "") in {"failed", "error", "interrupted"}
+                )
+            )
+            or (
+                str(progress_metadata.get("scan_key") or "") == "catalog"
+                and progress_status in matching_statuses
+            )
+            or (
+                str(workspace_metadata.get("scan_key") or "") == "catalog"
+                and workspace_status in matching_statuses
+            )
+        )
+        authority, results = _matching_authority(db, workspace, len(records))
+        matching_progress = db.get_discovery_song_progress_summary(workspace)
+        matching_current = None
+        if matching_active:
+            matching_current = next(
+                (
+                    dict(row) for row in db.get_discovery_song_progress(workspace, limit=20)
+                    if str(row["status"] or "") == "checking"
+                    and float(row["updated_at"] or 0) >= float(spotify_job_state.get("started_at") or 0)
+                ),
+                None,
+            )
+        if soundcloud_import_active or spotify_import_active:
+            matching_state = "music_ready"
+        elif soundcloud_failed or workspace_phase == "source_import":
+            matching_state = "music_ready"
+        elif matching_active:
+            matching_state = (
+                "matching_restoring"
+                if str(spotify_job_state.get("phase") or "") in {"starting", "restoring"}
+                else "matching_running"
+            )
+        elif (
+            str(spotify_job_state.get("scan_key") or "") == "catalog"
+            and str(spotify_job_state.get("status") or "") in {"failed", "error"}
+        ):
+            matching_state = "matching_failed"
+        elif (
+            str(spotify_job_state.get("scan_key") or "") == "catalog"
+            and str(spotify_job_state.get("status") or "") in {"interrupted", "partial", "cancelled"}
+        ):
+            matching_state = "matching_interrupted"
+        elif matching_run_marker and workspace_status in {"failed", "error"}:
+            matching_state = "matching_failed"
+        elif matching_run_marker and progress_status in {"failed", "error"}:
+            matching_state = "matching_failed"
+        elif latest_status in {"failed", "error"}:
+            matching_state = "matching_failed"
+        elif matching_run_marker and workspace_status in {"interrupted", "partial", "cancelled"}:
+            matching_state = "matching_interrupted"
+        elif matching_run_marker and progress_status in {"interrupted", "partial", "cancelled"}:
+            matching_state = "matching_interrupted"
+        elif latest_status in {"running", "pending", "interrupted", "partial", "cancelled"}:
+            matching_state = "matching_interrupted"
+        elif (
+            latest_status in {"complete", "completed"}
+            and str(latest_metadata.get("workflow") or "") == "combined_catalog"
+            and not authority
+            and (
+                matching_run_marker
+                or workspace_status in matching_statuses
+            )
+        ):
+            matching_state = "matching_failed"
+        elif authority:
+            matching_state = "charts_found"
+        elif (
+            latest_generation is None
+            and workspace_status in {"failed", "error"}
+            and (str(progress_metadata.get("scan_key") or "") == "catalog" or progress_status in {"failed", "error"})
+        ):
+            matching_state = "matching_failed"
+        elif (
+            latest_generation is None
+            and workspace_status in {"interrupted", "partial", "cancelled"}
+            and (str(progress_metadata.get("scan_key") or "") == "catalog" or progress_status in {"interrupted", "partial", "cancelled"})
+        ):
+            matching_state = "matching_interrupted"
+        else:
+            matching_state = "music_ready"
+        terminal_started = (
+            spotify_job_state.get("started_at") if matching_active
+            else progress_metadata.get("started_at")
+            or workspace_metadata.get("started_at")
+            or (latest_generation["started_at"] if latest_generation else None)
+        )
+        terminal_finished = (
+            None if matching_active
+            else progress_metadata.get("finished_at")
+            or workspace_metadata.get("finished_at")
+            or (workspace_row["completed_at"] if workspace_row is not None else None)
+            or (latest_generation["finished_at"] if latest_generation else None)
+        )
+        if matching_active:
+            elapsed = float(spotify_job_state.get("elapsed_seconds") or 0.0)
+            processed = int(progress_data.get("completed_tracks", 0) or 0)
+            total = len(records)
+        else:
+            elapsed_end = float(terminal_finished or time.time())
+            elapsed = max(0.0, elapsed_end - float(terminal_started or elapsed_end))
+            processed = matching_progress["completed"]
+            total = matching_progress["total"] or len(records)
+        matching = {
+            "state": matching_state,
+            "run_id": str(
+                "" if matching_state == "music_ready" else (
+                    spotify_job_state.get("run_id") if matching_active
+                    else progress_metadata.get("run_id") or ""
+                )
+            ),
+            "processed": (
+                0 if matching_state in {"music_ready", "matching_restoring"}
+                else total if matching_state == "charts_found" else processed
+            ),
+            "total": (
+                0 if matching_state == "music_ready"
+                else len(records) if matching_state == "charts_found" else total
+            ),
+            "current_song": (
+                {"artist": str(matching_current["artist"]), "title": str(matching_current["title"])}
+                if matching_current is not None and matching_state == "matching_running" else None
+            ),
+            "started_at": terminal_started if matching_state != "music_ready" else None,
+            "elapsed_seconds": elapsed if matching_state != "music_ready" else 0.0,
+            "authoritative": bool(authority and matching_state == "charts_found"),
+            "results": results if authority and matching_state == "charts_found" else None,
+            "error": (
+                "We could not finish finding charts. Your music is safe."
+                if matching_state == "matching_failed" else ""
+            ),
+            "details": {
+                "saved_work_reuse": bool(
+                    matching_state == "charts_found"
+                    and (
+                        progress_metadata.get("fast_path")
+                        or (
+                            isinstance(spotify_job_state.get("result"), Mapping)
+                            and spotify_job_state["result"].get("cached_tracks")
+                        )
+                    )
+                ),
+                "large_library_expectation": "A first check of a library this size can take tens of minutes.",
+            },
+        }
 
         def updated_at(row: Mapping[str, Any]) -> str | None:
             value = row.get("updated_at") or row.get("completed_at")
@@ -7614,6 +7950,11 @@ def create_app(
                 "state": "importing", "source_key": "spotify",
                 "message": str(spotify_job_state.get("message") or "Updating Spotify music..."),
             }
+        elif matching_active:
+            operation = {
+                "state": "matching", "source_key": None,
+                "message": "Finding your Clone Hero charts...",
+            }
         elif soundcloud_failed:
             operation = {
                 "state": "attention", "source_key": "soundcloud",
@@ -7621,6 +7962,7 @@ def create_app(
             }
 
         screen = (
+            matching_state if matching_state != "music_ready" else
             "importing" if operation["state"] == "importing" else
             "attention" if attention else
             "music_ready" if records else "add_music"
@@ -7629,11 +7971,20 @@ def create_app(
             "workspace": int(workspace),
             "sources": sources,
             "records": records,
+            "music": {
+                "canonical_count": len(records),
+                "spotify_count": spotify_count,
+                "soundcloud_count": soundcloud_count,
+                "shared_count": shared_count,
+            },
+            "matching": matching,
             "operation": operation,
         }, sort_keys=True, default=str).encode("utf-8")
         revision = hashlib.sha256(revision_input).hexdigest()[:16]
         return {
-            "schema_version": 1,
+            "schema_version": JOURNEY_SCHEMA_VERSION,
+            "app_surface": "journey",
+            "application_surface": "journey",
             "revision": revision,
             "screen": screen,
             "workspace_id": int(workspace),
@@ -7645,9 +7996,14 @@ def create_app(
                 "shared_count": shared_count,
                 "songs": records,
             },
+            "matching": matching,
             "operation": operation,
             "allowed_actions": {
-                "find_charts": False,
+                "find_charts": bool(
+                    records
+                    and matching_state in {"music_ready", "matching_interrupted", "matching_failed"}
+                    and operation["state"] == "idle"
+                ),
                 "download_song_list": True,
                 "manage_sources": True,
             },
@@ -7656,8 +8012,8 @@ def create_app(
 
     @app.get("/journey")
     def journey_page():
-        """Temporary Slice 1 route for the production-intended journey UI."""
-        return render_template("journey.html")
+        """Compatibility URL for the primary journey surface."""
+        return redirect(url_for("index", access_token=request.args.get("access_token")), code=302)
 
     @app.get("/api/journey")
     def journey_read_model():
@@ -7668,6 +8024,16 @@ def create_app(
             return jsonify(_journey_payload(db, workspace))
         finally:
             db.close()
+
+    @app.get("/healthz")
+    def healthz():
+        """Lightweight local process check that does not start any work."""
+        return jsonify({
+            "ok": True,
+            "app_surface": "journey",
+            "application_surface": "journey",
+            "schema_version": JOURNEY_SCHEMA_VERSION,
+        })
 
     def _spreadsheet_value(value: str) -> str:
         text = str(value or "")
@@ -7716,59 +8082,15 @@ def create_app(
 
     @app.get("/")
     def index():
-        workspace, _ = _get_local_library_workspace()
-        return (
-            _UNIFIED_PAGE
-            .replace("__OUTPUT_DEFAULT__", str(config.library_root))
-            .replace("__LAN_ACCESS_TOKEN__", json.dumps(str(app.config.get("LAN_ACCESS_TOKEN") or "")))
-            .replace("__PUBLIC_MODE__", "true" if app.config.get("PUBLIC_MODE") else "false")
-            .replace("__LOCAL_WORKSPACE_ID__", str(workspace))
+        return render_template(
+            "journey.html",
+            journey_schema_version=JOURNEY_SCHEMA_VERSION,
+            journey_asset_version=JOURNEY_ASSET_VERSION,
         )
 
     @app.get("/advanced")
     def advanced():
-        linked = _linked_library_root() or config.library_root
-        requested = request.args.get("workspace_id")
-        advanced_workspace = ""
-        source_neutral = False
-        db = Database(config.database_path)
-        try:
-            if requested not in (None, ""):
-                workspace = _workspace_id(requested, required=False)
-            else:
-                local_key = db.get_meta("local_workspace_key")
-                local = db.get_workspace(local_key) if local_key else None
-                workspace = int(local["id"]) if local is not None else None
-            if workspace is not None:
-                row = db.get_workspace(workspace)
-                neutral_tracks = db.get_neutral_library_tracks(workspace)
-                metadata = _json_object(row["metadata_json"], {}) if row is not None else {}
-                if not isinstance(metadata, Mapping):
-                    metadata = {}
-                source_neutral = bool(
-                    row is not None
-                    and neutral_tracks
-                    and metadata.get("workflow") == "source_neutral"
-                )
-                if source_neutral:
-                    advanced_workspace = str(int(workspace))
-        finally:
-            db.close()
-        page = _ADVANCED_PAGE
-        if source_neutral:
-            page = (
-                page
-                .replace("Add your music, preview chart matches, review the recommendation for each song, then export your choices.", "Matching is complete. Review the recommended charts, then export your choices.")
-                .replace("3 · Preview chart matches", "2 · Matching results")
-                .replace("Preview searches your imported songs without downloading. Review choices before downloading selected charts.", "Your matching results are ready. Review the recommendation for each song before exporting.")
-                .replace("No results yet — run a dry run first.", "Matching is complete. Review your selected charts below.")
-            )
-        return (
-            page
-            .replace("__LIBRARY_ROOT__", str(linked))
-            .replace("__ADVANCED_MODE__", "source-neutral-mode" if source_neutral else "legacy-mode")
-            .replace("__ADVANCED_WORKSPACE_ID__", advanced_workspace)
-        )
+        return redirect(url_for("index", access_token=request.args.get("access_token")), code=302)
 
     # -------------------------------------------------------------- files
     @app.get("/browser-exporter.js")
@@ -7837,6 +8159,14 @@ def create_app(
                 provider: Any | None = None
                 terminal: dict[str, Any] | None = None
                 try:
+                    db = Database(config.database_path)
+                    previous_fingerprint = db.get_library_matching_fingerprint(workspace)
+                    previous_authoritative, _ = _matching_authority(
+                        db,
+                        workspace,
+                        len(_journey_records(db, workspace)),
+                        previous_fingerprint,
+                    )
                     soundcloud_import_job.update({
                         "phase": "parse",
                         "message": "Reading the SoundCloud export...",
@@ -7900,7 +8230,6 @@ def create_app(
                         }
                         return
 
-                    db = Database(config.database_path)
                     db.update_workspace(
                         workspace,
                         status="running",
@@ -7935,7 +8264,14 @@ def create_app(
                         source_result is not None
                         and source_result.status == "complete"
                     )
-                    if source_succeeded:
+                    current_fingerprint = db.get_library_matching_fingerprint(workspace)
+                    preserve_matching = bool(
+                        source_succeeded
+                        and previous_authoritative
+                        and previous_fingerprint
+                        and current_fingerprint == previous_fingerprint
+                    )
+                    if source_succeeded and not preserve_matching:
                         # A successful replacement changes the canonical song
                         # set, so old exact results cannot be reused safely.
                         db.clear_workspace_candidates(workspace, kind="exact")
@@ -7963,6 +8299,7 @@ def create_app(
                             else "SoundCloud update failed; your previous music was retained."
                         ),
                         "retained_previous": not source_succeeded,
+                        "preserved_matching": preserve_matching,
                         "error": "" if source_succeeded else (source_result.error if source_result else "SoundCloud update failed"),
                         "workspace_id": workspace,
                         "workspace_key": key,
@@ -7972,7 +8309,15 @@ def create_app(
                         "sources": sources,
                         "combined": combined,
                     }
-                    if source_succeeded:
+                    if source_succeeded and preserve_matching:
+                        db.update_workspace(
+                            workspace,
+                            status="complete",
+                            phase="complete",
+                            message="Your music is unchanged; saved charts are still ready.",
+                            error="",
+                        )
+                    elif source_succeeded:
                         db.update_workspace(
                             workspace,
                             status="ready_for_matching",
@@ -8016,6 +8361,19 @@ def create_app(
                                 phase="source_import",
                                 error=message,
                             )
+                            latest_generation = db.get_latest_combined_generation(workspace)
+                            if latest_generation is not None and str(latest_generation["status"] or "").casefold() in {"running", "pending"}:
+                                generation_metadata = _json_object(latest_generation["metadata_json"], {})
+                                if not isinstance(generation_metadata, dict):
+                                    generation_metadata = {}
+                                generation_metadata["error"] = message
+                                db.create_discovery_scan(
+                                    workspace,
+                                    scan_key=str(latest_generation["scan_key"]),
+                                    kind="exact",
+                                    status="failed",
+                                    metadata=generation_metadata,
+                                )
                     except Exception:
                         pass
                     terminal = {
@@ -8815,1120 +9173,3 @@ def create_app(
         return jsonify(files)
 
     return app
-
-
-_UNIFIED_PAGE = r'''<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Music to Clone Hero</title><link rel="icon" href="data:,"><style>
-:root{color-scheme:dark;--bg:#10131a;--panel:#1b202b;--line:#394150;--muted:#aab3c2;--accent:#8fd3ff;--success:#42d392;--warn:#ffd479}
-*{box-sizing:border-box}body{font:16px system-ui,sans-serif;width:100%;max-width:980px;margin:auto;padding:24px;background:var(--bg);color:#eee;overflow-wrap:anywhere}
-section{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:20px;margin:14px 0;min-width:0}
-button,.primary{font:inherit;padding:10px 14px;border:1px solid #4b83bb;border-radius:7px;background:#3b82f6;color:white;cursor:pointer;margin:4px;text-decoration:none;display:inline-block}
-button:disabled{opacity:.5;cursor:default}button:focus-visible,a:focus-visible,input:focus-visible,summary:focus-visible{outline:3px solid var(--accent);outline-offset:3px}
-input{margin:8px;max-width:100%}small,.muted{color:var(--muted)}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(240px,100%),1fr));gap:12px}.card{border:1px solid #465064;padding:14px;border-radius:8px;min-width:0}
-.journey-status{border-top:1px solid var(--line);margin-top:16px;padding-top:16px}.journey-status h3{margin:0 0 6px}.journey-status p{margin:6px 0}.journey-status--warning{border-left:3px solid var(--warn);padding-left:12px}.journey-status--success{border-left:3px solid var(--success);padding-left:12px}
-.source-breakdown{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-top:14px}.source-breakdown .card{padding:12px}.source-breakdown strong{display:block;font-size:1.3rem}.source-filter{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin-top:12px}.source-filter button[aria-pressed="true"]{border-color:var(--accent);color:var(--accent)}.music-list{list-style:none;padding:0;max-height:280px;overflow:auto;border:1px solid var(--line)}.music-list li{padding:7px 10px;border-bottom:1px solid var(--line)}.music-list li:last-child{border-bottom:0}.happening-list{list-style:none;padding:0;margin:8px 0}.happening-list li{padding:7px 0;border-bottom:1px solid var(--line)}.happening-list li:last-child{border-bottom:0}.visual-placeholder{min-height:150px;display:grid;place-items:center;text-align:center;border:1px dashed var(--accent);border-radius:9px;background:#121b25}.visual-placeholder p{margin:4px}
-.matching-loading{display:inline-flex;align-items:center;gap:8px}.matching-spinner{width:12px;height:12px;border:2px solid var(--line);border-top-color:var(--accent);border-radius:50%;animation:matching-spin .8s linear infinite}@keyframes matching-spin{to{transform:rotate(360deg)}}@media (prefers-reduced-motion:reduce){.matching-spinner{animation:none}}
-details{margin-top:12px}summary{cursor:pointer}.diagnostics{font-size:.9rem}.diagnostics a{color:var(--accent)}
-@media(max-width:600px){body{padding:14px}section{padding:15px}button,.primary{width:100%;margin:4px 0}}
-</style></head>
-<body>
-<h1>Music to Clone Hero and YARG</h1>
-<p class="muted">Turn music you already love into playable charts. Start with a SoundCloud export; Spotify is optional.</p>
-<section aria-labelledby="importHeading"><h2 id="importHeading">1. Add your music</h2>
-  <div class="grid"><div class="card"><h3>SoundCloud export</h3>
-    <p>Upload a TuneMyMusic CSV or SoundCloud JSON export. No SoundCloud login is required.</p>
-    <label for="soundcloudFile">SoundCloud export file</label><input id="soundcloudFile" type="file" accept=".csv,.json">
-    <button id="soundcloudImport">Import SoundCloud export</button><p id="soundcloudMsg" class="muted" role="status" aria-live="polite"></p>
-    <a href="/browser-exporter.js">Download the optional browser exporter</a>
-   </div><div class="card"><h3>Spotify</h3><p id="spotifyDescription">Connect Spotify to add Liked Songs or playlists.</p>
-      <button id="spotifyConnect">Connect Spotify</button><button id="spotifySync" hidden>Sync Spotify</button><p id="spotifyPersistedCopy" class="muted">Previously imported Spotify songs remain available when the account is disconnected.</p><p class="muted">Spotify music is not included until you choose a scope and add it.</p>
-     <div id="spotifyScope" hidden><h4>Choose Spotify music</h4><label><input id="spotifyLiked" type="checkbox"> Liked Songs <span id="spotifyLikedCount" class="muted"></span></label><div id="spotifyPlaylists"></div><button id="spotifySelectAll" type="button">Select all accessible playlists</button><button id="spotifyAdd" disabled>Add selected to Your Music</button><progress id="spotifyProgress" max="100" value="0" hidden aria-label="Spotify import progress"></progress><p id="spotifyScopeMsg" class="muted" role="status" aria-live="polite"></p></div>
-   </div></div>
-   <div id="summary" class="muted" style="margin-top:14px">No music imported yet.</div>
-</section>
-<section aria-labelledby="yourMusicHeading"><h2 id="yourMusicHeading">YOUR MUSIC</h2><div id="localSourceBreakdown" class="source-breakdown"></div><div class="source-filter" role="group" aria-label="Filter songs by source"><button data-source-filter="all" aria-pressed="true">All</button><button data-source-filter="soundcloud" aria-pressed="false">SoundCloud</button><button data-source-filter="spotify" aria-pressed="false">Spotify</button><button data-source-filter="both" aria-pressed="false">Both</button><label for="musicSearch">Search</label><input id="musicSearch" type="search" placeholder="Artist or title"></div><ul id="localMusicList" class="music-list"></ul><p id="localMusicMore" class="muted"></p></section>
- <section aria-labelledby="happeningHeading"><h2 id="happeningHeading">WHAT'S HAPPENING</h2><div id="globalOperation" class="journey-status" hidden role="status" aria-live="polite"><h3 id="globalOperationHeadline"></h3><p id="globalOperationDetail"></p><p id="globalOperationProgress"></p><p id="globalOperationExpectation" class="muted"></p></div><p id="localHappeningCurrent" class="muted" role="status" aria-live="polite">Loading current status...</p><ul id="localHappeningList" class="happening-list"></ul></section>
- <section aria-labelledby="matchingHeading"><h2 id="matchingHeading">2. Find playable charts</h2>
-   <h3 id="matchingStateHeading">READY TO FIND CHARTS</h3><p id="matchingStateDetail" class="muted">We compare your songs with the local chart catalog without downloading anything.</p><p id="matchingLoading" class="matching-loading" hidden><span class="matching-spinner" aria-hidden="true"></span>Looking for reusable match results...</p>
-   <progress id="matchingProgressBar" max="1" value="0" aria-label="Chart matching progress"></progress><p id="matchingProgressText" role="status" aria-live="polite"></p><p id="matchingCurrent" class="muted"></p>
-   <div id="matchingCounters" class="grid"></div><h3>RECENT</h3><ul id="matchingRecent" class="happening-list"></ul><details><summary>View all song activity</summary><input id="matchingActivitySearch" type="search" placeholder="Search songs"><select id="matchingActivityFilter"><option value="all">All statuses</option><option value="strong">Strong</option><option value="review">Needs review</option><option value="no_suitable">No suitable</option><option value="not_playable">Not playable</option><option value="no_catalog_candidate">No catalog candidate</option></select><p class="muted">Use the existing Review matches page for full paginated results.</p></details>
-   <div id="localVisual" hidden></div><button id="find" disabled>Find chart matches</button><p id="progress" class="muted" hidden></p>
-</section>
-<section id="review" class="journey-status" hidden aria-labelledby="reviewHeading">
-  <h2 id="reviewHeading">3. Review and export</h2>
-  <h3 id="outcomeHeadline"></h3><p id="outcomeDetails"></p>
-  <a id="reviewLink" class="primary" href="/advanced?workspace_id=__LOCAL_WORKSPACE_ID__" hidden>Review matches</a>
-  <details id="diagnosticsPanel" hidden><summary>Technical details</summary><p id="diagnostics" class="muted diagnostics"></p></details>
-</section>
-<script>
-const publicMode = __PUBLIC_MODE__; const lanAccessToken = __LAN_ACCESS_TOKEN__;
-const $=id=>document.getElementById(id);let workspaceId=null;let importTimer=null;let matchingTimer=null;let operationTimer=null;
-async function api(url,opt){const r=await fetch(url,opt);const d=await r.json().catch(()=>({}));if(!r.ok)throw Error(d.error||'Request failed');return d}
-function esc(value){return String(value??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
-function number(value){return Number(value||0).toLocaleString()}
-function showDiagnostics(d){const panel=$('diagnosticsPanel');if(!d||!d.run_id||!d.diagnostics_url){panel.hidden=true;return}$('diagnostics').innerHTML=`Matching details: <code>${esc(d.run_id)}</code> · <a href="${esc(d.diagnostics_url)}">Download diagnostics</a>`;panel.hidden=false}
-function sourceLabel(provider){return String(provider||'').toLowerCase()==='soundcloud'?'SoundCloud export':String(provider||'Imported music')}
-let localMusic=[];let localFilter='all';let localSearch='';
-function spotifyScopeReady(){return $('spotifyLiked').checked||document.querySelectorAll('#spotifyPlaylists input:checked').length>0}
-function updateSpotifyAdd(){if($('spotifyAdd'))$('spotifyAdd').disabled=!spotifyScopeReady()}
-function renderSpotifyScope(data){$('spotifyScope').hidden=false;$('spotifyLikedCount').textContent=data.liked_available?`(${number(data.liked_count)} songs)`:'(count unavailable)';$('spotifyLiked').checked=!!data.scope?.include_liked;$('spotifyPlaylists').innerHTML=(data.playlists||[]).map(p=>{const count=p.item_count==null?'count unknown':`${number(p.item_count)} songs`;const state=p.access_status==='accessible'?count:`${p.access_status||'inaccessible'}${p.access_reason?`: ${p.access_reason}`:''}`;return `<label style="display:block"><input type="checkbox" value="${esc(p.spotify_id)}" ${p.selected?'checked':''} ${p.access_status!=='accessible'?'disabled':''}> ${esc(p.name||'Untitled playlist')} <small>(${esc(state)})</small></label>`}).join('')||'<small>No playlists found.</small>';document.querySelectorAll('#spotifyPlaylists input').forEach(input=>input.onchange=updateSpotifyAdd);updateSpotifyAdd()}
-async function loadSpotifyScope(){try{const d=await api('/api/spotify/scope?workspace_id='+encodeURIComponent(workspaceId));renderSpotifyScope(d);$('localHappeningCurrent').textContent='Spotify inventory ready. Choose Liked Songs or playlists to add.'}catch(e){$('spotifyScopeMsg').textContent=e.message}}
-async function syncSpotify(){if(!workspaceId)return;const button=$('spotifyConnect');button.disabled=true;$('localHappeningCurrent').textContent='Spotify connected. Fetching playlists and checking Liked Songs...';try{const d=await api('/api/spotify/inventory',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({workspace_id:workspaceId})});const poll=async()=>{const s=await api('/api/spotify/status?workspace_id='+encodeURIComponent(workspaceId));$('localHappeningCurrent').textContent=s.running?'Spotify connected. Reading playlists and Liked Songs...':'Spotify inventory ready.';if(s.running){setTimeout(poll,600);return}button.disabled=false;await loadSpotifyScope()};poll()}catch(e){button.disabled=false;$('spotifyScopeMsg').textContent=e.message}}
-async function addSpotify(){const ids=Array.from(document.querySelectorAll('#spotifyPlaylists input:checked')).map(input=>input.value);const includeLiked=$('spotifyLiked').checked;const msg=$('spotifyScopeMsg');msg.textContent='Saving selected Spotify scope...';try{await api('/api/spotify/scope',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({workspace_id:workspaceId,playlist_ids:ids,include_liked:includeLiked})});$('spotifyAdd').disabled=true;msg.textContent='Reading selected Spotify music...';$('localHappeningCurrent').textContent='Spotify import is running. Your Music will update when it finishes.';await api('/api/spotify/import',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({workspace_id:workspaceId})});const poll=async()=>{const s=await api('/api/spotify/status?workspace_id='+encodeURIComponent(workspaceId));if(s.running){renderSpotifyImportProgress(s);await refresh();setTimeout(poll,600);return}$('spotifyProgress').hidden=true;msg.textContent=s.status==='failed'?s.error||'Spotify import failed.':'Spotify import complete.';await refresh()};poll()}catch(e){msg.textContent=e.message;updateSpotifyAdd()}}
-function renderLocalMusic(){const rows=localMusic.filter(song=>{const source=localFilter==='both'?song.sources.length>1:localFilter==='all'||song.sources.includes(localFilter);return source&&(!localSearch||`${song.artist} ${song.title}`.toLowerCase().includes(localSearch))});$('localMusicList').innerHTML=rows.map(song=>`<li>[${esc(song.source_label.toUpperCase())}] ${esc(song.artist)} — ${esc(song.title)}</li>`).join('')||'<li class="muted">No songs match this filter.</li>';$('localMusicMore').textContent=`${number(rows.length)} shown of ${number(localMusic.length)} canonical songs.`}
-function spotifyTime(seconds){if(seconds==null)return '';const value=Math.max(0,Math.round(Number(seconds)));return value>=60?` · ~${Math.floor(value/60)}m ${value%60}s remaining`:` · ~${value}s remaining`}
-function renderSpotifyImportProgress(status){const p=status.progress||{};const meta=p.metadata||{};const read=Number(meta.spotify_items_processed||p.spotify_items_processed||0);const total=meta.spotify_items_expected??p.spotify_items_expected;const bar=$('spotifyProgress');bar.hidden=false;if(total!=null){bar.max=Number(total);bar.value=Math.min(read,Number(total))}else bar.removeAttribute('value');$('localHappeningCurrent').textContent=`${p.message||status.message||'Reading selected Spotify music...'} · ${number(read)}${total!=null?` / ${number(total)}`:' items read'}${meta.eta_seconds!=null?spotifyTime(meta.eta_seconds):''}`}
-function renderLocalShell(j){if(!j||!j.combined)return;const c=j.combined,s=j.sources||{},v=j.visualization||{},status=j.matching_status||'empty';$('yourMusicHeading').textContent=`YOUR MUSIC — ${number(c.canonical_count)} unique songs`;$('localSourceBreakdown').innerHTML=`<div class="card"><span>SoundCloud unique songs</span><strong>${number(c.soundcloud_count)}</strong><small>${s.soundcloud?.state==='not_imported'?'Not imported':`${number(s.soundcloud.raw_rows)} raw rows · ${number(s.soundcloud.accepted_rows)} accepted · ${number(s.soundcloud.skipped)} skipped · ${number(s.soundcloud.duplicates)} duplicates merged`}</small></div><div class="card"><span>Spotify unique songs</span><strong>${number(c.spotify_count)}</strong><small>${s.spotify?.state==='not_connected'?'Not connected':s.spotify?.imported?'Imported':'Connected, not imported'}</small></div><div class="card"><span>In both</span><strong>${number(c.shared_count)}</strong></div><div class="card"><span>Duplicates merged within sources</span><strong>${number(c.duplicates_merged)}</strong></div><div class="card"><span>Canonical unique songs</span><strong>${number(c.canonical_count)}</strong></div>`;localMusic=j.music||[];renderLocalMusic();const history=[];if(s.soundcloud?.state==='imported')history.push(`<li>✓ SoundCloud import complete<br><small>${number(s.soundcloud.raw_rows)} raw rows · ${number(s.soundcloud.accepted_rows)} accepted · ${number(s.soundcloud.skipped)} skipped · ${number(s.soundcloud.duplicates)} duplicates merged</small></li>`);else history.push('<li>○ SoundCloud<br><small>Not imported</small></li>');history.push(s.spotify?.state==='not_connected'?'<li>○ Spotify<br><small>Not connected</small></li>':`<li>${s.spotify?.imported?'✓':'○'} Spotify<br><small>${s.spotify?.imported?number(c.spotify_count)+' songs loaded':'Connected, not imported'}</small></li>`);if(c.canonical_count)history.push(`<li>✓ Your Music ready<br><small>${number(c.canonical_count)} unique songs · ${number(c.duplicates_merged)} duplicates merged</small></li>`);if(v.catalog_chart_count)history.push(`<li>✓ Enchor catalog ready<br><small>${number(v.catalog_chart_count)} charts</small></li>`);if(status==='running')history.push(`<li>◐ ${esc(j.headline||'Finding chart matches')}<br><small>${number(v.processed_count)} / ${number(c.canonical_count)} songs checked</small></li>`);if(status==='complete')history.push(`<li>✓ Matching complete<br><small>${number(j.counts?.chart_options)} chartable · ${number(j.counts?.strong_matches)} strong · ${number(j.counts?.needs_review)} review</small></li>`);if(['failed','incomplete'].includes(status))history.push(`<li>× ${esc(j.headline||'Matching stopped')}<br><small>${esc(j.message||'Run matching again; existing work is preserved.')}</small></li>`);if(status==='cancelled')history.push('<li>× Matching canceled<br><small>Existing imported music is preserved.</small></li>');$('localHappeningCurrent').textContent=status==='running'?'The application is working. Progress is saved and safe to refresh.':j.message||'Your music is ready for the next step.';$('localHappeningList').innerHTML=history.concat((j.activity||[]).slice(-8).map(row=>`<li>${row.classification==='strong'?'✓':row.classification==='review'?'•':row.classification==='not_playable'?'!':row.classification==='checking'?'◐':'×'} ${esc(row.artist)} — ${esc(row.title)}<br><small>${esc(row.classification||row.status||'Waiting')}</small></li>`)).join('');$('localVisual').dataset.contract=JSON.stringify(v)}
- function renderMatchingSurface(j){if(!j)return;const c=j.counts||{},p=j.progress||{},status=j.matching_status||'ready',total=Number(p.total||c.imported_songs||0),done=Number(p.processed||0),active=status==='running';$('matchingStateHeading').textContent=status==='complete'?'MATCHING COMPLETE':status==='failed'?'MATCHING STOPPED':status==='incomplete'?'MATCHING INCOMPLETE':status==='cancelled'?'MATCHING CANCELED':active?'FINDING PLAYABLE CHARTS':'READY TO FIND CHARTS';$('matchingStateDetail').textContent=status==='complete'?`${number(done||total)} songs checked against ${number(j.catalog_chart_count||0)} Enchor charts.`:status==='failed'?`Could not continue: ${j.message||'the matching job stopped.'}`:status==='cancelled'?`${number(done)} / ${number(total)} songs checked. Results from this incomplete run are not final.`:active?'The current matching run is saved and safe to refresh.':'Your Music and the Enchor catalog are ready.';$('matchingProgressBar').max=Math.max(1,total);$('matchingProgressBar').value=Math.min(done,total);$('matchingProgressText').textContent=`${number(done)} / ${number(total)} songs checked${p.elapsed_seconds!=null?` · Elapsed ${Math.floor(p.elapsed_seconds/60).toString().padStart(2,'0')}:${Math.round(p.elapsed_seconds%60).toString().padStart(2,'0')}`:''}${p.eta_seconds!=null?` · About ${Math.floor(p.eta_seconds/60)}m ${Math.round(p.eta_seconds%60)}s remaining`:''}`;const current=p.current_song;$('matchingCurrent').textContent=current?`Currently checking: ${current.artist} — ${current.title}`:'';$('matchingCounters').innerHTML=[['Strong',c.strong_matches],['Needs review',c.needs_review],['No suitable',c.no_suitable_songs],['Not playable',c.not_playable_songs],['No candidate',c.no_candidate_songs]].map(([label,value])=>`<div class="card"><span>${label}</span><strong>${number(value)}</strong></div>`).join('');const activity=p.recent||[];$('matchingRecent').innerHTML=activity.slice(0,30).map(row=>{const mark=row.classification==='strong'?'✓':row.classification==='review'?'•':row.classification==='not_playable'?'!':'×';return `<li>${mark} ${esc(row.artist)} — ${esc(row.title)}<br><small>${esc(row.classification||row.status||'Waiting')}</small></li>`}).join('')||'<li class="muted">No current-run song activity yet.</li>';}
-  function renderOperation(operation){const panel=$('globalOperation');if(!operation||operation.state==='idle'){panel.hidden=true;return}panel.hidden=false;$('globalOperationHeadline').textContent=operation.label||operation.state;$('globalOperationDetail').textContent=operation.detail||'';const p=operation.progress||{};const done=Number(p.completed??p.processed??0),total=Number(p.total??p.selected??0);$('globalOperationProgress').textContent=total?`${number(done)} of ${number(total)} complete${p.remaining!=null?` · ${number(p.remaining)} remaining`:''}${p.failed!=null?` · ${number(p.failed)} failed`:''}`:operation.busy?'Status is being prepared...':'';$('globalOperationExpectation').textContent=operation.busy?'You can leave this page open and do something else. Closing the app/server interrupts active work; completed charts are kept.':'Completed work is kept. Review the result or retry incomplete charts when available.'}
-  function render(d){workspaceId=d.workspace_id||workspaceId;const sources=d.sources||[];const combined=d.combined||{};$('summary').innerHTML=(sources.length?sources.map(source=>{const details=[];if(source.skipped_rows)details.push(`${number(source.skipped_rows)} skipped`);if(source.duplicate_rows)details.push(`${number(source.duplicate_rows)} duplicates`);return `<div><b>${esc(sourceLabel(source.provider))}</b>: ${number(source.tracks)} songs imported${details.length?` · ${esc(details.join(' · '))}`:''}</div>`}).join(''):'No music imported yet.')+`<p><b>Your music:</b> ${number(combined.tracks)} songs from ${number(combined.artists)} artists</p>`;$('find').disabled=!combined.tracks;showDiagnostics(d);if(d.journey){renderJourney(d.journey);renderMatchingSurface(d.journey)}}
- function journeyDetails(journey){const counts=journey.counts||{};if(journey.matching_status==='complete'&&journey.catalog_available===false)return 'Your music was imported, but no charts could be checked because the local chart catalog is unavailable.';if(journey.matching_status==='complete')return `${number(counts.imported_songs)} songs checked. ${number(counts.chart_options)} songs have eligible chart options across ${number(counts.candidate_charts)} chart versions. ${number(Math.max(0,counts.imported_songs-counts.no_candidate_songs))} songs had at least one catalog candidate evaluated. ${number(counts.strong_matches)} strong matches and ${number(counts.needs_review)} that need review. ${number(counts.no_suitable_songs)} songs have no suitable match.`;if(journey.matching_status==='incomplete')return `${number(counts.imported_songs)} songs were imported. ${number(counts.chart_options)} have eligible chart options, but matching did not finish for everything.`;if(journey.matching_status==='failed')return `${number(counts.imported_songs)} songs were imported, but matching stopped before it finished.`;return journey.message||''}
- function renderJourney(journey){if(!journey)return;renderLocalShell(journey);const counts=journey.counts||{};const review=$('review');const status=journey.matching_status||'empty';const active=status==='running';$('find').disabled=!counts.imported_songs||active;$('progress').textContent=active?journey.message||'Matching your songs...':status==='ready'?journey.message||'Your music is ready to match.':'';if(['complete','incomplete','failed'].includes(status)){review.hidden=false;$('outcomeHeadline').textContent=journey.headline||'Matching complete';$('outcomeDetails').textContent=journeyDetails(journey);$('reviewLink').hidden=!journey.review_available;$('reviewLink').href=journey.review_url||'/advanced';review.classList.toggle('journey-status--success',status==='complete'&&journey.catalog_available!==false);review.classList.toggle('journey-status--warning',status!=='complete'||journey.catalog_available===false)}else{review.hidden=true}}
-  const baseRenderJourney=renderJourney;renderJourney=function(journey){baseRenderJourney(journey);renderMatchingSurface(journey);const p=journey.progress||{};if(journey.matching_status==='restoring'){$('matchingStateHeading').textContent='CHECKING SAVED MATCH RESULTS';$('matchingStateDetail').textContent='Checking saved match results...';$('matchingProgressText').textContent='Imported songs are available; saved results are still being restored.';$('matchingCounters').innerHTML='';$('matchingRecent').innerHTML='<li class="muted">Previous matching activity is hidden while saved results are restored.</li>';$('find').disabled=true}if(journey.matching_status==='ready'){$('matchingProgressText').textContent='Your music is ready. Find chart matches when you are ready.';$('matchingCounters').innerHTML='';$('matchingRecent').innerHTML='<li class="muted">Previous matching activity is not current for this library.</li>'}if(journey.matching_status==='running'&&(p.cached_tracks||p.recomputed_tracks))$('matchingStateDetail').textContent=`${number(p.cached_tracks||0)} cached · ${number(p.recomputed_tracks||0)} to match`};
- function importMessage(s){const p=s.progress||{};if(s.phase==='persist'&&p.total_tracks)return `${s.message||'Saving tracks...'} ${number(p.persisted_tracks)} / ${number(p.total_tracks)}`;return s.message||s.phase||'Importing SoundCloud export...'}
-function pollImport(runId){if(importTimer)clearTimeout(importTimer);const poll=async()=>{try{const s=await api('/api/sources/soundcloud/import/status?run_id='+encodeURIComponent(runId));workspaceId=s.workspace_id||workspaceId;$('soundcloudMsg').textContent=importMessage(s);showDiagnostics(s);if(s.running){$('find').disabled=true;importTimer=setTimeout(poll,500);return}importTimer=null;$('soundcloudImport').disabled=false;if(s.status==='complete'||s.status==='partial'){const d=await api('/api/sources');render(d);$('soundcloudMsg').textContent=s.result?.message||`Imported ${number(s.result?.source?.tracks)} SoundCloud songs.`}else{$('find').disabled=true;$('soundcloudMsg').textContent=s.error||'SoundCloud import failed.'}}catch(e){importTimer=null;$('soundcloudImport').disabled=false;$('find').disabled=true;$('soundcloudMsg').textContent=e.message}};poll()}
- async function refresh(){try{const d=await api('/api/sources');render(d);const status=await api('/api/discovery/status?workspace_id='+encodeURIComponent(d.workspace_id));showDiagnostics(status);if(status.journey)renderJourney(status.journey);if(status.running)pollMatching(d.workspace_id);const imported=await api('/api/sources/soundcloud/import/status');if(imported.running&&imported.run_id){workspaceId=imported.workspace_id||workspaceId;$('soundcloudImport').disabled=true;$('find').disabled=true;pollImport(imported.run_id)}const appStatus=await api('/api/status');renderOperation(appStatus.operation);const busy=Boolean(appStatus.operation?.busy);$('soundcloudImport').disabled=busy;if(busy)$('find').disabled=true;if(busy){clearTimeout(operationTimer);operationTimer=setTimeout(refresh,700)} }catch(e){$('summary').textContent=e.message}}
-async function pollMatching(workspace){if(matchingTimer)clearTimeout(matchingTimer);const poll=async()=>{try{const status=await api('/api/discovery/status?workspace_id='+encodeURIComponent(workspace));showDiagnostics(status);if(status.journey)renderJourney(status.journey);if(status.running){matchingTimer=setTimeout(poll,700);return}matchingTimer=null;const d=await api('/api/sources');render(d)}catch(e){matchingTimer=null;$('progress').textContent=e.message}};poll()}
-$('soundcloudImport').onclick=async()=>{const file=$('soundcloudFile').files[0];if(!file){$('soundcloudMsg').textContent='Choose a CSV or JSON export first.';return}$('soundcloudImport').disabled=true;$('find').disabled=true;$('soundcloudMsg').textContent='Uploading export...';try{const body=new FormData;body.append('file',file);const d=await api('/api/sources/soundcloud/import',{method:'POST',body});workspaceId=d.workspace_id;$('soundcloudMsg').textContent='Upload accepted; importing in the background...';showDiagnostics(d);pollImport(d.run_id)}catch(e){$('soundcloudMsg').textContent=e.message;$('soundcloudImport').disabled=false}};
-  document.querySelectorAll('[data-source-filter]').forEach(button=>button.onclick=()=>{localFilter=button.dataset.sourceFilter;document.querySelectorAll('[data-source-filter]').forEach(item=>item.setAttribute('aria-pressed',String(item===button)));renderLocalMusic()});$('musicSearch').oninput=e=>{localSearch=e.target.value.trim().toLowerCase();renderLocalMusic()};$('spotifyConnect').onclick=async()=>{try{const d=await api('/api/auth/spotify/start');location.href=d.authorization_url}catch(e){$('soundcloudMsg').textContent=e.message}};$('spotifySync').onclick=syncSpotify;$('spotifyAdd').onclick=addSpotify; $('spotifySelectAll').onclick=()=>{document.querySelectorAll('#spotifyPlaylists input').forEach(input=>{input.checked=true});updateSpotifyAdd()};$('find').onclick=async()=>{if(!workspaceId)return;$('find').disabled=true;$('progress').textContent='Starting chart matching...';try{const d=await api('/api/discovery/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({source:'combined',workspace_id:workspaceId})});workspaceId=d.workspace_id||workspaceId;pollMatching(workspaceId)}catch(e){$('find').disabled=false;$('progress').textContent=e.message}};api('/api/auth/status').then(a=>{if(a.authenticated){$('spotifyConnect').hidden=true;$('spotifySync').hidden=false;$('spotifyDescription').textContent='Spotify is connected. Sync to choose music to add.'}}).catch(()=>{});refresh();
- const baseRenderMatchingSurface=renderMatchingSurface;renderMatchingSurface=function(journey){baseRenderMatchingSurface(journey);if(journey&&journey.matching_status==='running')$('matchingLoading').hidden=true};document.getElementById('find')?.addEventListener('click',()=>{document.getElementById('matchingLoading').hidden=false;document.getElementById('matchingStateHeading').textContent='CHECKING YOUR LIBRARY';document.getElementById('matchingStateDetail').textContent='Looking for reusable match results...';document.getElementById('find').disabled=true},{capture:true});</script></body></html>'''
-
-
-
-
-
-_ADVANCED_PAGE = """<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<link rel="icon" href="data:,">
-   <title>CSV to Clone Hero | Review and export</title>
-<style>
-   :root { color-scheme:dark; --ink:#f4f6fa; --muted:#aab3c2; --bg:#11151c; --panel:#1a202a; --line:#354052; --accent:#7cb7ff; --success:#72d4a0; }
-   * { box-sizing:border-box; }
-    body { font-family:"Segoe UI",system-ui,sans-serif; background:linear-gradient(145deg,#111722,#0d1117); color:var(--ink); margin:0; }
-    body.source-neutral-mode #legacyImportSources,
-    body.source-neutral-mode #importStepHeading,
-    body.source-neutral-mode #legacyFileStepHeading,
-    body.source-neutral-mode #drop,
-    body.source-neutral-mode #advancedSearchOptions,
-    body.source-neutral-mode #exactDry { display:none; }
-   main { width:100%; max-width:880px; min-width:0; margin:0 auto; padding:32px 20px 72px; }
-   h1 { font-size:clamp(2rem,5vw,3.5rem); letter-spacing:-.04em; margin:8px 0 4px; }
-   h2 { font-size:1.1rem; margin:32px 0 8px; color:var(--ink); }
-   .card { background:var(--panel); border:1px solid var(--line); border-radius:14px; padding:18px; margin-top:10px; min-width:0; overflow-wrap:anywhere; box-shadow:0 12px 30px rgba(0,0,0,.18); }
-   .muted { color:var(--muted); font-size:.9rem; }
-   a { color:var(--accent); }
-   button { font:inherit; border:1px solid var(--line); border-radius:8px; padding:10px 18px; cursor:pointer; background:#273143; color:var(--ink); }
-   button.primary { background:var(--success); border-color:var(--success); color:#07140d; font-weight:800; }
-   button:disabled { opacity:.45; cursor:default; }
-   button:focus-visible, input:focus-visible, a:focus-visible, summary:focus-visible { outline:3px solid var(--accent); outline-offset:3px; }
-  .file-row { display: flex; justify-content: space-between; align-items: center;
-              padding: 6px 4px; border-bottom: 1px solid #2a3247; }
-  .file-row button { padding: 4px 10px; background: #54303a; font-size: .85rem; }
-  .stage { padding: 4px 0; }
-  .stage .ok { color: #6fd08c; }
-  .stage .bad { color: #ff7a7a; }
-  .stage .spin { color: #ffd479; }
-  .job-status { background: #0d1017; border: 1px solid #2a3247; border-radius: 8px;
-                padding: 10px 12px; margin: 12px 0; }
-  .job-status-head { display: flex; justify-content: space-between; gap: 12px; }
-  .job-dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%;
-             background: #6fd08c; margin-right: 7px; }
-  .job-dot.running { background: #ffd479; box-shadow: 0 0 0 4px #4a3e23; }
-  .job-dot.failed { background: #ff7a7a; }
-  .job-track { height: 7px; background: #2a3247; border-radius: 99px; margin-top: 9px; overflow: hidden; }
-  .job-fill { height: 100%; width: 0; background: #8fd3ff; transition: width .25s ease; }
-  .review-toolbar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-top: 10px; }
-  table { border-collapse: collapse; margin-top: 6px; }
-  td { padding: 3px 14px 3px 0; }
-  td.num { text-align: right; font-variant-numeric: tabular-nums; }
-  #drop { border: 2px dashed #3a4456; border-radius: 10px; }
-  #drop.over { border-color: #8fd3ff; background: #20293d; }
-   .reports a { display: inline-block; margin: 2px 10px 2px 0; font-size: .9rem; }
-   code { background: #0d1017; padding: 1px 6px; border-radius: 5px; overflow-wrap:anywhere; word-break:break-word; }
-   .review-card { margin-top: 12px; min-width:0; overflow-wrap:anywhere; }
-   .review-card-head, .review-option-head, .review-option-actions { display: flex; align-items: center; gap: 10px; }
-   .review-card-head, .review-option-head { justify-content: space-between; }
-   .review-option-head > div { min-width:0; max-width:100%; }
-   .review-card h3, .review-card h4 { margin: 0; }
-   .review-eyebrow { color: var(--muted); font-size: .76rem; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }
-   .review-status, .review-selected { border: 1px solid var(--line); border-radius: 999px; display: inline-block; padding: 3px 9px; font-size: .82rem; font-weight: 700; }
-   .review-status-strong, .review-selected { border-color: var(--success); color: var(--success); }
-   .review-status-review { border-color: #ffd479; color: #ffd479; }
-   .review-status-blocked, .review-status-not-recommended { color: #ff7a7a; }
-   .review-option { border: 1px solid var(--line); border-radius: 8px; margin-top: 9px; padding: 12px; min-width:0; overflow-wrap:anywhere; }
-   input[type="file"] { max-width:100%; }
-   .review-option-selected { border-color: var(--success); background: #101e16; }
-   .review-option-blocked { background: #1b171a; }
-   .review-option-meta, .review-summary { color: var(--muted); font-size: .9rem; }
-   .review-option-meta { margin: 4px 0 0; }
-   .review-summary { margin: 7px 0 0; }
-   .review-option-actions { justify-content: flex-end; flex-wrap: wrap; margin-top: 10px; }
-   .review-why { margin-top: 10px; }
-   .review-why summary, .review-alternatives summary { cursor: pointer; }
-   .review-why ul { margin: 9px 0; padding-left: 20px; }
-   .review-concern { color: #ffd479; }
-   .review-why table { border-collapse: collapse; margin-top: 8px; width: 100%; }
-   .review-why th, .review-why td { border-bottom: 1px solid var(--line); padding: 5px 8px 5px 0; text-align: left; vertical-align: top; }
-   .review-why th { color: var(--muted); font-weight: 600; width: 34%; }
-   .review-alternatives { border-top: 1px solid var(--line); margin-top: 14px; padding-top: 11px; }
-   .review-selection-note { background: #102319; border-left: 3px solid var(--success); margin: 12px 0 0; padding: 8px 11px; }
-   .local-journey { border-left: 3px solid var(--accent); background: #111d2a; margin-top: 12px; padding: 10px 12px; }
-   .local-journey h3 { margin: 0 0 5px; }
-   .local-journey p { margin: 5px 0 0; }
-   .export-feedback { min-height: 1.4em; margin: 8px 0 0; }
-   .export-feedback.error { color: #ff7a7a; }
-   @media (max-width: 600px) {
-     .review-card-head, .review-option-head { align-items: flex-start; flex-direction: column; }
-     .review-option-actions { justify-content: flex-start; }
-     .review-option-actions button { width: 100%; }
-   }
-</style>
-</head>
-<body class="__ADVANCED_MODE__">
-<main>
-   <h1>Review and export charts</h1>
-   <p class="muted">Add your music, preview chart matches, review the recommendation for each song, then export your choices.
-       Library folder: <code id="libraryRoot">__LIBRARY_ROOT__</code>
-      · <a href="/">← Back to your music</a></p>
-
-   <h2 id="importStepHeading">1 · Add music exports</h2>
-   <div class="card" id="legacyImportSources">
-      Export Spotify playlists to CSV with one of these tools, or add iTunes/Music TXT or XML exports:
-    <ul>
-      <li><a href="https://www.chosic.com/spotify-playlist-exporter/" target="_blank" rel="noopener">Chosic Spotify Playlist Exporter</a> — log in with Spotify, pick a playlist, download CSV</li>
-      <li><a href="https://exportify.net/" target="_blank" rel="noopener">Exportify</a> — log in with Spotify, export playlists to CSV</li>
-    </ul>
-  </div>
-
-   <h2 id="legacyFileStepHeading">2 · Choose files to import</h2>
-   <div class="card" id="drop">
-     <input type="file" id="picker" accept=".csv,.txt,.xml" multiple>
-     <span class="muted">Spotify CSV, iTunes/Music TXT, or iTunes/Music XML · or drag files anywhere on this box</span>
-    <div id="files"></div>
-  </div>
-
-    <h2 id="matchingStepHeading" class="legacy-matching-heading">3 · Preview chart matches</h2>
-   <div class="card">
-     <div id="estimate" class="muted">Calculating search estimate...</div>
-      <p id="matchingIntro" class="muted">Preview searches your imported songs without downloading. Review choices before downloading selected charts.</p>
-      <button id="exactDry" class="primary">Preview chart matches</button>
-     <button id="exactBuild" title="Download selected charts into the library">Build library</button>
-      <details id="advancedSearchOptions" style="margin-top:14px"><summary class="muted">Advanced search options</summary><div style="margin-top:10px"><p class="muted">Artist expansion is optional and runs in a separate pass.</p><button id="expansionDry">Preview artist expansion</button><button id="expansionBuild">Download artist expansion charts</button></div></details>
-    <div id="jobStatus" class="job-status" aria-live="polite">
-      <div class="job-status-head">
-        <span><span id="jobDot" class="job-dot"></span><b id="jobHeadline">Ready</b></span>
-        <span id="jobElapsed" class="muted"></span>
-      </div>
-      <div id="jobActivity" class="muted" style="margin-top:5px">Start an exact dry run to search playlist songs.</div>
-      <div class="job-track"><div id="jobFill" class="job-fill"></div></div>
-      <div id="jobDetail" class="muted" style="margin-top:5px"></div>
-    </div>
-    <div id="stages" style="margin-top:12px"></div>
-  </div>
-
-   <div id="localJourney" class="local-journey" hidden role="status" aria-live="polite"><h3 id="localJourneyHeadline"></h3><p id="localJourneyMessage"></p><p id="localJourneyCounts"></p></div>
-
-   <h2>4 · Review your matches</h2>
-   <div class="card">
-     <p class="muted">One card represents one song from your music list. Start with the best chart and its short explanation; open other versions only when you need to compare them. Choices save immediately and apply to the next download build.</p>
-     <div id="reviewProgress" class="muted"></div>
-      <div class="review-toolbar">
-         <button id="acceptAll" class="primary">Accept recommended Review matches</button>
-        <button id="selectStrong" type="button">Select all Strong matches</button>
-        <span class="muted">Use this only when the recommended chart for every song looks right.</span>
-      </div>
-      <div class="review-toolbar">
-        <label class="muted">View
-          <select id="reviewState" aria-label="Filter matches by state">
-            <option value="eligible" selected>All eligible matches</option>
-            <option value="strong">Strong matches</option>
-            <option value="review">Needs review</option>
-            <option value="selected">Selected</option>
-            <option value="unselected">Unselected</option>
-            <option value="not_playable">Not playable</option>
-            <option value="all">All result cards</option>
-          </select>
-        </label>
-        <label class="muted">Sort
-          <select id="reviewSort" aria-label="Sort matches">
-            <option value="artist" selected>Artist and title</option>
-            <option value="score">Best score</option>
-          </select>
-         </label>
-         <label class="muted">Source
-           <select id="reviewSource" aria-label="Filter matches by source">
-             <option value="all" selected>All</option><option value="spotify">Spotify</option><option value="soundcloud">SoundCloud</option><option value="both">Both</option>
-           </select>
-         </label>
-         <label class="muted" style="margin-left:12px">
-          <input type="checkbox" id="showRejected"> also show charts the app did not recommend</label>
-        <input type="text" id="reviewFilter" placeholder="Search artist, title, chart, or charter" aria-label="Search matches" style="background:#0d1017; border:1px solid #2a3247; color:#e6e9ef; border-radius:6px; padding:6px 10px; min-width:220px;">
-      </div>
-      <div id="reviewPager" class="review-toolbar" hidden>
-        <button id="reviewPrevious" type="button">Previous</button>
-        <span id="reviewPageStatus" class="muted"></span>
-        <button id="reviewNext" type="button">Next</button>
-      </div>
-      <div id="review" style="margin-top:10px"></div>
-  </div>
-
-   <h2>5 · Build your library</h2>
-   <div class="card">
-     <div id="summary" class="muted">No results yet — run a dry run first.</div>
-      <div id="buildPreview" class="local-journey">
-        <p id="buildPreviewText" class="muted">Build preview is calculated from the selected charts.</p>
-        <div id="buildPreviewCounts" class="muted"></div>
-       <button id="cancelExport" type="button" hidden>Cancel build</button>
-        <button id="retryFailed" type="button" hidden>Retry failed charts</button>
-        <button id="openSongs" type="button" hidden>Open Songs Folder</button>
-     </div>
-     <p id="exportFeedback" class="export-feedback" role="status" aria-live="polite"></p>
-     <div class="reports" id="reports" style="margin-top:10px"></div>
-  </div>
-</main>
-<script>
-const $ = (id) => document.getElementById(id);
-const advancedWorkspaceId = "__ADVANCED_WORKSPACE_ID__";
-let reviewWorkspaceId = new URLSearchParams(window.location.search).get('workspace_id') || advancedWorkspaceId || '';
-let latestStatus = null;
-async function api(url, options) {
-  const response = await fetch(url, options);
-  const data = await response.json().catch(() => ({}));
-  if (!response.ok) throw Error(data.error || 'Request failed.');
-  return data;
-}
-
-function formatDuration(seconds) {
-  seconds = Math.max(0, Math.floor(Number(seconds) || 0));
-  const minutes = Math.floor(seconds / 60);
-  return minutes ? `${minutes}m ${String(seconds % 60).padStart(2, '0')}s` : `${seconds}s`;
-}
-
-function formatBytes(value) {
-  let bytes = Math.max(0, Number(value) || 0);
-  const units = ['B', 'KiB', 'MiB', 'GiB'];
-  let unit = 0;
-  while (bytes >= 1024 && unit < units.length - 1) { bytes /= 1024; unit++; }
-  return `${bytes.toFixed(unit ? 1 : 0)} ${units[unit]}`;
-}
-
-function setExportFeedback(message, isError = false) {
-  const element = $('exportFeedback');
-  if (!element) return;
-  element.textContent = String(message || '');
-  element.classList.toggle('error', Boolean(isError));
-}
-
-let latestPreview = null;
-let previewGeneration = 0;
-let previewInFlightGeneration = 0;
-
-function renderJobStatus(status) {
-  latestStatus = status;
-  updateMutationLock(status);
-  const stages = status.stages || [];
-  const progress = status.search_progress || {};
-  const localExport = status.action === 'exact-build' && (status.items || status.status || (typeof reviewData !== 'undefined' && reviewData.source_neutral));
-  const exportResult = status.result || {};
-  const doneStages = stages.filter(stage => stage.status === 'done').length;
-  const currentStage = stages.findIndex(stage => stage.status === 'running');
-  const stageTotal = Math.max(stages.length, 5);
-  let percent = stages.length ? (doneStages / stageTotal) * 100 : 0;
-  let detail = status.stage ? `${status.stage}` : '';
-  if (status.search_active && progress.queries_total) {
-    percent = (progress.queries_done / progress.queries_total) * 100;
-    detail = `${progress.queries_done} / ${progress.queries_total} queries · ` +
-      `${progress.scored_tracks} / ${progress.total_tracks} tracks scored · ` +
-      `${progress.review_candidates} review candidates available`;
-  } else if (status.running && currentStage >= 0) {
-    percent = ((doneStages + 0.25) / stageTotal) * 100;
-    detail = stages[currentStage].detail || detail;
-  } else if (!status.running && status.finished_at) {
-    percent = status.error ? Math.min(99, (doneStages / stageTotal) * 100) : 100;
-    detail = status.error || 'All stages finished.';
-  }
-  if (localExport && Number(status.total || 0) > 0) percent = (Number(status.done || 0) / Number(status.total)) * 100;
-  if (localExport && Number(status.total || 0) <= 0) $('jobFill').style.width = '0%';
-  else $('jobFill').style.width = `${Math.max(0, Math.min(100, percent))}%`;
-  const exportFailed = localExport && !status.running && status.status === 'failed';
-  $('jobDot').className = 'job-dot' + (status.error || exportFailed ? ' failed' : status.running ? ' running' : '');
-  const actionLabels = {
-    'dry-run': 'Exact dry run', 'build': 'Exact build',
-    'exact-dry-run': 'Exact dry run', 'exact-build': 'Exact build',
-    'expansion-dry-run': 'Expansion dry run', 'expansion-build': 'Expansion build'
-  };
-  let headline = status.running
-    ? `Running: ${actionLabels[status.action] || status.action || 'job'}`
-    : status.error ? 'Job failed' : status.finished_at ? 'Last run complete' : 'Ready';
-  let activity = status.activity || detail || 'Waiting to start.';
-  let userDetail = detail;
-  if (localExport) {
-    const published = Number(exportResult.published || 0);
-    const failed = Number(exportResult.failed || 0);
-    const invalid = Number(exportResult.invalid || 0);
-    const itemProgress = status.items || {};
-    const selected = Number(status.total || exportResult.selected || itemProgress.selected || 0);
-    const completed = Number(status.done || exportResult.ready || itemProgress.completed || 0);
-    if (status.running) {
-      headline = status.status === 'cancelling' ? 'Cancelling library build' : 'Building library';
-      activity = status.current || status.activity || 'Writing your selected charts into the library.';
-      userDetail = selected ? `${completed} of ${selected} charts complete · ${Number(itemProgress.downloading || 0)} downloading · ${Number(itemProgress.retrying || 0)} retrying · ${Number(itemProgress.failed || 0)} failed · ${Number(itemProgress.invalid || 0)} invalid · ${Number(itemProgress.remaining || 0)} remaining` : 'Preparing chart count…';
-      setExportFeedback('Export is in progress...');
-     } else if (status.status === 'partial' && exportResult.success) {
-       headline = 'LIBRARY READY — WITH ISSUES';
-       activity = `${Number(exportResult.ready || completed || 0)} ready · ${failed} failed · ${invalid} invalid`;
-       userDetail = `${Number(exportResult.selected || selected || 0)} selected charts · destination ${status.destination || exportResult.destination || ''}`;
-       setExportFeedback(activity);
-       $('retryFailed').hidden = false; $('cancelExport').hidden = true; $('openSongs').hidden = false;
-     } else if (status.status === 'complete' && exportResult.success) {
-      const added = Number(exportResult.added || 0);
-      const already = Number(exportResult.already_present || 0);
-      const ready = Number(exportResult.ready || published || 0);
-      const total = Number(exportResult.selected || selected || 0);
-      headline = 'LIBRARY READY';
-      activity = `${added} added · ${already} already present · ${invalid} invalid · ${Number(exportResult.download_failures || failed)} download failures`;
-      userDetail = `${ready} / ${total} selected charts ready`;
-      setExportFeedback(`${activity}. ${userDetail}. Selected charts exported successfully.`);
-       $('retryFailed').hidden = !(invalid || failed || Number(exportResult.cancelled_items || 0));
-       $('cancelExport').hidden = true;
-       $('openSongs').hidden = false;
-     } else if (status.status === 'interrupted') {
-       headline = 'BUILD INTERRUPTED';
-       activity = 'The previous build stopped before it finished. Completed charts were kept.';
-       userDetail = `${Number(exportResult.ready || completed || 0)} / ${Number(exportResult.selected || selected || 0)} selected charts ready; resume/retry incomplete work safely.`;
-       setExportFeedback(activity);
-       $('retryFailed').hidden = false;
-       $('cancelExport').hidden = true;
-       $('openSongs').hidden = true;
-     } else if (status.status === 'cancelled' && exportResult) {
-      headline = 'Build cancelled';
-      activity = 'Validated charts were kept in the library.';
-      userDetail = `${Number(exportResult.ready || completed || 0)} / ${Number(exportResult.selected || selected || 0)} selected charts ready; remaining charts can be retried.`;
-      setExportFeedback(`${activity} ${userDetail}`);
-     $('retryFailed').hidden = false;
-     $('cancelExport').hidden = true;
-     $('openSongs').hidden = true;
-    } else if (!status.running) {
-      headline = 'Export could not complete';
-      activity = status.error || 'No charts were exported.';
-      userDetail = failed ? `${failed} chart${failed === 1 ? '' : 's'} failed.` : '';
-      setExportFeedback(activity, true);
-     $('retryFailed').hidden = false;
-     $('cancelExport').hidden = true;
-     $('openSongs').hidden = true;
-    }
-    if (status.running) {
-      $('cancelExport').hidden = false;
-      $('retryFailed').hidden = true;
-    }
-  }
-  $('jobHeadline').textContent = headline;
-  $('jobActivity').textContent = activity;
-  $('jobDetail').textContent = userDetail;
-  const elapsed = status.running && status.started_at
-    ? (Date.now() / 1000 - status.started_at)
-    : status.elapsed_seconds;
-  $('jobElapsed').textContent = elapsed ? formatDuration(elapsed) : '';
-}
-
-function refreshJobElapsed() {
-  if (latestStatus) renderJobStatus(latestStatus);
-}
-
-setInterval(refreshJobElapsed, 1000);
-
-async function refreshFiles() {
-  const files = await (await fetch('/api/files')).json();
-  $('files').innerHTML = files.length
-    ? files.map(f => `<div class="file-row" style="${f.enabled ? '' : 'opacity:.5'}"><label style="cursor:pointer;flex:1;display:flex;align-items:center;gap:8px">
-        <input type="checkbox" ${f.enabled ? 'checked' : ''} onchange="toggleFile('${f.name.replace(/'/g, "\\'")}', this.checked)">
-        <span>${f.name} <span class="muted">(${(f.size/1024).toFixed(0)} KB)</span></span></label>
-        <button onclick="delFile('${f.name.replace(/'/g, "\\'")}')">remove</button></div>`).join('')
-    : '<p class="muted">No music exports yet.</p>';
-}
-
-async function toggleFile(name, enabled) {
-  await fetch('/api/files/toggle', {method: 'POST',
-    headers: {'Content-Type': 'application/json'}, body: JSON.stringify({name, enabled})});
-  await refreshFiles();
-  refreshEstimate();
-}
-
-async function delFile(name) {
-  await fetch('/api/files/delete', {method: 'POST',
-    headers: {'Content-Type': 'application/json'}, body: JSON.stringify({name})});
-  await refreshFiles();
-  refreshEstimate();
-}
-
-async function upload(fileList) {
-  const data = new FormData();
-  for (const f of fileList) data.append('files', f);
-  const res = await (await fetch('/api/upload', {method: 'POST', body: data})).json();
-  if (res.rejected && res.rejected.length)
-    alert('Skipped (supported formats are .csv, .txt, and .xml): ' + res.rejected.join(', '));
-  await refreshFiles();
-  refreshEstimate();
-}
-
-$('picker').addEventListener('change', e => upload(e.target.files));
-const drop = $('drop');
-['dragover','dragenter'].forEach(ev => drop.addEventListener(ev, e => {e.preventDefault(); drop.classList.add('over');}));
-['dragleave','drop'].forEach(ev => drop.addEventListener(ev, e => {e.preventDefault(); drop.classList.remove('over');}));
-drop.addEventListener('drop', e => upload(e.dataTransfer.files));
-
-const runButtons = ['exactDry', 'exactBuild', 'expansionDry', 'expansionBuild'];
-
-function setRunButtons(disabled) {
-  runButtons.forEach(id => $(id).disabled = disabled);
-  $('acceptAll').disabled = disabled;
-  $('selectStrong').disabled = disabled;
-}
-
-async function run(action) {
-  if (isLocalJourney() && action === 'exact-build') {
-    await runNeutralExport();
-    return;
-  }
-  jobRunning = true;
-  setRunButtons(true);
-  $('stages').innerHTML = '';
-  renderJobStatus({running: true, action, stage: 'Starting', activity: `Starting ${action}...`, stages: [], search_progress: {}});
-  try {
-    const res = await fetch('/api/run/' + action, {method: 'POST'});
-    if (!res.ok) throw Error((await res.json().catch(() => ({}))).error || 'Could not start this job.');
-    await poll();
-  } catch (err) {
-    jobRunning = false;
-    setRunButtons(false);
-    renderJobStatus({running: false, error: err.message, activity: err.message, stages: [], search_progress: {}});
-  }
-}
-
-async function poll() {
-  try {
-    const s = await (await fetch('/api/status')).json();
-    $('stages').innerHTML = (s.stages || []).map(st => {
-      const icon = st.status === 'done' ? '<span class="ok">✔</span>'
-                 : st.status === 'failed' ? '<span class="bad">✖</span>'
-                 : '<span class="spin">…</span>';
-      return `<div class="stage">${icon} ${st.label}
-        <span class="muted">${st.detail || ''}</span></div>`;
-    }).join('') + (s.error ? `<div class="stage bad" style="color:#ff7a7a">Error: ${s.error}</div>` : '');
-    jobRunning = s.running;
-    renderJobStatus(s);
-    renderReview();
-    if (s.running) {
-      await loadReview(false);
-      setTimeout(poll, 900);
-    } else {
-      setRunButtons(false);
-      await refreshSummary(); await refreshReports(); await refreshEstimate();
-      await loadReview(false);
-    }
-  } catch (err) {
-    jobRunning = false;
-    setRunButtons(false);
-    renderJobStatus({running: false, error: err.message, activity: err.message, stages: [], search_progress: {}});
-  }
-}
-
-async function runNeutralExport(retryOnly = false) {
-  jobRunning = true;
-  setRunButtons(true);
-  updateMutationLock({running:true, status:'running', action:'exact-build'});
-  setExportFeedback(retryOnly ? 'Retrying incomplete charts...' : 'Preparing your selected charts...');
-  renderJobStatus({running: true, action: 'exact-build', activity: 'Exporting selected charts...', stages: [], search_progress: {}});
-  try {
-    const response = await fetch('/api/spotify/export/start', {method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({kind: 'folder', workspace_id: reviewData.workspace_id || reviewData.journey?.workspace_id,
-        path: $('libraryRoot').textContent.trim(), retry_failed: Boolean(retryOnly)})});
-    const result = await response.json().catch(() => ({}));
-    if (!response.ok) throw Error(result.error || 'Could not start the export.');
-    await pollNeutralExport();
-  } catch (err) {
-    jobRunning = false;
-    setRunButtons(false);
-    setExportFeedback(err.message || 'Could not start the export.', true);
-    renderJobStatus({running: false, error: err.message, activity: err.message, stages: [], search_progress: {}});
-  }
-}
-
-async function cancelNeutralExport() {
-  if (!jobRunning) return;
-  try {
-    $('cancelExport').disabled = true;
-    await api('/api/spotify/export/cancel', {method: 'POST'});
-    setExportFeedback('Cancellation requested. The active chart will finish safely.');
-  } catch (error) {
-    setExportFeedback(error.message || 'Could not cancel the build.', true);
-    $('cancelExport').disabled = false;
-  }
-}
-
-async function pollNeutralExport() {
-  try {
-    const response = await fetch('/api/spotify/export/status');
-    const status = await response.json();
-    renderJobStatus({
-      running: status.running,
-      action: 'exact-build',
-      activity: status.current || (status.running ? 'Exporting selected charts...' : status.error || 'Export complete.'),
-      error: status.error,
-      status: status.status,
-      done: status.done,
-      total: status.total,
-      destination: status.destination,
-      result: status.result,
-      items: status.items,
-      started_at: status.started_at,
-      finished_at: status.running ? null : (Date.now() / 1000),
-      elapsed_seconds: 0,
-      stages: [],
-      search_progress: {},
-    });
-    if (status.running) {
-      setTimeout(pollNeutralExport, 700);
-      return;
-    }
-    jobRunning = false;
-    setRunButtons(false);
-    await refreshSummary(); await refreshReports(); await loadReview(false);
-  } catch (err) {
-    jobRunning = false;
-    setRunButtons(false);
-    setExportFeedback(err.message || 'Export status is unavailable.', true);
-    renderJobStatus({running: false, error: err.message, activity: err.message, stages: [], search_progress: {}});
-  }
-}
-
-async function refreshNeutralExportStatus() {
-  try {
-    const response = await fetch('/api/spotify/export/status');
-    const status = await response.json();
-    if (!status.running && !status.result && status.status === 'idle') return;
-    jobRunning = Boolean(status.running);
-    setRunButtons(jobRunning);
-    renderJobStatus({
-      running: status.running,
-      action: 'exact-build',
-      activity: status.current || (status.running ? 'Exporting selected charts...' : status.error || 'Export complete.'),
-      error: status.error,
-      status: status.status,
-      done: status.done,
-      total: status.total,
-      destination: status.destination,
-      result: status.result,
-      items: status.items,
-      started_at: status.started_at,
-      finished_at: status.running ? null : (Date.now() / 1000),
-      elapsed_seconds: 0,
-      stages: [],
-      search_progress: {},
-    });
-    if (status.running) setTimeout(pollNeutralExport, 700);
-  } catch (error) {
-    // The export status is supplementary; the review page remains usable.
-  }
-}
-
-function isLocalJourney(journey = reviewData.journey) {
-  return Boolean(journey && journey.source_neutral && journey.has_imported_music);
-}
-
-function renderLocalJourney(journey) {
-  const local = isLocalJourney(journey);
-  const panel = $('localJourney');
-  if (!local) {
-    panel.hidden = true;
-    $('importStepHeading').hidden = false;
-    $('legacyImportSources').hidden = false;
-    $('legacyFileStepHeading').hidden = false;
-    $('drop').hidden = false;
-    $('advancedSearchOptions').hidden = false;
-    $('matchingStepHeading').textContent = '3 · Preview chart matches';
-    $('matchingIntro').textContent = 'Preview searches your imported songs without downloading. Review choices before downloading selected charts.';
-    $('exactDry').hidden = false;
-    return;
-  }
-  const counts = journey.counts || {};
-  panel.hidden = false;
-  $('localJourneyHeadline').textContent = journey.headline || 'Your music is ready';
-  $('localJourneyMessage').textContent = journey.message || '';
-     const selected = Number(counts.selected_charts || 0);
-  $('localJourneyCounts').textContent = `${Number(counts.imported_songs || 0).toLocaleString()} songs checked · ${Number(counts.chart_options || 0).toLocaleString()} songs with chart options across ${Number(counts.candidate_charts || 0).toLocaleString()} chart versions · ${Number(counts.strong_matches || 0).toLocaleString()} strong matches · ${Number(counts.needs_review || 0).toLocaleString()} need review · ${Number(counts.no_suitable_songs || 0).toLocaleString()} without a safe recommendation · ${selected.toLocaleString()} selected for export`;
-  $('importStepHeading').hidden = true;
-  $('legacyImportSources').hidden = true;
-  $('legacyFileStepHeading').hidden = true;
-  $('drop').hidden = true;
-  $('advancedSearchOptions').hidden = true;
-  $('matchingStepHeading').textContent = '2 · Matching results';
-  $('matchingIntro').textContent = journey.matching_status === 'running'
-    ? 'Matching is still in progress. Results will appear here when the check finishes.'
-    : 'Your matching results are ready. Review the recommendation for each song before exporting.';
-  $('exactDry').hidden = true;
-  $('exactDry').textContent = journey.matching_status === 'running'
-    ? 'Matching in progress'
-    : journey.matching_status === 'ready'
-      ? 'Find chart matches on the home page'
-      : 'Matching complete';
-  $('exactDry').disabled = true;
-   $('exactBuild').textContent = `Build ${selected.toLocaleString()} selected charts`;
-  updateLocalExportState();
-}
-
-function updateLocalExportState() {
-  const journey = reviewData.journey;
-  if (!isLocalJourney(journey)) return;
-  const selected = Number(journey.counts?.selected_charts || 0);
-  const matching = journey.matching_status === 'running';
-  if (latestPreview && Number(latestPreview.selected_chart_count) !== selected) invalidateBuildPreview();
-  $('exactBuild').textContent = `Build ${selected.toLocaleString()} selected charts`;
-  $('exactBuild').disabled = Boolean(mutationLock) || jobRunning || matching || selected === 0 || !latestPreview;
-  $('exactBuild').title = mutationLock || (matching ? 'Build is unavailable while chart matching is running.' : selected ? (latestPreview ? 'Export the charts currently selected below.' : 'Calculating build preview…') : 'Select at least one chart first.');
-  refreshExportPreview();
-}
-
-function invalidateBuildPreview() {
-  latestPreview = null;
-  previewGeneration += 1;
-  $('exactBuild').disabled = true;
-}
-
-async function refreshExportPreview() {
-  const panel = $('buildPreview');
-  if (!panel || !isLocalJourney()) return;
-   const selected = Number(reviewData.journey?.counts?.selected_charts || 0);
-   if (latestPreview && Number(latestPreview.selected_chart_count) === selected) return;
-   const generation = previewGeneration;
-   if (previewInFlightGeneration === generation) return;
-   previewInFlightGeneration = generation;
-   latestPreview = null;
-   $('exactBuild').disabled = true;
-   if (!selected) {
-     latestPreview = null;
-     panel.hidden = false;
-     $('buildPreviewText').textContent = 'SELECTED 0 charts · Select at least one chart first.';
-     $('buildPreviewCounts').textContent = `DESTINATION ${$('libraryRoot').textContent.trim()}`;
-     return;
-   }
-   $('buildPreviewText').textContent = 'Calculating build preview…';
-   $('buildPreviewCounts').textContent = '';
-   panel.hidden = false;
-  try {
-    const data = await api('/api/spotify/export/preview', {method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({kind: 'folder', workspace_id: reviewData.workspace_id || reviewData.journey.workspace_id,
-        path: $('libraryRoot').textContent.trim()})});
-     if (generation !== previewGeneration || Number(reviewData.journey?.counts?.selected_charts || 0) !== selected) return;
-     latestPreview = data;
-     const selectedCount = Number(data.selected_chart_count || selected);
-     $('buildPreviewText').textContent = `SELECTED ${selectedCount.toLocaleString()} charts · ALREADY AVAILABLE / REUSABLE ${Number(data.reusable_count || 0).toLocaleString()} · NEED DOWNLOAD ${Number(data.download_required_count || 0).toLocaleString()} · INVALID / UNAVAILABLE ${Number(data.invalid_count || 0).toLocaleString()}`;
-     $('buildPreviewCounts').textContent = `ESTIMATED DOWNLOAD SIZE ${data.estimated_bytes ? formatBytes(data.estimated_bytes) : 'Unknown'} · DESTINATION ${data.destination}${selectedCount ? '' : ' · Select at least one chart first.'}`;
-     panel.hidden = false;
-     updateLocalExportState();
-   } catch (error) {
-     if (generation !== previewGeneration) return;
-     latestPreview = null;
-     $('buildPreviewText').textContent = error.message || 'Build preview unavailable.';
-     panel.hidden = false;
-   } finally {
-     if (previewInFlightGeneration === generation) previewInFlightGeneration = 0;
-   }
-}
-
-async function refreshEstimate() {
-  try {
-    const sourceData = await api('/api/sources');
-    if (sourceData.journey?.has_imported_music) {
-      reviewData.journey = sourceData.journey;
-      renderLocalJourney(sourceData.journey);
-      $('estimate').textContent = `${Number(sourceData.journey.counts?.imported_songs || 0).toLocaleString()} imported songs. Matching results appear below.`;
-      return;
-    }
-    const data = await api('/api/estimate');
-    const exact = data.exact || {};
-    const expansion = data.expansion || {};
-    $('estimate').innerHTML = `Exact: <b>${exact.song_count || 0}</b> songs,
-      <b>${exact.uncached_query_count || 0}</b> uncached queries ·
-      Expansion: <b>${expansion.eligible_artist_count || 0}</b> eligible artists,
-      <b>${expansion.uncached_query_count || 0}</b> uncached queries`;
-  } catch (err) {
-    $('estimate').textContent = 'Search estimate unavailable until the input is scanned.';
-  }
-}
-
-async function refreshSummary() {
-  const s = await api('/api/summary');
-  if (!s) return;
-  if (s.journey?.has_imported_music) {
-    reviewData.journey = s.journey;
-    renderLocalJourney(s.journey);
-    const counts = s.journey.counts || {};
-    const selected = Number(counts.selected_charts || 0);
-    $('summary').innerHTML = `<p><b>${selected.toLocaleString()} chart${selected === 1 ? '' : 's'} selected</b> for export.</p><p>${Number(counts.chart_options || 0).toLocaleString()} songs have chart options across ${Number(counts.candidate_charts || 0).toLocaleString()} chart versions: ${Number(counts.strong_matches || 0).toLocaleString()} strong matches and ${Number(counts.needs_review || 0).toLocaleString()} that need review. ${selected ? 'Export is ready when you are.' : 'Choose a chart above to make export available.'}</p>`;
-     updateLocalExportState();
-     refreshNeutralExportStatus();
-     return;
-  }
-  renderLocalJourney(null);
-  const exact = s.exact || {};
-  const expansion = s.expansion || {};
-  const plan = s.plan || {};
-  const downloads = s.downloads || {};
-  const manual = s.manual_decisions || {};
-  $('summary').innerHTML = `<table>
-    <tr><td>Music-list files</td><td class="num">${s.csv_files}</td></tr>
-    <tr><td>Songs imported</td><td class="num">${s.unique_tracks}</td></tr>
-    <tr><td>Artists represented</td><td class="num">${s.primary_artists}</td></tr>
-     <tr><td>Strong / needs review / no suitable chart</td>
-        <td class="num">${exact.auto_matches || 0} / ${exact.review || 0} / ${exact.no_match || 0}</td></tr>
-    <tr><td>Expansion selected</td><td class="num">${expansion.selected || 0}</td></tr>
-    <tr><td>Chart choices</td><td class="num">${manual.accept || 0}</td></tr>
-    <tr><td>Estimated library size</td><td class="num">${plan.estimated_gib || 0} GiB</td></tr>
-    <tr><td>Downloaded</td><td class="num">${downloads.completed || 0} (${downloads.gib_downloaded || 0} GiB)</td></tr>
-  </table>`;
-}
-
-async function refreshReports() {
-  const files = await (await fetch('/api/reports')).json();
-  $('reports').innerHTML = files.length
-    ? 'Reports: ' + files.map(f => `<a href="/reports/${f}">${f}</a>`).join('')
-    : '';
-}
-
-// ------------------------------------------------------------- review UI
-let reviewData = {tracks: [], progress: {}, journey: null};
-let jobRunning = false;
-let mutationLock = '';
-let lastSaved = '';
-let reviewOffset = 0;
-const reviewPageSize = 50;
-
-function updateMutationLock(status) {
-  const operation = status?.operation || {};
-  const active = Boolean(operation.busy || status?.running);
-  const operationState = operation.state || status?.status;
-  mutationLock = active ? (operationState === 'cancelling' ? 'Selections cannot be changed while your library is cancelling.' : operationState === 'building' || status?.action === 'exact-build' ? 'Selections cannot be changed while your library is building.' : operationState === 'importing' ? 'Selections cannot be changed while your music is importing.' : 'Selections cannot be changed while chart matching is running.') : '';
-  document.querySelectorAll('#review button[data-decision]').forEach(button => {
-    button.disabled = Boolean(mutationLock);
-    button.title = mutationLock;
-  });
-  $('acceptAll').disabled = Boolean(mutationLock);
-  $('selectStrong').disabled = Boolean(mutationLock);
-  $('exactBuild').disabled = Boolean(mutationLock) || $('exactBuild').disabled;
-}
-
-function esc(s) {
-  return String(s ?? '').replace(/[&<>"']/g, c =>
-    ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-}
-
-function reviewQueryUrl() {
-  const params = new URLSearchParams();
-  if (reviewWorkspaceId) params.set('workspace_id', reviewWorkspaceId);
-  params.set('limit', String(reviewPageSize));
-  params.set('offset', String(reviewOffset));
-  const state = $('reviewState').value || 'eligible';
-  const sort = $('reviewSort').value || 'artist';
-  const search = $('reviewFilter').value.trim();
-  params.set('state', state);
-  params.set('source', $('reviewSource').value || 'all');
-  params.set('sort', sort);
-  if (search) params.set('search', search);
-  if ($('showRejected').checked) params.set('include_rejected', '1');
-  return `/api/review?${params.toString()}`;
-}
-
-async function loadReview(showLoading = true) {
-  if (showLoading && !reviewData.tracks.length) $('review').innerHTML = '<p class="muted">Loading...</p>';
-  try {
-    reviewData = await api(reviewQueryUrl());
-    reviewWorkspaceId = String(reviewData.workspace_id || reviewWorkspaceId || '');
-  } catch (err) {
-    setReviewFeedback('We could not load your matches. Refresh the page and try again.', true);
-    $('review').innerHTML = '<p class="muted">Your match results are temporarily unavailable.</p>';
-    return;
-  }
-  const page = reviewData.page || {};
-  if (page.total && reviewOffset >= page.total) {
-    reviewOffset = Math.max(0, (Number(page.page_count || 1) - 1) * reviewPageSize);
-    return loadReview(showLoading);
-  }
-  if (reviewData.journey) renderLocalJourney(reviewData.journey);
-  renderReview();
-}
-
-function renderReviewPager() {
-  const page = reviewData.page || {};
-  const total = Number(page.total || 0);
-  const offset = Number(page.offset || 0);
-  const returned = Number(page.returned || 0);
-  const pager = $('reviewPager');
-  if (!pager) return;
-  pager.hidden = total <= Number(page.limit || reviewPageSize);
-  $('reviewPrevious').disabled = offset <= 0;
-  $('reviewNext').disabled = !page.has_more;
-  if (!total) {
-    $('reviewPageStatus').textContent = '';
-    return;
-  }
-  $('reviewPageStatus').textContent = `Showing ${offset + 1}-${offset + returned} of ${total} songs`;
-}
-
-function renderReview() {
-  const progress = reviewData.progress || {};
-  const allTracks = reviewData.tracks || [];
-  const local = isLocalJourney();
-  if (local) renderLocalJourney(reviewData.journey);
-  $('acceptAll').disabled = Boolean(mutationLock);
-  $('selectStrong').hidden = !local;
-  $('selectStrong').disabled = Boolean(mutationLock);
-  const items = allTracks;
-  const page = reviewData.page || {};
-  renderReviewPager();
-  const viewCount = Number(page.total ?? (local ? reviewData.journey.counts?.chart_options : allTracks.length) ?? 0);
-  const viewLabel = page.state === 'eligible' ? 'eligible songs' :
-    page.state === 'strong' ? 'strong songs' :
-    page.state === 'review' ? 'songs needing review' :
-    page.state === 'selected' ? 'selected songs' : 'result cards';
-  const statusText = local
-    ? `${viewCount.toLocaleString()} ${viewLabel} · ${Number(reviewData.journey.counts?.selected_charts || 0).toLocaleString()} selected for export`
-    : progress.has_search_run
-      ? `${progress.review_track_count || 0} songs need a decision · ` +
-        `${progress.scored_tracks || 0} / ${progress.total_tracks || 0} songs checked` +
-        (progress.searching ? ' · checking is still in progress' :
-         progress.exact_scoring_complete ? '' : ' · matching is incomplete')
-      : 'Run Preview chart matches to start a review.';
-  $('reviewProgress').textContent = lastSaved ? `${lastSaved} | ${statusText}` : statusText;
-  if (!items.length) {
-    let empty = 'There are no songs needing review right now.';
-    if (local) {
-      const journey = reviewData.journey;
-      if (journey.matching_status === 'running') empty = 'Matching is still checking your songs; no decision is ready yet.';
-      else if (journey.catalog_available === false) empty = 'Chart catalog is unavailable, so no recommendations were made.';
-      else if (journey.counts?.no_candidate_songs) empty = `No suitable chart was found for ${Number(journey.counts.no_candidate_songs).toLocaleString()} songs.`;
-      else if (journey.counts?.no_suitable_songs) empty = 'No safe chart recommendation is available for the imported songs.';
-       else if (page.search || page.state !== 'all') empty = 'No songs match this filter.';
-    } else if (!progress.has_search_run) empty = 'Run Preview chart matches to check your music.';
-    else if (progress.searching) empty = 'Matching is still checking your songs; no decision is ready yet.';
-    else if (!progress.exact_scoring_complete) empty = 'Matching did not finish; run the preview again before deciding.';
-     else if (page.search || page.state !== 'all') empty = 'No songs match this filter.';
-    $('review').innerHTML = `<p class="muted">${empty}</p>`;
-    return;
-  }
-  const cards = items.map(track => {
-    const candidates = track.candidates || [];
-    const best = candidates.find(candidate => candidate.best) || candidates[0];
-    const alternatives = candidates.filter(candidate => candidate !== best);
-    const review = track.review || {state:'needs_review', label:'Needs review', summary:'Review this chart carefully.', why:[], concerns:[], details:[]};
-    const stateClass = reviewStatusClass(review);
-    const selected = candidates.find(candidate => candidate.selected || candidate.manual === 'accept');
-    const selectedIsAlternative = Boolean(selected && selected !== best);
-    const selectionState = track.selection_state || (selected ? (selected === best ? 'recommended_selected' : 'alternative_selected') : 'unselected');
-    const selectionLabel = selectionState === 'recommended_selected' ? 'Recommended chart selected' : selectionState === 'alternative_selected' ? 'Alternative selected' : selectionState === 'skipped' ? 'Skipped' : 'Unselected';
-    const selectedNote = `<p class="review-selection-note"><b>Recommended:</b> ${best ? `${esc(best.candidate_artist)} — ${esc(best.candidate_title)}` : 'None'}<br><b>Selected:</b> ${selected ? `${esc(selected.candidate_artist)} — ${esc(selected.candidate_title)}` : selectionState === 'skipped' ? 'None, skipped' : 'None'} <span class="muted">(${selectionLabel})</span></p>`;
-    const playlists = (track.playlists || []).length ? ` · ${esc(track.playlists.join(', '))}` : '';
-    return `<article class="card review-card" data-review-state="${esc(review.state)}">
-      <header class="review-card-head">
-        <div><div class="review-eyebrow">My music</div><h3>${esc(track.artist)} — ${esc(track.title)}</h3>
-          <div class="muted">${esc(track.album || '')}${playlists}</div></div>
-        <span class="review-status ${stateClass}">${esc(review.label)}</span>
-      </header>
-      ${selectedNote}
-      <section class="review-recommendation">
-        <div class="review-eyebrow" style="margin-top:14px">Best chart</div>
-        ${best ? candidateHtml(track, best, true) : `<div class="review-option review-option-blocked"><b>${esc(review.label)}</b><p class="review-summary">${esc(review.summary)}</p></div>`}
-      </section>
-      ${alternatives.length ? `<details class="review-alternatives"${selectedIsAlternative ? ' open' : ''}><summary>Other versions (${alternatives.length})</summary>
-        ${alternatives.map(candidate => candidateHtml(track, candidate, false)).join('')}</details>` : ''}
-    </article>`;
-  }).join('');
-  $('review').innerHTML = cards;
-  document.querySelectorAll('#review button[data-decision]').forEach(button => {
-    button.addEventListener('click', () => decide(
-      button.dataset.track, button.dataset.source,
-      Number(button.dataset.chart), button.dataset.decision));
-  });
-}
-
-function reviewStatusClass(review) {
-  if (review.state === 'strong') return 'review-status-strong';
-  if (review.state === 'needs_review') return 'review-status-review';
-  if (review.state === 'not_playable') return 'review-status-blocked';
-  return 'review-status-not-recommended';
-}
-
-function candidateHtml(track, candidate, best) {
-  if (!candidate) return '';
-  const review = candidate.review || {state:'needs_review', label:'Needs review', summary:'Review this chart carefully.', why:[], concerns:[], details:[]};
-  const manual = candidate.manual || '';
-  const selectedClass = candidate.selected || manual === 'accept' ? ' review-option-selected' : '';
-  const blockedClass = review.state === 'not_playable' ? ' review-option-blocked' : '';
-  const marker = best ? '<span class="review-selected">Best match</span>' : '';
-  const selectedBadge = candidate.selected || manual === 'accept' ? '<span class="review-selected">Selected</span>' : manual === 'reject' ? '<span class="review-status review-status-not-recommended">Skipped</span>' : '';
-  const instruments = (candidate.instruments || []).join(', ');
-  const meta = [candidate.charter ? `Charter: ${candidate.charter}` : '', instruments ? `Instruments: ${instruments}` : '', candidate.pack_name ? `Pack: ${candidate.pack_name}` : ''].filter(Boolean).join(' · ');
-  const link = candidate.url ? ` <a href="${esc(candidate.url)}" target="_blank" rel="noopener">View chart</a>` : '';
-  const disabled = mutationLock ? ` disabled title="${esc(mutationLock)}"` : '';
-  let actions = '';
-  if (manual === 'accept' || candidate.selected) {
-    actions = `<button data-track="${esc(track.track_key)}" data-source="${esc(candidate.source)}" data-chart="${candidate.chart_id}" data-decision="clear"${disabled}>Clear current choice</button>`;
-  } else if (review.selectable) {
-    actions = `<button class="primary" data-track="${esc(track.track_key)}" data-source="${esc(candidate.source)}" data-chart="${candidate.chart_id}" data-decision="accept"${disabled}>${esc(review.action)}</button>
-      ${manual === 'reject' ? `<button data-track="${esc(track.track_key)}" data-source="${esc(candidate.source)}" data-chart="${candidate.chart_id}" data-decision="clear"${disabled}>Undo skip</button>` : `<button data-track="${esc(track.track_key)}" data-source="${esc(candidate.source)}" data-chart="${candidate.chart_id}" data-decision="reject"${disabled}>Skip this chart</button>`}`;
-  } else {
-    actions = `<button disabled aria-label="${esc(review.label)}: ${esc(candidate.candidate_title)}">${esc(review.label)}</button>`;
-  }
-  return `<div class="review-option${selectedClass}${blockedClass}">
-    <div class="review-option-head"><div><h4>${esc(candidate.candidate_artist)} — ${esc(candidate.candidate_title)}</h4>${meta ? `<p class="review-option-meta">${esc(meta)}${link ? ' ·' : ''}${link}</p>` : link}</div><div>${marker} ${selectedBadge} <span class="review-status ${reviewStatusClass(review)}">${esc(review.label)}</span></div></div>
-    <p class="review-summary">${esc(review.summary || review.label)}</p>
-    ${reviewDetails(candidate)}
-    <div class="review-option-actions">${actions}</div>
-  </div>`;
-}
-
-function reviewDetails(candidate) {
-  const review = candidate.review || {};
-  const why = (review.why || []).map(value => `<li>${esc(value)}</li>`).join('');
-  const concerns = (review.concerns || []).map(value => `<li class="review-concern">Potential issue: ${esc(value)}</li>`).join('');
-  const rows = (review.details || []).map(row => `<tr><th scope="row">${esc(row.label)}</th><td>${esc(row.value)}</td></tr>`).join('');
-  const reference = candidate.reference ? `<p class="muted">Chart reference: ${esc(candidate.reference)}</p>` : '';
-  const heading = review.state === 'not_playable' ? 'Why this chart is unavailable' : 'Why this match?';
-  return `<details class="review-why"><summary>${heading}</summary>${why || concerns ? `<ul>${why}${concerns}</ul>` : ''}${rows ? `<table><tbody>${rows}</tbody></table>` : ''}${reference}</details>`;
-}
-
-async function decide(trackKey, source, chartId, decision) {
-  try {
-    const result = await api('/api/review/decide', {method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({track_key: trackKey, source, chart_id: chartId, decision,
-        workspace_id: reviewData.workspace_id || undefined})});
-    lastSaved = decision === 'clear' ? 'Current choice cleared.' : 'Chart choice saved.';
-    invalidateBuildPreview();
-    // Reload the authoritative persisted rows instead of making the card state
-    // optimistic or allowing it to drift from SQLite.
-    await loadReview(false);
-    await refreshSummary();
-    setTimeout(() => { lastSaved = ''; renderReview(); }, 4000);
-    return result;
-  } catch (error) {
-    lastSaved = error.message || 'Could not save that choice.';
-    renderReview();
-  }
-}
-
-async function acceptAllReview() {
-  if (jobRunning) return;
-  const count = reviewData.journey?.counts?.needs_review || reviewData.progress?.review_track_count || 0;
-  if (!count) {
-    lastSaved = 'There are no review matches to accept.';
-    renderReview();
-    return;
-  }
-  if (!confirm(`Choose the best chart for all ${count} songs that need review?`)) return;
-  try {
-    const result = await api('/api/review/accept-all', {method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({workspace_id: reviewData.workspace_id || undefined})});
-    lastSaved = `Saved ${result.accepted || 0} chart choices.`;
-    invalidateBuildPreview();
-    await loadReview(false);
-    await refreshSummary();
-    setTimeout(() => { lastSaved = ''; renderReview(); }, 5000);
-  } catch (error) {
-    lastSaved = error.message || 'Bulk accept failed.';
-    renderReview();
-  }
-}
-
-async function selectBulkScope(scope) {
-  if (jobRunning || !isLocalJourney()) return;
-   const label = scope === 'strong' ? 'all Strong matches' : 'all recommended Review matches';
-   if (!confirm(`Select ${label}? Existing choices will be preserved.`)) return;
-  try {
-    const result = await api('/api/spotify/select-all', {method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({workspace_id: reviewData.workspace_id || reviewData.journey?.workspace_id,
-         scope})});
-    lastSaved = `Selected ${result.selected || 0} charts.`;
-    invalidateBuildPreview();
-    await loadReview(false);
-    await refreshSummary();
-    setTimeout(() => { lastSaved = ''; renderReview(); }, 5000);
-  } catch (error) {
-    lastSaved = error.message || 'Bulk selection failed.';
-    renderReview();
-  }
-}
-
-function resetReviewPage() {
-  reviewOffset = 0;
-  loadReview();
-}
-
-let reviewSearchTimer = null;
-function scheduleReviewSearch() {
-  reviewOffset = 0;
-  if (reviewSearchTimer) clearTimeout(reviewSearchTimer);
-  reviewSearchTimer = setTimeout(() => loadReview(false), 250);
-}
-
-$('showRejected').addEventListener('change', resetReviewPage);
-$('reviewState').addEventListener('change', resetReviewPage);
-$('reviewSort').addEventListener('change', resetReviewPage);
-$('reviewSource').addEventListener('change', resetReviewPage);
-$('reviewFilter').addEventListener('input', scheduleReviewSearch);
-$('reviewPrevious').addEventListener('click', () => {
-  if (reviewOffset <= 0) return;
-  reviewOffset = Math.max(0, reviewOffset - reviewPageSize);
-  loadReview(false);
-});
-$('reviewNext').addEventListener('click', () => {
-  if (!(reviewData.page || {}).has_more) return;
-  reviewOffset += reviewPageSize;
-  loadReview(false);
-});
-$('acceptAll').addEventListener('click', acceptAllReview);
-$('selectStrong').addEventListener('click', () => selectBulkScope('strong'));
-$('cancelExport').addEventListener('click', cancelNeutralExport);
-$('retryFailed').addEventListener('click', () => runNeutralExport(true));
-$('openSongs').addEventListener('click', async () => { try { await api('/api/open-folder', {method:'POST'}); } catch (error) { setExportFeedback(error.message || 'Could not open the Songs folder.', true); } });
-
-$('exactDry').addEventListener('click', () => run('exact-dry-run'));
-$('exactBuild').addEventListener('click', () => {
-  if (isLocalJourney()) {
-    const count = Number(reviewData.journey?.counts?.selected_charts || 0);
-    if (!count) { setExportFeedback('Select at least one chart first.', true); return; }
-    const preview = latestPreview;
-    if (!preview || Number(preview.selected_chart_count) !== count) { setExportFeedback('Build preview is still being calculated. Wait for the current preview before building.', true); return; }
-    const unavailable = Number(preview.invalid_count || preview.unavailable_count || 0);
-    const estimated = Number(preview.estimated_bytes || 0) ? formatBytes(preview.estimated_bytes) : 'Unknown';
-    if (!confirm(`Build ${count.toLocaleString()} charts?\n${Number(preview.download_required_count).toLocaleString()} need downloading\n${Number(preview.reusable_count).toLocaleString()} can be reused${unavailable ? `\n${unavailable.toLocaleString()} are unavailable and will not be added` : ''}\nEstimated download: ${estimated}\nDestination: ${preview.destination}`)) return;
-    run('exact-build');
-  } else if (confirm('Export the selected charts into the library now?')) {
-    run('exact-build');
-  }
-});
-$('expansionDry').addEventListener('click', () => run('expansion-dry-run'));
-$('expansionBuild').addEventListener('click', () => {
-  if (confirm('Search and download artist expansion charts now?')) run('expansion-build');
-});
-
-refreshFiles(); refreshSummary(); refreshReports(); refreshEstimate(); loadReview();
-fetch('/api/status').then(r => r.json()).then(s => {
-  updateMutationLock(s);
-  jobRunning = s.running;
-  setRunButtons(s.running);
-  renderJobStatus(s);
-  if (s.running) poll(); else renderReview();
-});
-</script>
-</body>
-</html>
-"""

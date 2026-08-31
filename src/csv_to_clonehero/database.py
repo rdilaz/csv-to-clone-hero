@@ -1218,8 +1218,26 @@ class Database:
     def refresh_library_matching_fingerprint(self, workspace_id: int | str) -> str:
         """Persist the canonical fields consumed by matching as one identity."""
         db_id = self._workspace_db_id(workspace_id)
+        # Provider provenance/import metadata is intentionally excluded: it
+        # does not affect retrieval or scoring and would make an equivalent
+        # source reimport invalidate a valid completed scan.
         rows = self._conn.execute(
-            "SELECT normalized_artist,normalized_title,title,artist,album,duration_ms,isrc,url,liked,metadata_json FROM library_tracks WHERE workspace_id=? ORDER BY normalized_artist,normalized_title",
+            """SELECT t.normalized_artist,t.normalized_title,t.title,t.artist,t.album,
+                      t.duration_ms,t.isrc,t.url
+                 FROM library_tracks t
+                WHERE t.workspace_id = ?
+                  AND EXISTS (
+                        SELECT 1
+                          FROM library_track_provenance p
+                          JOIN library_sources s ON s.id = p.source_id
+                         WHERE p.library_track_id = t.id
+                           AND p.source_import_id = (
+                                 SELECT MAX(i.id)
+                                   FROM source_imports i
+                                  WHERE i.source_id = s.id
+                           )
+                  )
+                ORDER BY t.normalized_artist,t.normalized_title""",
             (db_id,),
         )
         digest = hashlib.sha256()
@@ -2927,7 +2945,7 @@ class Database:
                     VALUES (?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(workspace_id, scan_key) DO UPDATE SET
                       kind = excluded.kind, status = excluded.status,
-                      started_at = excluded.started_at,
+                      started_at = COALESCE(discovery_scans.started_at, excluded.started_at),
                       finished_at = excluded.finished_at,
                       metadata_json = excluded.metadata_json""",
                  (db_id, scan_key, kind, status, now, finished_at, _json_text(data.get("metadata", {}), {})),
