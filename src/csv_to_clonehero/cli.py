@@ -406,7 +406,21 @@ def cmd_web(config, args) -> int:
         # Werkzeug's reloader starts a child process. Keep the bearer token
         # stable across that handoff instead of generating a second URL.
         os.environ["CSV_TO_CLONEHERO_LAN_TOKEN"] = access_token
-    app = create_app(config, lan_access_token=access_token or None)
+    reload_enabled = bool(getattr(args, "reload", False)) and not (
+        args.lan or public_mode
+    )
+    reloader_child = os.environ.get("WERKZEUG_RUN_MAIN") == "true"
+    try:
+        app = create_app(
+            config,
+            lan_access_token=access_token or None,
+            # The reloader parent owns no process lease; its child does.
+            enforce_single_process=not reload_enabled or reloader_child,
+            recover_interrupted_state=not reload_enabled or reloader_child,
+        )
+    except RuntimeError as exc:
+        console.print(f"[red]Could not start the local web app: {exc}[/red]")
+        return 2
     local_url = f"http://127.0.0.1:{args.port}/"
     console.print(f"[green bold]Web interface running locally at {local_url}[/green bold]")
     console.print(f"[dim]Python: {sys.executable}[/dim]")
@@ -437,18 +451,21 @@ def cmd_web(config, args) -> int:
     console.print("Press Ctrl+C to stop.")
     # Flask's reloader starts the command twice. Open the browser only in the
     # reloader child so one launcher invocation creates one tab.
-    reloader_child = os.environ.get("WERKZEUG_RUN_MAIN") == "true"
     if not args.no_browser and (not getattr(args, "reload", False) or reloader_child):
         webbrowser.open(local_url)
-    reload_enabled = bool(getattr(args, "reload", False)) and not (args.lan or public_mode)
     if getattr(args, "reload", False) and not reload_enabled:
         console.print("[yellow]Reload is disabled in LAN/public mode.[/yellow]")
-    app.run(
-        host=host,
-        port=args.port,
-        debug=reload_enabled,
-        use_reloader=reload_enabled,
-    )
+    try:
+        app.run(
+            host=host,
+            port=args.port,
+            debug=reload_enabled,
+            use_reloader=reload_enabled,
+        )
+    finally:
+        web_process_lease = app.extensions.get("journey_web_process_lease")
+        if web_process_lease is not None:
+            web_process_lease.release()
     return 0
 
 

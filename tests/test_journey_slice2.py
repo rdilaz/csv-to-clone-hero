@@ -132,10 +132,10 @@ def test_find_charts_uses_local_combined_path_and_restores_without_scoring(match
     monkeypatch.setattr(pipeline, "score_candidate", lambda *args, **kwargs: pytest.fail("warm path scored a candidate"))
     response = client.post("/api/discovery/start", json={"source": "combined", "workspace_id": workspace})
     assert response.status_code == 202
-    assert entered.wait(5)
     restoring = client.get("/api/journey").get_json()
     assert restoring["matching"]["state"] == "matching_restoring"
     assert restoring["matching"]["results"] is None
+    assert entered.wait(5)
     release.set()
     found = wait_for_state(client, "charts_found")
     assert found["matching"]["authoritative"] is True
@@ -210,6 +210,7 @@ def test_cold_find_charts_calls_discover_combined_and_exposes_real_progress(matc
     monkeypatch.setattr(pipeline, "score_candidate", blocked_score)
     response = client.post("/api/discovery/start", json={"source": "combined", "workspace_id": workspace})
     assert response.status_code == 202
+    assert client.get("/api/journey").get_json()["matching"]["state"] == "matching_restoring"
     assert entered.wait(5)
     running = client.get("/api/journey").get_json()
     assert running["matching"]["state"] == "matching_running"
@@ -293,6 +294,7 @@ def test_matching_cannot_start_twice_and_blocks_import(matching_client, monkeypa
     monkeypatch.setattr(pipeline, "completed_scan_fast_path", blocked_fast)
     monkeypatch.setattr(pipeline, "load_enchor_catalog", lambda _path: (_ for _ in ()).throw(RuntimeError("stop cold path")))
     assert client.post("/api/discovery/start", json={"source": "combined", "workspace_id": workspace}).status_code == 202
+    assert client.get("/api/journey").get_json()["matching"]["state"] == "matching_restoring"
     assert entered.wait(5)
     assert client.post("/api/discovery/start", json={"source": "combined", "workspace_id": workspace}).status_code == 409
     upload = client.post("/api/sources/soundcloud/import", data={"file": (io.BytesIO(b"artist,title\nA,B\n"), "music.csv")}, content_type="multipart/form-data")

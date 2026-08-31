@@ -140,12 +140,13 @@ def matching_config_fingerprint(config: AppConfig) -> str:
     return hashlib.sha256(json.dumps(values, sort_keys=True, default=str).encode()).hexdigest()
 
 
-def completed_scan_fast_path(config: AppConfig, db: Database, workspace_id: int | str, library_fingerprint: str, *, on_progress: Any = None, miss_diagnostic: dict[str, str] | None = None) -> CombinedDiscoveryResult | None:
+def completed_scan_fast_path(config: AppConfig, db: Database, workspace_id: int | str, library_fingerprint: str, *, tracks: Iterable[Any] = (), on_progress: Any = None, miss_diagnostic: dict[str, str] | None = None) -> CombinedDiscoveryResult | None:
     """Reuse a structurally valid completed scan without rebuilding the library."""
     def miss(reason: str) -> None:
         if miss_diagnostic is not None:
             miss_diagnostic["reason"] = reason
-    if not library_fingerprint:
+    track_values = list(tracks)
+    if not library_fingerprint and not track_values:
         miss("missing library fingerprint")
         return None
 
@@ -157,7 +158,7 @@ def completed_scan_fast_path(config: AppConfig, db: Database, workspace_id: int 
         manifest = read_catalog_manifest(config.catalog_path)
         timings["catalog_manifest_seconds"] = time.perf_counter() - manifest_started
         config_started = time.perf_counter()
-        fingerprint = matching_scan_fingerprint((), manifest, config, library_fingerprint=library_fingerprint)
+        fingerprint = matching_scan_fingerprint(track_values, manifest, config, library_fingerprint=library_fingerprint)
         timings["config_fingerprint_seconds"] = time.perf_counter() - config_started
         lookup_started = time.perf_counter()
         row = db.get_matching_scan_cache(workspace_id, fingerprint)
@@ -166,6 +167,9 @@ def completed_scan_fast_path(config: AppConfig, db: Database, workspace_id: int 
         progress = db.get_discovery_song_progress_summary(workspace_id)
         if row is None:
             miss("no scan record")
+            return None
+        if track_values and int(row["track_count"]) != len(track_values):
+            miss("current input track count mismatch")
             return None
         if progress["total"] != int(row["track_count"]) or progress["completed"] != progress["total"]:
             miss("progress incomplete")
@@ -265,6 +269,8 @@ def discover_combined(
     expansion_artists: Iterable[str] = (),
     diagnostics: Any = None,
     on_progress: Any = None,
+    on_stage: Any = None,
+    operation_id: str = "",
     cancellation_event: Any = None,
 ) -> CombinedDiscoveryResult:
     """Import provider snapshots, match them locally, and persist candidates.
@@ -274,6 +280,11 @@ def discover_combined(
     candidates; every candidate still passes the normal production matcher and
     quality gates before it reaches the workspace.
     """
+    def set_stage(value: str) -> None:
+        if on_stage is not None:
+            on_stage(value)
+
+    set_stage("source_library_loading")
     snapshots = list(snapshots)
     tracks = merge_provider_tracks(track for snapshot in snapshots for track in snapshot.tracks)
     normalized = [track for provider_track in tracks for track in [provider_track_to_track(provider_track)]]
@@ -287,26 +298,30 @@ def discover_combined(
     scan_fingerprint = ""
     config_fingerprint = matching_config_fingerprint(config)
     if catalog is None:
-        try:
-            catalog_manifest = read_catalog_manifest(config.catalog_path)
-            library_fingerprint = db.get_library_matching_fingerprint(workspace_id)
-            scan_fingerprint = matching_scan_fingerprint(normalized, catalog_manifest, config, library_fingerprint=library_fingerprint)
-            scan_cache = db.get_matching_scan_cache(workspace_id, scan_fingerprint)
-            progress_state = db.get_discovery_song_progress_summary(workspace_id)
-            current_generation = db.get_current_combined_generation(workspace_id)
-            if scan_cache is not None and current_generation is not None and int(scan_cache["track_count"]) == len(normalized) and progress_state["total"] == len(normalized) and progress_state["completed"] == len(normalized):
-                cached_result = CombinedDiscoveryResult(**json.loads(scan_cache["result_json"]))
-                cached_result.cached_tracks = len(normalized)
-                cached_result.recomputed_tracks = 0
-                cached_result.discovery_seconds = 0.0
-                if on_progress is not None:
-                    on_progress({"total_tracks": len(normalized), "catalog_chart_count": int(catalog_manifest["chart_count"]), "phase": "complete", "status": "complete", "message": f"Reusing {len(normalized):,} existing matches", "processed_tracks": len(normalized), "cached_tracks": len(normalized), "recomputed_tracks": 0, "strong_matches": cached_result.strong_match_tracks, "review_matches": cached_result.review_match_tracks, "songs_with_options": cached_result.plausible_match_tracks})
+        set_stage("completed_scan_validation")
+        library_fingerprint = db.get_library_matching_fingerprint(workspace_id)
+        if not library_fingerprint:
+            cached_result = completed_scan_fast_path(
+                config,
+                db,
+                workspace_id,
+                library_fingerprint,
+                tracks=normalized,
+                on_progress=on_progress,
+            )
+            if cached_result is not None:
                 return cached_result
+        try:
+            set_stage("catalog_manifest_load")
+            catalog_manifest = read_catalog_manifest(config.catalog_path)
+            scan_fingerprint = matching_scan_fingerprint(normalized, catalog_manifest, config, library_fingerprint=library_fingerprint)
         except (OSError, TypeError, ValueError, KeyError, json.JSONDecodeError):
             catalog_manifest = None
             scan_fingerprint = ""
+        set_stage("catalog_load")
         catalog = load_enchor_catalog(config.catalog_path)
     else:
+        set_stage("catalog_load")
         catalog_manifest = {"snapshot_id": getattr(catalog, "snapshot_id", ""), "chart_count": getattr(catalog, "chart_count", 0), "sha256": ""}
         scan_fingerprint = matching_scan_fingerprint(normalized, catalog_manifest, config)
     result = CombinedDiscoveryResult(
@@ -317,15 +332,16 @@ def discover_combined(
         catalog_chart_count=int(getattr(catalog, "chart_count", 0) or 0),
         catalog_load_seconds=float(getattr(catalog, "load_seconds", 0.0) or 0.0),
     )
+    set_stage("generation_preparation")
     generation_key = f"combined-{uuid.uuid4().hex}"
     scan_id = db.create_discovery_scan(
         workspace_id, scan_key=generation_key, kind="exact", status="running",
-        metadata={"workflow": "combined_catalog", "generation": generation_key},
+        metadata={"workflow": "combined_catalog", "generation": generation_key, "run_id": operation_id},
     )
     generation_task_id = db.upsert_discovery_task(
         workspace_id, source="combined", kind="generation", query_key=generation_key,
         query_text="combined candidate generation", scan_id=scan_id,
-        status="running", total=len(normalized),
+        status="running", total=len(normalized), metadata={"run_id": operation_id},
     )
     task_ids = {track.track_key: generation_task_id for track in normalized}
     db.initialize_discovery_song_progress(workspace_id, normalized)
@@ -387,10 +403,12 @@ def discover_combined(
             if cancellation_event is not None and cancellation_event.is_set():
                 from csv_to_clonehero.spotify_pipeline import DiscoveryCancelled
                 raise DiscoveryCancelled("matching cancelled")
+            set_stage("cache_lookup")
             fingerprint = matching_cache_fingerprint(track, catalog, config, config_fingerprint=config_fingerprint)
             cached = db.get_matching_song_cache(fingerprint)
             if cached is not None:
                 try:
+                    set_stage("candidate_restoration")
                     cached_result = json.loads(cached["result_json"])
                     classification = str(cached_result["classification"])
                     entries = cached_result.get("candidates", [])
@@ -429,9 +447,11 @@ def discover_combined(
                     continue
                 except (TypeError, ValueError, KeyError, json.JSONDecodeError):
                     pass
+            set_stage("database_persistence")
             result.recomputed_tracks += 1
             db.update_discovery_song_progress(workspace_id, track.track_key, status="checking")
             db.clear_workspace_track_candidates(workspace_id, track.track_key)
+            set_stage("retrieval")
             retrieval_started = time.perf_counter()
             lookup_method = getattr(catalog, "high_recall_candidates", None)
             if callable(lookup_method):
@@ -497,6 +517,7 @@ def discover_combined(
                 )
             # Score before persisting so the normal review surface receives all
             # plausible alternatives but not hundreds of clearly wrong rows.
+            set_stage("scoring")
             scored: list[tuple[Any, Any]] = []
             scoring_started = time.perf_counter()
             for chart in matches:
@@ -546,6 +567,7 @@ def discover_combined(
                     to_persist = [
                         max(hard, key=lambda item: (item[1].final_score, item[1].quality))
                     ]
+            set_stage("database_persistence")
             persistence_started = time.perf_counter()
             for chart, breakdown in to_persist:
                 db.upsert_candidate(chart)
@@ -643,6 +665,7 @@ def discover_combined(
         _persist_expansion(db, workspace_id, catalog, normalized, expansion_artists, config, result)
     if not result.discovery_seconds:
         result.discovery_seconds = time.perf_counter() - discovery_started
+    set_stage("generation_finalization")
     result.expansion_artists = rank_expansion_artists(catalog, normalized)
     if scan_fingerprint:
         _, result.candidate_relationship_digest, _ = db.workspace_current_candidate_digest(workspace_id)
@@ -661,6 +684,7 @@ def discover_combined(
         metadata={
             "workflow": "combined_catalog",
             "generation": generation_key,
+            "run_id": operation_id,
             "candidate_relationship_digest": result.candidate_relationship_digest,
         },
     )

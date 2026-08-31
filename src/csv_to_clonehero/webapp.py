@@ -15,13 +15,16 @@ import io
 import json
 import logging
 import os
+import platform
 import re
 import secrets
 import shutil
 import sqlite3
 import string
+import sys
 import threading
 import time
+import traceback
 import uuid
 from collections import deque
 from dataclasses import fields, is_dataclass
@@ -41,7 +44,12 @@ from csv_to_clonehero.csv_import import (
 )
 from csv_to_clonehero.catalog import load_enchor_catalog
 from csv_to_clonehero.database import Database
-from csv_to_clonehero.diagnostics import RunDiagnostics, diagnostics_path
+from csv_to_clonehero.diagnostics import (
+    RunDiagnostics,
+    diagnostics_path,
+    redact_diagnostic_text,
+    write_journey_failure,
+)
 from csv_to_clonehero.exporter import ExportOptions, ExportService
 from csv_to_clonehero.filesystem import destination_path, is_within, sanitize_component
 from csv_to_clonehero.library_inventory import InventoryLimits, scan_library
@@ -92,7 +100,64 @@ log = logging.getLogger(__name__)
 
 _SPOTIFY_WORKSPACE_KEY = "spotify"
 JOURNEY_SCHEMA_VERSION = 1
-JOURNEY_ASSET_VERSION = "2.5.0"
+JOURNEY_ASSET_VERSION = "2.5.1"
+JOURNEY_MATCHING_FAILURE_CODE = "MATCHING_WORKER_FAILED"
+JOURNEY_MATCHING_START_CONFLICT_CODE = "MATCHING_START_CONFLICT"
+JOURNEY_MATCHING_START_REJECTED_CODE = "MATCHING_START_REJECTED"
+JOURNEY_MATCHING_FAILURE_MESSAGE = (
+    "We could not finish finding charts. Your music is safe."
+)
+
+
+class _JourneyOperationLease:
+    """Process-wide file lock preventing two local matching workers."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.stream: Any = None
+
+    def acquire(self) -> bool:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        stream = self.path.open("a+b")
+        stream.seek(0, os.SEEK_END)
+        if stream.tell() == 0:
+            stream.write(b"\0")
+            stream.flush()
+        stream.seek(0)
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except (OSError, BlockingIOError):
+            stream.close()
+            return False
+        self.stream = stream
+        return True
+
+    def release(self) -> None:
+        stream = self.stream
+        self.stream = None
+        if stream is None:
+            return
+        try:
+            stream.seek(0)
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
+        finally:
+            stream.close()
 
 
 class _OAuthAccessLogFilter(logging.Filter):
@@ -312,6 +377,10 @@ class _SpotifyJobState:
             self.phase = "idle"
             self.message = ""
             self.error = ""
+            self.error_code = ""
+            self.diagnostic_id = ""
+            self.failure_phase = ""
+            self.start_acknowledged = threading.Event()
             self.partial = False
             self.workspace_id: int | None = None
             self.workspace_key = "spotify"
@@ -395,6 +464,29 @@ class _SpotifyJobState:
                 return False
             self.worker = worker
             return True
+
+    def acknowledge_start(self, run_id: str) -> bool:
+        """Release the worker only after this run was projected to a client."""
+        with self.lock:
+            if (
+                self.run_id != str(run_id)
+                or not self.running
+                or self.scan_key != "catalog"
+            ):
+                return False
+            self.start_acknowledged.set()
+            return True
+
+    def wait_for_start_acknowledgement(
+        self,
+        run_id: str,
+        timeout: float = 1.0,
+    ) -> bool:
+        with self.lock:
+            if self.run_id != str(run_id) or not self.running:
+                return False
+            event = self.start_acknowledged
+        return event.wait(timeout=max(0.0, float(timeout)))
 
     def cleanup(self, run_id: str, worker: threading.Thread) -> bool:
         """Release only this run's guard, preserving recorded terminal state."""
@@ -518,11 +610,21 @@ class _SpotifyJobState:
             else:
                 self._log_locked("Spotify discovery complete")
 
-    def fail(self, error: Any) -> None:
+    def fail(
+        self,
+        error: Any,
+        *,
+        error_code: str = "",
+        diagnostic_id: str = "",
+        failure_phase: str = "",
+    ) -> None:
         with self.lock:
             self.running = False
             self.status = "failed"
             self.error = _safe_message(error)
+            self.error_code = str(error_code or "")
+            self.diagnostic_id = str(diagnostic_id or "")
+            self.failure_phase = str(failure_phase or self.phase or "")
             self.message = f"Discovery failed: {self.error}"
             self.finished_at = time.time()
             self._log_locked(self.message)
@@ -601,6 +703,9 @@ class _SpotifyJobState:
                 "message": self.message,
                 "activity": self.message,
                 "error": self.error,
+                "error_code": self.error_code,
+                "diagnostic_id": self.diagnostic_id,
+                "failure_phase": self.failure_phase,
                 "partial": self.partial,
                 "workspace_id": self.workspace_id,
                 "workspace_key": self.workspace_key,
@@ -1906,6 +2011,8 @@ def create_app(
     oauth_factory: Callable[..., Any] | Any | None = None,
     keyring: Any | None = None,
     lan_access_token: str | None = None,
+    enforce_single_process: bool = False,
+    recover_interrupted_state: bool = True,
 ) -> Flask:
     """Create the local Flask app.
 
@@ -1924,6 +2031,16 @@ def create_app(
     app.config["JOURNEY_SCHEMA_VERSION"] = JOURNEY_SCHEMA_VERSION
     app.config["JOURNEY_ASSET_VERSION"] = JOURNEY_ASSET_VERSION
     logging.getLogger("werkzeug").addFilter(_OAuthAccessLogFilter())
+    web_process_lease = None
+    if enforce_single_process:
+        web_process_lease = _JourneyOperationLease(
+            Path(config.state_path) / "journey-web.lock"
+        )
+        if not web_process_lease.acquire():
+            raise RuntimeError(
+                "another local web application process is already using this state"
+            )
+    app.extensions["journey_web_process_lease"] = web_process_lease
 
     @app.after_request
     def prevent_stale_journey_assets(response: Response) -> Response:
@@ -1934,14 +2051,24 @@ def create_app(
             response.headers["Expires"] = "0"
         return response
 
-    recovery_db = Database(config.database_path)
-    try:
-        recovery_db.recover_interrupted_discovery()
-        recovery_db.mark_active_expansion_batches_interrupted()
-        recovery_db.recover_running_exports()
-        recovery_db.delete_workspace_by_key("spotify-demo")
-    finally:
-        recovery_db.close()
+    if recover_interrupted_state:
+        recovery_lease = _JourneyOperationLease(
+            Path(config.state_path) / "journey-matching.lock"
+        )
+        if recovery_lease.acquire():
+            recovery_db = Database(config.database_path)
+            try:
+                recovery_db.recover_interrupted_discovery()
+                recovery_db.mark_active_expansion_batches_interrupted()
+                recovery_db.recover_running_exports()
+                recovery_db.delete_workspace_by_key("spotify-demo")
+            finally:
+                recovery_db.close()
+                recovery_lease.release()
+        else:
+            log.warning(
+                "Skipped startup recovery because another local matching worker is active"
+            )
     state = JobState()
     spotify_job = _SpotifyJobState()
     soundcloud_import_job = _SoundCloudImportJobState()
@@ -3907,6 +4034,7 @@ def create_app(
         if busy is not None:
             return busy
         workspace, workspace_key = _get_local_library_workspace()
+        warm_only = bool(payload.get("warm_only"))
         db = Database(config.database_path)
         try:
             requested_workspace = payload.get("workspace_id")
@@ -3914,15 +4042,33 @@ def create_app(
             if requested_workspace not in (None, ""):
                 requested_row = db.get_workspace(requested_workspace)
                 if requested_row is None or int(requested_row["id"]) != int(workspace):
-                    return {"error": "the requested workspace is not the local journey workspace"}, 400
+                    return {
+                        "error": "the requested workspace is not the local journey workspace",
+                        "error_code": JOURNEY_MATCHING_START_REJECTED_CODE,
+                    }, 400
             canonical_count = len(db.get_neutral_library_tracks(workspace))
             if canonical_count <= 0:
-                return {"error": "add music before finding Clone Hero charts"}, 400
+                return {
+                    "error": "add music before finding Clone Hero charts",
+                    "error_code": JOURNEY_MATCHING_START_REJECTED_CODE,
+                }, 400
         finally:
             db.close()
+        operation_lease = _JourneyOperationLease(
+            Path(config.state_path) / "journey-matching.lock"
+        )
+        if not operation_lease.acquire():
+            return {
+                "error": "another local chart-finding worker is already running",
+                "error_code": JOURNEY_MATCHING_START_CONFLICT_CODE,
+            }, 409
         with spotify_job.lock:
             if spotify_job.running:
-                return {"error": "a discovery job is already running"}, 409
+                operation_lease.release()
+                return {
+                    "error": "a discovery job is already running",
+                    "error_code": JOURNEY_MATCHING_START_CONFLICT_CODE,
+                }, 409
             run_id = uuid.uuid4().hex
             spotify_job.begin(workspace, workspace_key=workspace_key, scan_key="catalog", run_id=run_id)
             spotify_job.phase = "restoring"
@@ -3932,6 +4078,16 @@ def create_app(
         workspace_metadata = _json_object(workspace_row["metadata_json"], {}) if workspace_row is not None else {}
         if not isinstance(workspace_metadata, Mapping):
             workspace_metadata = {}
+        workspace_metadata = dict(workspace_metadata)
+        for stale_key in (
+            "diagnostic_id",
+            "error",
+            "error_code",
+            "failed_at",
+            "failure",
+            "failure_phase",
+        ):
+            workspace_metadata.pop(stale_key, None)
         generation_key = f"journey-{run_id}"
         run_metadata = {
             **workspace_metadata,
@@ -3941,8 +4097,9 @@ def create_app(
             "generation": generation_key,
             "started_at": started_at,
         }
-        status_db = Database(config.database_path)
+        status_db = None
         try:
+            status_db = Database(config.database_path)
             # Persist identity before the daemon thread starts so a new process
             # can recover an abandoned run as interrupted.
             status_db.set_meta("local_current_run_id", run_id)
@@ -3963,22 +4120,324 @@ def create_app(
                 metadata=run_metadata,
             )
         except Exception as exc:
-            spotify_job.fail(_safe_message(exc))
-            return {"error": "could not start chart finding"}, 500
+            failed_at = time.time()
+            correlation_id = secrets.token_hex(8)
+            diagnostic_id = ""
+            try:
+                write_journey_failure(
+                    config.state_path,
+                    correlation_id,
+                    operation="matching",
+                    error_code=JOURNEY_MATCHING_FAILURE_CODE,
+                    run_id=run_id,
+                    workspace_id=int(workspace),
+                    phase="workspace_preparation",
+                    failed_at=failed_at,
+                    error=exc,
+                    state_summary={
+                        "canonical_tracks": canonical_count,
+                        "workspace_id": int(workspace),
+                    },
+                    environment={
+                        "python_executable": sys.executable,
+                        "python_version": platform.python_version(),
+                        "platform": platform.platform(),
+                        "process_id": os.getpid(),
+                        "database_path": str(config.database_path),
+                        "catalog_path": str(config.catalog_path),
+                        "state_path": str(config.state_path),
+                    },
+                )
+                diagnostic_id = correlation_id
+            except Exception:
+                log.warning(
+                    "Could not write journey matching diagnostic %s",
+                    correlation_id,
+                    exc_info=True,
+                )
+            traceback_text = redact_diagnostic_text(
+                "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+            )
+            log.error(
+                "Journey background operation failed timestamp=%s "
+                "operation_id=%s phase=workspace_preparation "
+                "exception_type=%s diagnostic_id=%s\n%s",
+                datetime.fromtimestamp(failed_at, timezone.utc).isoformat(),
+                run_id,
+                type(exc).__name__,
+                correlation_id,
+                traceback_text,
+            )
+            failure = {
+                "error_code": JOURNEY_MATCHING_FAILURE_CODE,
+                "diagnostic_id": diagnostic_id,
+                "phase": "workspace_preparation",
+                "failed_at": failed_at,
+                "message": JOURNEY_MATCHING_FAILURE_MESSAGE,
+                "retry_available": True,
+            }
+            if status_db is not None:
+                try:
+                    failure_metadata = {
+                        **run_metadata,
+                        "finished_at": failed_at,
+                        "error": JOURNEY_MATCHING_FAILURE_MESSAGE,
+                        "error_code": JOURNEY_MATCHING_FAILURE_CODE,
+                        "diagnostic_id": diagnostic_id,
+                        "failure_phase": "workspace_preparation",
+                        "failed_at": failed_at,
+                        "failure": failure,
+                    }
+                    status_db.update_workspace(
+                        workspace,
+                        status="failed",
+                        phase="workspace_preparation",
+                        metadata=failure_metadata,
+                    )
+                    status_db.update_workspace_progress(
+                        workspace,
+                        status="failed",
+                        phase="workspace_preparation",
+                        message="Matching could not start.",
+                        error=JOURNEY_MATCHING_FAILURE_MESSAGE,
+                        metadata=failure_metadata,
+                    )
+                except Exception:
+                    log.warning(
+                        "Could not persist local matching startup failure",
+                        exc_info=True,
+                    )
+            operation_lease.release()
+            spotify_job.fail(
+                JOURNEY_MATCHING_FAILURE_MESSAGE,
+                error_code=JOURNEY_MATCHING_FAILURE_CODE,
+                diagnostic_id=diagnostic_id,
+                failure_phase="workspace_preparation",
+            )
+            return {
+                "error": JOURNEY_MATCHING_FAILURE_MESSAGE,
+                "error_code": JOURNEY_MATCHING_FAILURE_CODE,
+                "diagnostic_id": diagnostic_id,
+                "run_id": run_id,
+                "state": "matching_failed",
+            }, 500
         finally:
-            status_db.close()
+            if status_db is not None:
+                status_db.close()
+
+        def record_matching_failure(
+            exc: BaseException,
+            phase: str,
+            failure_db: Database | None,
+        ) -> str:
+            failed_at = time.time()
+            correlation_id = secrets.token_hex(8)
+            diagnostic_id = ""
+            failure = {
+                "error_code": JOURNEY_MATCHING_FAILURE_CODE,
+                "diagnostic_id": "",
+                "phase": phase,
+                "failed_at": failed_at,
+                "message": JOURNEY_MATCHING_FAILURE_MESSAGE,
+                "retry_available": True,
+            }
+            state_summary: dict[str, Any] = {
+                "canonical_tracks": canonical_count,
+                "workspace_id": int(workspace),
+            }
+            if failure_db is not None:
+                try:
+                    row = failure_db.get_workspace(workspace)
+                    if row is not None:
+                        state_summary["workspace"] = {
+                            "status": str(row["status"] or ""),
+                            "phase": str(row["phase"] or ""),
+                            "candidate_revision": int(row["candidate_revision"] or 0),
+                        }
+                    state_summary["song_progress"] = dict(
+                        failure_db.get_discovery_song_progress_summary(workspace)
+                    )
+                    state_summary["candidate_relationships"] = (
+                        failure_db.workspace_exact_candidate_count(workspace)
+                    )
+                    latest = failure_db.get_latest_combined_generation(workspace)
+                    if latest is not None:
+                        state_summary["latest_generation"] = {
+                            "id": int(latest["id"]),
+                            "scan_key": str(latest["scan_key"] or ""),
+                            "status": str(latest["status"] or ""),
+                        }
+                    cache = failure_db._conn.execute(
+                        "SELECT track_count,candidate_revision,result_json "
+                        "FROM matching_scan_cache WHERE workspace_id=?",
+                        (int(workspace),),
+                    ).fetchone()
+                    if cache is not None:
+                        result_data = _json_object(cache["result_json"], {})
+                        state_summary["matching_scan_cache"] = {
+                            "track_count": int(cache["track_count"] or 0),
+                            "candidate_revision": int(cache["candidate_revision"] or 0),
+                            "expected_candidate_relationships": int(
+                                result_data.get("persisted_candidates", 0) or 0
+                            ) if isinstance(result_data, Mapping) else 0,
+                        }
+                except Exception:
+                    log.warning(
+                        "Could not collect journey matching failure state summary",
+                        exc_info=True,
+                    )
+            environment = {
+                "python_executable": sys.executable,
+                "python_version": platform.python_version(),
+                "platform": platform.platform(),
+                "process_id": os.getpid(),
+                "database_path": str(config.database_path),
+                "catalog_path": str(config.catalog_path),
+                "state_path": str(config.state_path),
+                "journey_schema_version": JOURNEY_SCHEMA_VERSION,
+                "journey_asset_version": JOURNEY_ASSET_VERSION,
+            }
+            try:
+                write_journey_failure(
+                    config.state_path,
+                    correlation_id,
+                    operation="matching",
+                    error_code=JOURNEY_MATCHING_FAILURE_CODE,
+                    run_id=run_id,
+                    workspace_id=int(workspace),
+                    phase=phase,
+                    failed_at=failed_at,
+                    error=exc,
+                    state_summary=state_summary,
+                    environment=environment,
+                )
+                diagnostic_id = correlation_id
+                failure["diagnostic_id"] = diagnostic_id
+            except Exception:
+                log.warning(
+                    "Could not write journey matching diagnostic %s",
+                    correlation_id,
+                    exc_info=True,
+                )
+            traceback_text = redact_diagnostic_text(
+                "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+            )
+            log.error(
+                "Journey background operation failed timestamp=%s "
+                "operation_id=%s phase=%s exception_type=%s diagnostic_id=%s\n%s",
+                datetime.fromtimestamp(failed_at, timezone.utc).isoformat(),
+                run_id,
+                phase,
+                type(exc).__name__,
+                correlation_id,
+                traceback_text,
+            )
+            with spotify_job.lock:
+                spotify_job.phase = phase
+
+            owns_db = failure_db is None
+            persisted_db = failure_db
+            try:
+                if persisted_db is None:
+                    persisted_db = Database(config.database_path)
+                current_workspace = persisted_db.get_workspace(workspace)
+                current_metadata = _json_object(
+                    current_workspace["metadata_json"], {}
+                ) if current_workspace is not None else {}
+                if (
+                    not isinstance(current_metadata, Mapping)
+                    or str(current_metadata.get("run_id") or "") != run_id
+                ):
+                    log.warning(
+                        "Skipped stale matching failure persistence for run %s",
+                        run_id,
+                    )
+                    return diagnostic_id
+                failure_metadata = {
+                    **run_metadata,
+                    "finished_at": failed_at,
+                    "error": JOURNEY_MATCHING_FAILURE_MESSAGE,
+                    "error_code": JOURNEY_MATCHING_FAILURE_CODE,
+                    "diagnostic_id": diagnostic_id,
+                    "failure_phase": phase,
+                    "failed_at": failed_at,
+                    "failure": failure,
+                }
+                persisted_db.update_workspace(
+                    workspace,
+                    status="failed",
+                    phase=phase,
+                    metadata=failure_metadata,
+                )
+                latest_generation = persisted_db.get_latest_combined_generation(workspace)
+                if latest_generation is not None and str(
+                    latest_generation["status"] or ""
+                ).casefold() in {"running", "pending"}:
+                    generation_metadata = _json_object(
+                        latest_generation["metadata_json"], {}
+                    )
+                    if not isinstance(generation_metadata, dict):
+                        generation_metadata = {}
+                    if str(generation_metadata.get("run_id") or "") == run_id:
+                        generation_metadata["failure"] = failure
+                        persisted_db.create_discovery_scan(
+                            workspace,
+                            scan_key=str(latest_generation["scan_key"]),
+                            kind="exact",
+                            status="failed",
+                            metadata=generation_metadata,
+                        )
+                        for task in persisted_db.get_discovery_tasks(workspace):
+                            if (
+                                task["scan_id"] == latest_generation["id"]
+                                and str(task["status"] or "").casefold()
+                                in {"running", "pending"}
+                            ):
+                                persisted_db.update_discovery_task(
+                                    int(task["id"]),
+                                    status="failed",
+                                    error=JOURNEY_MATCHING_FAILURE_MESSAGE,
+                                    metadata_json={"failure": failure},
+                                )
+                persisted_db.update_workspace_progress(
+                    workspace,
+                    status="failed",
+                    phase=phase,
+                    message="Matching stopped before it finished.",
+                    error=JOURNEY_MATCHING_FAILURE_MESSAGE,
+                    metadata=failure_metadata,
+                )
+            except Exception:
+                log.warning("Could not persist local matching failure", exc_info=True)
+            finally:
+                if owns_db and persisted_db is not None:
+                    persisted_db.close()
+            return diagnostic_id
 
         def worker() -> None:
-            db = Database(config.database_path)
+            db = None
             diagnostics = None
+            failure_phase = "workspace_preparation"
+            failed_diagnostic_id = ""
+            worker_failed = False
+            completed_result: Any = None
+
+            def set_failure_phase(value: str) -> None:
+                nonlocal failure_phase
+                failure_phase = str(value or "matching")
+
             try:
+                spotify_job.wait_for_start_acknowledgement(run_id, timeout=30.0)
+                db = Database(config.database_path)
                 from csv_to_clonehero.combined_pipeline import discover_combined
                 from csv_to_clonehero.providers.base import LibrarySnapshot, ProviderTrack
                 from csv_to_clonehero.combined_pipeline import completed_scan_fast_path
+                set_failure_phase("workspace_preparation")
                 library_fingerprint = db.get_library_matching_fingerprint(workspace)
                 if not library_fingerprint:
                     library_fingerprint = db.refresh_library_matching_fingerprint(workspace)
                 cache_miss_diagnostic: dict[str, str] = {}
+                set_failure_phase("completed_scan_validation")
                 fast_result = completed_scan_fast_path(config, db, workspace, library_fingerprint, on_progress=spotify_job.progress_update, miss_diagnostic=cache_miss_diagnostic)
                 if fast_result is not None:
                     finished_at = time.time()
@@ -3999,8 +4458,13 @@ def create_app(
                         metadata=result_metadata,
                     )
                     db.update_workspace_progress(workspace, status="complete", phase="complete", message=f"Reusing {fast_result.tracks:,} existing matches.", error="", total_tracks=fast_result.tracks, completed_tracks=fast_result.tracks, metadata={**result_metadata, "cached_tracks": fast_result.tracks, "recomputed_tracks": 0, "fast_path": True, "fast_path_timings": fast_result.fast_path_timings, "funnel": fast_result.funnel})
-                    spotify_job.finish(fast_result)
+                    completed_result = fast_result
                     return
+                if warm_only:
+                    raise RuntimeError(
+                        "saved matching state did not pass completed fast-path validation"
+                    )
+                set_failure_phase("source_library_loading")
                 grouped: dict[str, list[ProviderTrack]] = {}
                 for row in db.get_track_provenance(workspace):
                     provider = str(row["provider"])
@@ -4034,7 +4498,19 @@ def create_app(
                     diagnostics.update("source_setup", workspace_id=workspace, workspace_key=workspace_key)
                 except OSError:
                     diagnostics = None
-                result = discover_combined(config, db, [LibrarySnapshot(name, tracks) for name, tracks in grouped.items()], workspace_key=workspace_key, workspace_name="Local combined library", expansion_artists=(), diagnostics=diagnostics, on_progress=on_progress)
+                result = discover_combined(
+                    config,
+                    db,
+                    [LibrarySnapshot(name, tracks) for name, tracks in grouped.items()],
+                    workspace_key=workspace_key,
+                    workspace_name="Local combined library",
+                    expansion_artists=(),
+                    diagnostics=diagnostics,
+                    on_progress=on_progress,
+                    on_stage=set_failure_phase,
+                    operation_id=run_id,
+                )
+                set_failure_phase("generation_finalization")
                 finished_at = time.time()
                 result_metadata = {
                     **run_metadata,
@@ -4054,89 +4530,109 @@ def create_app(
                     error=result.error,
                     metadata={**result_metadata, "cached_tracks": result.cached_tracks, "recomputed_tracks": result.recomputed_tracks, "retrieval_seconds": round(result.retrieval_seconds, 3), "scoring_seconds": round(result.scoring_seconds, 3), "persistence_seconds": round(result.persistence_seconds, 3), "discovery_seconds": round(result.discovery_seconds, 3), "funnel": result.funnel},
                 )
-                spotify_job.finish(result)
-                if diagnostics:
-                    diagnostics.update("selection", counters={"selected_charts": 0})
-                    diagnostics.update("export", counters={"export_attempts": 0, "exported_charts": 0})
-                    diagnostics.finish(
-                        result.status,
-                        workspace_id=workspace,
-                        workspace_key=workspace_key,
-                        counters={
-                            "exact_hits": result.exact_hits,
-                            "exact_misses": result.exact_misses,
-                            "artist_found_title_different": result.artist_found_title_different,
-                            "title_found_artist_different": result.title_found_artist_different,
-                            "broader_retrieval_tracks": result.broader_retrieval_tracks,
-                            "zero_candidate_tracks": result.zero_candidate_tracks,
-                            "tracks_with_candidates": result.tracks_with_candidates,
-                            "candidate_charts_evaluated": result.candidate_charts_evaluated,
-                            "unique_charts_evaluated": result.unique_charts_evaluated,
-                            "strong_match_tracks": result.strong_match_tracks,
-                            "review_match_tracks": result.review_match_tracks,
-                            "hard_rejected_only_tracks": result.hard_rejected_only_tracks,
-                            "soft_rejected_only_tracks": result.soft_rejected_only_tracks,
-                            "no_plausible_tracks": result.no_plausible_tracks,
-                            "candidate_charts_created": result.persisted_candidates,
-                            "eligible_candidates": result.eligible_candidates,
-                            "rejected_candidates": result.rejected_candidates,
-                            "retrieval_seconds": round(result.retrieval_seconds, 3),
-                            "scoring_seconds": round(result.scoring_seconds, 3),
-                            "discovery_seconds": round(result.discovery_seconds, 3),
-                        },
-                    )
-            except Exception as exc:  # noqa: BLE001
-                message = _safe_message(exc)
-                spotify_job.fail(message)
-                try:
-                    db.update_workspace(
-                        workspace,
-                        status="failed",
-                        phase="catalog_match",
-                        message="Matching stopped before it finished.",
-                        error=message,
-                        metadata={**run_metadata, "error": message, "finished_at": time.time()},
-                    )
-                    latest_generation = db.get_latest_combined_generation(workspace)
-                    if latest_generation is not None and str(latest_generation["status"] or "").casefold() in {"running", "pending"}:
-                        generation_metadata = _json_object(latest_generation["metadata_json"], {})
-                        if not isinstance(generation_metadata, dict):
-                            generation_metadata = {}
-                        generation_metadata["error"] = message
-                        db.create_discovery_scan(
-                            workspace,
-                            scan_key=str(latest_generation["scan_key"]),
-                            kind="exact",
-                            status="failed",
-                            metadata=generation_metadata,
-                        )
-                    db.update_workspace_progress(
-                        workspace,
-                        status="failed",
-                        phase="catalog_match",
-                        message="Matching stopped before it finished.",
-                        error=message,
-                        metadata={**run_metadata, "error": message, "finished_at": time.time()},
-                    )
-                except Exception:
-                    log.warning("Could not persist local matching failure", exc_info=True)
+                completed_result = result
                 if diagnostics:
                     try:
-                        diagnostics.finish("failed", error=message)
-                    except OSError:
+                        diagnostics.update("selection", counters={"selected_charts": 0})
+                        diagnostics.update("export", counters={"export_attempts": 0, "exported_charts": 0})
+                        diagnostics.finish(
+                            result.status,
+                            workspace_id=workspace,
+                            workspace_key=workspace_key,
+                            counters={
+                                "exact_hits": result.exact_hits,
+                                "exact_misses": result.exact_misses,
+                                "artist_found_title_different": result.artist_found_title_different,
+                                "title_found_artist_different": result.title_found_artist_different,
+                                "broader_retrieval_tracks": result.broader_retrieval_tracks,
+                                "zero_candidate_tracks": result.zero_candidate_tracks,
+                                "tracks_with_candidates": result.tracks_with_candidates,
+                                "candidate_charts_evaluated": result.candidate_charts_evaluated,
+                                "unique_charts_evaluated": result.unique_charts_evaluated,
+                                "strong_match_tracks": result.strong_match_tracks,
+                                "review_match_tracks": result.review_match_tracks,
+                                "hard_rejected_only_tracks": result.hard_rejected_only_tracks,
+                                "soft_rejected_only_tracks": result.soft_rejected_only_tracks,
+                                "no_plausible_tracks": result.no_plausible_tracks,
+                                "candidate_charts_created": result.persisted_candidates,
+                                "eligible_candidates": result.eligible_candidates,
+                                "rejected_candidates": result.rejected_candidates,
+                                "retrieval_seconds": round(result.retrieval_seconds, 3),
+                                "scoring_seconds": round(result.scoring_seconds, 3),
+                                "discovery_seconds": round(result.discovery_seconds, 3),
+                            },
+                        )
+                    except Exception:
+                        log.warning(
+                            "Could not persist completed local matching diagnostics",
+                            exc_info=True,
+                        )
+            except Exception as exc:  # noqa: BLE001
+                worker_failed = True
+                failed_diagnostic_id = record_matching_failure(
+                    exc, failure_phase, db
+                )
+                if diagnostics:
+                    try:
+                        diagnostics.finish(
+                            "failed",
+                            error=JOURNEY_MATCHING_FAILURE_MESSAGE,
+                            error_code=JOURNEY_MATCHING_FAILURE_CODE,
+                            diagnostic_id=failed_diagnostic_id,
+                            failure_phase=failure_phase,
+                        )
+                    except Exception:
                         log.warning("Could not persist local matching diagnostics", exc_info=True)
             finally:
-                try:
-                    db.recover_discovery_run(workspace, run_id)
-                except Exception:
-                    log.warning("Could not recover local matching run state", exc_info=True)
+                if db is not None:
+                    try:
+                        db.recover_discovery_run(workspace, run_id)
+                    except Exception:
+                        log.warning("Could not recover local matching run state", exc_info=True)
+                if db is not None:
+                    db.close()
+                operation_lease.release()
+                if worker_failed:
+                    spotify_job.fail(
+                        JOURNEY_MATCHING_FAILURE_MESSAGE,
+                        error_code=JOURNEY_MATCHING_FAILURE_CODE,
+                        diagnostic_id=failed_diagnostic_id,
+                        failure_phase=failure_phase,
+                    )
+                elif completed_result is not None:
+                    spotify_job.finish(completed_result)
                 spotify_job.cleanup(run_id, threading.current_thread())
-                db.close()
 
         thread = threading.Thread(target=worker, daemon=True)
         spotify_job.attach_worker(run_id, thread)
-        thread.start()
-        return {"started": "catalog", "workspace_id": workspace, "workspace_key": workspace_key, "run_id": run_id}, 202
+        try:
+            thread.start()
+        except Exception as exc:
+            diagnostic_id = record_matching_failure(exc, "thread_start", None)
+            operation_lease.release()
+            spotify_job.fail(
+                JOURNEY_MATCHING_FAILURE_MESSAGE,
+                error_code=JOURNEY_MATCHING_FAILURE_CODE,
+                diagnostic_id=diagnostic_id,
+                failure_phase="thread_start",
+            )
+            spotify_job.cleanup(run_id, thread)
+            return {
+                "error": JOURNEY_MATCHING_FAILURE_MESSAGE,
+                "error_code": JOURNEY_MATCHING_FAILURE_CODE,
+                "diagnostic_id": diagnostic_id,
+                "run_id": run_id,
+                "state": "matching_failed",
+            }, 500
+        return {
+            "started": True,
+            "run_id": run_id,
+            "workspace_id": workspace,
+            "workspace_key": workspace_key,
+            "state": "matching_restoring",
+            "started_at": started_at,
+            "generation": generation_key,
+        }, 202
 
     @app.post("/api/spotify/scan")
     @app.post("/api/discovery/start")
@@ -7645,9 +8141,18 @@ def create_app(
             "no_candidate": progress["no_catalog_candidate"],
         }
 
-    def _journey_payload(db: Database, workspace: int | str) -> dict[str, Any]:
+    def _journey_payload(
+        db: Database,
+        workspace: int | str,
+        spotify_job_snapshot: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
         """Project all local source facts into one authoritative read model."""
         _recover_stale_spotify_job()
+        spotify_job_state = (
+            dict(spotify_job_snapshot)
+            if spotify_job_snapshot is not None
+            else spotify_job.snapshot()
+        )
         source_rows = {
             str(row["provider"]).casefold(): dict(row)
             for row in db.get_source_summary(workspace)
@@ -7656,7 +8161,6 @@ def create_app(
         spotify = source_rows.get("spotify", {})
         soundcloud = source_rows.get("soundcloud", {})
         spotify_connected = _is_authenticated()
-        spotify_job_state = spotify_job.snapshot()
         soundcloud_job_state = soundcloud_import_job.snapshot()
         progress = db.get_workspace_progress(workspace)
         progress_data = dict(progress) if progress is not None else {}
@@ -7693,6 +8197,37 @@ def create_app(
         workspace_metadata = _json_object(workspace_row["metadata_json"], {}) if workspace_row is not None else {}
         if not isinstance(workspace_metadata, Mapping):
             workspace_metadata = {}
+        memory_run_id = str(
+            spotify_job_state.get("run_id")
+            if str(spotify_job_state.get("scan_key") or "") == "catalog"
+            else ""
+        )
+        durable_run_id = str(
+            progress_metadata.get("run_id")
+            or workspace_metadata.get("run_id")
+            or ""
+        )
+        failure_from_memory = False
+        failure_data = progress_metadata.get("failure")
+        if not isinstance(failure_data, Mapping):
+            failure_data = workspace_metadata.get("failure")
+        if not isinstance(failure_data, Mapping):
+            failure_data = {}
+        if (
+            str(spotify_job_state.get("status") or "") in {"failed", "error"}
+            and str(spotify_job_state.get("scan_key") or "") == "catalog"
+        ):
+            failure_from_memory = True
+            failure_data = {
+                "error_code": spotify_job_state.get("error_code"),
+                "diagnostic_id": spotify_job_state.get("diagnostic_id"),
+                "phase": spotify_job_state.get("failure_phase"),
+            }
+        failure_run_id = str(
+            progress_metadata.get("run_id")
+            or workspace_metadata.get("run_id")
+            or ""
+        )
         matching_statuses = {
             "running", "pending", "complete", "completed", "failed", "error",
             "interrupted", "partial", "cancelled",
@@ -7806,13 +8341,109 @@ def create_app(
             elapsed = max(0.0, elapsed_end - float(terminal_started or elapsed_end))
             processed = matching_progress["completed"]
             total = matching_progress["total"] or len(records)
+        matching_failed = matching_state == "matching_failed"
+        matching_run_id = ""
+        if matching_state != "music_ready":
+            matching_run_id = (
+                memory_run_id
+                if memory_run_id
+                and str(spotify_job_state.get("status") or "")
+                in {
+                    "running",
+                    "pending",
+                    "complete",
+                    "completed",
+                    "failed",
+                    "error",
+                    "interrupted",
+                    "partial",
+                    "cancelled",
+                }
+                else durable_run_id
+            )
+        if (
+            failure_data
+            and not failure_from_memory
+            and failure_run_id
+            and failure_run_id != matching_run_id
+        ):
+            failure_data = {}
+        retry_available = bool(
+            records
+            and matching_state in {"matching_failed", "matching_interrupted"}
+            and not matching_active
+            and not soundcloud_import_active
+            and not spotify_import_active
+        )
+        error_code = ""
+        diagnostic_id = ""
+        failure_phase = ""
+        if matching_failed:
+            durable_failure_is_current = bool(
+                durable_run_id and durable_run_id == matching_run_id
+            )
+            error_code = str(
+                failure_data.get("error_code")
+                or (
+                    progress_metadata.get("error_code")
+                    if durable_failure_is_current else ""
+                )
+                or (
+                    workspace_metadata.get("error_code")
+                    if durable_failure_is_current else ""
+                )
+                or "MATCHING_RESULT_NOT_AUTHORITATIVE"
+            )
+            diagnostic_id = str(
+                failure_data.get("diagnostic_id")
+                or (
+                    progress_metadata.get("diagnostic_id")
+                    if durable_failure_is_current else ""
+                )
+                or (
+                    workspace_metadata.get("diagnostic_id")
+                    if durable_failure_is_current else ""
+                )
+                or ""
+            )
+            failure_phase = str(
+                failure_data.get("phase")
+                or (
+                    progress_metadata.get("failure_phase")
+                    if durable_failure_is_current else ""
+                )
+                or (
+                    workspace_metadata.get("failure_phase")
+                    if durable_failure_is_current else ""
+                )
+                or "result_validation"
+            )
         matching = {
             "state": matching_state,
-            "run_id": str(
-                "" if matching_state == "music_ready" else (
-                    spotify_job_state.get("run_id") if matching_active
-                    else progress_metadata.get("run_id") or ""
+            "run_id": matching_run_id,
+            "is_active_run": bool(
+                matching_active and matching_run_id == memory_run_id
+            ),
+            "is_newest_run": bool(
+                matching_run_id
+                and (
+                    matching_run_id == durable_run_id
+                    or (matching_active and matching_run_id == memory_run_id)
                 )
+            ),
+            "generation": str(
+                progress_metadata.get("generation")
+                or workspace_metadata.get("generation")
+                or ""
+            ) if matching_state != "music_ready" else "",
+            "candidate_generation": (
+                {
+                    "id": int(latest_generation["id"]),
+                    "key": str(latest_generation["scan_key"] or ""),
+                    "status": str(latest_generation["status"] or ""),
+                    "run_id": str(latest_metadata.get("run_id") or ""),
+                }
+                if latest_generation is not None else None
             ),
             "processed": (
                 0 if matching_state in {"music_ready", "matching_restoring"}
@@ -7831,9 +8462,13 @@ def create_app(
             "authoritative": bool(authority and matching_state == "charts_found"),
             "results": results if authority and matching_state == "charts_found" else None,
             "error": (
-                "We could not finish finding charts. Your music is safe."
+                JOURNEY_MATCHING_FAILURE_MESSAGE
                 if matching_state == "matching_failed" else ""
             ),
+            "error_code": error_code,
+            "diagnostic_id": diagnostic_id,
+            "failure_phase": failure_phase,
+            "retry_available": retry_available,
             "details": {
                 "saved_work_reuse": bool(
                     matching_state == "charts_found"
@@ -7846,6 +8481,10 @@ def create_app(
                     )
                 ),
                 "large_library_expectation": "A first check of a library this size can take tens of minutes.",
+                "failure_next_step": (
+                    "Try Find Charts again. Use the diagnostic ID if the same error returns."
+                    if matching_failed else ""
+                ),
             },
         }
 
@@ -8018,10 +8657,28 @@ def create_app(
     @app.get("/api/journey")
     def journey_read_model():
         """Return one server-authoritative snapshot for the journey UI."""
+        _recover_stale_spotify_job()
+        start_snapshot = spotify_job.snapshot()
         workspace, _ = _get_local_library_workspace()
         db = Database(config.database_path)
         try:
-            return jsonify(_journey_payload(db, workspace))
+            response = jsonify(
+                _journey_payload(
+                    db,
+                    workspace,
+                    spotify_job_snapshot=start_snapshot,
+                )
+            )
+            if (
+                start_snapshot.get("running")
+                and str(start_snapshot.get("scan_key") or "") == "catalog"
+                and str(start_snapshot.get("phase") or "")
+                in {"starting", "restoring"}
+            ):
+                spotify_job.acknowledge_start(
+                    str(start_snapshot.get("run_id") or "")
+                )
+            return response
         finally:
             db.close()
 

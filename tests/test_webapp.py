@@ -168,42 +168,44 @@ def test_index_serves_source_neutral_workflow(client):
     assert response.status_code == 200
     html = response.get_data(as_text=True)
     for text in (
-        "Music to Clone Hero and YARG",
-        "SoundCloud export",
-        "Import SoundCloud export",
-        "Connect Spotify",
-        "Find chart matches",
-        "Review and export",
-        "Review matches",
+        "Riff",
+        "music to Clone Hero",
+        "journey.css",
+        "journey.js",
+        "Restoring your library...",
+        'data-app-surface="journey"',
     ):
         assert text in html
     assert "source_key" not in html
     assert "provenance" not in html
-    assert "Open advanced review and download" not in html
+    assert "/advanced" not in html
+    assert "WHAT'S HAPPENING" not in html
     ids = re.findall(r'id="([^\"]+)"', html)
     assert len(ids) == len(set(ids))
 
 
 def test_local_home_exposes_spotify_sync_scope_and_import_controls(client):
     html = client.get("/").get_data(as_text=True)
-    for text in ("Sync Spotify", "spotifySync", "spotifyLiked", "spotifyPlaylists", "Add selected to Your Music"):
-        assert text in html
+    assert "Sync Spotify" not in html
+    assert "spotifyScope" not in html
+    assert "/api/spotify/inventory" not in html
     assert client.post("/api/spotify/import", json={}).status_code == 401
 
 
 def test_matching_loading_state_has_accessible_immediate_feedback(client):
     html = client.get("/").get_data(as_text=True)
-    assert 'id="matchingLoading"' in html
-    assert "CHECKING YOUR LIBRARY" in html
-    assert "prefers-reduced-motion" in html
+    assert 'data-test="journey-loading"' in html
+    assert "Restoring your library..." in html
+    assert "globalOperation" not in html
+    assert "READY TO FIND CHARTS" not in html
 
 
 def test_local_home_exposes_provenance_filters_and_activity_shell(client):
     html = client.get("/").get_data(as_text=True)
-    for text in ("YOUR MUSIC", "SoundCloud", "Spotify", "In both", "Duplicates merged", "WHAT'S HAPPENING", "READY TO FIND CHARTS", "View all song activity"):
-        assert text in html
-    for source in ("all", "soundcloud", "spotify", "both"):
-        assert f'data-source-filter="{source}"' in html
+    assert "WHAT'S HAPPENING" not in html
+    assert "View all song activity" not in html
+    assert "data-source-filter" not in html
+    assert "Preview chart matches" not in html
 
     payload = client.get("/api/sources").get_json()["journey"]
     assert payload["sources"]["soundcloud"]["state"] == "not_imported"
@@ -267,15 +269,13 @@ def test_current_matching_generation_is_the_candidate_boundary(client, config, t
     assert client.post("/api/spotify/export/start", json={"workspace_id": workspace, "kind": "folder", "path": str(tmp_path / "songs")}).status_code == 400
 
 
-def test_home_inline_script_parses_in_javascript_engine(client, tmp_path):
+def test_journey_static_script_parses_in_javascript_engine(client, tmp_path):
     if shutil.which("node") is None:
         pytest.skip("Node.js is not installed")
 
-    html = client.get("/").get_data(as_text=True)
-    scripts = re.findall(r"<script>\s*(.*?)\s*</script>", html, flags=re.DOTALL)
-    assert len(scripts) == 1
+    script = client.get("/static/journey.js").get_data(as_text=True)
     script_path = tmp_path / "home.js"
-    script_path.write_text(scripts[0], encoding="utf-8")
+    script_path.write_text(script, encoding="utf-8")
     checked = subprocess.run(
         ["node", "--check", str(script_path)],
         capture_output=True,
@@ -283,28 +283,17 @@ def test_home_inline_script_parses_in_javascript_engine(client, tmp_path):
         check=False,
     )
     assert checked.returncode == 0, checked.stderr
-    assert "/api/sources/soundcloud/import" in scripts[0]
-    assert "/api/sources/soundcloud/import/status" in scripts[0]
-    assert "/api/discovery/start" in scripts[0]
+    assert "/api/sources/soundcloud/import" in script
+    assert "/api/discovery/start" in script
+    assert "/api/journey" in script
+    assert "/api/spotify/status" not in script
 
 
-def test_advanced_inline_script_parses_in_javascript_engine(client, tmp_path):
-    if shutil.which("node") is None:
-        pytest.skip("Node.js is not installed")
-
-    html = client.get("/advanced").get_data(as_text=True)
-    scripts = re.findall(r"<script>\s*(.*?)\s*</script>", html, flags=re.DOTALL)
-    assert len(scripts) == 1
-    script_path = tmp_path / "advanced.js"
-    script_path.write_text(scripts[0], encoding="utf-8")
-    checked = subprocess.run(
-        ["node", "--check", str(script_path)],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert checked.returncode == 0, checked.stderr
-    assert "exported successfully" in scripts[0]
+def test_advanced_page_is_only_a_compatibility_redirect(client):
+    response = client.get("/advanced")
+    assert response.status_code == 302
+    assert response.headers["Location"] == "/"
+    assert "Review and export charts" not in response.get_data(as_text=True)
 
 
 def test_local_journey_summary_and_review_rehydrate_after_fresh_app(client, config):
@@ -328,7 +317,7 @@ def test_local_journey_summary_and_review_rehydrate_after_fresh_app(client, conf
             "no_suitable_songs": 1,
             "selected_charts": 0,
         }
-        assert journey["review_url"].startswith("/advanced?workspace_id=")
+        assert journey["review_url"] == "/"
 
         status = fresh.get(
             f"/api/discovery/status?workspace_id={initial['workspace_id']}"
@@ -366,25 +355,19 @@ def test_local_journey_summary_and_review_rehydrate_after_fresh_app(client, conf
         assert after["journey"]["counts"]["selected_charts"] == 1
 
     home = client.get("/").get_data(as_text=True)
-    assert "Review matches" in home
+    assert "Review matches" not in home
+    assert "/advanced" not in home
     assert "source_key" not in home
     assert "provenance" not in home
 
 
-def test_home_review_handoff_preserves_local_workspace(client, config):
+def test_review_api_preserves_local_workspace_without_page_handoff(client, config):
     initial = client.get("/api/sources").get_json()
     seed_local_workspace(config, initial["workspace_id"])
 
     home = client.get("/").get_data(as_text=True)
-    href = re.search(r'id="reviewLink"[^>]+href="([^"]+)"', home).group(1)
-    assert href == f"/advanced?workspace_id={initial['workspace_id']}"
-
-    advanced = client.get(href)
-    assert advanced.status_code == 200
-    advanced_html = advanced.get_data(as_text=True)
-    assert 'class="source-neutral-mode"' in advanced_html
-    assert "Matching is complete. Review the recommended charts" in advanced_html
-    assert "body.source-neutral-mode #exactDry" in advanced_html
+    assert 'data-app-surface="journey"' in home
+    assert "/advanced" not in home
 
     review = client.get(
         f"/api/review?workspace_id={initial['workspace_id']}&state=eligible&limit=50&offset=0"
@@ -394,8 +377,6 @@ def test_home_review_handoff_preserves_local_workspace(client, config):
     assert review["journey"]["matching_complete"] is True
     assert review["tracks"]
 
-    scripts = re.findall(r"<script>\s*(.*?)\s*</script>", advanced_html, flags=re.DOTALL)
-    assert "params.set('workspace_id', reviewWorkspaceId)" in scripts[0]
 
 
 def test_bulk_selection_defaults_to_strong_and_explicit_eligible_scope(client, config):
@@ -623,7 +604,9 @@ def test_local_export_reports_one_human_readable_success(config):
             assert items and items[0]["status"] == "published"
         finally:
             db.close()
-        assert "exported successfully" in http.get("/advanced").get_data(as_text=True)
+        advanced = http.get("/advanced")
+        assert advanced.status_code == 302
+        assert advanced.headers["Location"] == "/"
 
 
 def test_local_journey_distinguishes_catalog_failure_and_incomplete_matching(client, config):
@@ -1418,7 +1401,8 @@ def test_public_mode_uses_browser_downloads_on_remote_device(config):
     with app.test_client() as http:
         page = http.get("/?access_token=public-secret", environ_base=remote)
         assert page.status_code == 200
-        assert "const publicMode = true" in page.get_data(as_text=True)
+        assert 'data-app-surface="journey"' in page.get_data(as_text=True)
+        assert "/advanced" not in page.get_data(as_text=True)
         assert http.post(
             "/api/spotify/path/pick",
             headers={"X-CSV-To-CloneHero-Access-Token": "public-secret"},
@@ -1550,30 +1534,11 @@ def test_app_startup_removes_legacy_demo_workspace(config):
         db.close()
 
 
-def test_advanced_page_serves_music_file_import_workflow(client):
+def test_advanced_page_is_retired(client):
     response = client.get("/advanced")
-    assert response.status_code == 200
-    html = response.get_data(as_text=True)
-    for text in (
-        "Review and export charts",
-        "Add music exports",
-        "Preview chart matches",
-        "Review your matches",
-        "My music",
-        "Best chart",
-        "Why this match?",
-        "Download selected charts",
-        "iTunes/Music TXT",
-        "iTunes/Music XML",
-    ):
-        assert text in html
-    assert 'id="picker" accept=".csv,.txt,.xml"' in html
-    assert 'id="review"' in html
-    assert 'id="jobStatus"' in html
-    assert 'href="/"' in html
-    assert 'id="legacyImportSources"' in html
-    assert 'id="localJourney"' in html
-    assert "Spotify library workflow" not in html
+    assert response.status_code == 302
+    assert response.headers["Location"] == "/"
+    assert "Review and export charts" not in response.get_data(as_text=True)
 
 
 def test_upload_list_delete_csv(client, config):
@@ -1939,8 +1904,10 @@ def test_build_status_reports_real_counters_and_cross_page_state(client):
         assert export["items"]["failed"] == 1
         assert export["items"]["invalid"] == 1
         assert export["items"]["remaining"] == 1
-        assert "Building library" in client.get("/advanced").get_data(as_text=True)
-        assert "globalOperation" in client.get("/").get_data(as_text=True)
+        advanced = client.get("/advanced")
+        assert advanced.status_code == 302
+        assert advanced.headers["Location"] == "/"
+        assert "globalOperation" not in client.get("/").get_data(as_text=True)
     finally:
         with job.lock:
             job.running = False
@@ -1979,7 +1946,9 @@ def test_matching_busy_state_blocks_review_mutation_but_allows_read(client):
         assert response.status_code == 409
         assert "Spotify discovery" in response.get_json()["error"]
         assert client.get("/api/review").status_code == 200
-        assert "Selections cannot be changed while chart matching is running." in client.get("/advanced").get_data(as_text=True)
+        advanced = client.get("/advanced")
+        assert advanced.status_code == 302
+        assert advanced.headers["Location"] == "/"
     finally:
         with matching.lock:
             matching.running = False
@@ -2079,26 +2048,19 @@ def test_open_folder_prefers_actual_completed_export_destination(client, config,
     assert str(actual.resolve()) != str(config.library_root.resolve())
 
 
-def test_advanced_script_wires_real_progress_preview_and_operation_lock(client):
-    html = client.get("/advanced").get_data(as_text=True)
-    assert "done: status.done" in html
-    assert "total: status.total" in html
-    assert "Selections cannot be changed while your library is building." in html
-    assert "Calculating build preview" in html
-    assert "Build ${selected.toLocaleString()} selected charts" in html
-    assert "LIBRARY READY — WITH ISSUES" in html
+def test_primary_root_does_not_serve_the_retired_build_surface(client):
+    html = client.get("/").get_data(as_text=True)
+    assert "journey.js?v=2.5.1" in html
+    assert "done: status.done" not in html
+    assert "Calculating build preview" not in html
+    assert "LIBRARY READY" not in html
+    assert client.get("/advanced").status_code == 302
 
 
-def test_advanced_preview_uses_generation_not_just_selection_count(client):
-    html = client.get("/advanced").get_data(as_text=True)
-    assert "let previewGeneration = 0" in html
-    assert "function invalidateBuildPreview()" in html
-    assert "previewGeneration += 1" in html
-    assert "const generation = previewGeneration" in html
-    assert "generation !== previewGeneration" in html
-    # Every persisted review selection mutation invalidates the prior preview.
-    assert html.count("invalidateBuildPreview();") >= 3
-    assert "if (!preview || Number(preview.selected_chart_count) !== count)" in html
+def test_retired_page_does_not_expose_build_preview_script(client):
+    response = client.get("/advanced")
+    assert response.status_code == 302
+    assert "previewGeneration" not in response.get_data(as_text=True)
 
 
 def test_newer_import_operation_outweighs_historical_export(client):
@@ -2168,14 +2130,14 @@ def test_real_home_path_does_not_reuse_old_progress_after_import(client, config)
     assert journey["counts"]["no_suitable_songs"] == 0
 
 
-def test_build_confirmation_uses_full_current_preview_and_import_copy(client):
-    advanced = client.get("/advanced").get_data(as_text=True)
+def test_build_endpoints_remain_backend_compatible_after_page_cutover(client):
+    advanced = client.get("/advanced")
     home = client.get("/").get_data(as_text=True)
-    assert "Estimated download: ${estimated}" in advanced
-    assert "are unavailable and will not be added" in advanced
-    assert "preview.destination" in advanced
-    assert "Selections cannot be changed while your music is importing." in advanced
-    assert "operation.busy?'Status is being prepared...':''" in home
+    assert advanced.status_code == 302
+    assert advanced.headers["Location"] == "/"
+    assert "Estimated download" not in home
+    assert "preview.destination" not in home
+    assert client.post("/api/spotify/export/preview", json={}).status_code in {400, 404}
 
 
 def test_retry_reuses_completed_chart_and_retries_only_incomplete(config):
@@ -2296,9 +2258,9 @@ def test_open_folder_rejects_arbitrary_path_and_accepts_validated_destination(cl
 
 
 def test_build_ui_has_reduced_motion_and_no_fake_export_eta(client):
-    html = client.get("/advanced").get_data(as_text=True)
-    assert "prefers-reduced-motion" in client.get("/").get_data(as_text=True)
-    assert "estimated download size" in html.lower()
+    html = client.get("/").get_data(as_text=True)
+    assert "prefers-reduced-motion" not in html
+    assert "estimated download size" not in html.lower()
     assert "No fake ETA" not in html
     assert "eta_seconds" not in html
 

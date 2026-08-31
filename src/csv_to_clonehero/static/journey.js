@@ -191,10 +191,14 @@
   function matchingDetails(matching) {
     const expectation = matching.details && matching.details.large_library_expectation;
     const reuse = matching.details && matching.details.saved_work_reuse;
+    const errorCode = matching.error_code;
+    const diagnosticId = matching.diagnostic_id;
+    const nextStep = matching.details && matching.details.failure_next_step;
+    const failure = errorCode ? '<p class="failure-reference"><strong>Error code:</strong> ' + escapeHtml(errorCode) + (diagnosticId ? '<br><strong>Diagnostic ID:</strong> ' + escapeHtml(diagnosticId) : '') + (nextStep ? '<br>' + escapeHtml(nextStep) : '') + '</p>' : '';
     return '<details class="details"><summary>Details</summary><p>' +
       (reuse ? "Saved chart work was reused without checking every song again. " : "") +
       "Results are shown only when the current check is complete. " + escapeHtml(expectation || "") +
-      '</p></details>';
+      '</p>' + failure + '</details>';
   }
 
   function matchingVisual(snapshot) {
@@ -215,7 +219,7 @@
     } else if (state === "matching_interrupted") {
       copy = '<p class="overline">Find charts</p><h1>Matching stopped before it finished</h1><p class="matching-count"><strong>' + number(processed) + '</strong> of ' + number(total) + ' songs checked</p><p class="lead-copy">Your completed saved work can be reused when you try again.</p><button class="button primary" data-test="retry-matching" data-action="retry-matching">Try Find Charts again ' + icons.arrow + '</button>' + matchingDetails(matching);
     } else {
-      copy = '<p class="overline">Find charts</p><h1>We couldn’t finish finding charts</h1><p class="lead-copy">Your music is safe.</p><button class="button primary" data-test="retry-matching" data-action="retry-matching">Try Find Charts again ' + icons.arrow + '</button>' + matchingDetails(matching);
+      copy = '<p class="overline">Find charts</p><h1>We couldn’t finish finding charts</h1><p class="lead-copy">Your music is safe.</p><button class="button primary" data-test="retry-matching" data-action="retry-matching"' + (matching.retry_available ? '' : ' disabled aria-disabled="true"') + '>Try Find Charts again ' + icons.arrow + '</button>' + matchingDetails(matching);
     }
     return shell('<section class="matching-stage stage-section" data-test="' + escapeHtml(state) + '"><div class="matching-visual"><div class="matching-glow"></div>' + ring + '<div class="matching-record" aria-hidden="true"></div></div><div class="matching-copy">' + copy + '</div></section>', "Find charts");
   }

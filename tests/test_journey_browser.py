@@ -214,7 +214,7 @@ def matching_start_page(config, monkeypatch):
         workspace = client.get("/api/journey").get_json()["workspace_id"]
         db = Database(config.database_path)
         try:
-            db.upsert_library_snapshot(LibrarySnapshot("soundcloud", [_track("soundcloud", "one", "Artist", "Song")]))
+            db.upsert_library_snapshot(workspace, LibrarySnapshot("soundcloud", [_track("soundcloud", "one", "Artist", "Song")]))
         finally:
             db.close()
     entered = threading.Event()

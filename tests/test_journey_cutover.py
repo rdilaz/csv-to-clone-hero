@@ -107,8 +107,8 @@ def test_root_is_the_only_normal_journey_page(cutover_app):
     assert 'data-app-surface="journey"' in html
     assert 'data-test="journey-loading"' in html
     assert "Restoring your library..." in html
-    assert "journey.css?v=2.5.0" in html
-    assert "journey.js?v=2.5.0" in html
+    assert "journey.css?v=2.5.1" in html
+    assert "journey.js?v=2.5.1" in html
     assert "/advanced" not in html
     assert "WHAT'S HAPPENING" not in html
     assert "Preview chart matches" not in html
@@ -153,7 +153,7 @@ def test_journey_api_and_health_identity_are_read_only(cutover_app):
 
 def test_journey_shell_and_assets_cannot_be_immutable(cutover_app):
     client = cutover_app.test_client()
-    for path in ("/", "/api/journey", "/static/journey.css?v=2.5.0", "/static/journey.js?v=2.5.0"):
+    for path in ("/", "/api/journey", "/static/journey.css?v=2.5.1", "/static/journey.js?v=2.5.1"):
         response = client.get(path)
         assert response.status_code == 200
         assert response.headers["Cache-Control"] == "no-store"
@@ -194,7 +194,7 @@ def test_legacy_inline_pages_are_removed_from_local_delivery():
     source = (PRODUCTION_ROOT / "webapp.py").read_text(encoding="utf-8")
     assert "_UNIFIED_PAGE" not in source
     assert "_ADVANCED_PAGE" not in source
-    assert "source_neutral-mode" not in source
+    assert "source-neutral-mode" not in source
 
 
 def test_launcher_starts_real_app_without_normal_reload():
