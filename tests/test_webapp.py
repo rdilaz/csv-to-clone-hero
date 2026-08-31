@@ -255,6 +255,7 @@ def test_current_matching_generation_is_the_candidate_boundary(client, config, t
     bulk = client.post("/api/spotify/select-all", json={"workspace_id": workspace, "scope": "eligible"})
     assert bulk.status_code == 200
     assert bulk.get_json()["selected"] == 1
+    assert [item["chart_id"] for item in bulk.get_json()["items"]] == [301]
 
     db = Database(config.database_path)
     try:
@@ -379,7 +380,7 @@ def test_review_api_preserves_local_workspace_without_page_handoff(client, confi
 
 
 
-def test_bulk_selection_defaults_to_strong_and_explicit_eligible_scope(client, config):
+def test_charts_found_cohort_scopes_replace_and_rehydrate(client, config):
     initial = client.get("/api/sources").get_json()
     seed_local_workspace(config, initial["workspace_id"])
     db = Database(config.database_path)
@@ -416,29 +417,52 @@ def test_bulk_selection_defaults_to_strong_and_explicit_eligible_scope(client, c
     finally:
         db.close()
 
+    workspace = initial["workspace_id"]
+
     strong = client.post(
-        "/api/spotify/select-all",
-        json={"workspace_id": initial["workspace_id"], "scope": "strong"},
+        "/api/discovery/select-all",
+        json={"workspace_id": workspace, "scope": "strong"},
     )
     assert strong.status_code == 200
     assert strong.get_json()["selected"] == 1
     assert strong.get_json()["scope"] == "strong"
+    assert strong.get_json()["selected_count"] == 1
+    assert [item["chart_id"] for item in strong.get_json()["items"]] == [301]
+
+    cleared = client.post(
+        "/api/discovery/select-all",
+        json={"workspace_id": workspace, "action": "clear"},
+    )
+    assert cleared.get_json()["selected_count"] == 0
+    all_recommendations = client.post(
+        "/api/discovery/select-all",
+        json={"workspace_id": workspace, "scope": "eligible"},
+    )
+    assert all_recommendations.status_code == 200
+    assert all_recommendations.get_json()["selected"] == 2
+    assert all_recommendations.get_json()["selected_count"] == 2
+    assert {item["chart_id"] for item in all_recommendations.get_json()["items"]} == {301, 304}
 
     client.post(
-        "/api/spotify/select-all",
-        json={"workspace_id": initial["workspace_id"], "action": "clear"},
+        "/api/discovery/select-all",
+        json={"workspace_id": workspace, "action": "clear"},
     )
-    eligible = client.post(
-        "/api/spotify/select-all",
-        json={
-            "workspace_id": initial["workspace_id"],
-            "scope": "eligible",
-            "search": "Missing Song",
-        },
+    best_again = client.post(
+        "/api/discovery/select-all",
+        json={"workspace_id": workspace, "scope": "strong"},
     )
-    assert eligible.status_code == 200
-    assert eligible.get_json()["selected"] == 1
-    assert eligible.get_json()["items"][0]["chart_id"] == 304
+    assert best_again.status_code == 200
+    assert best_again.get_json()["selected_count"] == 1
+    assert [item["chart_id"] for item in best_again.get_json()["items"]] == [301]
+
+    fresh_app = create_app(config, source_factory=lambda cfg: [FakeSource()])
+    fresh_app.config["TESTING"] = True
+    with fresh_app.test_client() as fresh:
+        persisted = fresh.get(
+            f"/api/discovery/selections?workspace_id={workspace}"
+        ).get_json()
+        assert persisted["selected_count"] == 1
+        assert [item["chart_id"] for item in persisted["items"]] == [301]
 
 
 def test_review_bulk_actions_are_explicit_scoped_and_preserve_manual_alternatives(client, config):

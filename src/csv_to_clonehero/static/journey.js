@@ -16,7 +16,10 @@
     controller: null,
     opener: null,
     formatOpen: false,
-    spotifyScope: null
+    spotifyScope: null,
+    selections: null,
+    selectionError: "",
+    cohortPreference: ""
   };
 
   const icons = {
@@ -224,14 +227,48 @@
     return shell('<section class="matching-stage stage-section" data-test="' + escapeHtml(state) + '"><div class="matching-visual"><div class="matching-glow"></div>' + ring + '<div class="matching-record" aria-hidden="true"></div></div><div class="matching-copy">' + copy + '</div></section>', "Find charts");
   }
 
-  function cohortCard(count, title, description) {
-    return '<article class="cohort-card"><div class="cohort-card-head"><div class="cohort-index" aria-hidden="true"></div><div><p class="cohort-label">Recommended</p><h2><strong>' + number(count) + '</strong> ' + title + '</h2></div></div><p>' + description + '</p><button class="cohort-action" data-test="cohort-placeholder" data-action="cohort-placeholder" disabled aria-disabled="true">Available in the next step' + icons.arrow + '</button></article>';
+  function exactSelectionState(snapshot) {
+    const result = snapshot.matching.results || {};
+    const items = model.selections && Array.isArray(model.selections.items)
+      ? model.selections.items.filter(function (item) { return String(item.kind || "exact").toLowerCase() === "exact"; })
+      : [];
+    const strong = items.filter(function (item) {
+      return ["RECOMMENDED", "AUTO_ACCEPT"].includes(String(item.eligibility || "").toUpperCase());
+    }).length;
+    const review = items.filter(function (item) {
+      return ["ELIGIBLE_REVIEW", "REVIEW"].includes(String(item.eligibility || "").toUpperCase());
+    }).length;
+    const bestMatches = Number(result.best_matches || 0);
+    const bestAvailable = Number(result.best_available || 0);
+    const recommendations = Number(result.recommendations || 0);
+    const matchesBest = bestMatches > 0 && items.length === bestMatches && strong === bestMatches && review === 0;
+    const matchesAll = recommendations > 0 && items.length === recommendations && strong === bestMatches && review === bestAvailable;
+    let cohort = "";
+    if (matchesBest && matchesAll && ["best", "all"].includes(model.cohortPreference)) cohort = model.cohortPreference;
+    else if (matchesAll && bestAvailable > 0) cohort = "all";
+    else if (matchesBest) cohort = "best";
+    else if (matchesAll) cohort = "all";
+    return { cohort: cohort, count: items.length };
+  }
+
+  function cohortCard(kind, count, title, description, action, selected, pending, enabled) {
+    const disabled = pending || !enabled;
+    const buttonCopy = pending ? "Saving selection..." : selected ? "Selected" : action;
+    return '<article class="cohort-card' + (selected ? " is-selected" : "") + '"><div class="cohort-card-head"><div class="cohort-index" aria-hidden="true">' + (selected ? icons.check : "") + '</div><div><p class="cohort-label">' + (kind === "best" ? "Option A" : "Option B") + '</p><h2><strong>' + number(count) + '</strong> ' + title + '</h2></div>' + (selected ? '<span class="selected-badge">Selected</span>' : '') + '</div><p>' + description + '</p><button class="cohort-action" data-action="select-cohort" data-cohort="' + kind + '" aria-pressed="' + (selected ? "true" : "false") + '"' + (disabled ? ' disabled aria-disabled="true"' : '') + '>' + buttonCopy + (selected ? icons.check : icons.arrow) + '</button></article>';
   }
 
   function chartsFound(snapshot) {
     const result = snapshot.matching.results || {};
+    const selection = exactSelectionState(snapshot);
+    const activeCohort = selection.cohort;
+    const selectionKnown = model.selections !== null;
+    const pending = model.pendingAction === "cohort";
+    const enabled = Boolean(snapshot.matching.authoritative);
+    let status = '<span class="empty-status-mark" aria-hidden="true"></span><span>Nothing selected yet</span>';
+    if (!selectionKnown) status = '<span class="empty-status-mark" aria-hidden="true"></span><span>Selection unavailable</span>';
+    else if (selection.count > 0) status = '<span class="status-check">' + icons.check + '</span><strong>' + number(selection.count) + ' selected</strong>';
     const details = '<details class="details"><summary>Details</summary><p>' + number(result.no_suitable) + ' no suitable, ' + number(result.not_playable) + ' not playable, and ' + number(result.no_candidate) + ' had no candidate.</p></details>';
-    return shell('<section class="found-stage stage-section" data-test="charts-found"><header class="found-head"><div><p class="overline">Charts found</p><h1>We found charts for <span>' + number(result.recommendations) + '</span> of your songs.</h1></div><div class="selection-status"><span class="empty-status-mark" aria-hidden="true"></span><span>Nothing selected yet</span></div></header><div class="cohort-grid">' + cohortCard(result.best_matches, "Best matches", "Most reliable recommendations for artist, title, version, and playability.") + cohortCard(result.best_available, "Best available", "Other playable recommendations that may need a closer look.") + '</div><footer class="found-footer"><div class="found-gaps"><span><strong>' + number(result.no_suitable) + '</strong> no suitable</span><span><strong>' + number(result.not_playable) + '</strong> not playable</span><span><strong>' + number(result.no_candidate) + '</strong> no candidate</span></div>' + details + '</footer></section>', "Confirm charts");
+    return shell('<section class="found-stage stage-section" data-test="charts-found"><header class="found-head"><div><p class="overline">Confirm charts</p><h1>We found charts for <span>' + number(result.recommendations) + '</span> of your songs.</h1></div><div class="selection-status' + (selection.count > 0 ? " has-selection" : "") + '">' + status + '</div></header><div class="cohort-grid">' + cohortCard("best", result.best_matches, "Best matches", "Most reliable. Artist, title, version, and playability all look right.", "Use " + number(result.best_matches) + " best matches", activeCohort === "best", pending, enabled) + cohortCard("all", result.recommendations, "recommendations", "Includes " + number(result.best_available) + " Best available suggestions. Some may be live, remastered, alternate, or otherwise imperfect versions.", "Use all " + number(result.recommendations) + " recommendations", activeCohort === "all", pending, enabled) + '</div>' + (model.selectionError ? '<p class="cohort-error" role="alert">' + escapeHtml(model.selectionError) + '</p>' : '') + '<footer class="found-footer"><div class="found-gaps"><span><strong>' + number(result.no_suitable) + '</strong> no suitable</span><span><strong>' + number(result.not_playable) + '</strong> not playable</span><span><strong>' + number(result.no_candidate) + '</strong> no candidate</span></div>' + details + '</footer></section>', "Confirm charts");
   }
 
   function formatChooser() {
@@ -316,6 +353,15 @@
       const snapshot = await response.json();
       if (!response.ok) throw new Error(snapshot.error || "Your music could not be loaded.");
       if (revision !== model.requestRevision) return;
+      if (snapshot.matching && snapshot.matching.state === "charts_found" && snapshot.matching.authoritative) {
+        model.selections = await api("/api/discovery/selections?workspace_id=" + encodeURIComponent(snapshot.workspace_id), { signal: model.controller.signal });
+        model.cohortPreference = "";
+        if (revision !== model.requestRevision) return;
+      } else {
+        model.selections = null;
+        model.cohortPreference = "";
+      }
+      model.selectionError = "";
       const previous = model.snapshot;
       const wasImporting = previous && previous.operation && previous.operation.state === "importing";
       const wasMatching = previous && previous.matching && ["matching_restoring", "matching_running"].includes(previous.matching.state);
@@ -423,6 +469,51 @@
     } finally { model.pendingAction = ""; }
   }
 
+  async function selectCohort(cohort) {
+    if (model.pendingAction || !model.snapshot || !model.snapshot.matching.authoritative) return;
+    const scope = cohort === "all" ? "eligible" : cohort === "best" ? "strong" : "";
+    if (!scope) return;
+    const workspace = model.snapshot.workspace_id;
+    const endpoint = "/api/discovery/select-all";
+    const headers = { "Content-Type": "application/json" };
+    model.pendingAction = "cohort";
+    model.selectionError = "";
+    render(false);
+    try {
+      model.selections = await api(endpoint, {
+        method: "POST", headers: headers,
+        body: JSON.stringify({ workspace_id: workspace, kind: "exact", action: "clear" })
+      });
+      model.cohortPreference = "";
+      render(false);
+      model.selections = await api(endpoint, {
+        method: "POST", headers: headers,
+        body: JSON.stringify({ workspace_id: workspace, kind: "exact", scope: scope })
+      });
+      model.cohortPreference = cohort;
+      const persisted = exactSelectionState(model.snapshot);
+      if (persisted.cohort === cohort) {
+        announce(number(persisted.count) + " charts selected.");
+      } else {
+        model.selectionError = "Some recommendations could not be selected. Your saved selection is shown. Try again.";
+        announce(model.selectionError);
+      }
+    } catch (error) {
+      model.cohortPreference = "";
+      try {
+        model.selections = await api("/api/discovery/selections?workspace_id=" + encodeURIComponent(workspace));
+        model.selectionError = "We could not update your chart choices. Your saved selection is shown. Try again.";
+      } catch (_refreshError) {
+        model.selections = null;
+        model.selectionError = "We could not update or verify your chart choices. Retry the selection or reload this page.";
+      }
+      announce(model.selectionError);
+    } finally {
+      model.pendingAction = "";
+      render(false);
+    }
+  }
+
   app.addEventListener("click", function (event) {
     const backdrop = event.target.closest(".sheet-backdrop");
     if (backdrop && event.target === backdrop) { model.overlay = null; render(false); return; }
@@ -441,7 +532,7 @@
     else if (action === "reconnect-source") { window.location.assign(apiUrl("/api/auth/spotify/start")); }
     else if (action === "view-imported") { model.overlay = null; render(false); document.getElementById("main-content").focus(); }
     else if (action === "find-charts" || action === "retry-matching") { startMatching(); }
-    else if (action === "cohort-placeholder") { announce("Chart choices will be available in the next step."); }
+    else if (action === "select-cohort") { selectCohort(target.dataset.cohort); }
     else if (action === "retry") { refresh(); }
   });
 

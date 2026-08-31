@@ -182,14 +182,54 @@ def test_browser_matching_running_is_composed_on_mobile(matching_browser_page):
 
 @pytest.mark.parametrize("matching_browser_page", ["charts_found"], indirect=True)
 @pytest.mark.mobile
-def test_browser_charts_found_does_not_preselect_cohorts(matching_browser_page):
+def test_browser_charts_found_selects_and_rehydrates_best_cohort(matching_browser_page):
     page = matching_browser_page
     assert page.locator("[data-test='charts-found']").is_visible()
     assert page.get_by_text("We found charts for 1 of your songs.").is_visible()
     assert page.get_by_role("heading", name="1 Best matches").is_visible()
-    assert page.get_by_role("heading", name="0 Best available").is_visible()
-    assert page.locator("[data-test='cohort-placeholder']").count() == 2
-    assert page.locator("[data-test='cohort-placeholder']:disabled").count() == 2
+    assert page.get_by_role("heading", name="1 recommendations").is_visible()
+    best = page.get_by_role("button", name="Use 1 best matches")
+    all_recommendations = page.get_by_role("button", name="Use all 1 recommendations")
+    assert best.is_enabled()
+    assert all_recommendations.is_enabled()
+    assert page.get_by_text("Nothing selected yet", exact=True).is_visible()
+
+    best.click()
+    page.get_by_text("1 selected", exact=True).wait_for()
+    best_card = page.locator(".cohort-card").filter(has_text="Best matches")
+    assert "is-selected" in (best_card.get_attribute("class") or "").split()
+
+    all_recommendations.click()
+    page.locator(".cohort-card.is-selected").filter(has_text="recommendations").wait_for()
+    page.get_by_role("button", name="Use 1 best matches").click()
+    page.locator(".cohort-card.is-selected").filter(has_text="Best matches").wait_for()
+
+    page.reload(wait_until="domcontentloaded")
+    page.get_by_text("1 selected", exact=True).wait_for()
+    best_card = page.locator(".cohort-card").filter(has_text="Best matches")
+    assert "is-selected" in (best_card.get_attribute("class") or "").split()
+    assert "/advanced" not in page.content()
+
+
+@pytest.mark.parametrize("matching_browser_page", ["charts_found"], indirect=True)
+def test_browser_failed_cohort_mutation_keeps_truthful_state(matching_browser_page):
+    page = matching_browser_page
+    page.route(
+        "**/api/discovery/select-all",
+        lambda route: route.fulfill(
+            status=503,
+            content_type="application/json",
+            body='{"error":"Temporary selection failure"}',
+        ),
+    )
+
+    page.get_by_role("button", name="Use 1 best matches").click()
+    alert = page.get_by_role("alert")
+    alert.wait_for()
+    assert "could not update your chart choices" in alert.inner_text()
+    assert page.get_by_text("Nothing selected yet", exact=True).is_visible()
+    assert page.locator(".cohort-card.is-selected").count() == 0
+    assert page.get_by_role("button", name="Use 1 best matches").is_enabled()
 
 
 @pytest.mark.parametrize("matching_browser_page", ["interrupted"], indirect=True)
