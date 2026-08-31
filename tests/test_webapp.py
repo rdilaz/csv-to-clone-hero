@@ -271,9 +271,19 @@ def test_current_matching_generation_is_the_candidate_boundary(client, config, t
         db._conn.commit()
     finally:
         db.close()
+    before_preview = client.get(
+        f"/api/discovery/selections?workspace_id={workspace}"
+    ).get_json()
     preview = client.post("/api/spotify/export/preview", json={"workspace_id": workspace, "kind": "folder", "path": str(tmp_path / "songs")})
     assert preview.status_code == 200
     assert preview.get_json()["ok"] is False
+    after_preview = client.get(
+        f"/api/discovery/selections?workspace_id={workspace}"
+    ).get_json()
+    assert after_preview["selected_count"] == before_preview["selected_count"]
+    assert [item["candidate_id"] for item in after_preview["items"]] == [
+        item["candidate_id"] for item in before_preview["items"]
+    ]
     assert client.post("/api/spotify/export/start", json={"workspace_id": workspace, "kind": "folder", "path": str(tmp_path / "songs")}).status_code == 400
 
 
@@ -293,8 +303,11 @@ def test_journey_static_script_parses_in_javascript_engine(client, tmp_path):
     assert checked.returncode == 0, checked.stderr
     assert "/api/sources/soundcloud/import" in script
     assert "/api/discovery/start" in script
+    assert "/api/export/preview" in script
+    assert "/api/paths/pick" in script
     assert "/api/journey" in script
     assert "/api/spotify/status" not in script
+    assert "/api/spotify/export/start" not in script
 
 
 def test_advanced_page_is_only_a_compatibility_redirect(client):
@@ -2011,6 +2024,93 @@ def test_build_preview_exposes_all_truthful_buckets(client, config):
     )
     assert cleared.status_code == 200
     assert cleared.get_json()["selection_count"] == 1
+
+
+def test_journey_folder_preflight_is_no_write_and_exposes_destination_truth(config):
+    source = FakeSource()
+    app = create_app(config, source_factory=lambda cfg: [source])
+    app.config["TESTING"] = True
+    with app.test_client() as http:
+        workspace = http.get("/api/sources").get_json()["workspace_id"]
+        track = seed_local_workspace(config, workspace)
+        db = Database(config.database_path)
+        try:
+            current = next(
+                row
+                for row in db.get_workspace_candidates(
+                    workspace,
+                    track_id=track.track_key,
+                    kind="exact",
+                    include_rejected=True,
+                    current_only=True,
+                )
+                if int(row["chart_id"]) == 301
+            )
+        finally:
+            db.close()
+
+        empty = http.post(
+            "/api/export/preview",
+            json={"kind": "folder", "workspace_id": workspace},
+        )
+        assert empty.status_code == 400
+        assert "select at least one" in empty.get_json()["error"].casefold()
+
+        selected = http.post(
+            "/api/discovery/select",
+            json={
+                "workspace_id": workspace,
+                "kind": "exact",
+                "track_id": track.track_key,
+                "candidate_id": current["candidate_id"],
+            },
+        )
+        assert selected.status_code == 200
+        assert selected.get_json()["selected_count"] == 1
+
+        initial = http.post(
+            "/api/export/preview",
+            json={"kind": "folder", "workspace_id": workspace},
+        ).get_json()
+        assert initial["ok"] is True
+        assert initial["selected_chart_count"] == 1
+        assert initial["eligible_chart_count"] == 1
+        assert initial["reusable_count"] == 0
+        assert initial["download_required_count"] == 1
+        assert initial["destination"] == str(config.library_root.resolve())
+        assert initial["available_bytes"] > 0
+        assert initial["current_library_bytes"] == 0
+        assert initial["configured_budget_bytes"] == config.storage.max_library_bytes
+        assert isinstance(initial["warnings"], list)
+
+        dedicated = config.base_dir / "Dedicated Songs"
+        assert dedicated.exists() is False
+        changed = http.post(
+            "/api/export/preview",
+            json={
+                "kind": "folder",
+                "workspace_id": workspace,
+                "path": str(dedicated),
+            },
+        ).get_json()
+        assert changed["ok"] is True
+        assert changed["destination"] == str(dedicated.resolve())
+        assert changed["selected_chart_count"] == 1
+        assert dedicated.exists() is False
+
+        tray = http.get(
+            f"/api/discovery/selections?workspace_id={workspace}"
+        ).get_json()
+        assert tray["selected_count"] == 1
+        assert source.downloads == []
+        assert app.extensions["export_job"].running is False
+
+    db = Database(config.database_path)
+    try:
+        assert db.list_export_records(workspace_id=workspace) == []
+    finally:
+        db.close()
+    assert list(config.base_dir.rglob("*.sng")) == []
 
 
 def test_duplicate_build_request_preserves_active_build(client):

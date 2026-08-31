@@ -7219,7 +7219,11 @@ def create_app(
                 "unavailable_count": invalid_count,
                 "estimated_bytes": preflight.estimated_bytes,
                 "estimated_size_bytes": preflight.estimated_bytes,
+                "available_bytes": preflight.available_bytes,
+                "current_library_bytes": preflight.current_bytes,
+                "configured_budget_bytes": preflight.budget_bytes,
                 "errors": [_safe_message(issue.message) for issue in preflight.errors],
+                "warnings": [_safe_message(issue.message) for issue in preflight.warnings],
                 "items": items,
             }, 200
         finally:

@@ -7,13 +7,17 @@ build and remains skipped when Playwright is not installed.
 
 from __future__ import annotations
 
+import json
 import threading
+from pathlib import Path
 
 import pytest
 
 from csv_to_clonehero.database import Database
 from csv_to_clonehero.providers.base import LibrarySnapshot, ProviderTrack
 from csv_to_clonehero.webapp import create_app
+
+from .conftest import FakeSource
 
 pytestmark = pytest.mark.browser
 playwright = pytest.importorskip("playwright.sync_api")
@@ -110,7 +114,8 @@ def matching_browser_page(config, request, monkeypatch):
 
     state = request.param
     config.input_path.mkdir(parents=True, exist_ok=True)
-    app = create_app(config, source_factory=lambda cfg: [])
+    source = FakeSource()
+    app = create_app(config, source_factory=lambda cfg: [source])
     app.config["TESTING"] = True
     with app.test_client() as client:
         workspace = client.get("/api/journey").get_json()["workspace_id"]
@@ -265,6 +270,86 @@ def test_browser_failed_row_mutation_rehydrates_saved_checkbox(matching_browser_
     alert.wait_for()
     assert "saved choice was restored" in alert.inner_text()
     assert page.get_by_role("checkbox", name="Use Song by Artist").is_checked()
+    assert page.get_by_text("1 selected", exact=True).is_visible()
+
+
+@pytest.mark.parametrize("matching_browser_page", ["charts_found"], indirect=True)
+@pytest.mark.mobile
+def test_browser_continue_uses_real_preflight_and_changed_folder(matching_browser_page):
+    page = matching_browser_page
+    requests = []
+    page.on("request", lambda request: requests.append(request.url))
+    assert page.locator("[data-test='continue-download']").count() == 0
+
+    page.get_by_role("button", name="Use 1 best matches").click()
+    continue_button = page.get_by_role("button", name="Continue with 1 charts")
+    continue_button.wait_for()
+    with page.expect_response("**/api/export/preview") as preview_info:
+        continue_button.click()
+    preview = preview_info.value.json()
+    assert preview["ok"] is True
+    page.get_by_role("heading", name="Ready to add 1 songs").wait_for()
+    assert page.locator("[data-test='preflight-selected']").inner_text() == str(preview["selected_chart_count"])
+    assert page.locator("[data-test='preflight-reusable']").inner_text() == str(preview["reusable_count"])
+    assert page.locator("[data-test='preflight-required']").inner_text() == str(preview["download_required_count"])
+    assert page.locator("[data-test='preflight-destination']").inner_text() == preview["destination"]
+    assert page.get_by_role("button", name="Download library").count() == 0
+
+    chosen = str(Path(preview["destination"]).parent / "Dedicated Test Songs")
+    page.route(
+        "**/api/paths/pick",
+        lambda route: route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps({"selected": True, "path": chosen, "resolved": chosen}),
+        ),
+    )
+    with page.expect_response("**/api/export/preview") as changed_info:
+        page.get_by_role("button", name="Change folder").click()
+    changed = changed_info.value.json()
+    assert changed["ok"] is True
+    assert changed["destination"] == str(Path(chosen).resolve())
+    assert page.locator("[data-test='preflight-destination']").inner_text() == changed["destination"]
+    assert not any("/api/spotify/export/start" in url for url in requests)
+
+    page.get_by_role("button", name="Change chart choices").click()
+    assert page.locator("[data-test='charts-found']").is_visible()
+    assert page.get_by_text("1 selected", exact=True).is_visible()
+    assert page.get_by_role("button", name="Continue with 1 charts").is_visible()
+    assert page.evaluate("document.documentElement.scrollWidth <= document.documentElement.clientWidth")
+
+
+@pytest.mark.parametrize("matching_browser_page", ["charts_found"], indirect=True)
+def test_browser_preflight_failure_is_not_ready_and_preserves_selection(matching_browser_page):
+    page = matching_browser_page
+    page.get_by_role("button", name="Use 1 best matches").click()
+    page.route(
+        "**/api/export/preview",
+        lambda route: route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps({
+                "ok": False,
+                "selected_chart_count": 1,
+                "eligible_chart_count": 0,
+                "reusable_count": 0,
+                "download_required_count": 0,
+                "invalid_count": 1,
+                "estimated_bytes": 0,
+                "available_bytes": 1024,
+                "destination": "C:\\Test\\Songs",
+                "errors": ["A persisted selection is no longer current."],
+                "warnings": [],
+            }),
+        ),
+    )
+
+    page.get_by_role("button", name="Continue with 1 charts").click()
+    page.get_by_role("heading", name="Your library needs one more check").wait_for()
+    assert page.get_by_text("A persisted selection is no longer current.").is_visible()
+    assert page.get_by_text("Ready for download").count() == 0
+    assert page.locator("[data-test='preflight-selected']").inner_text() == "1"
+    page.get_by_role("button", name="Change chart choices").click()
     assert page.get_by_text("1 selected", exact=True).is_visible()
 
 

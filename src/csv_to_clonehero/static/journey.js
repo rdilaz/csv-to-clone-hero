@@ -25,6 +25,10 @@
     reviewRevision: 0,
     reviewController: null,
     reviewTimer: null,
+    downloadView: false,
+    preflight: null,
+    preflightDestination: "",
+    preflightNotice: "",
     review: {
       tracks: [],
       page: null,
@@ -41,6 +45,7 @@
     check: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12 4 4L19 6"/></svg>',
     close: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"/></svg>',
     download: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12m0 0 5-5m-5 5-5-5M5 20h14"/></svg>',
+    folder: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7h7l2 2h9v10H3z"/></svg>',
     search: '<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="6.5"/><path d="m16 16 4 4"/></svg>',
     sparkle: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m12 3 1.6 5.4L19 10l-5.4 1.6L12 17l-1.6-5.4L5 10l5.4-1.6L12 3Z"/></svg>',
     vinyl: '<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8.5"/><circle cx="12" cy="12" r="2"/><path d="M12 3.5v3M20.5 12h-3M12 20.5v-3M3.5 12h3"/></svg>'
@@ -62,6 +67,25 @@
   }
 
   function number(value) { return Number(value || 0).toLocaleString("en-US"); }
+
+  function bytes(value) {
+    if (value == null || Number.isNaN(Number(value))) return "Not available";
+    const amount = Math.max(0, Number(value));
+    if (amount < 1024) return number(amount) + " B";
+    const units = ["KB", "MB", "GB", "TB"];
+    let size = amount / 1024;
+    let unit = units[0];
+    for (let index = 1; index < units.length && size >= 1024; index += 1) {
+      size /= 1024;
+      unit = units[index];
+    }
+    return size.toLocaleString("en-US", { maximumFractionDigits: size >= 100 ? 0 : 1 }) + " " + unit;
+  }
+
+  function destinationName(value) {
+    const parts = String(value || "Songs folder").split(/[\\/]+/).filter(Boolean);
+    return parts.length ? parts[parts.length - 1] : "Songs folder";
+  }
 
   function elapsed(value) {
     const seconds = Math.max(0, Math.round(Number(value || 0)));
@@ -350,11 +374,83 @@
     const selectionKnown = model.selections !== null;
     const pending = model.pendingAction === "cohort";
     const enabled = Boolean(snapshot.matching.authoritative) && !model.pendingRow;
+    const mutationPending = Boolean(model.pendingAction) || Boolean(model.pendingRow);
     let status = '<span class="empty-status-mark" aria-hidden="true"></span><span>Nothing selected yet</span>';
     if (!selectionKnown) status = '<span class="empty-status-mark" aria-hidden="true"></span><span>Selection unavailable</span>';
     else if (selection.count > 0) status = '<span class="status-check">' + icons.check + '</span><strong>' + number(selection.count) + ' selected</strong>';
     const details = '<details class="details"><summary>Details</summary><p>' + number(result.no_suitable) + ' no suitable, ' + number(result.not_playable) + ' not playable, and ' + number(result.no_candidate) + ' had no candidate.</p></details>';
-    return shell('<section class="found-stage stage-section" data-test="charts-found"><header class="found-head"><div><p class="overline">Confirm charts</p><h1>We found charts for <span>' + number(result.recommendations) + '</span> of your songs.</h1></div><div class="selection-status' + (selection.count > 0 ? " has-selection" : "") + '">' + status + '</div></header><div class="cohort-grid">' + cohortCard("best", result.best_matches, "Best matches", "Most reliable. Artist, title, version, and playability all look right.", "Use " + number(result.best_matches) + " best matches", activeCohort === "best", pending, enabled) + cohortCard("all", result.recommendations, "recommendations", "Includes " + number(result.best_available) + " Best available suggestions. Some may be live, remastered, alternate, or otherwise imperfect versions.", "Use all " + number(result.recommendations) + " recommendations", activeCohort === "all", pending, enabled) + '</div>' + (model.selectionError ? '<p class="cohort-error" role="alert">' + escapeHtml(model.selectionError) + '</p>' : '') + (model.confirmationVisible ? confirmationList() : "") + '<footer class="found-footer"><div class="found-gaps"><span><strong>' + number(result.no_suitable) + '</strong> no suitable</span><span><strong>' + number(result.not_playable) + '</strong> not playable</span><span><strong>' + number(result.no_candidate) + '</strong> no candidate</span></div>' + details + '</footer></section>', "Confirm charts");
+    const continuation = selectionKnown && selection.count > 0
+      ? '<button class="button primary" data-test="continue-download" data-action="continue-download"' + (mutationPending ? ' disabled aria-disabled="true"' : '') + '>Continue with ' + number(selection.count) + ' charts ' + icons.arrow + '</button>'
+      : '<span class="footer-hint">Choose at least one chart to continue</span>';
+    return shell('<section class="found-stage stage-section" data-test="charts-found"><header class="found-head"><div><p class="overline">Confirm charts</p><h1>We found charts for <span>' + number(result.recommendations) + '</span> of your songs.</h1></div><div class="selection-status' + (selection.count > 0 ? " has-selection" : "") + '">' + status + '</div></header><div class="cohort-grid">' + cohortCard("best", result.best_matches, "Best matches", "Most reliable. Artist, title, version, and playability all look right.", "Use " + number(result.best_matches) + " best matches", activeCohort === "best", pending, enabled) + cohortCard("all", result.recommendations, "recommendations", "Includes " + number(result.best_available) + " Best available suggestions. Some may be live, remastered, alternate, or otherwise imperfect versions.", "Use all " + number(result.recommendations) + " recommendations", activeCohort === "all", pending, enabled) + '</div>' + (model.selectionError ? '<p class="cohort-error" role="alert">' + escapeHtml(model.selectionError) + '</p>' : '') + (model.confirmationVisible ? confirmationList() : "") + '<footer class="found-footer"><div class="found-gaps"><span><strong>' + number(result.no_suitable) + '</strong> no suitable</span><span><strong>' + number(result.not_playable) + '</strong> not playable</span><span><strong>' + number(result.no_candidate) + '</strong> no candidate</span></div><div class="found-footer-actions">' + details + continuation + '</div></footer></section>', "Confirm charts");
+  }
+
+  function preflightCount(preflight, key, fallback) {
+    const value = preflight && preflight[key];
+    if (value != null) return Number(value || 0);
+    return fallback == null ? null : Number(fallback || 0);
+  }
+
+  function preflightCountText(value) {
+    return value == null ? "Not available" : number(value);
+  }
+
+  function preflightMessages(preflight) {
+    const messages = [];
+    ["errors", "warnings"].forEach(function (key) {
+      const values = preflight && Array.isArray(preflight[key]) ? preflight[key] : [];
+      values.forEach(function (value) {
+        const message = String(value || "").trim();
+        if (message && !messages.includes(message)) messages.push(message);
+      });
+    });
+    return messages;
+  }
+
+  function downloadFact(label, value, testName) {
+    return '<div><dt>' + label + '</dt><dd' + (testName ? ' data-test="' + testName + '"' : '') + '>' + value + '</dd></div>';
+  }
+
+  function folderVisual(preflight, ready) {
+    const destination = String(preflight && preflight.destination || model.preflightDestination || "Songs folder");
+    return '<div class="songs-folder-visual" data-test="destination-visual"><div class="folder-halo"></div><div class="folder-card' + (ready ? " is-ready" : " needs-attention") + '"><span class="folder-icon">' + icons.folder + '</span><span><small>Destination</small><strong>' + escapeHtml(destinationName(destination)) + '</strong></span><span class="folder-check" aria-hidden="true">' + (ready ? icons.check : "!") + '</span></div></div>';
+  }
+
+  function downloadReady() {
+    const preflight = model.preflight;
+    const persistedCount = exactSelectionItems().length;
+    if (model.pendingAction === "preflight" && !preflight) {
+      return shell('<section class="ready-download-stage stage-section" data-test="download-preflight" aria-busy="true"><div class="download-ready-copy"><p class="overline">Download</p><h1>Checking your library</h1><p class="lead-copy">Validating your selected charts, destination, and available space.</p><div class="preflight-wait" role="status"><span></span>Running real download preflight...</div></div>' + folderVisual(null, false) + '</section>', "Download");
+    }
+
+    const ready = Boolean(preflight && preflight.ok);
+    const selected = preflightCount(preflight, "selected_chart_count", persistedCount);
+    const reusable = preflightCount(preflight, "reusable_count", preflight && preflight.already_present_count);
+    const required = preflightCount(preflight, "download_required_count", preflight && preflight.need_download_count);
+    const invalid = preflightCount(preflight, "invalid_count", 0);
+    const estimated = preflight && preflight.estimated_bytes;
+    const available = preflight && preflight.available_bytes;
+    const destination = String(preflight && preflight.destination || model.preflightDestination || "Not resolved");
+    const space = ready
+      ? '<span class="enough-mark">' + icons.check + '</span>' + (available == null ? "Destination validated" : bytes(available) + " available")
+      : '<span class="attention-symbol" aria-hidden="true">!</span>Needs attention';
+    const estimate = required === 0 && Number(estimated || 0) === 0 ? "No download needed" : bytes(estimated);
+    let facts = downloadFact("Selected charts", number(selected), "preflight-selected");
+    facts += downloadFact("Already available", preflightCountText(reusable), "preflight-reusable");
+    facts += downloadFact("Need download", preflightCountText(required), "preflight-required");
+    if (estimated != null) facts += downloadFact("Estimated download", escapeHtml(estimate), "preflight-estimated");
+    facts += downloadFact("Destination", '<span class="destination-value" title="' + escapeHtml(destination) + '">' + escapeHtml(destination) + '</span>', "preflight-destination");
+    facts += downloadFact("Space check", space, "preflight-space");
+    if (invalid > 0) facts += downloadFact("Needs attention", number(invalid), "preflight-invalid");
+
+    const messages = preflightMessages(preflight);
+    const issueList = messages.length ? '<div class="preflight-issues" role="alert"><strong>' + (ready ? "Preflight notes" : "Preflight could not finish") + '</strong><ul>' + messages.map(function (message) { return '<li>' + escapeHtml(message) + '</li>'; }).join("") + '</ul></div>' : "";
+    const notice = model.preflightNotice ? '<p class="preflight-notice" role="alert">' + escapeHtml(model.preflightNotice) + '</p>' : "";
+    const choosing = model.pendingAction === "folder";
+    if (ready) {
+      return shell('<section class="ready-download-stage stage-section" data-test="download-ready"><div class="download-ready-copy"><p class="overline">Download</p><h1>Ready to add <span>' + number(selected) + '</span> songs</h1><p class="lead-copy">Your chart choices and destination passed every current check.</p><dl class="download-facts">' + facts + '</dl>' + notice + issueList + '<div class="download-ready-status"><span class="enough-mark">' + icons.check + '</span><span><strong>Ready for download</strong><small>No chart files have been downloaded yet.</small></span></div><div class="download-actions"><button class="button secondary" data-action="change-folder"' + (choosing ? ' disabled aria-disabled="true"' : '') + '>' + (choosing ? "Choosing folder..." : "Change folder") + '</button><button class="text-link quiet-back" data-action="back-to-charts"' + (choosing ? ' disabled aria-disabled="true"' : '') + '>Change chart choices ' + icons.arrow + '</button></div></div>' + folderVisual(preflight, true) + '</section>', "Download");
+    }
+    return shell('<section class="ready-download-stage stage-section" data-test="download-preflight-error"><div class="download-ready-copy"><p class="overline">Download</p><h1>Your library needs one more check</h1><p class="lead-copy">No chart files were downloaded. Your selected charts are still saved.</p><dl class="download-facts">' + facts + '</dl>' + notice + issueList + '<div class="download-actions"><button class="button secondary" data-action="retry-preflight"' + (choosing ? ' disabled aria-disabled="true"' : '') + '>Retry preflight</button><button class="button quiet" data-action="change-folder"' + (choosing ? ' disabled aria-disabled="true"' : '') + '>' + (choosing ? "Choosing folder..." : "Change folder") + '</button><button class="text-link quiet-back" data-action="back-to-charts"' + (choosing ? ' disabled aria-disabled="true"' : '') + '>Change chart choices ' + icons.arrow + '</button></div></div>' + folderVisual(preflight, false) + '</section>', "Download");
   }
 
   function formatChooser() {
@@ -396,13 +492,13 @@
     const snapshot = model.snapshot;
     if (!snapshot) return;
     let content;
-    if (snapshot.matching && snapshot.matching.state === "charts_found") content = chartsFound(snapshot);
+    if (snapshot.matching && snapshot.matching.state === "charts_found") content = model.downloadView ? downloadReady() : chartsFound(snapshot);
     else if (snapshot.matching && snapshot.matching.state !== "music_ready") content = matchingVisual(snapshot);
     else if (snapshot.operation && snapshot.operation.state === "importing") content = importing(snapshot);
     else content = snapshot.music.canonical_count ? musicReady(snapshot) : sourcesEmpty(snapshot);
-    const stage = snapshot.matching && snapshot.matching.state === "charts_found" ? "Confirm charts" : snapshot.matching && snapshot.matching.state !== "music_ready" ? "Find charts" : snapshot.operation.state === "importing" ? "Add music" : snapshot.music.canonical_count ? "Music ready" : "Add music";
+    const stage = snapshot.matching && snapshot.matching.state === "charts_found" ? (model.downloadView ? "Download" : "Confirm charts") : snapshot.matching && snapshot.matching.state !== "music_ready" ? "Find charts" : snapshot.operation.state === "importing" ? "Add music" : snapshot.music.canonical_count ? "Music ready" : "Add music";
     app.innerHTML = '<header class="topbar"><div class="brand"><span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span><span class="brand-name">Riff</span><span class="brand-divider" aria-hidden="true"></span><span class="brand-context">music to Clone Hero</span></div><div class="stage-label"><span class="stage-pip" aria-hidden="true"></span><span id="stage-label">' + stage + '</span></div></header>' + content.slice(content.indexOf("<main"));
-    app.setAttribute("aria-busy", matchingActive(snapshot) ? "true" : "false");
+    app.setAttribute("aria-busy", matchingActive(snapshot) || ["preflight", "folder"].includes(model.pendingAction) ? "true" : "false");
     if (model.overlay) {
       app.insertAdjacentHTML("beforeend", sourceSheet(snapshot.sources[model.overlay]));
       if (focusOverlay) {
@@ -793,6 +889,94 @@
     }
   }
 
+  async function runPreflight(destination) {
+    if (model.pendingAction || model.pendingRow || !model.snapshot || !model.snapshot.matching.authoritative) return;
+    const selected = exactSelectionItems().length;
+    if (selected < 1) {
+      announce("Choose at least one chart before continuing.");
+      return;
+    }
+    model.downloadView = true;
+    model.preflight = null;
+    model.preflightNotice = "";
+    model.preflightDestination = destination == null ? "" : String(destination);
+    model.pendingAction = "preflight";
+    render(false);
+    const payload = { kind: "folder", workspace_id: model.snapshot.workspace_id };
+    if (model.preflightDestination) payload.path = model.preflightDestination;
+    try {
+      const preflight = await api("/api/export/preview", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload)
+      });
+      model.preflight = preflight;
+      model.preflightDestination = String(preflight.destination || model.preflightDestination || "");
+      if (preflight.ok) announce("Download preflight passed for " + number(preflight.selected_chart_count) + " charts.");
+      else announce((preflight.errors && preflight.errors[0]) || "Download preflight needs attention.");
+    } catch (error) {
+      model.preflight = {
+        ok: false,
+        selected_chart_count: selected,
+        eligible_chart_count: 0,
+        reusable_count: null,
+        download_required_count: null,
+        invalid_count: 0,
+        estimated_bytes: null,
+        available_bytes: null,
+        destination: model.preflightDestination,
+        errors: [error.message],
+        warnings: []
+      };
+      announce(error.message);
+    } finally {
+      model.pendingAction = "";
+      render(false);
+    }
+  }
+
+  async function changeFolder() {
+    if (model.pendingAction || model.pendingRow || !model.downloadView) return;
+    model.pendingAction = "folder";
+    model.preflightNotice = "";
+    render(false);
+    try {
+      const picked = await api("/api/paths/pick", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: "{}"
+      });
+      if (!picked.selected) {
+        announce("Folder unchanged.");
+        return;
+      }
+      const resolved = String(picked.resolved || picked.path || "");
+      if (!resolved) throw new Error("The selected folder could not be resolved.");
+      model.pendingAction = "";
+      await runPreflight(resolved);
+      return;
+    } catch (error) {
+      model.preflightNotice = "We could not change the folder. " + error.message;
+      announce(model.preflightNotice);
+    } finally {
+      if (model.pendingAction === "folder") {
+        model.pendingAction = "";
+        render(false);
+      }
+    }
+  }
+
+  function backToCharts() {
+    if (model.pendingAction) return;
+    model.downloadView = false;
+    model.preflight = null;
+    model.preflightNotice = "";
+    render(false);
+    const main = document.getElementById("main-content");
+    if (main) main.focus();
+    announce(number(exactSelectionItems().length) + " chart choices are still selected.");
+  }
+
   app.addEventListener("click", function (event) {
     const backdrop = event.target.closest(".sheet-backdrop");
     if (backdrop && event.target === backdrop) { model.overlay = null; render(false); return; }
@@ -817,6 +1001,10 @@
       loadReview(true);
     }
     else if (action === "load-more-review") { loadReview(false); }
+    else if (action === "continue-download") { runPreflight(); }
+    else if (action === "retry-preflight") { runPreflight(model.preflightDestination || undefined); }
+    else if (action === "change-folder") { changeFolder(); }
+    else if (action === "back-to-charts") { backToCharts(); }
     else if (action === "retry") { refresh(); }
   });
 
