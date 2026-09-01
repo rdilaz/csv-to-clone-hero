@@ -562,6 +562,69 @@ def test_title_conflict_cannot_be_selected_or_preflighted(config):
         assert "select at least one" in preview.get_json()["error"].casefold()
 
 
+def test_review_identity_is_best_available_and_never_strong(config):
+    from csv_to_clonehero.combined_pipeline import discover_combined
+    from csv_to_clonehero.providers.base import LibrarySnapshot, ProviderTrack
+
+    borderline = make_chart(
+        "Falling Down", "Atreyu", chart_id=306,
+        charter="Harmonix", icon="rb2",
+    )
+    borderline.pack_name = "Official Pack"
+
+    class BorderlineCatalog:
+        available = True
+        diagnostic = ""
+        snapshot_id = "title-review"
+        chart_count = 1
+
+        def candidates(self, artist, title):
+            return (borderline,) if (artist, title) == ("Atreyu", "Drowning") else ()
+
+        def artist_songs(self, _artist):
+            return ()
+
+    db = Database(config.database_path)
+    try:
+        discover_combined(
+            config,
+            db,
+            [LibrarySnapshot("soundcloud", [
+                ProviderTrack("soundcloud", "atreyu", "Drowning", "Atreyu")
+            ])],
+            workspace_key="combined:web-title-review",
+            catalog=BorderlineCatalog(),
+        )
+        workspace = int(db.get_workspace("combined:web-title-review")["id"])
+    finally:
+        db.close()
+
+    app = create_app(config, source_factory=lambda cfg: [FakeSource()])
+    app.config["TESTING"] = True
+    with app.test_client() as http:
+        strong = http.post(
+            "/api/discovery/select-all",
+            json={"workspace_id": workspace, "scope": "strong"},
+        ).get_json()
+        assert strong["selected_count"] == 0
+        eligible = http.post(
+            "/api/discovery/select-all",
+            json={"workspace_id": workspace, "scope": "eligible"},
+        ).get_json()
+        assert eligible["selected_count"] == 1
+        assert eligible["items"][0]["eligibility"] == "ELIGIBLE_REVIEW"
+        preview = http.post(
+            "/api/export/preview",
+            json={
+                "workspace_id": workspace,
+                "kind": "folder",
+                "path": str(config.base_dir / "Songs"),
+            },
+        )
+        assert preview.status_code == 200
+        assert preview.get_json()["ok"] is True
+
+
 def test_confirmation_review_is_paged_searchable_mutable_and_persistent(client, config):
     from csv_to_clonehero.providers.base import LibrarySnapshot, ProviderTrack
 

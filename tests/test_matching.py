@@ -68,6 +68,7 @@ def test_strong_normalized_title_still_auto_accepts(config):
     )
 
     assert result.gate_factors["title_identity"] == "strong"
+    assert result.match_factors["title"]["identity"]["number_word_equivalent"] is False
     assert result.decision == "AUTO_ACCEPT"
     assert result.eligibility == "RECOMMENDED"
 
@@ -96,6 +97,255 @@ def test_pick_best_prefers_correct_song_over_higher_quality_wrong_song(config):
     assert breakdown.eligibility == "RECOMMENDED"
     wrong_score = next(score for chart, score in scored if chart is wrong)
     assert wrong_score.eligibility == "INCOMPATIBLE"
+
+
+def _high_quality_chart(title, artist, *, chart_id=1):
+    chart = make_chart(
+        title, artist, chart_id=chart_id, charter="Harmonix", icon="rb2"
+    )
+    chart.pack_name = "Official Pack"
+    chart.diff_band = 5
+    chart.difficulty_fields = {
+        "diff_band": 5, "diff_guitar": 3, "diff_bass": 3, "diff_drums": 3
+    }
+    return chart
+
+
+@pytest.mark.parametrize(
+    ("artist", "track_title", "chart_title"),
+    [
+        ("Atreyu", "Drowning", "Falling Down"),
+        ("Michael Jackson", "You Rock My World", "Rock With You"),
+        ("Viagra Boys", "Ain’t No Thief", "Ain’t Nice"),
+        ("ONE OK ROCK", "Let Me Let You Go - Japanese Version", "Prove - Japanese version"),
+    ],
+)
+def test_live_same_artist_false_positives_cannot_be_best_matches(
+    config, artist, track_title, chart_title
+):
+    result = score_candidate(
+        make_track(track_title, artist),
+        _high_quality_chart(chart_title, artist),
+        config,
+    )
+
+    assert result.gate_factors["title_auto_identity"] is False
+    assert result.eligibility != "RECOMMENDED"
+    assert result.decision != "AUTO_ACCEPT"
+    assert result.final_score < config.matching.auto_accept_threshold
+
+
+@pytest.mark.parametrize(
+    ("track_artist", "track_title", "chart_artist", "chart_title"),
+    [
+        ("Daryl Hall & John Oates", "You Make My Dreams (Come True)", "Tally Hall", "You"),
+        ("Tyler, The Creator", "911 / Mr. Lonely (feat. Frank Ocean & Steve Lacy)", "The Bunny the Bear", "Lonely"),
+        ("Keyshia Cole", "Love", "Kesha", "Dirty Love (feat. Iggy Pop)"),
+        ("Machine Girl", "Ghost", "Rage Against The Machine", "The Ghost Of Tom Joad"),
+    ],
+)
+def test_live_cross_artist_false_positives_cannot_be_best_matches(
+    config, track_artist, track_title, chart_artist, chart_title
+):
+    result = score_candidate(
+        make_track(track_title, track_artist),
+        _high_quality_chart(chart_title, chart_artist),
+        config,
+    )
+
+    assert result.eligibility != "RECOMMENDED"
+    assert result.decision != "AUTO_ACCEPT"
+    assert not (
+        result.gate_factors["title_auto_identity"]
+        and result.gate_factors["artist_auto_identity"]
+    )
+
+
+@pytest.mark.parametrize(
+    ("track_title", "chart_title"),
+    [("Song One", "Song 1"), ("Song 1", "Song One")],
+)
+def test_number_word_equivalent_titles_auto_identify_in_both_directions(
+    config, track_title, chart_title
+):
+    result = score_candidate(
+        make_track(track_title, "Sample Artist"),
+        _high_quality_chart(chart_title, "Sample Artist"),
+        config,
+    )
+
+    identity = result.match_factors["title"]["identity"]
+    assert identity["number_word_equivalent"] is True
+    assert result.eligibility == "RECOMMENDED"
+
+
+@pytest.mark.parametrize(
+    ("artist", "track_title", "chart_artist", "chart_title"),
+    [
+        ("B.o.B", "Airplanes (feat. Hayley Williams)", "B.o.B featuring Hayley Williams", "Airplanes"),
+        ("Bee Gees", "Stayin' Alive - From Saturday Night Fever Soundtrack", "The Bee Gees", "Stayin' Alive"),
+        ("Yasuha", "Fly-day Chinatown", "Yasuha", "Flyday Chinatown"),
+        ("Dexys Midnight Runners", "Come On Eileen", "Dexys Midnight Runners", "Come on Elieen"),
+        ("The Weeknd", "Pray For Me", "The Weeknd & Kendrick Lamar", "Pray for Me"),
+    ],
+)
+def test_legitimate_nonexact_title_and_credit_variants_remain_auto_identified(
+    config, artist, track_title, chart_artist, chart_title
+):
+    result = score_candidate(
+        make_track(track_title, artist),
+        _high_quality_chart(chart_title, chart_artist),
+        config,
+    )
+
+    assert result.gate_factors["title_auto_identity"] is True
+    assert result.gate_factors["artist_auto_identity"] is True
+    assert result.eligibility == "RECOMMENDED"
+
+
+def test_title_auto_artist_auto_allows_quality_recommendation(config):
+    result = score_candidate(
+        make_track("Sample Song", "Sample Artist"),
+        _high_quality_chart("Sample Song", "Sample Artist"),
+        config,
+    )
+    assert result.eligibility == "RECOMMENDED"
+
+
+def test_title_review_artist_auto_never_recommended(config):
+    result = score_candidate(
+        make_track("Drowning", "Atreyu"),
+        _high_quality_chart("Falling Down", "Atreyu"),
+        config,
+    )
+    assert result.gate_factors["title_identity"] == "borderline"
+    assert result.gate_factors["artist_identity"] == "strong"
+    assert result.eligibility == "ELIGIBLE_REVIEW"
+
+
+def test_title_auto_artist_review_never_recommended(config):
+    result = score_candidate(
+        make_track("Wake Up", "Ahmad Anonimis"),
+        _high_quality_chart("Wake Up", "Mad Season"),
+        config,
+    )
+    assert result.gate_factors["title_identity"] == "strong"
+    assert result.gate_factors["artist_identity"] == "borderline"
+    assert result.eligibility == "ELIGIBLE_REVIEW"
+
+
+def test_both_review_identities_never_recommended(config):
+    result = score_candidate(
+        make_track("Only Exception", "Ahmad Anonimis"),
+        _high_quality_chart("Only One", "Mad Season"),
+        config,
+    )
+    assert result.gate_factors["title_identity"] == "borderline"
+    assert result.gate_factors["artist_identity"] == "borderline"
+    assert result.eligibility == "ELIGIBLE_REVIEW"
+
+
+def test_exact_isrc_identity_establishes_pair_despite_unusual_text(config):
+    track = make_track("You Make My Dreams (Come True)", "Daryl Hall & John Oates")
+    track.isrc = "US-AAA-12-34567"
+    chart = _high_quality_chart("You", "Tally Hall")
+    chart.source_metadata = {"isrc": "USAAA1234567"}
+    result = score_candidate(track, chart, config)
+
+    assert result.gate_factors["external_identity_match"] is True
+    assert result.gate_factors["title_auto_identity"] is True
+    assert result.gate_factors["artist_auto_identity"] is True
+    assert result.eligibility == "RECOMMENDED"
+
+
+def test_exact_spotify_identity_establishes_pair(config):
+    track = make_track(
+        "You Make My Dreams (Come True)", "Daryl Hall & John Oates",
+        spotify_id="spotify-track-123",
+    )
+    chart = _high_quality_chart("You", "Tally Hall")
+    chart.source_metadata = {"spotify": {"track_id": "spotify-track-123"}}
+    result = score_candidate(track, chart, config)
+
+    assert result.gate_factors["external_identity_match"] is True
+    assert result.eligibility == "RECOMMENDED"
+
+
+def test_track_isrc_without_candidate_is_unknown_not_conflict(config):
+    track = make_track("Sample Song", "Sample Artist")
+    track.isrc = "US-AAA-12-34567"
+    result = score_candidate(
+        track,
+        _high_quality_chart("Sample Song", "Sample Artist"),
+        config,
+    )
+
+    assert result.match_factors["isrc"]["match"] is None
+    assert result.gate_factors["external_identity_conflict"] is False
+    assert result.eligibility == "RECOMMENDED"
+
+
+def test_track_spotify_id_without_candidate_is_unknown_not_conflict(config):
+    track = make_track("Sample Song", "Sample Artist", spotify_id="track-one")
+    result = score_candidate(
+        track,
+        _high_quality_chart("Sample Song", "Sample Artist"),
+        config,
+    )
+
+    assert result.match_factors["spotify_identity"]["exact_match"] is None
+    assert result.gate_factors["external_identity_conflict"] is False
+    assert result.eligibility == "RECOMMENDED"
+
+
+def test_isrc_mismatch_alone_is_hard_gate(config):
+    track = make_track("Sample Song", "Sample Artist")
+    track.isrc = "US-AAA-12-34567"
+    chart = _high_quality_chart("Sample Song", "Sample Artist")
+    chart.source_metadata = {"isrc": "US-BBB-12-34567"}
+    result = score_candidate(track, chart, config)
+
+    assert result.match_factors["isrc"]["match"] is False
+    assert result.gate_factors["external_identity_conflict"] is True
+    assert result.eligibility == "INCOMPATIBLE"
+
+
+def test_spotify_mismatch_alone_is_hard_gate(config):
+    track = make_track("Sample Song", "Sample Artist", spotify_id="track-one")
+    chart = _high_quality_chart("Sample Song", "Sample Artist")
+    chart.source_metadata = {"spotify": {"track_id": "track-two"}}
+    result = score_candidate(track, chart, config)
+
+    assert result.match_factors["spotify_identity"]["exact_match"] is False
+    assert result.gate_factors["external_identity_conflict"] is True
+    assert result.eligibility == "INCOMPATIBLE"
+
+
+def test_external_identity_mismatch_is_hard_gate(config):
+    track = make_track("Sample Song", "Sample Artist", spotify_id="track-one")
+    track.isrc = "US-AAA-12-34567"
+    chart = _high_quality_chart("Sample Song", "Sample Artist")
+    chart.source_metadata = {
+        "isrc": "US-BBB-12-34567",
+        "spotify": {"track_id": "track-two"},
+    }
+    result = score_candidate(track, chart, config)
+
+    assert result.gate_factors["external_identity_conflict"] is True
+    assert result.eligibility == "INCOMPATIBLE"
+    assert result.decision == "REJECT"
+    assert any("external song identity conflict" in reason for reason in result.reasons)
+
+
+def test_huge_quality_cannot_rescue_review_artist_identity(config):
+    result = score_candidate(
+        make_track("Wake Up", "Ahmad Anonimis"),
+        _high_quality_chart("Wake Up", "Mad Season"),
+        config,
+    )
+    assert result.quality > 0
+    assert result.final_score < config.matching.auto_accept_threshold
+    assert result.eligibility == "ELIGIBLE_REVIEW"
 
 
 def test_remaster_matches_chart_strongly(config):

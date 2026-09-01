@@ -24,7 +24,13 @@ from rapidfuzz import fuzz
 
 from csv_to_clonehero.config import AppConfig
 from csv_to_clonehero.models import ChartCandidate, ScoreBreakdown, Track
-from csv_to_clonehero.normalization import normalize_text, version_markers
+from csv_to_clonehero.normalization import (
+    normalize_artist,
+    normalize_text,
+    normalize_title_without_recognized_annotations,
+    split_artists,
+    version_markers,
+)
 
 # Known "official game conversion" icon/charter signals on Enchor.
 _OFFICIAL_ICONS = {
@@ -42,12 +48,20 @@ TITLE_WEIGHT = 0.55
 ARTIST_WEIGHT = 0.35
 BASE_COMPLEMENT = 0.10
 
-# Identity is stricter than ranking quality.  Below 55, two normalized titles
-# are clearly different songs (the live Paramore failure was 37.84%).  The
-# 55-70 band remains reviewable for plausible formatting/spelling variation,
-# while 70 preserves the existing "Song One"/"Song 1" case at 71.43%.
+# Ranking can remain high-recall, but automatic identity uses independent plain
+# similarity and conservative deterministic exceptions.  The 55 conflict floor
+# remains the clear-conflict boundary for the ranking signal.
 TITLE_IDENTITY_CONFLICT_THRESHOLD = 55.0
-TITLE_IDENTITY_AUTO_THRESHOLD = 70.0
+TITLE_IDENTITY_PLAIN_AUTO_THRESHOLD = 80.0
+ARTIST_IDENTITY_PLAIN_AUTO_THRESHOLD = 80.0
+
+_NUMBER_WORDS = {
+    "zero": "0", "one": "1", "two": "2", "three": "3", "four": "4",
+    "five": "5", "six": "6", "seven": "7", "eight": "8", "nine": "9",
+    "ten": "10", "eleven": "11", "twelve": "12", "thirteen": "13",
+    "fourteen": "14", "fifteen": "15", "sixteen": "16", "seventeen": "17",
+    "eighteen": "18", "nineteen": "19", "twenty": "20",
+}
 
 DEFAULT_AUTO_ACCEPT_THRESHOLD = 90.0
 DEFAULT_REVIEW_THRESHOLD = 70.0
@@ -216,9 +230,14 @@ def _new_breakdown() -> SpotifyScoreBreakdown:
             "required_five_fret_guitar": None,
             "artist_match": None,
             "artist_conflict": False,
+            "artist_identity": None,
+            "artist_auto_identity": False,
             "title_similarity": None,
             "title_identity": None,
+            "title_auto_identity": False,
             "title_conflict": False,
+            "external_identity_match": False,
+            "external_identity_conflict": False,
             "modchart_allowed": None,
             "severe_issue": None,
             "download_supported": None,
@@ -405,6 +424,185 @@ def _similarity(a: str, b: str) -> float:
     if not a or not b:
         return 0.0
     return max(fuzz.ratio(a, b), fuzz.token_set_ratio(a, b))
+
+
+def _plain_similarity(a: str, b: str) -> float:
+    if not a or not b:
+        return 0.0
+    return fuzz.ratio(a, b)
+
+
+def _tokens(value: str) -> tuple[str, ...]:
+    return tuple(token for token in str(value or "").split() if token)
+
+
+def _is_token_prefix(shorter: tuple[str, ...], longer: tuple[str, ...]) -> bool:
+    return bool(shorter and len(shorter) < len(longer) and longer[: len(shorter)] == shorter)
+
+
+def _contains_token_sequence(shorter: tuple[str, ...], longer: tuple[str, ...]) -> bool:
+    if not shorter or len(shorter) > len(longer):
+        return False
+    width = len(shorter)
+    return any(longer[index:index + width] == shorter for index in range(len(longer) - width + 1))
+
+
+def _number_word_equivalent(left: str, right: str) -> bool:
+    left_raw = _tokens(left)
+    right_raw = _tokens(right)
+    left_tokens = tuple(_NUMBER_WORDS.get(token, token) for token in left_raw)
+    right_tokens = tuple(_NUMBER_WORDS.get(token, token) for token in right_raw)
+    changed = left_tokens != left_raw or right_tokens != right_raw
+    return bool(changed and left_raw != right_raw and left_tokens == right_tokens)
+
+
+def _recognized_title_suffix_relationship(
+    track_title: str,
+    chart_title: str,
+    track_norm: str,
+    chart_norm: str,
+) -> bool:
+    """True only when a complete title prefix has a known annotation suffix."""
+    track_tokens = _tokens(track_norm)
+    chart_tokens = _tokens(chart_norm)
+    if _is_token_prefix(track_tokens, chart_tokens):
+        return normalize_title_without_recognized_annotations(chart_title) == track_norm
+    if _is_token_prefix(chart_tokens, track_tokens):
+        return normalize_title_without_recognized_annotations(track_title) == chart_norm
+    return False
+
+
+def _artist_identity_forms(track: Track, chart: ChartCandidate) -> tuple[set[str], set[str]]:
+    track_primary, _ = split_artists(str(getattr(track, "artist_full", "") or ""))
+    chart_primary, _ = split_artists(str(getattr(chart, "artist", "") or ""))
+    track_forms = {
+        str(getattr(track, "primary_artist_norm", "") or ""),
+        str(getattr(track, "artist_norm", "") or ""),
+        normalize_artist(track_primary),
+    }
+    chart_forms = {
+        _normalised_chart_artist(chart),
+        normalize_artist(str(getattr(chart, "artist", "") or "")),
+        normalize_artist(chart_primary),
+    }
+    return {value for value in track_forms if value}, {value for value in chart_forms if value}
+
+
+def _directional_artist_credit_extension(shorter: str, longer: str) -> bool:
+    shorter = str(shorter or "").strip()
+    longer = str(longer or "").strip()
+    if not shorter or not longer:
+        return False
+    return bool(re.match(
+        rf"^\s*{re.escape(shorter)}(?:\s*(?:&|,|;)|\s+(?:and|feat\.?|ft\.?|featuring|with)\b)",
+        longer,
+        flags=re.IGNORECASE,
+    ))
+
+
+def _title_identity_evidence(
+    track: Track,
+    chart: ChartCandidate,
+    track_norm: str,
+    chart_norm: str,
+    ranking_score: float,
+    *,
+    external_match: bool,
+) -> dict[str, Any]:
+    plain_ratio = _plain_similarity(track_norm, chart_norm)
+    exact = bool(track_norm and track_norm == chart_norm)
+    number_equivalent = _number_word_equivalent(track_norm, chart_norm)
+    annotation_suffix = _recognized_title_suffix_relationship(
+        str(getattr(track, "title", "") or ""),
+        str(getattr(chart, "name", "") or ""),
+        track_norm,
+        chart_norm,
+    )
+    auto = bool(
+        external_match
+        or exact
+        or number_equivalent
+        or plain_ratio >= TITLE_IDENTITY_PLAIN_AUTO_THRESHOLD
+        or annotation_suffix
+    )
+    track_tokens = _tokens(track_norm)
+    chart_tokens = _tokens(chart_norm)
+    containment = _contains_token_sequence(track_tokens, chart_tokens) or _contains_token_sequence(chart_tokens, track_tokens)
+    state = "strong" if auto else "conflict" if ranking_score < TITLE_IDENTITY_CONFLICT_THRESHOLD and not containment else "borderline"
+    return {
+        "state": state,
+        "auto": auto,
+        "plain_ratio": plain_ratio,
+        "ranking_score": ranking_score,
+        "exact_normalized": exact,
+        "number_word_equivalent": number_equivalent,
+        "recognized_annotation_suffix": annotation_suffix,
+        "token_containment": containment,
+        "plain_auto_threshold": TITLE_IDENTITY_PLAIN_AUTO_THRESHOLD,
+        "conflict_threshold": TITLE_IDENTITY_CONFLICT_THRESHOLD,
+        "external_identity": external_match,
+    }
+
+
+def _artist_identity_evidence(
+    track: Track,
+    chart: ChartCandidate,
+    ranking_score: float,
+    *,
+    external_match: bool,
+    conflict_threshold: float,
+) -> dict[str, Any]:
+    track_forms, chart_forms = _artist_identity_forms(track, chart)
+    exact = bool(track_forms & chart_forms)
+    plain_ratio = max(
+        (_plain_similarity(track_form, chart_form) for track_form in track_forms for chart_form in chart_forms),
+        default=0.0,
+    )
+    # Exact split-primary equality is the conservative credit-extension signal;
+    # arbitrary token containment is never sufficient.
+    track_primary, _ = split_artists(str(getattr(track, "artist_full", "") or ""))
+    chart_primary, _ = split_artists(str(getattr(chart, "artist", "") or ""))
+    credit_prefix = bool(
+        normalize_artist(track_primary)
+        and normalize_artist(track_primary) == normalize_artist(chart_primary)
+        and normalize_artist(str(getattr(track, "artist_full", "") or ""))
+        != normalize_artist(str(getattr(chart, "artist", "") or ""))
+    ) or any(
+        _directional_artist_credit_extension(shorter, longer)
+        for shorter, longer in (
+            (str(getattr(track, "primary_artist", "") or ""), str(getattr(chart, "artist", "") or "")),
+            (str(getattr(track, "artist_full", "") or ""), str(getattr(chart, "artist", "") or "")),
+            (chart_primary, str(getattr(track, "artist_full", "") or "")),
+        )
+    )
+    auto = bool(
+        external_match
+        or exact
+        or plain_ratio >= ARTIST_IDENTITY_PLAIN_AUTO_THRESHOLD
+        or credit_prefix
+    )
+    state = "strong" if auto else "conflict" if ranking_score < conflict_threshold else "borderline"
+    return {
+        "state": state,
+        "auto": auto,
+        "plain_ratio": plain_ratio,
+        "ranking_score": ranking_score,
+        "exact_normalized": exact,
+        "credit_prefix": credit_prefix,
+        "plain_auto_threshold": ARTIST_IDENTITY_PLAIN_AUTO_THRESHOLD,
+        "conflict_threshold": conflict_threshold,
+        "external_identity": external_match,
+    }
+
+
+def _external_identity_state(breakdown: SpotifyScoreBreakdown) -> tuple[bool, bool]:
+    isrc = breakdown.match_factors.get("isrc", {})
+    spotify = breakdown.match_factors.get("spotify_identity", {})
+    values = (
+        isrc.get("match") if isinstance(isrc, Mapping) else None,
+        spotify.get("exact_match") if isinstance(spotify, Mapping) else None,
+    )
+    return any(value is True for value in values), any(value is False for value in values)
 
 
 def _normalised_chart_artist(chart: ChartCandidate) -> str:
@@ -1128,25 +1326,28 @@ def _set_threshold_eligibility(
         return
     auto_threshold, review_threshold = _thresholds(config)
     borderline_title = breakdown.gate_factors.get("title_identity") == "borderline"
-    if breakdown.final_score >= auto_threshold and not borderline_title:
+    borderline_artist = breakdown.gate_factors.get("artist_identity") == "borderline"
+    identity_review = borderline_title or borderline_artist
+    if breakdown.final_score >= auto_threshold and not identity_review:
         state = RECOMMENDED
         reasons = ["score meets recommendation threshold"]
         decision = "AUTO_ACCEPT"
     elif breakdown.final_score >= review_threshold:
         state = ELIGIBLE_REVIEW
-        reasons = [
-            "borderline title identity requires review"
-            if borderline_title
-            else "score meets export review threshold"
-        ]
+        identity_reasons = []
+        if borderline_title:
+            identity_reasons.append("borderline title identity requires review")
+        if borderline_artist:
+            identity_reasons.append("borderline artist identity requires review")
+        reasons = identity_reasons or ["score meets export review threshold"]
         decision = "REVIEW"
     else:
         state = EXCLUDED
-        reasons = [
-            "borderline title identity below review threshold"
-            if borderline_title
-            else "score below export eligibility threshold"
-        ]
+        reasons = ["score below export eligibility threshold"]
+        if borderline_title:
+            reasons.append("borderline title identity below review threshold")
+        if borderline_artist:
+            reasons.append("borderline artist identity below review threshold")
         decision = "REJECT"
     _set_eligibility(breakdown, state, reasons)
     if update_decision:
@@ -1167,8 +1368,110 @@ def score_candidate(
     """
     breakdown = _new_breakdown()
 
-    # Hard gate: a chart with no instruments and no difficulty ratings has no
-    # playable content at all.
+    title_norm = str(getattr(track, "title_norm", "") or normalize_text(getattr(track, "title", "")))
+    chart_name_norm = str(getattr(chart, "name_norm", "") or normalize_text(getattr(chart, "name", "")))
+    title_score = _similarity(title_norm, chart_name_norm)
+    artist_score = _best_artist_similarity(track, chart)
+    breakdown.title_score = title_score
+    breakdown.artist_score = artist_score
+    artist_threshold = _number(_config_value(config, ("artist_conflict_threshold",), 55.0), 55.0)
+    base = title_score * TITLE_WEIGHT + artist_score * ARTIST_WEIGHT + 100 * BASE_COMPLEMENT
+    breakdown.base_score = base
+
+    # External IDs are pair-level identity and must be known before textual
+    # identity gates.  Any explicit disagreement is stronger than fuzzy text.
+    _identity_evidence(breakdown, track, chart)
+    external_match, external_conflict = _external_identity_state(breakdown)
+    breakdown.gate_factors["external_identity_match"] = external_match
+    breakdown.gate_factors["external_identity_conflict"] = external_conflict
+    if external_conflict:
+        review_threshold = _thresholds(config)[1]
+        return _hard_gate(
+            breakdown,
+            INCOMPATIBLE,
+            ["external song identity conflict"],
+            decision="REJECT",
+            final_score=min(base, max(0.0, review_threshold - 1)),
+        )
+
+    title_identity = _title_identity_evidence(
+        track,
+        chart,
+        title_norm,
+        chart_name_norm,
+        title_score,
+        external_match=external_match,
+    )
+    artist_identity = _artist_identity_evidence(
+        track,
+        chart,
+        artist_score,
+        external_match=external_match,
+        conflict_threshold=artist_threshold,
+    )
+    _record_factor(
+        breakdown,
+        "title",
+        {
+            "similarity": title_score,
+            "plain_similarity": title_identity["plain_ratio"],
+            "exact_normalized": title_norm == chart_name_norm,
+            "conflict_threshold": TITLE_IDENTITY_CONFLICT_THRESHOLD,
+            "auto_trust_threshold": TITLE_IDENTITY_PLAIN_AUTO_THRESHOLD,
+            "identity": title_identity,
+        },
+    )
+    _record_factor(
+        breakdown,
+        "artist",
+        {
+            "similarity": artist_score,
+            "plain_similarity": artist_identity["plain_ratio"],
+            "conflict_threshold": artist_threshold,
+            "auto_trust_threshold": ARTIST_IDENTITY_PLAIN_AUTO_THRESHOLD,
+            "identity": artist_identity,
+        },
+    )
+    breakdown.gate_factors["artist_match"] = artist_score
+    breakdown.gate_factors["title_similarity"] = title_score
+    breakdown.gate_factors["title_identity"] = title_identity["state"]
+    breakdown.gate_factors["title_auto_identity"] = title_identity["auto"]
+    breakdown.gate_factors["artist_identity"] = artist_identity["state"]
+    breakdown.gate_factors["artist_auto_identity"] = artist_identity["auto"]
+
+    if artist_identity["state"] == "conflict":
+        breakdown.gate_factors["artist_match"] = False
+        breakdown.gate_factors["artist_conflict"] = True
+        breakdown.base_score = title_score * TITLE_WEIGHT
+        review_threshold = _thresholds(config)[1]
+        final_score = min(breakdown.base_score, max(0.0, review_threshold - 1))
+        return _hard_gate(
+            breakdown,
+            INCOMPATIBLE,
+            [f"artist conflict ({track.primary_artist!r} vs {chart.artist!r})"],
+            decision="REJECT",
+            final_score=final_score,
+        )
+
+    if title_identity["state"] == "conflict":
+        breakdown.gate_factors["title_conflict"] = True
+        breakdown.base_score = base
+        review_threshold = _thresholds(config)[1]
+        final_score = min(base, max(0.0, review_threshold - 1))
+        return _hard_gate(
+            breakdown,
+            INCOMPATIBLE,
+            [
+                f"title conflict ({title_identity['plain_ratio']:.1f}% plain similarity; "
+                f"{title_score:.1f}% ranking similarity: "
+                f"{track.title!r} vs {chart.name!r})"
+            ],
+            decision="REJECT",
+            final_score=final_score,
+        )
+
+    # Compatibility follows identity: chart quality or playability cannot
+    # change whether the metadata identifies the requested song.
     if not has_playable_content(chart):
         breakdown.gate_factors["playable_content"] = False
         return _hard_gate(
@@ -1188,63 +1491,6 @@ def score_candidate(
     breakdown.gate_factors["required_five_fret_guitar"] = _has_five_fret_guitar(chart)
     breakdown.gate_factors["modchart_allowed"] = True
 
-    title_norm = str(getattr(track, "title_norm", "") or normalize_text(getattr(track, "title", "")))
-    chart_name_norm = str(getattr(chart, "name_norm", "") or normalize_text(getattr(chart, "name", "")))
-    title_score = _similarity(title_norm, chart_name_norm)
-    artist_score = _best_artist_similarity(track, chart)
-    breakdown.title_score = title_score
-    breakdown.artist_score = artist_score
-    _record_factor(
-        breakdown,
-        "title",
-        {
-            "similarity": title_score,
-            "exact_normalized": title_norm == chart_name_norm,
-            "conflict_threshold": TITLE_IDENTITY_CONFLICT_THRESHOLD,
-            "auto_trust_threshold": TITLE_IDENTITY_AUTO_THRESHOLD,
-        },
-    )
-    _record_factor(breakdown, "artist", {"similarity": artist_score, "conflict_threshold": _number(_config_value(config, ("artist_conflict_threshold",), 55.0), 55.0)})
-    breakdown.gate_factors["artist_match"] = artist_score
-    breakdown.gate_factors["title_similarity"] = title_score
-
-    artist_threshold = _number(_config_value(config, ("artist_conflict_threshold",), 55.0), 55.0)
-    base = title_score * TITLE_WEIGHT + artist_score * ARTIST_WEIGHT + 100 * BASE_COMPLEMENT
-    if artist_score < artist_threshold:
-        breakdown.gate_factors["artist_match"] = False
-        breakdown.gate_factors["artist_conflict"] = True
-        breakdown.base_score = title_score * TITLE_WEIGHT
-        review_threshold = _thresholds(config)[1]
-        final_score = min(breakdown.base_score, max(0.0, review_threshold - 1))
-        return _hard_gate(
-            breakdown,
-            INCOMPATIBLE,
-            [f"artist conflict ({track.primary_artist!r} vs {chart.artist!r})"],
-            decision="REJECT",
-            final_score=final_score,
-        )
-
-    if title_score < TITLE_IDENTITY_CONFLICT_THRESHOLD:
-        breakdown.gate_factors["title_identity"] = "conflict"
-        breakdown.gate_factors["title_conflict"] = True
-        breakdown.base_score = base
-        review_threshold = _thresholds(config)[1]
-        final_score = min(base, max(0.0, review_threshold - 1))
-        return _hard_gate(
-            breakdown,
-            INCOMPATIBLE,
-            [
-                f"title conflict ({title_score:.1f}% similarity: "
-                f"{track.title!r} vs {chart.name!r})"
-            ],
-            decision="REJECT",
-            final_score=final_score,
-        )
-    if title_score < TITLE_IDENTITY_AUTO_THRESHOLD:
-        breakdown.gate_factors["title_identity"] = "borderline"
-    else:
-        breakdown.gate_factors["title_identity"] = "strong"
-
     issues, _review, download = _source_evidence(breakdown, chart, source)
     source_gate_reasons: list[str] = []
     if not download["supported"]:
@@ -1256,8 +1502,6 @@ def score_candidate(
     if source_gate_reasons:
         return _hard_gate(breakdown, EXCLUDED, source_gate_reasons, decision="REJECT")
 
-    breakdown.base_score = base
-
     # ---- deterministic match evidence ------------------------------------
     if title_norm == chart_name_norm:
         _add_bonus(breakdown, "exact normalized title", 6)
@@ -1268,7 +1512,6 @@ def score_candidate(
         _add_bonus(breakdown, "album match", 4)
 
     _duration_evidence(breakdown, track, chart, config)
-    _identity_evidence(breakdown, track, chart)
     _grouping_and_versions(breakdown, track, chart)
 
     # ---- quality bonuses --------------------------------------------------
@@ -1302,12 +1545,18 @@ def score_candidate(
 
     total = base + sum(value for _, value in breakdown.bonuses) - sum(value for _, value in breakdown.penalties)
     breakdown.final_score = max(0.0, min(100.0, total))
-    if breakdown.gate_factors.get("title_identity") == "borderline":
+    review_identities = [
+        label
+        for label in ("title", "artist")
+        if breakdown.gate_factors.get(f"{label}_identity") == "borderline"
+    ]
+    if review_identities:
         auto_threshold = _thresholds(config)[0]
         breakdown.final_score = min(breakdown.final_score, max(0.0, auto_threshold - 1))
-        breakdown.reasons.append(
-            f"borderline title identity ({title_score:.1f}% similarity); automatic recommendation blocked"
-        )
+        for label in review_identities:
+            breakdown.reasons.append(
+                f"borderline {label} identity; automatic recommendation blocked"
+            )
     _set_threshold_eligibility(breakdown, config)
     return breakdown
 

@@ -2,6 +2,7 @@ from csv_to_clonehero.normalization import (
     normalize_artist,
     normalize_text,
     normalize_title,
+    normalize_title_without_recognized_annotations,
     retrieval_artist_forms,
     retrieval_title_forms,
     retrieval_title_tokens,
@@ -103,3 +104,21 @@ def test_retrieval_title_forms_remove_only_recognized_annotations():
 
 def test_retrieval_title_tokens_exclude_annotation_words():
     assert retrieval_title_tokens("Sample Song feat. Guest") == ("sample", "song", "guest")
+
+
+def test_recognized_title_annotations_are_available_as_separate_identity_signal():
+    assert normalize_title_without_recognized_annotations(
+        "Airplanes (feat. Hayley Williams)"
+    ) == normalize_title("Airplanes")
+    assert normalize_title_without_recognized_annotations(
+        "Stayin' Alive - From Saturday Night Fever Soundtrack"
+    ) == normalize_title("Stayin' Alive")
+
+
+def test_recognized_title_annotations_do_not_remove_arbitrary_suffixes():
+    assert normalize_title_without_recognized_annotations(
+        "You Make My Dreams (Come True)"
+    ) != normalize_title("You")
+    assert normalize_title_without_recognized_annotations(
+        "Garden Shed (feat. Estelle)"
+    ) != normalize_title("Garden")

@@ -236,6 +236,7 @@ _RETRIEVAL_ANNOTATION_WORDS = frozenset(
         "rework",
         "rmx",
         "slowed",
+        "soundtrack",
         "stereo",
         "tribute",
         "unplugged",
@@ -262,6 +263,25 @@ _RETRIEVAL_DASH_ANNOTATION_RE = re.compile(
     + r")\b.*$",
     re.IGNORECASE,
 )
+
+
+@lru_cache(maxsize=16384)
+def normalize_title_without_recognized_annotations(title: str) -> str:
+    """Normalize a title after removing only existing recognized annotations.
+
+    Unlike :func:`normalize_title`, this is an opt-in identity signal for a
+    complete title followed by feature/producer/version text.  It deliberately
+    does not remove arbitrary words or generic parenthesized title content.
+    """
+    simplified = strip_version_noise(_fold_unicode(str(title or "")).strip())
+    previous = None
+    while simplified != previous:
+        previous = simplified
+        simplified = _RETRIEVAL_CLAUSE_RE.sub("", simplified)
+        simplified = _RETRIEVAL_TRAILING_ANNOTATION_RE.sub("", simplified)
+        simplified = _RETRIEVAL_DASH_ANNOTATION_RE.sub("", simplified)
+        simplified = _WS_RE.sub(" ", simplified).strip()
+    return normalize_title(simplified)
 
 
 @lru_cache(maxsize=16384)
@@ -342,14 +362,7 @@ def retrieval_title_forms(title: str) -> tuple[str, ...]:
             forms.append(key)
 
     add(text)
-    simplified = strip_version_noise(text)
-    previous = None
-    while simplified != previous:
-        previous = simplified
-        simplified = _RETRIEVAL_CLAUSE_RE.sub("", simplified)
-        simplified = _RETRIEVAL_TRAILING_ANNOTATION_RE.sub("", simplified)
-        simplified = _RETRIEVAL_DASH_ANNOTATION_RE.sub("", simplified)
-        simplified = _WS_RE.sub(" ", simplified).strip()
+    simplified = normalize_title_without_recognized_annotations(text)
     add(simplified)
 
     # SoundCloud titles sometimes carry a second identity after a pipe.  Both

@@ -107,7 +107,7 @@ class CombinedDiscoveryResult:
         }
 
 
-MATCH_CACHE_VERSION = "combined-match-v4"
+MATCH_CACHE_VERSION = "combined-match-v5"
 
 
 def matching_cache_fingerprint(track: Any, catalog: Any, config: AppConfig, *, config_fingerprint: str = "") -> str:
