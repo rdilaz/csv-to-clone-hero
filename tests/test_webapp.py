@@ -487,6 +487,81 @@ def test_charts_found_cohort_scopes_replace_and_rehydrate(client, config):
         assert [item["chart_id"] for item in persisted["items"]] == [301]
 
 
+def test_title_conflict_cannot_be_selected_or_preflighted(config):
+    from csv_to_clonehero.combined_pipeline import discover_combined
+    from csv_to_clonehero.providers.base import LibrarySnapshot, ProviderTrack
+
+    wrong = make_chart(
+        "That's What You Get", "Paramore", chart_id=305,
+        charter="Harmonix", icon="rb2",
+    )
+
+    class WrongSongCatalog:
+        available = True
+        diagnostic = ""
+        snapshot_id = "title-conflict"
+        chart_count = 1
+
+        def candidates(self, artist, title):
+            return (wrong,) if (artist, title) == ("Paramore", "The Only Exception") else ()
+
+        def artist_songs(self, _artist):
+            return ()
+
+    db = Database(config.database_path)
+    try:
+        discover_combined(
+            config,
+            db,
+            [LibrarySnapshot("soundcloud", [
+                ProviderTrack("soundcloud", "paramore", "The Only Exception", "Paramore")
+            ])],
+            workspace_key="combined:web-title-conflict",
+            catalog=WrongSongCatalog(),
+        )
+        workspace = int(db.get_workspace("combined:web-title-conflict")["id"])
+        row = db.get_workspace_candidates(
+            workspace, kind="exact", include_rejected=True, current_only=True
+        )[0]
+        candidate_id = int(row["candidate_id"])
+        assert row["eligibility"] == "INCOMPATIBLE"
+    finally:
+        db.close()
+
+    app = create_app(config, source_factory=lambda cfg: [FakeSource()])
+    app.config["TESTING"] = True
+    with app.test_client() as http:
+        strong = http.post(
+            "/api/discovery/select-all",
+            json={"workspace_id": workspace, "scope": "strong"},
+        ).get_json()
+        eligible = http.post(
+            "/api/discovery/select-all",
+            json={"workspace_id": workspace, "scope": "eligible"},
+        ).get_json()
+        assert strong["selected_count"] == 0
+        assert eligible["selected_count"] == 0
+        rejected = http.post(
+            "/api/discovery/select",
+            json={
+                "workspace_id": workspace,
+                "kind": "exact",
+                "track_id": "paramore|the only exception",
+                "candidate_id": candidate_id,
+            },
+        )
+        assert rejected.status_code == 400
+        assert http.get(
+            f"/api/discovery/selections?workspace_id={workspace}"
+        ).get_json()["selected_count"] == 0
+        preview = http.post(
+            "/api/export/preview",
+            json={"workspace_id": workspace, "kind": "folder"},
+        )
+        assert preview.status_code == 400
+        assert "select at least one" in preview.get_json()["error"].casefold()
+
+
 def test_confirmation_review_is_paged_searchable_mutable_and_persistent(client, config):
     from csv_to_clonehero.providers.base import LibrarySnapshot, ProviderTrack
 

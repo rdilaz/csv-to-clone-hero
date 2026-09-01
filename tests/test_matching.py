@@ -1,3 +1,5 @@
+import pytest
+
 from csv_to_clonehero.matching import (
     instrument_compatible,
     pick_best,
@@ -15,6 +17,85 @@ def test_artist_conflict_rejected(config):
     assert result.decision == "REJECT"
     assert result.final_score < config.matching.review_threshold
     assert any("artist conflict" in r for r in result.reasons)
+
+
+def test_same_artist_different_song_is_a_hard_title_conflict(config):
+    track = make_track("The Only Exception", "Paramore")
+    chart = make_chart("That's What You Get", "Paramore", charter="Harmonix", icon="rb2")
+    result = score_candidate(track, chart, config)
+
+    assert result.title_score == pytest.approx(37.8378378)
+    assert result.decision == "REJECT"
+    assert result.eligibility == "INCOMPATIBLE"
+    assert result.final_score < config.matching.review_threshold
+    assert result.gate_factors["title_conflict"] is True
+    assert any("title conflict" in reason for reason in result.reasons)
+
+
+def test_quality_cannot_rescue_low_title_identity(config):
+    track = make_track("The Only Exception", "Paramore")
+    chart = make_chart("That's What You Get", "Paramore", charter="Harmonix", icon="rb2")
+    chart.pack_name = "Rock Band 2"
+    chart.diff_band = 5
+    chart.difficulty_fields = {"diff_band": 5, "diff_guitar": 3, "diff_bass": 3, "diff_drums": 3}
+    result = score_candidate(track, chart, config)
+
+    assert result.decision == "REJECT"
+    assert result.eligibility not in {"RECOMMENDED", "ELIGIBLE_REVIEW"}
+    assert result.quality == 0.0
+    assert result.final_score < config.matching.review_threshold
+
+
+def test_borderline_title_identity_is_never_auto_accepted_from_quality(config):
+    track = make_track("Only Exception", "Paramore")
+    chart = make_chart("Only One", "Paramore", charter="Harmonix", icon="rb2")
+    chart.pack_name = "Official Pack"
+    result = score_candidate(track, chart, config)
+
+    assert 55.0 <= result.title_score < 70.0
+    assert result.gate_factors["title_identity"] == "borderline"
+    assert result.quality > 0
+    assert result.final_score < config.matching.auto_accept_threshold
+    assert result.decision == "REVIEW"
+    assert result.eligibility == "ELIGIBLE_REVIEW"
+
+
+def test_strong_normalized_title_still_auto_accepts(config):
+    result = score_candidate(
+        make_track("The Only Exception", "Paramore"),
+        make_chart("The Only Exception", "Paramore"),
+        config,
+    )
+
+    assert result.gate_factors["title_identity"] == "strong"
+    assert result.decision == "AUTO_ACCEPT"
+    assert result.eligibility == "RECOMMENDED"
+
+
+def test_meaningful_version_mismatch_remains_version_evidence(config):
+    result = score_candidate(
+        make_track("Sample Song (Remix)", "Sample Artist"),
+        make_chart("Sample Song", "Sample Artist"),
+        config,
+    )
+
+    assert result.gate_factors["title_identity"] == "strong"
+    assert result.gate_factors["title_conflict"] is False
+    assert any("version mismatch" in label for label, _ in result.penalties)
+
+
+def test_pick_best_prefers_correct_song_over_higher_quality_wrong_song(config):
+    track = make_track("The Only Exception", "Paramore")
+    wrong = make_chart("That's What You Get", "Paramore", chart_id=1, charter="Harmonix", icon="rb2")
+    wrong.pack_name = "Rock Band 2"
+    right = make_chart("The Only Exception", "Paramore", chart_id=2, instruments=["guitar"])
+
+    best, breakdown, scored = pick_best(track, [wrong, right], config)
+
+    assert best is right
+    assert breakdown.eligibility == "RECOMMENDED"
+    wrong_score = next(score for chart, score in scored if chart is wrong)
+    assert wrong_score.eligibility == "INCOMPATIBLE"
 
 
 def test_remaster_matches_chart_strongly(config):

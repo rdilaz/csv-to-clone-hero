@@ -491,14 +491,16 @@ def test_expansion_reuses_exact_catalog_queries(config):
             return super().search_artist(artist)
 
     source = CountingSource()
-    # Exact pass: Artist A qualifies for catalog; Artist B falls back to per-song.
+    # Exact pass: Artist A qualifies for catalog, but its different-song chart
+    # now correctly triggers per-song fallback for all three tracks. Artist B
+    # also uses its normal per-song query.
     run_search(config, db, [source], _no_overrides(), include_expansion=False)
     assert source.artist_calls == 1
-    assert source.song_calls == 1
+    assert source.song_calls == 4
 
     # Expansion: Artist A's catalog is already cached from the exact pass;
     # Artist B is eligible and needs its first artist query.
     run_search(config, db, [source], _no_overrides(), include_expansion=True)
     assert source.artist_calls == 2
-    assert source.song_calls == 1
+    assert source.song_calls == 4
     db.close()

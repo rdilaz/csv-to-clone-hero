@@ -1047,7 +1047,9 @@ def test_discovery_shortlists_broad_source_results(config):
     db = Database(config.database_path)
     result = run_spotify_discovery(config, db, [Source()], Client())
 
-    assert len(db.get_workspace_candidates(result.workspace_id)) == 12
+    candidates = db.get_workspace_candidates(result.workspace_id)
+    assert len(candidates) == 1
+    assert candidates[0]["chart_id"] == 1
     db.close()
 
 
