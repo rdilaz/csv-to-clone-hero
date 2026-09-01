@@ -1218,8 +1218,26 @@ class Database:
     def refresh_library_matching_fingerprint(self, workspace_id: int | str) -> str:
         """Persist the canonical fields consumed by matching as one identity."""
         db_id = self._workspace_db_id(workspace_id)
+        # Provider provenance/import metadata is intentionally excluded: it
+        # does not affect retrieval or scoring and would make an equivalent
+        # source reimport invalidate a valid completed scan.
         rows = self._conn.execute(
-            "SELECT normalized_artist,normalized_title,title,artist,album,duration_ms,isrc,url,liked,metadata_json FROM library_tracks WHERE workspace_id=? ORDER BY normalized_artist,normalized_title",
+            """SELECT t.normalized_artist,t.normalized_title,t.title,t.artist,t.album,
+                      t.duration_ms,t.isrc,t.url
+                 FROM library_tracks t
+                WHERE t.workspace_id = ?
+                  AND EXISTS (
+                        SELECT 1
+                          FROM library_track_provenance p
+                          JOIN library_sources s ON s.id = p.source_id
+                         WHERE p.library_track_id = t.id
+                           AND p.source_import_id = (
+                                 SELECT MAX(i.id)
+                                   FROM source_imports i
+                                  WHERE i.source_id = s.id
+                           )
+                  )
+                ORDER BY t.normalized_artist,t.normalized_title""",
             (db_id,),
         )
         digest = hashlib.sha256()
@@ -1335,14 +1353,30 @@ class Database:
                         "persisted_tracks": position,
                     })
             # Keep the existing chart engine projection usable for all callers.
-            stored = self.upsert_spotify_tracks(legacy_tracks)
-            for track in stored:
-                if track.db_id is not None:
-                    self._conn.execute(
-                        "INSERT OR IGNORE INTO workspace_library_tracks(workspace_id,track_id,already_owned,owned_count,membership_json) VALUES(?,?,?,?,?)",
-                        (db_id, track.db_id, 0, 0, "{}"),
-                    )
+            self.upsert_spotify_tracks(legacy_tracks)
         library_fingerprint = self.refresh_library_matching_fingerprint(db_id)
+        # A replacement import must remove tracks that disappeared from that
+        # source while retaining tracks from every other current source.
+        current_rows = self.get_neutral_library_tracks(db_id)
+        engine_tracks = self.get_spotify_tracks(True)
+        by_identity = {
+            (track.primary_artist_norm, track.title_norm): track
+            for track in engine_tracks
+            if track.db_id is not None
+        }
+        by_identity.update({
+            (track.artist_norm, track.title_norm): track
+            for track in engine_tracks
+            if track.db_id is not None
+        })
+        self.replace_workspace_library_tracks(
+            db_id,
+            [
+                by_identity[(str(row["normalized_artist"]), str(row["normalized_title"]))]
+                for row in current_rows
+                if (str(row["normalized_artist"]), str(row["normalized_title"])) in by_identity
+            ],
+        )
         return {"provider": provider, "source_id": source_id, "import_id": import_id, "tracks": len(snapshot.tracks), "report": report, "library_matching_fingerprint": library_fingerprint}
 
     def get_neutral_library_tracks(self, workspace_id: int | str, *, provider: str | None = None) -> list[sqlite3.Row]:
@@ -1368,10 +1402,12 @@ class Database:
             clause = " AND s.provider=?"
             params.append(str(provider).casefold())
         return list(self._conn.execute(
-            """SELECT s.provider,s.source_key,s.status,COUNT(DISTINCT p.library_track_id) AS tracks,
-                      COUNT(DISTINCT p.provider_id) AS provenance, i.skipped_rows AS skipped_rows,
-                      i.duplicate_rows AS duplicate_rows, i.report_json AS report_json,
-                      i.id AS import_id, i.total_rows AS total_rows, i.accepted_rows AS accepted_rows
+            """SELECT s.provider,s.source_key,s.status,s.updated_at,
+                       COUNT(DISTINCT p.library_track_id) AS tracks,
+                       COUNT(DISTINCT p.provider_id) AS provenance, i.skipped_rows AS skipped_rows,
+                       i.duplicate_rows AS duplicate_rows, i.report_json AS report_json,
+                       i.id AS import_id, i.status AS import_status, i.error AS import_error,
+                       i.completed_at AS completed_at, i.total_rows AS total_rows, i.accepted_rows AS accepted_rows
                  FROM library_sources s
                  LEFT JOIN source_imports i ON i.id=(SELECT MAX(i2.id) FROM source_imports i2 WHERE i2.source_id=s.id)
                  LEFT JOIN library_track_provenance p ON p.source_id=s.id AND p.source_import_id=i.id
@@ -2909,7 +2945,7 @@ class Database:
                     VALUES (?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(workspace_id, scan_key) DO UPDATE SET
                       kind = excluded.kind, status = excluded.status,
-                      started_at = excluded.started_at,
+                      started_at = COALESCE(discovery_scans.started_at, excluded.started_at),
                       finished_at = excluded.finished_at,
                       metadata_json = excluded.metadata_json""",
                  (db_id, scan_key, kind, status, now, finished_at, _json_text(data.get("metadata", {}), {})),

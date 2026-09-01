@@ -42,6 +42,13 @@ TITLE_WEIGHT = 0.55
 ARTIST_WEIGHT = 0.35
 BASE_COMPLEMENT = 0.10
 
+# Identity is stricter than ranking quality.  Below 55, two normalized titles
+# are clearly different songs (the live Paramore failure was 37.84%).  The
+# 55-70 band remains reviewable for plausible formatting/spelling variation,
+# while 70 preserves the existing "Song One"/"Song 1" case at 71.43%.
+TITLE_IDENTITY_CONFLICT_THRESHOLD = 55.0
+TITLE_IDENTITY_AUTO_THRESHOLD = 70.0
+
 DEFAULT_AUTO_ACCEPT_THRESHOLD = 90.0
 DEFAULT_REVIEW_THRESHOLD = 70.0
 DEFAULT_DURATION_TOLERANCE_MS = 5_000
@@ -209,6 +216,9 @@ def _new_breakdown() -> SpotifyScoreBreakdown:
             "required_five_fret_guitar": None,
             "artist_match": None,
             "artist_conflict": False,
+            "title_similarity": None,
+            "title_identity": None,
+            "title_conflict": False,
             "modchart_allowed": None,
             "severe_issue": None,
             "download_supported": None,
@@ -1117,17 +1127,26 @@ def _set_threshold_eligibility(
     if breakdown.gate_factors.get("hard_gate"):
         return
     auto_threshold, review_threshold = _thresholds(config)
-    if breakdown.final_score >= auto_threshold:
+    borderline_title = breakdown.gate_factors.get("title_identity") == "borderline"
+    if breakdown.final_score >= auto_threshold and not borderline_title:
         state = RECOMMENDED
         reasons = ["score meets recommendation threshold"]
         decision = "AUTO_ACCEPT"
     elif breakdown.final_score >= review_threshold:
         state = ELIGIBLE_REVIEW
-        reasons = ["score meets export review threshold"]
+        reasons = [
+            "borderline title identity requires review"
+            if borderline_title
+            else "score meets export review threshold"
+        ]
         decision = "REVIEW"
     else:
         state = EXCLUDED
-        reasons = ["score below export eligibility threshold"]
+        reasons = [
+            "borderline title identity below review threshold"
+            if borderline_title
+            else "score below export eligibility threshold"
+        ]
         decision = "REJECT"
     _set_eligibility(breakdown, state, reasons)
     if update_decision:
@@ -1175,9 +1194,19 @@ def score_candidate(
     artist_score = _best_artist_similarity(track, chart)
     breakdown.title_score = title_score
     breakdown.artist_score = artist_score
-    _record_factor(breakdown, "title", {"similarity": title_score, "exact_normalized": title_norm == chart_name_norm})
+    _record_factor(
+        breakdown,
+        "title",
+        {
+            "similarity": title_score,
+            "exact_normalized": title_norm == chart_name_norm,
+            "conflict_threshold": TITLE_IDENTITY_CONFLICT_THRESHOLD,
+            "auto_trust_threshold": TITLE_IDENTITY_AUTO_THRESHOLD,
+        },
+    )
     _record_factor(breakdown, "artist", {"similarity": artist_score, "conflict_threshold": _number(_config_value(config, ("artist_conflict_threshold",), 55.0), 55.0)})
     breakdown.gate_factors["artist_match"] = artist_score
+    breakdown.gate_factors["title_similarity"] = title_score
 
     artist_threshold = _number(_config_value(config, ("artist_conflict_threshold",), 55.0), 55.0)
     base = title_score * TITLE_WEIGHT + artist_score * ARTIST_WEIGHT + 100 * BASE_COMPLEMENT
@@ -1194,6 +1223,27 @@ def score_candidate(
             decision="REJECT",
             final_score=final_score,
         )
+
+    if title_score < TITLE_IDENTITY_CONFLICT_THRESHOLD:
+        breakdown.gate_factors["title_identity"] = "conflict"
+        breakdown.gate_factors["title_conflict"] = True
+        breakdown.base_score = base
+        review_threshold = _thresholds(config)[1]
+        final_score = min(base, max(0.0, review_threshold - 1))
+        return _hard_gate(
+            breakdown,
+            INCOMPATIBLE,
+            [
+                f"title conflict ({title_score:.1f}% similarity: "
+                f"{track.title!r} vs {chart.name!r})"
+            ],
+            decision="REJECT",
+            final_score=final_score,
+        )
+    if title_score < TITLE_IDENTITY_AUTO_THRESHOLD:
+        breakdown.gate_factors["title_identity"] = "borderline"
+    else:
+        breakdown.gate_factors["title_identity"] = "strong"
 
     issues, _review, download = _source_evidence(breakdown, chart, source)
     source_gate_reasons: list[str] = []
@@ -1252,6 +1302,12 @@ def score_candidate(
 
     total = base + sum(value for _, value in breakdown.bonuses) - sum(value for _, value in breakdown.penalties)
     breakdown.final_score = max(0.0, min(100.0, total))
+    if breakdown.gate_factors.get("title_identity") == "borderline":
+        auto_threshold = _thresholds(config)[0]
+        breakdown.final_score = min(breakdown.final_score, max(0.0, auto_threshold - 1))
+        breakdown.reasons.append(
+            f"borderline title identity ({title_score:.1f}% similarity); automatic recommendation blocked"
+        )
     _set_threshold_eligibility(breakdown, config)
     return breakdown
 

@@ -168,42 +168,44 @@ def test_index_serves_source_neutral_workflow(client):
     assert response.status_code == 200
     html = response.get_data(as_text=True)
     for text in (
-        "Music to Clone Hero and YARG",
-        "SoundCloud export",
-        "Import SoundCloud export",
-        "Connect Spotify",
-        "Find chart matches",
-        "Review and export",
-        "Review matches",
+        "Riff",
+        "music to Clone Hero",
+        "journey.css",
+        "journey.js",
+        "Restoring your library...",
+        'data-app-surface="journey"',
     ):
         assert text in html
     assert "source_key" not in html
     assert "provenance" not in html
-    assert "Open advanced review and download" not in html
+    assert "/advanced" not in html
+    assert "WHAT'S HAPPENING" not in html
     ids = re.findall(r'id="([^\"]+)"', html)
     assert len(ids) == len(set(ids))
 
 
 def test_local_home_exposes_spotify_sync_scope_and_import_controls(client):
     html = client.get("/").get_data(as_text=True)
-    for text in ("Sync Spotify", "spotifySync", "spotifyLiked", "spotifyPlaylists", "Add selected to Your Music"):
-        assert text in html
+    assert "Sync Spotify" not in html
+    assert "spotifyScope" not in html
+    assert "/api/spotify/inventory" not in html
     assert client.post("/api/spotify/import", json={}).status_code == 401
 
 
 def test_matching_loading_state_has_accessible_immediate_feedback(client):
     html = client.get("/").get_data(as_text=True)
-    assert 'id="matchingLoading"' in html
-    assert "CHECKING YOUR LIBRARY" in html
-    assert "prefers-reduced-motion" in html
+    assert 'data-test="journey-loading"' in html
+    assert "Restoring your library..." in html
+    assert "globalOperation" not in html
+    assert "READY TO FIND CHARTS" not in html
 
 
 def test_local_home_exposes_provenance_filters_and_activity_shell(client):
     html = client.get("/").get_data(as_text=True)
-    for text in ("YOUR MUSIC", "SoundCloud", "Spotify", "In both", "Duplicates merged", "WHAT'S HAPPENING", "READY TO FIND CHARTS", "View all song activity"):
-        assert text in html
-    for source in ("all", "soundcloud", "spotify", "both"):
-        assert f'data-source-filter="{source}"' in html
+    assert "WHAT'S HAPPENING" not in html
+    assert "View all song activity" not in html
+    assert "data-source-filter" not in html
+    assert "Preview chart matches" not in html
 
     payload = client.get("/api/sources").get_json()["journey"]
     assert payload["sources"]["soundcloud"]["state"] == "not_imported"
@@ -236,7 +238,8 @@ def test_current_matching_generation_is_the_candidate_boundary(client, config, t
         current_scan = db.create_discovery_scan(workspace, scan_key="current", kind="exact", status="complete", metadata={"workflow": "combined_catalog"})
         current_task = db.upsert_discovery_task(workspace, scan_id=current_scan, source="fake", kind="song", query_key="current")
         current = db._conn.execute("SELECT id FROM candidate_charts WHERE chart_id = 301").fetchone()["id"]
-        db._conn.execute("UPDATE workspace_candidates SET task_id = ? WHERE workspace_id = ? AND candidate_id = ?", (current_task, workspace, current))
+        blocked = db._conn.execute("SELECT id FROM candidate_charts WHERE chart_id = 303").fetchone()["id"]
+        db._conn.execute("UPDATE workspace_candidates SET task_id = ? WHERE workspace_id = ? AND candidate_id IN (?, ?)", (current_task, workspace, current, blocked))
         stale_chart = make_chart("Song", "Artist", chart_id=399)
         db.upsert_candidate(stale_chart)
         stale = db._conn.execute("SELECT id FROM candidate_charts WHERE chart_id = 399").fetchone()["id"]
@@ -245,14 +248,21 @@ def test_current_matching_generation_is_the_candidate_boundary(client, config, t
     finally:
         db.close()
 
-    review = client.get("/api/review").get_json()
+    review = client.get(f"/api/review?workspace_id={workspace}&state=eligible").get_json()
     candidates = [item for card in review["tracks"] for item in card["candidates"]]
     assert 301 in [item["chart_id"] for item in candidates]
     assert 399 not in [item["chart_id"] for item in candidates]
+    assert review["tracks"][0]["recommendation_candidate_id"] == current
     assert client.post("/api/spotify/select", json={"workspace_id": workspace, "track_id": track.db_id, "source": "fake", "chart_id": 399}).status_code == 404
+    assert client.post("/api/discovery/select", json={"workspace_id": workspace, "track_id": track.track_key, "candidate_id": stale}).status_code == 404
+    assert client.post("/api/discovery/select", json={"workspace_id": workspace, "track_id": track.track_key, "candidate_id": blocked}).status_code == 400
     bulk = client.post("/api/spotify/select-all", json={"workspace_id": workspace, "scope": "eligible"})
     assert bulk.status_code == 200
     assert bulk.get_json()["selected"] == 1
+    assert [item["chart_id"] for item in bulk.get_json()["items"]] == [301]
+    persisted = client.get(f"/api/discovery/selections?workspace_id={workspace}").get_json()
+    assert persisted["selected_count"] == 1
+    assert [item["chart_id"] for item in persisted["items"]] == [301]
 
     db = Database(config.database_path)
     try:
@@ -261,21 +271,29 @@ def test_current_matching_generation_is_the_candidate_boundary(client, config, t
         db._conn.commit()
     finally:
         db.close()
+    before_preview = client.get(
+        f"/api/discovery/selections?workspace_id={workspace}"
+    ).get_json()
     preview = client.post("/api/spotify/export/preview", json={"workspace_id": workspace, "kind": "folder", "path": str(tmp_path / "songs")})
     assert preview.status_code == 200
     assert preview.get_json()["ok"] is False
+    after_preview = client.get(
+        f"/api/discovery/selections?workspace_id={workspace}"
+    ).get_json()
+    assert after_preview["selected_count"] == before_preview["selected_count"]
+    assert [item["candidate_id"] for item in after_preview["items"]] == [
+        item["candidate_id"] for item in before_preview["items"]
+    ]
     assert client.post("/api/spotify/export/start", json={"workspace_id": workspace, "kind": "folder", "path": str(tmp_path / "songs")}).status_code == 400
 
 
-def test_home_inline_script_parses_in_javascript_engine(client, tmp_path):
+def test_journey_static_script_parses_in_javascript_engine(client, tmp_path):
     if shutil.which("node") is None:
         pytest.skip("Node.js is not installed")
 
-    html = client.get("/").get_data(as_text=True)
-    scripts = re.findall(r"<script>\s*(.*?)\s*</script>", html, flags=re.DOTALL)
-    assert len(scripts) == 1
+    script = client.get("/static/journey.js").get_data(as_text=True)
     script_path = tmp_path / "home.js"
-    script_path.write_text(scripts[0], encoding="utf-8")
+    script_path.write_text(script, encoding="utf-8")
     checked = subprocess.run(
         ["node", "--check", str(script_path)],
         capture_output=True,
@@ -283,28 +301,22 @@ def test_home_inline_script_parses_in_javascript_engine(client, tmp_path):
         check=False,
     )
     assert checked.returncode == 0, checked.stderr
-    assert "/api/sources/soundcloud/import" in scripts[0]
-    assert "/api/sources/soundcloud/import/status" in scripts[0]
-    assert "/api/discovery/start" in scripts[0]
+    assert "/api/sources/soundcloud/import" in script
+    assert "/api/discovery/start" in script
+    assert "/api/export/preview" in script
+    assert "/api/paths/pick" in script
+    assert "/api/spotify/export/start" in script
+    assert "/api/export/status" in script
+    assert "/api/spotify/export/cancel" in script
+    assert "/api/journey" in script
+    assert "/api/spotify/status" not in script
 
 
-def test_advanced_inline_script_parses_in_javascript_engine(client, tmp_path):
-    if shutil.which("node") is None:
-        pytest.skip("Node.js is not installed")
-
-    html = client.get("/advanced").get_data(as_text=True)
-    scripts = re.findall(r"<script>\s*(.*?)\s*</script>", html, flags=re.DOTALL)
-    assert len(scripts) == 1
-    script_path = tmp_path / "advanced.js"
-    script_path.write_text(scripts[0], encoding="utf-8")
-    checked = subprocess.run(
-        ["node", "--check", str(script_path)],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert checked.returncode == 0, checked.stderr
-    assert "exported successfully" in scripts[0]
+def test_advanced_page_is_only_a_compatibility_redirect(client):
+    response = client.get("/advanced")
+    assert response.status_code == 302
+    assert response.headers["Location"] == "/"
+    assert "Review and export charts" not in response.get_data(as_text=True)
 
 
 def test_local_journey_summary_and_review_rehydrate_after_fresh_app(client, config):
@@ -328,7 +340,7 @@ def test_local_journey_summary_and_review_rehydrate_after_fresh_app(client, conf
             "no_suitable_songs": 1,
             "selected_charts": 0,
         }
-        assert journey["review_url"].startswith("/advanced?workspace_id=")
+        assert journey["review_url"] == "/"
 
         status = fresh.get(
             f"/api/discovery/status?workspace_id={initial['workspace_id']}"
@@ -366,12 +378,31 @@ def test_local_journey_summary_and_review_rehydrate_after_fresh_app(client, conf
         assert after["journey"]["counts"]["selected_charts"] == 1
 
     home = client.get("/").get_data(as_text=True)
-    assert "Review matches" in home
+    assert "Review matches" not in home
+    assert "/advanced" not in home
     assert "source_key" not in home
     assert "provenance" not in home
 
 
-def test_bulk_selection_defaults_to_strong_and_explicit_eligible_scope(client, config):
+def test_review_api_preserves_local_workspace_without_page_handoff(client, config):
+    initial = client.get("/api/sources").get_json()
+    seed_local_workspace(config, initial["workspace_id"])
+
+    home = client.get("/").get_data(as_text=True)
+    assert 'data-app-surface="journey"' in home
+    assert "/advanced" not in home
+
+    review = client.get(
+        f"/api/review?workspace_id={initial['workspace_id']}&state=eligible&limit=50&offset=0"
+    ).get_json()
+    assert review["workspace_id"] == initial["workspace_id"]
+    assert review["source_neutral"] is True
+    assert review["journey"]["matching_complete"] is True
+    assert review["tracks"]
+
+
+
+def test_charts_found_cohort_scopes_replace_and_rehydrate(client, config):
     initial = client.get("/api/sources").get_json()
     seed_local_workspace(config, initial["workspace_id"])
     db = Database(config.database_path)
@@ -408,29 +439,267 @@ def test_bulk_selection_defaults_to_strong_and_explicit_eligible_scope(client, c
     finally:
         db.close()
 
+    workspace = initial["workspace_id"]
+
     strong = client.post(
-        "/api/spotify/select-all",
-        json={"workspace_id": initial["workspace_id"], "scope": "strong"},
+        "/api/discovery/select-all",
+        json={"workspace_id": workspace, "scope": "strong"},
     )
     assert strong.status_code == 200
     assert strong.get_json()["selected"] == 1
     assert strong.get_json()["scope"] == "strong"
+    assert strong.get_json()["selected_count"] == 1
+    assert [item["chart_id"] for item in strong.get_json()["items"]] == [301]
+
+    cleared = client.post(
+        "/api/discovery/select-all",
+        json={"workspace_id": workspace, "action": "clear"},
+    )
+    assert cleared.get_json()["selected_count"] == 0
+    all_recommendations = client.post(
+        "/api/discovery/select-all",
+        json={"workspace_id": workspace, "scope": "eligible"},
+    )
+    assert all_recommendations.status_code == 200
+    assert all_recommendations.get_json()["selected"] == 2
+    assert all_recommendations.get_json()["selected_count"] == 2
+    assert {item["chart_id"] for item in all_recommendations.get_json()["items"]} == {301, 304}
 
     client.post(
-        "/api/spotify/select-all",
-        json={"workspace_id": initial["workspace_id"], "action": "clear"},
+        "/api/discovery/select-all",
+        json={"workspace_id": workspace, "action": "clear"},
     )
-    eligible = client.post(
-        "/api/spotify/select-all",
+    best_again = client.post(
+        "/api/discovery/select-all",
+        json={"workspace_id": workspace, "scope": "strong"},
+    )
+    assert best_again.status_code == 200
+    assert best_again.get_json()["selected_count"] == 1
+    assert [item["chart_id"] for item in best_again.get_json()["items"]] == [301]
+
+    fresh_app = create_app(config, source_factory=lambda cfg: [FakeSource()])
+    fresh_app.config["TESTING"] = True
+    with fresh_app.test_client() as fresh:
+        persisted = fresh.get(
+            f"/api/discovery/selections?workspace_id={workspace}"
+        ).get_json()
+        assert persisted["selected_count"] == 1
+        assert [item["chart_id"] for item in persisted["items"]] == [301]
+
+
+def test_title_conflict_cannot_be_selected_or_preflighted(config):
+    from csv_to_clonehero.combined_pipeline import discover_combined
+    from csv_to_clonehero.providers.base import LibrarySnapshot, ProviderTrack
+
+    wrong = make_chart(
+        "That's What You Get", "Paramore", chart_id=305,
+        charter="Harmonix", icon="rb2",
+    )
+
+    class WrongSongCatalog:
+        available = True
+        diagnostic = ""
+        snapshot_id = "title-conflict"
+        chart_count = 1
+
+        def candidates(self, artist, title):
+            return (wrong,) if (artist, title) == ("Paramore", "The Only Exception") else ()
+
+        def artist_songs(self, _artist):
+            return ()
+
+    db = Database(config.database_path)
+    try:
+        discover_combined(
+            config,
+            db,
+            [LibrarySnapshot("soundcloud", [
+                ProviderTrack("soundcloud", "paramore", "The Only Exception", "Paramore")
+            ])],
+            workspace_key="combined:web-title-conflict",
+            catalog=WrongSongCatalog(),
+        )
+        workspace = int(db.get_workspace("combined:web-title-conflict")["id"])
+        row = db.get_workspace_candidates(
+            workspace, kind="exact", include_rejected=True, current_only=True
+        )[0]
+        candidate_id = int(row["candidate_id"])
+        assert row["eligibility"] == "INCOMPATIBLE"
+    finally:
+        db.close()
+
+    app = create_app(config, source_factory=lambda cfg: [FakeSource()])
+    app.config["TESTING"] = True
+    with app.test_client() as http:
+        strong = http.post(
+            "/api/discovery/select-all",
+            json={"workspace_id": workspace, "scope": "strong"},
+        ).get_json()
+        eligible = http.post(
+            "/api/discovery/select-all",
+            json={"workspace_id": workspace, "scope": "eligible"},
+        ).get_json()
+        assert strong["selected_count"] == 0
+        assert eligible["selected_count"] == 0
+        rejected = http.post(
+            "/api/discovery/select",
+            json={
+                "workspace_id": workspace,
+                "kind": "exact",
+                "track_id": "paramore|the only exception",
+                "candidate_id": candidate_id,
+            },
+        )
+        assert rejected.status_code == 400
+        assert http.get(
+            f"/api/discovery/selections?workspace_id={workspace}"
+        ).get_json()["selected_count"] == 0
+        preview = http.post(
+            "/api/export/preview",
+            json={"workspace_id": workspace, "kind": "folder"},
+        )
+        assert preview.status_code == 400
+        assert "select at least one" in preview.get_json()["error"].casefold()
+
+
+def test_confirmation_review_is_paged_searchable_mutable_and_persistent(client, config):
+    from csv_to_clonehero.providers.base import LibrarySnapshot, ProviderTrack
+
+    workspace = client.get("/api/sources").get_json()["workspace_id"]
+    library = [
+        ProviderTrack(
+            provider="soundcloud",
+            provider_id=f"confirmation-{index:03d}",
+            artist=f"Artist {index:03d}",
+            title=f"Song {index:03d}",
+        )
+        for index in range(60)
+    ]
+    db = Database(config.database_path)
+    try:
+        db.upsert_library_snapshot(workspace, LibrarySnapshot("soundcloud", library))
+        tracks = sorted(db.get_spotify_tracks(True), key=lambda track: track.title)
+        scan_id = db.create_discovery_scan(
+            workspace,
+            scan_key="confirmation-current",
+            kind="exact",
+            status="complete",
+            metadata={"workflow": "combined_catalog"},
+        )
+        task_id = db.upsert_discovery_task(
+            workspace,
+            scan_id=scan_id,
+            source="test",
+            kind="generation",
+            query_key="confirmation-current",
+            status="complete",
+            total=len(tracks),
+            completed=len(tracks),
+        )
+        for index, track in enumerate(tracks):
+            review_tier = index >= 30
+            chart = make_chart(
+                track.title + (" (Live)" if review_tier else ""),
+                track.primary_artist,
+                chart_id=1000 + index,
+            )
+            db.upsert_candidate(chart)
+            db.upsert_workspace_candidate(
+                workspace,
+                track.track_key,
+                chart,
+                score=82 if review_tier else 95,
+                eligibility="ELIGIBLE_REVIEW" if review_tier else "RECOMMENDED",
+                decision="REVIEW" if review_tier else "AUTO_ACCEPT",
+                kind="exact",
+                task_id=task_id,
+            )
+        db.update_workspace(workspace, status="complete", phase="complete")
+        db.update_workspace_progress(
+            workspace,
+            status="complete",
+            phase="complete",
+            total_tracks=len(tracks),
+            completed_tracks=len(tracks),
+        )
+    finally:
+        db.close()
+
+    first = client.get(
+        f"/api/review?workspace_id={workspace}&state=eligible&limit=25&offset=0"
+    ).get_json()
+    assert first["page"]["returned"] == 25
+    assert first["page"]["total"] == 60
+    assert first["page"]["has_more"] is True
+    assert client.get(
+        f"/api/review?workspace_id={workspace}&state=strong&limit=25"
+    ).get_json()["page"]["total"] == 30
+    assert client.get(
+        f"/api/review?workspace_id={workspace}&state=review&limit=25"
+    ).get_json()["page"]["total"] == 30
+
+    searched = client.get(
+        f"/api/review?workspace_id={workspace}&state=eligible&limit=25&search=Artist%20055"
+    ).get_json()
+    assert searched["page"]["total"] == 1
+    outside = searched["tracks"][0]
+    assert outside["title"] == "Song 055"
+    first_card = first["tracks"][0]
+
+    def select(card):
+        return client.post(
+            "/api/discovery/select",
+            json={
+                "workspace_id": workspace,
+                "kind": "exact",
+                "track_id": card["track_key"],
+                "candidate_id": card["recommendation_candidate_id"],
+            },
+        )
+
+    assert select(first_card).get_json()["selected_count"] == 1
+    assert select(outside).get_json()["selected_count"] == 2
+    assert client.get(
+        f"/api/review?workspace_id={workspace}&state=strong&limit=25"
+    ).get_json()["page"]["total"] == 30
+    assert client.get(
+        f"/api/review?workspace_id={workspace}&state=review&limit=25"
+    ).get_json()["page"]["total"] == 30
+    selected = client.get(
+        f"/api/review?workspace_id={workspace}&state=selected&limit=25"
+    ).get_json()
+    assert selected["page"]["total"] == 2
+    assert {card["track_key"] for card in selected["tracks"]} == {
+        first_card["track_key"], outside["track_key"]
+    }
+
+    cleared = client.post(
+        "/api/discovery/select",
         json={
-            "workspace_id": initial["workspace_id"],
-            "scope": "eligible",
-            "search": "Missing Song",
+            "workspace_id": workspace,
+            "kind": "exact",
+            "track_id": outside["track_key"],
+            "action": "clear",
         },
-    )
-    assert eligible.status_code == 200
-    assert eligible.get_json()["selected"] == 1
-    assert eligible.get_json()["items"][0]["chart_id"] == 304
+    ).get_json()
+    assert cleared["selected_count"] == 1
+    after_clear = client.get(
+        f"/api/review?workspace_id={workspace}&state=selected&limit=25"
+    ).get_json()
+    assert [card["track_key"] for card in after_clear["tracks"]] == [first_card["track_key"]]
+    assert select(outside).get_json()["selected_count"] == 2
+
+    fresh_app = create_app(config, source_factory=lambda cfg: [FakeSource()])
+    fresh_app.config["TESTING"] = True
+    with fresh_app.test_client() as fresh:
+        tray = fresh.get(f"/api/discovery/selections?workspace_id={workspace}").get_json()
+        rehydrated = fresh.get(
+            f"/api/review?workspace_id={workspace}&state=selected&limit=25"
+        ).get_json()
+        assert tray["selected_count"] == 2
+        assert {card["track_key"] for card in rehydrated["tracks"]} == {
+            first_card["track_key"], outside["track_key"]
+        }
 
 
 def test_review_bulk_actions_are_explicit_scoped_and_preserve_manual_alternatives(client, config):
@@ -576,6 +845,7 @@ def test_local_export_reports_one_human_readable_success(config):
             json={"kind": "folder", "workspace_id": workspace_id, "path": str(config.base_dir / "Songs")},
         )
         assert started.status_code == 200
+        assert started.get_json()["kind"] == "folder"
         deadline = time.time() + 10
         status = None
         while time.time() < deadline:
@@ -584,6 +854,8 @@ def test_local_export_reports_one_human_readable_success(config):
                 break
             time.sleep(0.05)
         assert status is not None and status["status"] == "complete"
+        assert status["kind"] == "folder"
+        assert status["result"]["kind"] == "folder"
         assert status["result"]["success"] is True
         assert status["result"]["published"] == 1
         assert status["result"]["failed"] == 0
@@ -596,7 +868,9 @@ def test_local_export_reports_one_human_readable_success(config):
             assert items and items[0]["status"] == "published"
         finally:
             db.close()
-        assert "exported successfully" in http.get("/advanced").get_data(as_text=True)
+        advanced = http.get("/advanced")
+        assert advanced.status_code == 302
+        assert advanced.headers["Location"] == "/"
 
 
 def test_local_journey_distinguishes_catalog_failure_and_incomplete_matching(client, config):
@@ -1391,7 +1665,8 @@ def test_public_mode_uses_browser_downloads_on_remote_device(config):
     with app.test_client() as http:
         page = http.get("/?access_token=public-secret", environ_base=remote)
         assert page.status_code == 200
-        assert "const publicMode = true" in page.get_data(as_text=True)
+        assert 'data-app-surface="journey"' in page.get_data(as_text=True)
+        assert "/advanced" not in page.get_data(as_text=True)
         assert http.post(
             "/api/spotify/path/pick",
             headers={"X-CSV-To-CloneHero-Access-Token": "public-secret"},
@@ -1523,30 +1798,11 @@ def test_app_startup_removes_legacy_demo_workspace(config):
         db.close()
 
 
-def test_advanced_page_serves_music_file_import_workflow(client):
+def test_advanced_page_is_retired(client):
     response = client.get("/advanced")
-    assert response.status_code == 200
-    html = response.get_data(as_text=True)
-    for text in (
-        "Review and export charts",
-        "Add music exports",
-        "Preview chart matches",
-        "Review your matches",
-        "My music",
-        "Best chart",
-        "Why this match?",
-        "Download selected charts",
-        "iTunes/Music TXT",
-        "iTunes/Music XML",
-    ):
-        assert text in html
-    assert 'id="picker" accept=".csv,.txt,.xml"' in html
-    assert 'id="review"' in html
-    assert 'id="jobStatus"' in html
-    assert 'href="/"' in html
-    assert 'id="legacyImportSources"' in html
-    assert 'id="localJourney"' in html
-    assert "Spotify library workflow" not in html
+    assert response.status_code == 302
+    assert response.headers["Location"] == "/"
+    assert "Review and export charts" not in response.get_data(as_text=True)
 
 
 def test_upload_list_delete_csv(client, config):
@@ -1850,6 +2106,93 @@ def test_build_preview_exposes_all_truthful_buckets(client, config):
     assert cleared.get_json()["selection_count"] == 1
 
 
+def test_journey_folder_preflight_is_no_write_and_exposes_destination_truth(config):
+    source = FakeSource()
+    app = create_app(config, source_factory=lambda cfg: [source])
+    app.config["TESTING"] = True
+    with app.test_client() as http:
+        workspace = http.get("/api/sources").get_json()["workspace_id"]
+        track = seed_local_workspace(config, workspace)
+        db = Database(config.database_path)
+        try:
+            current = next(
+                row
+                for row in db.get_workspace_candidates(
+                    workspace,
+                    track_id=track.track_key,
+                    kind="exact",
+                    include_rejected=True,
+                    current_only=True,
+                )
+                if int(row["chart_id"]) == 301
+            )
+        finally:
+            db.close()
+
+        empty = http.post(
+            "/api/export/preview",
+            json={"kind": "folder", "workspace_id": workspace},
+        )
+        assert empty.status_code == 400
+        assert "select at least one" in empty.get_json()["error"].casefold()
+
+        selected = http.post(
+            "/api/discovery/select",
+            json={
+                "workspace_id": workspace,
+                "kind": "exact",
+                "track_id": track.track_key,
+                "candidate_id": current["candidate_id"],
+            },
+        )
+        assert selected.status_code == 200
+        assert selected.get_json()["selected_count"] == 1
+
+        initial = http.post(
+            "/api/export/preview",
+            json={"kind": "folder", "workspace_id": workspace},
+        ).get_json()
+        assert initial["ok"] is True
+        assert initial["selected_chart_count"] == 1
+        assert initial["eligible_chart_count"] == 1
+        assert initial["reusable_count"] == 0
+        assert initial["download_required_count"] == 1
+        assert initial["destination"] == str(config.library_root.resolve())
+        assert initial["available_bytes"] > 0
+        assert initial["current_library_bytes"] == 0
+        assert initial["configured_budget_bytes"] == config.storage.max_library_bytes
+        assert isinstance(initial["warnings"], list)
+
+        dedicated = config.base_dir / "Dedicated Songs"
+        assert dedicated.exists() is False
+        changed = http.post(
+            "/api/export/preview",
+            json={
+                "kind": "folder",
+                "workspace_id": workspace,
+                "path": str(dedicated),
+            },
+        ).get_json()
+        assert changed["ok"] is True
+        assert changed["destination"] == str(dedicated.resolve())
+        assert changed["selected_chart_count"] == 1
+        assert dedicated.exists() is False
+
+        tray = http.get(
+            f"/api/discovery/selections?workspace_id={workspace}"
+        ).get_json()
+        assert tray["selected_count"] == 1
+        assert source.downloads == []
+        assert app.extensions["export_job"].running is False
+
+    db = Database(config.database_path)
+    try:
+        assert db.list_export_records(workspace_id=workspace) == []
+    finally:
+        db.close()
+    assert list(config.base_dir.rglob("*.sng")) == []
+
+
 def test_duplicate_build_request_preserves_active_build(client):
     job = _set_active_export(client.application, done=2, total=4)
     try:
@@ -1912,8 +2255,10 @@ def test_build_status_reports_real_counters_and_cross_page_state(client):
         assert export["items"]["failed"] == 1
         assert export["items"]["invalid"] == 1
         assert export["items"]["remaining"] == 1
-        assert "Building library" in client.get("/advanced").get_data(as_text=True)
-        assert "globalOperation" in client.get("/").get_data(as_text=True)
+        advanced = client.get("/advanced")
+        assert advanced.status_code == 302
+        assert advanced.headers["Location"] == "/"
+        assert "globalOperation" not in client.get("/").get_data(as_text=True)
     finally:
         with job.lock:
             job.running = False
@@ -1952,7 +2297,9 @@ def test_matching_busy_state_blocks_review_mutation_but_allows_read(client):
         assert response.status_code == 409
         assert "Spotify discovery" in response.get_json()["error"]
         assert client.get("/api/review").status_code == 200
-        assert "Selections cannot be changed while chart matching is running." in client.get("/advanced").get_data(as_text=True)
+        advanced = client.get("/advanced")
+        assert advanced.status_code == 302
+        assert advanced.headers["Location"] == "/"
     finally:
         with matching.lock:
             matching.running = False
@@ -1988,6 +2335,100 @@ def test_export_cancelling_survives_subsequent_progress_then_settles(client):
         with job.lock:
             job.running = False
             job.status = "idle"
+
+
+def test_real_worker_preserves_cancelled_terminal_status_with_useful_output(config, monkeypatch):
+    source = FakeSource()
+    app = create_app(config, source_factory=lambda cfg: [source])
+    app.config["TESTING"] = True
+    with app.test_client() as http:
+        workspace = http.get("/api/sources").get_json()["workspace_id"]
+        track = seed_local_workspace(config, workspace)
+        db = Database(config.database_path)
+        try:
+            current = next(
+                row
+                for row in db.get_workspace_candidates(
+                    workspace,
+                    track_id=track.track_key,
+                    kind="exact",
+                    include_rejected=True,
+                    current_only=True,
+                )
+                if int(row["chart_id"]) == 301
+            )
+        finally:
+            db.close()
+        assert http.post(
+            "/api/discovery/select",
+            json={
+                "workspace_id": workspace,
+                "kind": "exact",
+                "track_id": track.track_key,
+                "candidate_id": current["candidate_id"],
+            },
+        ).status_code == 200
+
+        item = type("Item", (), {
+            "selection_index": 0,
+            "selection_id": 1,
+            "source": "test",
+            "chart_id": 301,
+            "target_relpath": "Artist/Song.sng",
+            "target_path": config.base_dir / "Songs" / "Artist" / "Song.sng",
+            "status": "published",
+            "result": "published",
+            "bytes_count": 100,
+            "sha256": "",
+            "source_hash": "",
+            "source_hash_algorithm": "",
+            "artifact_key": "",
+            "failure": "",
+            "playable_note_count": 1,
+        })()
+        cancelled_result = type("Result", (), {
+            "kind": "folder",
+            "destination": config.base_dir / "Songs",
+            "success": True,
+            "cancelled": True,
+            "published_count": 1,
+            "failed_count": 0,
+            "invalid_count": 0,
+            "download_failure_count": 0,
+            "cancelled_items": [object()],
+            "ready_count": 1,
+            "remaining_count": 1,
+            "output_bytes": 100,
+            "errors": [],
+            "items": [item],
+            "preflight": None,
+            "manifest": None,
+            "manifest_path": None,
+            "sync": None,
+        })()
+        monkeypatch.setattr(
+            "csv_to_clonehero.webapp.ExportService.export_folder",
+            lambda self, *args, **kwargs: cancelled_result,
+        )
+        started = http.post(
+            "/api/spotify/export/start",
+            json={
+                "kind": "folder",
+                "workspace_id": workspace,
+                "path": str(config.base_dir / "Songs"),
+            },
+        )
+        assert started.status_code == 200
+        for _ in range(100):
+            status = http.get(
+                f"/api/export/status?workspace_id={workspace}"
+            ).get_json()
+            if not status["running"]:
+                break
+            time.sleep(0.01)
+        assert status["status"] == "cancelled"
+        assert status["operation"]["state"] == "cancelled"
+        assert status["result"]["ready"] == 1
 
 
 @pytest.mark.parametrize(
@@ -2052,36 +2493,96 @@ def test_open_folder_prefers_actual_completed_export_destination(client, config,
     assert str(actual.resolve()) != str(config.library_root.resolve())
 
 
-def test_advanced_script_wires_real_progress_preview_and_operation_lock(client):
-    html = client.get("/advanced").get_data(as_text=True)
-    assert "done: status.done" in html
-    assert "total: status.total" in html
-    assert "Selections cannot be changed while your library is building." in html
-    assert "Calculating build preview" in html
-    assert "Build ${selected.toLocaleString()} selected charts" in html
-    assert "LIBRARY READY — WITH ISSUES" in html
+def test_primary_root_does_not_serve_the_retired_build_surface(client):
+    html = client.get("/").get_data(as_text=True)
+    assert "journey.js?v=2.5.1" in html
+    assert "done: status.done" not in html
+    assert "Calculating build preview" not in html
+    assert "LIBRARY READY" not in html
+    assert client.get("/advanced").status_code == 302
 
 
-def test_advanced_preview_uses_generation_not_just_selection_count(client):
-    html = client.get("/advanced").get_data(as_text=True)
-    assert "let previewGeneration = 0" in html
-    assert "function invalidateBuildPreview()" in html
-    assert "previewGeneration += 1" in html
-    assert "const generation = previewGeneration" in html
-    assert "generation !== previewGeneration" in html
-    # Every persisted review selection mutation invalidates the prior preview.
-    assert html.count("invalidateBuildPreview();") >= 3
-    assert "if (!preview || Number(preview.selected_chart_count) !== count)" in html
+def test_retired_page_does_not_expose_build_preview_script(client):
+    response = client.get("/advanced")
+    assert response.status_code == 302
+    assert "previewGeneration" not in response.get_data(as_text=True)
 
 
-def test_build_confirmation_uses_full_current_preview_and_import_copy(client):
-    advanced = client.get("/advanced").get_data(as_text=True)
+def test_newer_import_operation_outweighs_historical_export(client):
+    export = client.application.extensions["export_job"]
+    with export.lock:
+        export.status = "complete"
+        export.finished_at = time.time() - 30
+        export.result = {"success": True, "ready": 5}
+    imported = client.application.extensions["soundcloud_import_job"]
+    with imported.lock:
+        imported.running = False
+        imported.status = "complete"
+        imported.finished_at = time.time()
+        imported.result = {"source": {"tracks": 5031}}
+    try:
+        operation = client.get("/api/status").get_json()["operation"]
+        assert operation["label"] == "SOUNDCLOUD IMPORT COMPLETE"
+        assert "5,031 SoundCloud songs imported" in operation["detail"]
+    finally:
+        with imported.lock:
+            imported.status = "idle"
+            imported.result = None
+
+
+def test_restoring_matching_payload_hides_unauthoritative_partition(client):
+    matching = client.application.extensions["spotify_job"]
+    with matching.lock:
+        matching.running = True
+        matching.status = "running"
+        matching.phase = "restoring"
+        matching.message = "Checking saved match results..."
+    try:
+        status = client.get("/api/status").get_json()["operation"]
+        assert status["state"] == "matching"
+        assert "Checking saved match results" in status["detail"]
+    finally:
+        with matching.lock:
+            matching.running = False
+            matching.status = "created"
+            matching.phase = ""
+            matching.message = ""
+
+
+def test_spotify_disconnected_copy_preserves_imported_library_contract(client):
+    html = client.get("/").get_data(as_text=True)
+    assert "Spotify songs already imported" in html or "connection_copy" in client.get("/api/sources").get_data(as_text=True)
+
+
+def test_real_home_path_does_not_reuse_old_progress_after_import(client, config):
+    workspace = client.get("/api/sources").get_json()["workspace_id"]
+    seed_local_workspace(config, workspace, charts=False)
+    db = Database(config.database_path)
+    try:
+        tracks = db.get_spotify_tracks(True)
+        db.initialize_discovery_song_progress(workspace, tracks)
+        db.update_discovery_song_progress(workspace, tracks[0].track_key, status="complete", classification="review")
+        db.update_workspace(workspace, status="ready_for_matching", phase="ready_for_matching")
+    finally:
+        db.close()
+    payload = client.get("/api/sources").get_json()
+    journey = payload["journey"]
+    assert journey["matching_status"] == "ready"
+    assert journey["progress"]["processed"] == 0
+    assert journey["progress"]["total"] == 0
+    assert journey["progress"]["recent"] == []
+    assert journey["counts"]["no_candidate_songs"] == 0
+    assert journey["counts"]["no_suitable_songs"] == 0
+
+
+def test_build_endpoints_remain_backend_compatible_after_page_cutover(client):
+    advanced = client.get("/advanced")
     home = client.get("/").get_data(as_text=True)
-    assert "Estimated download: ${estimated}" in advanced
-    assert "are unavailable and will not be added" in advanced
-    assert "preview.destination" in advanced
-    assert "Selections cannot be changed while your music is importing." in advanced
-    assert "operation.busy?'Status is being prepared...':''" in home
+    assert advanced.status_code == 302
+    assert advanced.headers["Location"] == "/"
+    assert "Estimated download" not in home
+    assert "preview.destination" not in home
+    assert client.post("/api/spotify/export/preview", json={}).status_code in {400, 404}
 
 
 def test_retry_reuses_completed_chart_and_retries_only_incomplete(config):
@@ -2181,6 +2682,77 @@ def test_partial_export_survives_fresh_app_as_partial(config):
         assert payload["operation"]["label"] == "LIBRARY READY — WITH ISSUES"
 
 
+def test_export_status_filters_durable_history_to_requested_workspace(config):
+    db = Database(config.database_path)
+    try:
+        first_workspace = db.create_workspace(
+            workspace_key="history:first",
+            name="First history",
+            kind="exact",
+            status="complete",
+            phase="complete",
+        )
+        second_workspace = db.create_workspace(
+            workspace_key="history:second",
+            name="Second history",
+            kind="exact",
+            status="complete",
+            phase="complete",
+        )
+        first_export = db.create_export_record(
+            first_workspace,
+            export_key="first-history",
+            kind="folder",
+            destination=str(config.base_dir / "First Songs"),
+            status="complete",
+        )
+        db.record_export_item(
+            first_export,
+            {
+                "source": "test",
+                "chart_id": 1,
+                "target_relpath": "Artist/First.sng",
+                "status": "published",
+                "result": "downloaded",
+            },
+        )
+        second_export = db.create_export_record(
+            second_workspace,
+            export_key="second-history",
+            kind="folder",
+            destination=str(config.base_dir / "Second Songs"),
+            status="partial",
+        )
+        db.record_export_item(
+            second_export,
+            {
+                "source": "test",
+                "chart_id": 2,
+                "target_relpath": "Artist/Second.sng",
+                "status": "failed",
+                "error": "download failed",
+            },
+        )
+    finally:
+        db.close()
+
+    app = create_app(config, source_factory=lambda cfg: [FakeSource()])
+    app.config["TESTING"] = True
+    with app.test_client() as http:
+        first = http.get(
+            f"/api/export/status?workspace_id={first_workspace}"
+        ).get_json()
+        second = http.get(
+            f"/api/export/status?workspace_id={second_workspace}"
+        ).get_json()
+        assert first["workspace_id"] == first_workspace
+        assert first["status"] == "complete"
+        assert first["result"]["ready"] == 1
+        assert second["workspace_id"] == second_workspace
+        assert second["status"] == "partial"
+        assert second["result"]["ready"] == 0
+
+
 def test_open_folder_rejects_arbitrary_path_and_accepts_validated_destination(client, config, monkeypatch, tmp_path):
     opened = []
     monkeypatch.setattr(os, "startfile", lambda path: opened.append(path), raising=False)
@@ -2202,9 +2774,9 @@ def test_open_folder_rejects_arbitrary_path_and_accepts_validated_destination(cl
 
 
 def test_build_ui_has_reduced_motion_and_no_fake_export_eta(client):
-    html = client.get("/advanced").get_data(as_text=True)
-    assert "prefers-reduced-motion" in client.get("/").get_data(as_text=True)
-    assert "estimated download size" in html.lower()
+    html = client.get("/").get_data(as_text=True)
+    assert "prefers-reduced-motion" not in html
+    assert "estimated download size" not in html.lower()
     assert "No fake ETA" not in html
     assert "eta_seconds" not in html
 

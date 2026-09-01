@@ -46,6 +46,39 @@ def test_combined_discovery_deduplicates_provenance_and_scores(config):
         db.close()
 
 
+def test_combined_discovery_persists_wrong_same_artist_song_as_noneligible(config):
+    from tests.conftest import make_chart
+
+    wrong = make_chart("That's What You Get", "Paramore", chart_id=25, charter="Harmonix", icon="rb2")
+
+    class WrongSongCatalog(FakeCatalog):
+        def candidates(self, artist, title):
+            return (wrong,) if (artist, title) == ("Paramore", "The Only Exception") else ()
+
+    db = Database(config.database_path)
+    try:
+        result = discover_combined(
+            config,
+            db,
+            [LibrarySnapshot("soundcloud", [
+                ProviderTrack("soundcloud", "paramore", "The Only Exception", "Paramore")
+            ])],
+            workspace_key="combined:title-conflict",
+            catalog=WrongSongCatalog(wrong),
+        )
+        rows = db.get_workspace_candidates(
+            "combined:title-conflict", kind="exact", include_rejected=True, current_only=True
+        )
+        assert len(rows) == 1
+        assert rows[0]["decision"] == "REJECT"
+        assert rows[0]["eligibility"] == "INCOMPATIBLE"
+        assert result.strong_match_tracks == 0
+        assert result.review_match_tracks == 0
+        assert result.hard_rejected_only_tracks == 1
+    finally:
+        db.close()
+
+
 def test_combined_progress_reports_full_retrieval_and_final_song_state(config):
     from tests.conftest import make_chart
 
@@ -278,6 +311,24 @@ def test_matching_cache_fingerprint_changes_with_track_catalog_and_config(config
     assert matching_cache_fingerprint(track, catalog, config) != baseline
     config.instruments.require_five_fret_guitar = not config.instruments.require_five_fret_guitar
     assert matching_cache_fingerprint(track, catalog, config) != baseline
+
+
+def test_matching_semantic_v3_cache_keys_cannot_satisfy_v4(config, monkeypatch):
+    from tests.conftest import make_chart, make_track
+    import csv_to_clonehero.combined_pipeline as pipeline
+
+    track = make_track("The Only Exception", "Paramore")
+    catalog = FakeCatalog(make_chart("The Only Exception", "Paramore", chart_id=26))
+    manifest = {"snapshot_id": "fixture", "sha256": "fixture-sha", "chart_count": 1}
+
+    assert pipeline.MATCH_CACHE_VERSION == "combined-match-v4"
+    monkeypatch.setattr(pipeline, "MATCH_CACHE_VERSION", "combined-match-v3")
+    stale_song = pipeline.matching_cache_fingerprint(track, catalog, config)
+    stale_scan = pipeline.matching_scan_fingerprint([track], manifest, config)
+    monkeypatch.setattr(pipeline, "MATCH_CACHE_VERSION", "combined-match-v4")
+
+    assert pipeline.matching_cache_fingerprint(track, catalog, config) != stale_song
+    assert pipeline.matching_scan_fingerprint([track], manifest, config) != stale_scan
 
 
 def test_corrupt_matching_cache_fails_safe_and_recomputes(config, monkeypatch):

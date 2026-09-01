@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en" data-app-surface="journey" data-schema-version="{{ journey_schema_version }}">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Riff | Music to Clone Hero</title>
+  <link rel="icon" href="data:,">
+  <script>
+    window.journeyAssetError = function (asset) {
+      var showError = function () {
+        var main = document.getElementById("main-content");
+        var app = document.getElementById("app");
+        if (!main || !app) return;
+        main.innerHTML = "<section class=\"error-stage stage-section\"><p class=\"overline\">Your music</p><h1>Riff could not load this screen.</h1><p class=\"lead-copy\">The " + asset + " asset is unavailable. No music or matching work was changed.</p><button class=\"button secondary\" type=\"button\" id=\"asset-retry\">Retry</button></section>";
+        app.setAttribute("aria-busy", "false");
+        var retry = document.getElementById("asset-retry");
+        if (retry) retry.addEventListener("click", function () { window.location.reload(); });
+      };
+      if (document.getElementById("main-content")) showError();
+      else document.addEventListener("DOMContentLoaded", showError, { once: true });
+    };
+  </script>
+  <link rel="stylesheet" href="{{ url_for('static', filename='journey.css', v=journey_asset_version, access_token=request.args.get('access_token')) }}" onerror="journeyAssetError('style')">
+</head>
+<body>
+  <a class="skip-link" href="#main-content">Skip to content</a>
+  <div id="app" data-app-surface="journey" aria-busy="true">
+    <header class="topbar">
+      <div class="brand"><span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span><span class="brand-name">Riff</span><span class="brand-divider" aria-hidden="true"></span><span class="brand-context">music to Clone Hero</span></div>
+      <div class="stage-label"><span class="stage-pip" aria-hidden="true"></span><span id="stage-label">Add music</span></div>
+    </header>
+    <main id="main-content" class="main-content" tabindex="-1">
+      <section class="loading-stage stage-section" aria-labelledby="loading-heading">
+        <p class="overline">Your music</p>
+        <h1 id="loading-heading" data-test="journey-loading">Restoring your library...</h1>
+      </section>
+    </main>
+  </div>
+  <div id="announcer" class="sr-only" aria-live="polite" aria-atomic="true"></div>
+  <script src="{{ url_for('static', filename='journey.js', v=journey_asset_version, access_token=request.args.get('access_token')) }}" onerror="journeyAssetError('script')"></script>
+</body>
+</html>
