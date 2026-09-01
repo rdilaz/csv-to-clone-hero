@@ -29,6 +29,11 @@
     preflight: null,
     preflightDestination: "",
     preflightNotice: "",
+    exportStatus: null,
+    exportError: "",
+    exportPollTimer: null,
+    exportController: null,
+    exportRevision: 0,
     review: {
       tracks: [],
       page: null,
@@ -447,10 +452,173 @@
     const issueList = messages.length ? '<div class="preflight-issues" role="alert"><strong>' + (ready ? "Preflight notes" : "Preflight could not finish") + '</strong><ul>' + messages.map(function (message) { return '<li>' + escapeHtml(message) + '</li>'; }).join("") + '</ul></div>' : "";
     const notice = model.preflightNotice ? '<p class="preflight-notice" role="alert">' + escapeHtml(model.preflightNotice) + '</p>' : "";
     const choosing = model.pendingAction === "folder";
+    const starting = model.pendingAction === "export-start";
+    const busy = Boolean(model.pendingAction);
+    const start = persistedCount > 0
+      ? '<button class="button primary" data-action="start-export"' + (busy ? ' disabled aria-disabled="true"' : '') + '>' + (starting ? "Starting download..." : "Download library " + icons.download) + '</button>'
+      : "";
     if (ready) {
-      return shell('<section class="ready-download-stage stage-section" data-test="download-ready"><div class="download-ready-copy"><p class="overline">Download</p><h1>Ready to add <span>' + number(selected) + '</span> songs</h1><p class="lead-copy">Your chart choices and destination passed every current check.</p><dl class="download-facts">' + facts + '</dl>' + notice + issueList + '<div class="download-ready-status"><span class="enough-mark">' + icons.check + '</span><span><strong>Ready for download</strong><small>No chart files have been downloaded yet.</small></span></div><div class="download-actions"><button class="button secondary" data-action="change-folder"' + (choosing ? ' disabled aria-disabled="true"' : '') + '>' + (choosing ? "Choosing folder..." : "Change folder") + '</button><button class="text-link quiet-back" data-action="back-to-charts"' + (choosing ? ' disabled aria-disabled="true"' : '') + '>Change chart choices ' + icons.arrow + '</button></div></div>' + folderVisual(preflight, true) + '</section>', "Download");
+      return shell('<section class="ready-download-stage stage-section" data-test="download-ready"><div class="download-ready-copy"><p class="overline">Download</p><h1>Ready to add <span>' + number(selected) + '</span> songs</h1><p class="lead-copy">Your chart choices and destination passed every current check.</p><dl class="download-facts">' + facts + '</dl>' + notice + issueList + '<div class="download-ready-status"><span class="enough-mark">' + icons.check + '</span><span><strong>Ready for download</strong><small>No chart files have been downloaded yet.</small></span></div><div class="download-actions">' + start + '<button class="button secondary" data-action="change-folder"' + (busy ? ' disabled aria-disabled="true"' : '') + '>' + (choosing ? "Choosing folder..." : "Change folder") + '</button><button class="text-link quiet-back" data-action="back-to-charts"' + (busy ? ' disabled aria-disabled="true"' : '') + '>Change chart choices ' + icons.arrow + '</button></div></div>' + folderVisual(preflight, true) + '</section>', "Download");
     }
     return shell('<section class="ready-download-stage stage-section" data-test="download-preflight-error"><div class="download-ready-copy"><p class="overline">Download</p><h1>Your library needs one more check</h1><p class="lead-copy">No chart files were downloaded. Your selected charts are still saved.</p><dl class="download-facts">' + facts + '</dl>' + notice + issueList + '<div class="download-actions"><button class="button secondary" data-action="retry-preflight"' + (choosing ? ' disabled aria-disabled="true"' : '') + '>Retry preflight</button><button class="button quiet" data-action="change-folder"' + (choosing ? ' disabled aria-disabled="true"' : '') + '>' + (choosing ? "Choosing folder..." : "Change folder") + '</button><button class="text-link quiet-back" data-action="back-to-charts"' + (choosing ? ' disabled aria-disabled="true"' : '') + '>Change chart choices ' + icons.arrow + '</button></div></div>' + folderVisual(preflight, false) + '</section>', "Download");
+  }
+
+  function knownNumber() {
+    for (let index = 0; index < arguments.length; index += 1) {
+      const value = arguments[index];
+      if (value != null && value !== "" && Number.isFinite(Number(value))) return Number(value);
+    }
+    return null;
+  }
+
+  function exportState(status) {
+    if (!status) return "idle";
+    const operation = status.operation || {};
+    const rawStatus = String(status.status || "idle").toLowerCase();
+    let state = rawStatus === "cancelling" ? "cancelling" : String(operation.state || rawStatus).toLowerCase();
+    if (status.running && state !== "cancelling") state = "building";
+    if (["success", "completed"].includes(state)) state = "complete";
+    return state;
+  }
+
+  function exportCounts(status) {
+    const payload = status || {};
+    const itemSummary = payload.items || {};
+    const itemRows = Array.isArray(itemSummary.items) ? itemSummary.items : [];
+    const result = payload.result || {};
+    const total = knownNumber(
+      Number(payload.total) > 0 ? payload.total : null,
+      Number(itemSummary.selected) > 0 ? itemSummary.selected : null,
+      result.selected
+    );
+    const itemReady = knownNumber(itemSummary.completed, 0);
+    const ready = Math.max(knownNumber(result.ready, 0), itemReady);
+    const processed = Math.max(itemReady, knownNumber(payload.done, 0));
+    const itemAdded = itemRows.filter(function (item) {
+      return item.status === "published" && item.result !== "already_present";
+    }).length;
+    const itemAvailable = itemRows.filter(function (item) {
+      return item.status === "duplicate" || item.result === "already_present";
+    }).length;
+    const added = knownNumber(result.added, itemAdded, 0);
+    const alreadyAvailable = knownNumber(result.already_present, itemAvailable, 0);
+    const failed = knownNumber(result.failed, itemSummary.failed, 0);
+    const invalid = knownNumber(result.invalid, itemSummary.invalid, 0);
+    const cancelled = knownNumber(result.cancelled_items, itemSummary.cancelled, 0);
+    let remaining = knownNumber(result.remaining);
+    if (remaining == null && Number(itemSummary.selected) > 0) remaining = knownNumber(itemSummary.remaining, 0);
+    if (remaining == null && total != null) remaining = Math.max(0, total - ready - failed - invalid);
+    return {
+      total: total,
+      selected: knownNumber(result.selected, total, itemSummary.selected),
+      ready: ready,
+      processed: processed,
+      added: added,
+      alreadyAvailable: alreadyAvailable,
+      failed: failed,
+      invalid: invalid,
+      cancelled: cancelled,
+      remaining: remaining,
+      downloading: knownNumber(itemSummary.downloading, 0),
+      retrying: knownNumber(itemSummary.retrying, 0)
+    };
+  }
+
+  function exportActivity(value, cancelling) {
+    if (cancelling) return "Finishing active charts safely";
+    const activity = String(value || "").trim();
+    const labels = {
+      "Checking download sizes": "Checking selected charts",
+      "Writing files": "Adding charts to your Songs folder",
+      "Writing ZIP archive": "Preparing your library",
+      "Cancellation requested; finishing the active chart safely": "Finishing active charts safely"
+    };
+    if (labels[activity]) return labels[activity];
+    return activity
+      .replace(/^Publishing\s+/i, "Adding ")
+      .replace(/^Downloading\s+/i, "Downloading ")
+      || "Preparing selected charts";
+  }
+
+  function downloadRunning() {
+    const status = model.exportStatus || {};
+    const counts = exportCounts(status);
+    const state = exportState(status);
+    const cancelling = state === "cancelling";
+    const totalKnown = counts.total != null && counts.total > 0;
+    const percent = totalKnown ? Math.max(0, Math.min(100, Math.round((counts.processed / counts.total) * 100))) : null;
+    const countCopy = totalKnown
+      ? '<strong>' + number(counts.ready) + '</strong> / ' + number(counts.total) + ' ready'
+      : '<strong>' + number(counts.ready) + '</strong> ready';
+    const percentCopy = percent == null ? "" : '<div class="building-percent"><strong>' + number(percent) + '%</strong><span>processed</span></div>';
+    const progress = percent == null
+      ? '<div class="building-progress is-indeterminate" aria-label="Progress total is not available"><span></span></div>'
+      : '<div class="building-progress" role="progressbar" aria-label="Charts processed" aria-valuemin="0" aria-valuemax="' + counts.total + '" aria-valuenow="' + counts.processed + '"><span style="width:' + percent + '%"></span></div>';
+    const transfers = counts.downloading + counts.retrying;
+    const transferCopy = transfers > 0
+      ? '<span class="in-progress"><span class="status-symbol" aria-hidden="true"></span>' + number(transfers) + ' active</span>'
+      : "";
+    const remaining = counts.remaining == null ? "Not available" : number(counts.remaining);
+    const elapsedCopy = status.started_at ? elapsed(Math.max(0, Date.now() / 1000 - Number(status.started_at))) : "Not available";
+    const error = model.exportError ? '<p class="build-inline-error" role="alert">' + escapeHtml(model.exportError) + '</p>' : "";
+    const stop = '<button class="button quiet stop-safe" data-action="cancel-export"' + (cancelling || model.pendingAction === "cancel" ? ' disabled aria-disabled="true"' : '') + '>' + (cancelling || model.pendingAction === "cancel" ? "Stopping safely..." : "Stop safely") + '</button>';
+    return shell('<section class="building-stage stage-section" data-test="export-' + (cancelling ? "cancelling" : "running") + '" aria-live="polite"><header class="building-head"><div><p class="overline">Download</p><h1>Building your Clone Hero library</h1><p class="building-count">' + countCopy + '</p></div>' + percentCopy + '</header>' + progress + '<div class="flow-visual" aria-hidden="true"><div class="flow-orbit flow-orbit-one"></div><div class="flow-orbit flow-orbit-two"></div><span class="flow-node flow-node-one"></span><span class="flow-node flow-node-two"></span><span class="flow-node flow-node-three"></span><div class="flow-line"></div><div class="songs-folder-target"><span>' + icons.folder + '</span><strong>Songs</strong><small>library</small></div></div><div class="download-now"><span class="activity-mark">' + icons.download + '<i aria-hidden="true"></i></span><div class="download-now-copy"><small>' + (cancelling ? "Stopping safely" : "Current activity") + '</small><h2>' + escapeHtml(exportActivity(status.current, cancelling)) + '</h2><p>' + (cancelling ? "Completed songs are being kept" : "Each chart is validated before it is added") + '</p></div>' + transferCopy + '</div><div class="download-counters"><span><strong>' + number(counts.added) + '</strong> downloaded</span><span><strong>' + number(counts.alreadyAvailable) + '</strong> already available</span><span class="counter-warning"><strong>' + number(counts.failed + counts.invalid) + '</strong> couldn’t be added</span><span><strong>' + remaining + '</strong> remaining</span></div><div class="building-reassurance"><span class="reassurance-mark">' + icons.check + '</span><span><strong>' + (cancelling ? "Stopping safely." : "No action needed.") + '</strong><small>' + (cancelling ? "Charts already completed will stay in your Songs folder." : "Keep the app running; you can leave this screen.") + '</small></span><p class="elapsed"><span>Elapsed</span><strong>' + elapsedCopy + '</strong></p></div>' + error + stop + '</section>', "Download");
+  }
+
+  function terminalIssue(status) {
+    const result = status && status.result || {};
+    const values = [];
+    if (status && status.error) values.push(status.error);
+    if (Array.isArray(result.errors)) values.push.apply(values, result.errors);
+    return String(values.find(function (value) { return String(value || "").trim(); }) || "The library build could not finish.");
+  }
+
+  function exportTerminal() {
+    const status = model.exportStatus || {};
+    const counts = exportCounts(status);
+    let state = exportState(status);
+    if (state === "failed" && counts.ready > 0) state = "partial";
+    const destination = String(status.destination || status.result && status.result.destination || model.preflightDestination || "");
+    const selected = counts.selected == null ? exactSelectionItems().length : counts.selected;
+    const notReady = Math.max(0, selected - counts.ready, counts.failed + counts.invalid + counts.cancelled);
+    const destinationDetail = destination ? '<p class="done-destination"><span>Destination</span><strong>' + escapeHtml(destination) + '</strong></p>' : "";
+    const changeChoices = '<button class="text-link" data-action="back-to-charts">Change chart choices ' + icons.arrow + '</button>';
+    let visual = icons.check;
+    let heading = '<span>' + number(counts.ready) + '</span> songs are ready to play';
+    let body = '<p class="done-instruction">In Clone Hero or YARG, scan your Songs folder.</p>';
+    let actions = changeChoices;
+    let className = "is-complete";
+    let testName = "export-complete";
+
+    if (state === "partial") {
+      visual = number(notReady);
+      heading = '<span>' + number(counts.ready) + '</span> songs are ready';
+      body = '<p class="done-issue"><strong>' + number(notReady) + '</strong> couldn’t be added</p><p class="done-instruction">Completed charts are safe. Retry only the remaining work.</p>';
+      actions = '<button class="button secondary" data-action="retry-export">Retry remaining</button>' + changeChoices;
+      className = "is-partial";
+      testName = "export-partial";
+    } else if (["cancelled", "interrupted"].includes(state)) {
+      visual = number(counts.ready);
+      heading = '<span>' + number(counts.ready) + '</span> charts are already ready';
+      body = '<p class="done-issue"><strong>' + number(counts.remaining == null ? notReady : counts.remaining) + '</strong> remain</p><p class="done-instruction">Completed charts were kept. Resume only when you are ready.</p>';
+      actions = '<button class="button primary" data-action="resume-export">Resume download ' + icons.download + '</button>' + changeChoices;
+      className = "is-recovery";
+      testName = "export-" + state;
+    } else if (state === "failed") {
+      visual = "!";
+      heading = 'Build failed';
+      body = '<p class="done-instruction">' + escapeHtml(terminalIssue(status)) + '</p><p class="done-issue"><strong>' + number(selected) + '</strong> charts selected</p>';
+      actions = '<button class="button secondary" data-action="retry-export">Try again</button>' + changeChoices;
+      className = "is-failed";
+      testName = "export-failed";
+    }
+    return shell('<section class="done-stage stage-section ' + className + '" data-test="' + testName + '"><div class="done-visual" aria-hidden="true"><div class="done-disc"><span>' + visual + '</span></div><i class="done-orbit done-orbit-one"></i><i class="done-orbit done-orbit-two"></i></div><div class="done-copy"><p class="overline">' + (state === "complete" ? "Done" : "Download") + '</p><h1>' + heading + '</h1>' + body + '<div class="done-summary"><span><strong>' + number(counts.added) + '</strong> added</span><span><strong>' + number(counts.alreadyAvailable) + '</strong> already available</span></div>' + destinationDetail + '<div class="done-actions">' + actions + '</div></div></section>', state === "complete" ? "Done" : "Download");
+  }
+
+  function exportScreen() {
+    return ["building", "cancelling"].includes(exportState(model.exportStatus))
+      ? downloadRunning()
+      : exportTerminal();
   }
 
   function formatChooser() {
@@ -492,13 +660,15 @@
     const snapshot = model.snapshot;
     if (!snapshot) return;
     let content;
-    if (snapshot.matching && snapshot.matching.state === "charts_found") content = model.downloadView ? downloadReady() : chartsFound(snapshot);
+    const lifecycle = model.downloadView && model.exportStatus && exportState(model.exportStatus) !== "idle";
+    if (snapshot.matching && snapshot.matching.state === "charts_found") content = lifecycle ? exportScreen() : model.downloadView ? downloadReady() : chartsFound(snapshot);
     else if (snapshot.matching && snapshot.matching.state !== "music_ready") content = matchingVisual(snapshot);
     else if (snapshot.operation && snapshot.operation.state === "importing") content = importing(snapshot);
     else content = snapshot.music.canonical_count ? musicReady(snapshot) : sourcesEmpty(snapshot);
-    const stage = snapshot.matching && snapshot.matching.state === "charts_found" ? (model.downloadView ? "Download" : "Confirm charts") : snapshot.matching && snapshot.matching.state !== "music_ready" ? "Find charts" : snapshot.operation.state === "importing" ? "Add music" : snapshot.music.canonical_count ? "Music ready" : "Add music";
+    const terminalDone = lifecycle && exportState(model.exportStatus) === "complete";
+    const stage = snapshot.matching && snapshot.matching.state === "charts_found" ? (terminalDone ? "Done" : model.downloadView ? "Download" : "Confirm charts") : snapshot.matching && snapshot.matching.state !== "music_ready" ? "Find charts" : snapshot.operation.state === "importing" ? "Add music" : snapshot.music.canonical_count ? "Music ready" : "Add music";
     app.innerHTML = '<header class="topbar"><div class="brand"><span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span><span class="brand-name">Riff</span><span class="brand-divider" aria-hidden="true"></span><span class="brand-context">music to Clone Hero</span></div><div class="stage-label"><span class="stage-pip" aria-hidden="true"></span><span id="stage-label">' + stage + '</span></div></header>' + content.slice(content.indexOf("<main"));
-    app.setAttribute("aria-busy", matchingActive(snapshot) || ["preflight", "folder"].includes(model.pendingAction) ? "true" : "false");
+    app.setAttribute("aria-busy", matchingActive(snapshot) || ["preflight", "folder", "export-start", "cancel"].includes(model.pendingAction) || lifecycle && ["building", "cancelling"].includes(exportState(model.exportStatus)) ? "true" : "false");
     if (model.overlay) {
       app.insertAdjacentHTML("beforeend", sourceSheet(snapshot.sources[model.overlay]));
       if (focusOverlay) {
@@ -650,10 +820,69 @@
     model.review.error = "";
   }
 
+  function cancelExportPolling() {
+    if (model.exportPollTimer !== null) {
+      window.clearTimeout(model.exportPollTimer);
+      model.exportPollTimer = null;
+    }
+    if (model.exportController) {
+      model.exportController.abort();
+      model.exportController = null;
+    }
+    model.exportRevision += 1;
+  }
+
+  function scheduleExportPoll() {
+    if (model.exportPollTimer !== null) window.clearTimeout(model.exportPollTimer);
+    model.exportPollTimer = window.setTimeout(function () {
+      model.exportPollTimer = null;
+      loadExportStatus({ render: true });
+    }, 850);
+  }
+
+  async function loadExportStatus(options) {
+    const settings = options || {};
+    if (!model.snapshot || !model.snapshot.workspace_id) return null;
+    if (model.exportController) model.exportController.abort();
+    const controller = new AbortController();
+    model.exportController = controller;
+    const revision = ++model.exportRevision;
+    try {
+      const status = await api(
+        "/api/export/status?workspace_id=" + encodeURIComponent(model.snapshot.workspace_id),
+        { signal: controller.signal }
+      );
+      if (revision !== model.exportRevision) return null;
+      const state = exportState(status);
+      if (state !== "idle") {
+        model.exportStatus = status;
+        model.downloadView = true;
+        model.exportError = "";
+        if (status.destination) model.preflightDestination = String(status.destination);
+      } else if (settings.rehydrate) {
+        model.exportStatus = null;
+      }
+      if (settings.render !== false) render(false);
+      if (["building", "cancelling"].includes(state)) scheduleExportPoll();
+      return status;
+    } catch (error) {
+      if (error.name === "AbortError" || revision !== model.exportRevision) return null;
+      if (model.exportStatus && ["building", "cancelling"].includes(exportState(model.exportStatus))) {
+        model.exportError = "Live progress could not be refreshed. Retrying automatically.";
+        if (settings.render !== false) render(false);
+        scheduleExportPoll();
+      }
+      return null;
+    } finally {
+      if (revision === model.exportRevision) model.exportController = null;
+    }
+  }
+
   async function refresh() {
     const revision = ++model.requestRevision;
     if (model.controller) model.controller.abort();
     cancelReviewRequest();
+    cancelExportPolling();
     model.controller = new AbortController();
     try {
       const response = await fetch(apiUrl("/api/journey"), { credentials: "same-origin", signal: model.controller.signal });
@@ -677,9 +906,12 @@
       if (snapshot.matching && snapshot.matching.state === "charts_found" && snapshot.matching.authoritative) {
         model.confirmationVisible = model.confirmationVisible || exactSelectionItems().length > 0;
         if (model.confirmationVisible) await loadReview(true, { renderStart: false, renderEnd: false });
+        await loadExportStatus({ render: false, rehydrate: true });
         if (revision !== model.requestRevision) return;
       } else {
         resetReview();
+        model.exportStatus = null;
+        model.downloadView = false;
       }
       render(false);
       if (wasImporting && snapshot.operation.state !== "importing") announce("Your music import finished.");
@@ -933,6 +1165,7 @@
       model.pendingAction = "";
       render(false);
     }
+    return model.preflight;
   }
 
   async function changeFolder() {
@@ -966,11 +1199,113 @@
     }
   }
 
+  async function startExport() {
+    if (model.pendingAction || model.pendingRow || !model.preflight || !model.preflight.ok) return;
+    if (exactSelectionItems().length < 1) {
+      model.preflightNotice = "Choose at least one chart before starting the download.";
+      render(false);
+      return;
+    }
+    const destination = String(model.preflight.destination || model.preflightDestination || "");
+    if (!destination) {
+      model.preflightNotice = "The destination is no longer available. Run preflight again.";
+      render(false);
+      return;
+    }
+    model.pendingAction = "export-start";
+    model.preflightNotice = "";
+    model.exportError = "";
+    render(false);
+    try {
+      const started = await api("/api/spotify/export/start", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          kind: "folder",
+          workspace_id: model.snapshot.workspace_id,
+          path: destination
+        })
+      });
+      if (!started.started) throw new Error("The library download did not start.");
+      model.downloadView = true;
+      model.exportStatus = {
+        running: true,
+        status: "starting",
+        workspace_id: started.workspace_id || model.snapshot.workspace_id,
+        destination: started.destination || destination,
+        done: 0,
+        total: 0,
+        current: "Preparing selected charts",
+        started_at: null,
+        items: {}
+      };
+      const live = await loadExportStatus({ render: false });
+      if (!live) scheduleExportPoll();
+      announce("Library download started.");
+    } catch (error) {
+      model.exportStatus = null;
+      model.preflightNotice = "We could not start the download. " + error.message;
+      announce(model.preflightNotice);
+    } finally {
+      model.pendingAction = "";
+      render(false);
+    }
+  }
+
+  async function restartExport() {
+    if (model.pendingAction || model.pendingRow) return;
+    const destination = String(
+      model.exportStatus && model.exportStatus.destination
+      || model.exportStatus && model.exportStatus.result && model.exportStatus.result.destination
+      || model.preflightDestination
+      || ""
+    );
+    cancelExportPolling();
+    model.exportStatus = null;
+    model.exportError = "";
+    const preflight = await runPreflight(destination || undefined);
+    if (preflight && preflight.ok) await startExport();
+  }
+
+  async function cancelExport() {
+    if (model.pendingAction || !model.exportStatus || !["building", "cancelling"].includes(exportState(model.exportStatus))) return;
+    model.pendingAction = "cancel";
+    model.exportError = "";
+    render(false);
+    try {
+      const response = await api("/api/spotify/export/cancel", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: "{}"
+      });
+      if (response.status === "cancelling") {
+        model.exportStatus = Object.assign({}, model.exportStatus, {
+          running: true,
+          status: "cancelling",
+          current: "Finishing active charts safely",
+          operation: Object.assign({}, model.exportStatus.operation || {}, { state: "cancelling" })
+        });
+        announce("Safe stop requested. Completed songs will be kept.");
+      }
+      await loadExportStatus({ render: false });
+    } catch (error) {
+      model.exportError = "We could not request a safe stop. " + error.message;
+      announce(model.exportError);
+    } finally {
+      model.pendingAction = "";
+      render(false);
+      if (model.exportStatus && ["building", "cancelling"].includes(exportState(model.exportStatus))) scheduleExportPoll();
+    }
+  }
+
   function backToCharts() {
     if (model.pendingAction) return;
+    cancelExportPolling();
     model.downloadView = false;
     model.preflight = null;
     model.preflightNotice = "";
+    model.exportStatus = null;
+    model.exportError = "";
     render(false);
     const main = document.getElementById("main-content");
     if (main) main.focus();
@@ -1004,6 +1339,9 @@
     else if (action === "continue-download") { runPreflight(); }
     else if (action === "retry-preflight") { runPreflight(model.preflightDestination || undefined); }
     else if (action === "change-folder") { changeFolder(); }
+    else if (action === "start-export") { startExport(); }
+    else if (action === "cancel-export") { cancelExport(); }
+    else if (["resume-export", "retry-export"].includes(action)) { restartExport(); }
     else if (action === "back-to-charts") { backToCharts(); }
     else if (action === "retry") { refresh(); }
   });

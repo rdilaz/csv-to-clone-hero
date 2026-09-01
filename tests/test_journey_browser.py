@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -351,6 +352,190 @@ def test_browser_preflight_failure_is_not_ready_and_preserves_selection(matching
     assert page.locator("[data-test='preflight-selected']").inner_text() == "1"
     page.get_by_role("button", name="Change chart choices").click()
     assert page.get_by_text("1 selected", exact=True).is_visible()
+
+
+def _reach_download_ready(page):
+    page.get_by_role("button", name="Use 1 best matches").click()
+    page.get_by_role("button", name="Continue with 1 charts").click()
+    page.locator("[data-test='download-ready']").wait_for()
+
+
+@pytest.mark.parametrize("matching_browser_page", ["charts_found"], indirect=True)
+def test_browser_export_start_rejection_stays_download_ready(matching_browser_page):
+    page = matching_browser_page
+    _reach_download_ready(page)
+    page.route(
+        "**/api/spotify/export/start",
+        lambda route: route.fulfill(
+            status=409,
+            content_type="application/json",
+            body=json.dumps({"error": "Another library build is already running."}),
+        ),
+    )
+
+    page.get_by_role("button", name="Download library").click()
+    alert = page.get_by_role("alert")
+    alert.wait_for()
+    assert "already running" in alert.inner_text()
+    assert page.locator("[data-test='download-ready']").is_visible()
+    assert page.locator("[data-test='export-running']").count() == 0
+
+
+@pytest.mark.parametrize("matching_browser_page", ["charts_found"], indirect=True)
+@pytest.mark.mobile
+def test_browser_export_cancel_resume_and_complete_use_live_status(matching_browser_page):
+    page = matching_browser_page
+    _reach_download_ready(page)
+    destination = page.locator("[data-test='preflight-destination']").inner_text()
+    state = {"starts": 0, "phase": "idle", "cancel_polls": 0, "resume_polls": 0, "payloads": []}
+
+    def start_handler(route):
+        payload = json.loads(route.request.post_data or "{}")
+        state["payloads"].append(payload)
+        state["starts"] += 1
+        state["phase"] = "running" if state["starts"] == 1 else "resumed"
+        route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps({
+                "started": True,
+                "kind": "folder",
+                "workspace_id": payload["workspace_id"],
+                "destination": payload["path"],
+            }),
+        )
+
+    def status_handler(route):
+        workspace = state["payloads"][-1]["workspace_id"] if state["payloads"] else 1
+        if state["phase"] == "cancelling":
+            state["cancel_polls"] += 1
+            if state["cancel_polls"] >= 2:
+                state["phase"] = "cancelled"
+            else:
+                route.fulfill(status=200, content_type="application/json", body=json.dumps({
+                    "running": True, "status": "cancelling", "workspace_id": workspace,
+                    "destination": destination, "done": 0, "total": 1,
+                    "current": "Cancellation requested; finishing the active chart safely",
+                    "started_at": time.time() - 2,
+                    "items": {"selected": 1, "completed": 0, "downloading": 1, "retrying": 0, "failed": 0, "invalid": 0, "cancelled": 0, "remaining": 1, "items": []},
+                }))
+                return
+        if state["phase"] == "cancelled":
+            route.fulfill(status=200, content_type="application/json", body=json.dumps({
+                "running": False, "status": "cancelled", "workspace_id": workspace,
+                "destination": destination, "done": 1, "total": 1,
+                "items": {"selected": 1, "completed": 0, "failed": 0, "invalid": 0, "cancelled": 1, "remaining": 1, "items": []},
+                "result": {"success": False, "status": "cancelled", "selected": 1, "ready": 0, "added": 0, "already_present": 0, "failed": 0, "invalid": 0, "cancelled_items": 1, "remaining": 1, "destination": destination},
+            }))
+            return
+        if state["phase"] == "resumed":
+            state["resume_polls"] += 1
+            if state["resume_polls"] >= 2:
+                state["phase"] = "complete"
+            else:
+                route.fulfill(status=200, content_type="application/json", body=json.dumps({
+                    "running": True, "status": "running", "workspace_id": workspace,
+                    "destination": destination, "done": 0, "total": 1,
+                    "current": "Downloading Artist - Song", "started_at": time.time() - 1,
+                    "items": {"selected": 1, "completed": 0, "downloading": 1, "retrying": 0, "failed": 0, "invalid": 0, "cancelled": 0, "remaining": 1, "items": []},
+                }))
+                return
+        if state["phase"] == "complete":
+            route.fulfill(status=200, content_type="application/json", body=json.dumps({
+                "running": False, "status": "complete", "workspace_id": workspace,
+                "destination": destination,
+                "items": {"selected": 1, "completed": 1, "failed": 0, "invalid": 0, "cancelled": 0, "remaining": 0, "items": []},
+                "result": {"success": True, "status": "success", "selected": 1, "ready": 1, "added": 0, "already_present": 1, "failed": 0, "invalid": 0, "cancelled_items": 0, "remaining": 0, "destination": destination},
+            }))
+            return
+        route.fulfill(status=200, content_type="application/json", body=json.dumps({
+            "running": True, "status": "running", "workspace_id": workspace,
+            "destination": destination, "done": 0, "total": 1,
+            "current": "Downloading Artist - Song", "started_at": time.time() - 1,
+            "items": {"selected": 1, "completed": 0, "downloading": 1, "retrying": 0, "failed": 0, "invalid": 0, "cancelled": 0, "remaining": 1, "items": []},
+        }))
+
+    def cancel_handler(route):
+        state["phase"] = "cancelling"
+        route.fulfill(status=200, content_type="application/json", body=json.dumps({"ok": True, "cancelled": True, "status": "cancelling"}))
+
+    page.route("**/api/spotify/export/start", start_handler)
+    page.route("**/api/export/status?*", status_handler)
+    page.route("**/api/spotify/export/cancel", cancel_handler)
+
+    page.get_by_role("button", name="Download library").click()
+    page.locator("[data-test='export-running']").wait_for()
+    assert page.get_by_text("0 / 1 ready", exact=True).is_visible()
+    assert state["payloads"][0]["kind"] == "folder"
+    assert state["payloads"][0]["path"] == destination
+    page.get_by_role("button", name="Stop safely").click()
+    page.locator("[data-test='export-cancelling']").wait_for()
+    assert page.get_by_text("Completed songs are being kept").is_visible()
+    page.get_by_role("button", name="Resume download").wait_for()
+    assert page.get_by_role("heading", name="0 charts are already ready").is_visible()
+    assert state["cancel_polls"] >= 2
+    page.get_by_role("button", name="Resume download").click()
+    page.locator("[data-test='export-complete']").wait_for()
+    assert page.get_by_role("heading", name="1 songs are ready to play").is_visible()
+    assert page.get_by_text("1 already available", exact=True).is_visible()
+    assert state["starts"] == 2
+    assert page.evaluate("document.documentElement.scrollWidth <= document.documentElement.clientWidth")
+    assert "/advanced" not in page.content()
+
+
+@pytest.mark.parametrize("matching_browser_page", ["charts_found"], indirect=True)
+def test_browser_unknown_progress_partial_retry_and_failed_states(matching_browser_page):
+    page = matching_browser_page
+    _reach_download_ready(page)
+    destination = page.locator("[data-test='preflight-destination']").inner_text()
+    requests = []
+    state = {"starts": 0, "phase": "unknown"}
+    page.on("request", lambda request: requests.append(request.url))
+
+    def start_handler(route):
+        payload = json.loads(route.request.post_data or "{}")
+        state["starts"] += 1
+        state["phase"] = "unknown" if state["starts"] == 1 else "failed"
+        route.fulfill(status=200, content_type="application/json", body=json.dumps({"started": True, "kind": "folder", "workspace_id": payload["workspace_id"], "destination": payload["path"]}))
+
+    def status_handler(route):
+        if state["phase"] == "partial":
+            route.fulfill(status=200, content_type="application/json", body=json.dumps({
+                "running": False, "status": "partial", "workspace_id": 1, "destination": destination,
+                "items": {"selected": 1, "completed": 0, "failed": 1, "invalid": 0, "cancelled": 0, "remaining": 0, "items": []},
+                "result": {"success": True, "status": "partial", "selected": 1, "ready": 0, "added": 0, "already_present": 0, "failed": 1, "invalid": 0, "cancelled_items": 0, "remaining": 0, "destination": destination},
+            }))
+        elif state["phase"] == "failed":
+            route.fulfill(status=200, content_type="application/json", body=json.dumps({
+                "running": False, "status": "failed", "workspace_id": 1, "destination": destination, "error": "The source could not provide this chart.",
+                "items": {"selected": 1, "completed": 0, "failed": 1, "invalid": 0, "cancelled": 0, "remaining": 0, "items": []},
+                "result": {"success": False, "status": "failed", "selected": 1, "ready": 0, "added": 0, "already_present": 0, "failed": 1, "invalid": 0, "cancelled_items": 0, "remaining": 0, "destination": destination, "errors": ["The source could not provide this chart."]},
+            }))
+        else:
+            route.fulfill(status=200, content_type="application/json", body=json.dumps({
+                "running": True, "status": "running", "workspace_id": 1, "destination": destination,
+                "done": 0, "total": 0, "current": "Checking download sizes", "started_at": time.time() - 1,
+                "items": {"selected": 0, "completed": 0, "downloading": 0, "retrying": 0, "failed": 0, "invalid": 0, "cancelled": 0, "remaining": 0, "items": []},
+            }))
+
+    page.route("**/api/spotify/export/start", start_handler)
+    page.route("**/api/export/status?*", status_handler)
+    page.get_by_role("button", name="Download library").click()
+    page.locator("[data-test='export-running']").wait_for()
+    assert page.locator(".building-percent").count() == 0
+    assert page.locator(".building-progress[role='progressbar']").count() == 0
+    assert "ETA" not in page.locator("[data-test='export-running']").inner_text()
+
+    state["phase"] = "partial"
+    page.locator("[data-test='export-partial']").wait_for()
+    assert page.get_by_text("1 couldn’t be added", exact=True).is_visible()
+    page.get_by_role("button", name="Retry remaining").click()
+    page.locator("[data-test='export-failed']").wait_for()
+    assert page.get_by_role("heading", name="Build failed").is_visible()
+    assert page.get_by_text("The source could not provide this chart.").is_visible()
+    assert page.locator("[data-test='export-complete']").count() == 0
+    assert state["starts"] == 2
+    assert sum("/api/export/preview" in url for url in requests) >= 2
 
 
 @pytest.mark.parametrize("matching_browser_page", ["interrupted"], indirect=True)

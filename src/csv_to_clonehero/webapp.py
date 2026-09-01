@@ -7302,8 +7302,8 @@ def create_app(
         try:
             for selection in start_db.list_workspace_selections(workspace):
                 data = _row_dict(selection)
-                kind = str(data.get("kind") or "exact").casefold()
-                if kind != "exact":
+                selection_kind = str(data.get("kind") or "exact").casefold()
+                if selection_kind != "exact":
                     continue
                 current = start_db.get_workspace_candidates(
                     workspace,
@@ -7341,7 +7341,12 @@ def create_app(
         with export_job.lock:
             export_job.worker = worker
         worker.start()
-        return jsonify({"started": True, "kind": kind, "destination": destination})
+        return jsonify({
+            "started": True,
+            "kind": kind,
+            "workspace_id": workspace,
+            "destination": destination,
+        })
 
     def _export_worker(kind, payload, workspace, destination, browser_download):
         export_job.log(f"Export started ({kind}) → {destination}")
@@ -7368,7 +7373,9 @@ def create_app(
                     export_job.result = result
                     result_status = str(result.get("status") or "")
                     export_job.status = (
-                        "partial"
+                        "cancelled"
+                        if result_status == "cancelled"
+                        else "partial"
                         if result.get("success") and result_status == "partial"
                         else "complete"
                         if result.get("success")
@@ -7397,12 +7404,17 @@ def create_app(
                 else:
                     export_job.events.append({"ts": time.time(), "message": f"Export failed: {export_job.error}"})
 
-    def _latest_export_history() -> dict[str, Any] | None:
+    def _latest_export_history(
+        workspace: int | str | None = None,
+    ) -> dict[str, Any] | None:
         """Rehydrate the last durable export for a fresh web process."""
         db = Database(config.database_path)
         try:
-            workspace = export_job.workspace_id
-            records = db.list_export_records(workspace_id=workspace) if workspace is not None else db.list_export_records()
+            records = (
+                db.list_export_records(workspace_id=workspace)
+                if workspace is not None
+                else db.list_export_records()
+            )
             if not records:
                 return None
             record = records[0]
@@ -7460,6 +7472,7 @@ def create_app(
             }
             return {
                 "export_id": int(record["id"]),
+                "workspace_id": record["workspace_id"],
                 "status": "partial" if record_status == "partial" else "complete" if result["success"] else record_status,
                 "kind": record["kind"],
                 "destination": record["destination"],
@@ -7488,29 +7501,60 @@ def create_app(
     @app.get("/api/spotify/export/status")
     @app.get("/api/export/status")
     def spotify_export_status():
+        requested: int | str | None = None
+        if request.args.get("workspace_id") not in (None, ""):
+            try:
+                requested = _workspace_id(request.args.get("workspace_id"))
+            except (OSError, ValueError) as exc:
+                return {"error": _safe_message(exc)}, 404
         with export_job.lock:
-            payload = {
-                "running": export_job.running,
-                "status": export_job.status,
-                "kind": export_job.kind,
-                "done": export_job.done,
-                "total": export_job.total,
-                "current": export_job.current,
-                "error": export_job.error,
-                "destination": export_job.destination,
-                "started_at": export_job.started_at,
-                "recent_events": list(export_job.events)[-8:],
-                "items": export_job.item_snapshot(),
-            }
-            if not export_job.running and export_job.result is not None:
+            matches_memory = requested is None or (
+                export_job.workspace_id is not None
+                and str(export_job.workspace_id) == str(requested)
+            )
+            if matches_memory:
+                payload = {
+                    "running": export_job.running,
+                    "status": export_job.status,
+                    "kind": export_job.kind,
+                    "done": export_job.done,
+                    "total": export_job.total,
+                    "current": export_job.current,
+                    "error": export_job.error,
+                    "destination": export_job.destination,
+                    "workspace_id": export_job.workspace_id,
+                    "started_at": export_job.started_at,
+                    "finished_at": export_job.finished_at,
+                    "recent_events": list(export_job.events)[-8:],
+                    "items": export_job.item_snapshot(),
+                }
+            else:
+                payload = {
+                    "running": False,
+                    "status": "idle",
+                    "kind": "",
+                    "done": 0,
+                    "total": 0,
+                    "current": "",
+                    "error": "",
+                    "destination": "",
+                    "workspace_id": requested,
+                    "started_at": None,
+                    "finished_at": None,
+                    "recent_events": [],
+                    "items": {},
+                }
+            if matches_memory and not export_job.running and export_job.result is not None:
                 payload["result"] = export_job.result
-            elif not export_job.running:
-                history = _latest_export_history()
+            elif not payload["running"]:
+                history_workspace = requested if requested is not None else payload.get("workspace_id")
+                history = _latest_export_history(history_workspace)
                 if history is not None:
                     payload.update({
                         "status": history["status"],
                         "kind": history["kind"],
                         "destination": history["destination"],
+                        "workspace_id": history["workspace_id"],
                         "export_id": history["export_id"],
                         "items": history["items"],
                         "result": history["result"],

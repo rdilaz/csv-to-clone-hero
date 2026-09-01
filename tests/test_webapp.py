@@ -305,9 +305,11 @@ def test_journey_static_script_parses_in_javascript_engine(client, tmp_path):
     assert "/api/discovery/start" in script
     assert "/api/export/preview" in script
     assert "/api/paths/pick" in script
+    assert "/api/spotify/export/start" in script
+    assert "/api/export/status" in script
+    assert "/api/spotify/export/cancel" in script
     assert "/api/journey" in script
     assert "/api/spotify/status" not in script
-    assert "/api/spotify/export/start" not in script
 
 
 def test_advanced_page_is_only_a_compatibility_redirect(client):
@@ -768,6 +770,7 @@ def test_local_export_reports_one_human_readable_success(config):
             json={"kind": "folder", "workspace_id": workspace_id, "path": str(config.base_dir / "Songs")},
         )
         assert started.status_code == 200
+        assert started.get_json()["kind"] == "folder"
         deadline = time.time() + 10
         status = None
         while time.time() < deadline:
@@ -776,6 +779,8 @@ def test_local_export_reports_one_human_readable_success(config):
                 break
             time.sleep(0.05)
         assert status is not None and status["status"] == "complete"
+        assert status["kind"] == "folder"
+        assert status["result"]["kind"] == "folder"
         assert status["result"]["success"] is True
         assert status["result"]["published"] == 1
         assert status["result"]["failed"] == 0
@@ -2257,6 +2262,100 @@ def test_export_cancelling_survives_subsequent_progress_then_settles(client):
             job.status = "idle"
 
 
+def test_real_worker_preserves_cancelled_terminal_status_with_useful_output(config, monkeypatch):
+    source = FakeSource()
+    app = create_app(config, source_factory=lambda cfg: [source])
+    app.config["TESTING"] = True
+    with app.test_client() as http:
+        workspace = http.get("/api/sources").get_json()["workspace_id"]
+        track = seed_local_workspace(config, workspace)
+        db = Database(config.database_path)
+        try:
+            current = next(
+                row
+                for row in db.get_workspace_candidates(
+                    workspace,
+                    track_id=track.track_key,
+                    kind="exact",
+                    include_rejected=True,
+                    current_only=True,
+                )
+                if int(row["chart_id"]) == 301
+            )
+        finally:
+            db.close()
+        assert http.post(
+            "/api/discovery/select",
+            json={
+                "workspace_id": workspace,
+                "kind": "exact",
+                "track_id": track.track_key,
+                "candidate_id": current["candidate_id"],
+            },
+        ).status_code == 200
+
+        item = type("Item", (), {
+            "selection_index": 0,
+            "selection_id": 1,
+            "source": "test",
+            "chart_id": 301,
+            "target_relpath": "Artist/Song.sng",
+            "target_path": config.base_dir / "Songs" / "Artist" / "Song.sng",
+            "status": "published",
+            "result": "published",
+            "bytes_count": 100,
+            "sha256": "",
+            "source_hash": "",
+            "source_hash_algorithm": "",
+            "artifact_key": "",
+            "failure": "",
+            "playable_note_count": 1,
+        })()
+        cancelled_result = type("Result", (), {
+            "kind": "folder",
+            "destination": config.base_dir / "Songs",
+            "success": True,
+            "cancelled": True,
+            "published_count": 1,
+            "failed_count": 0,
+            "invalid_count": 0,
+            "download_failure_count": 0,
+            "cancelled_items": [object()],
+            "ready_count": 1,
+            "remaining_count": 1,
+            "output_bytes": 100,
+            "errors": [],
+            "items": [item],
+            "preflight": None,
+            "manifest": None,
+            "manifest_path": None,
+            "sync": None,
+        })()
+        monkeypatch.setattr(
+            "csv_to_clonehero.webapp.ExportService.export_folder",
+            lambda self, *args, **kwargs: cancelled_result,
+        )
+        started = http.post(
+            "/api/spotify/export/start",
+            json={
+                "kind": "folder",
+                "workspace_id": workspace,
+                "path": str(config.base_dir / "Songs"),
+            },
+        )
+        assert started.status_code == 200
+        for _ in range(100):
+            status = http.get(
+                f"/api/export/status?workspace_id={workspace}"
+            ).get_json()
+            if not status["running"]:
+                break
+            time.sleep(0.01)
+        assert status["status"] == "cancelled"
+        assert status["operation"]["state"] == "cancelled"
+        assert status["result"]["ready"] == 1
+
+
 @pytest.mark.parametrize(
     ("status", "expected", "label"),
     [
@@ -2506,6 +2605,77 @@ def test_partial_export_survives_fresh_app_as_partial(config):
         assert payload["status"] == "partial"
         assert payload["operation"]["state"] == "partial"
         assert payload["operation"]["label"] == "LIBRARY READY — WITH ISSUES"
+
+
+def test_export_status_filters_durable_history_to_requested_workspace(config):
+    db = Database(config.database_path)
+    try:
+        first_workspace = db.create_workspace(
+            workspace_key="history:first",
+            name="First history",
+            kind="exact",
+            status="complete",
+            phase="complete",
+        )
+        second_workspace = db.create_workspace(
+            workspace_key="history:second",
+            name="Second history",
+            kind="exact",
+            status="complete",
+            phase="complete",
+        )
+        first_export = db.create_export_record(
+            first_workspace,
+            export_key="first-history",
+            kind="folder",
+            destination=str(config.base_dir / "First Songs"),
+            status="complete",
+        )
+        db.record_export_item(
+            first_export,
+            {
+                "source": "test",
+                "chart_id": 1,
+                "target_relpath": "Artist/First.sng",
+                "status": "published",
+                "result": "downloaded",
+            },
+        )
+        second_export = db.create_export_record(
+            second_workspace,
+            export_key="second-history",
+            kind="folder",
+            destination=str(config.base_dir / "Second Songs"),
+            status="partial",
+        )
+        db.record_export_item(
+            second_export,
+            {
+                "source": "test",
+                "chart_id": 2,
+                "target_relpath": "Artist/Second.sng",
+                "status": "failed",
+                "error": "download failed",
+            },
+        )
+    finally:
+        db.close()
+
+    app = create_app(config, source_factory=lambda cfg: [FakeSource()])
+    app.config["TESTING"] = True
+    with app.test_client() as http:
+        first = http.get(
+            f"/api/export/status?workspace_id={first_workspace}"
+        ).get_json()
+        second = http.get(
+            f"/api/export/status?workspace_id={second_workspace}"
+        ).get_json()
+        assert first["workspace_id"] == first_workspace
+        assert first["status"] == "complete"
+        assert first["result"]["ready"] == 1
+        assert second["workspace_id"] == second_workspace
+        assert second["status"] == "partial"
+        assert second["result"]["ready"] == 0
 
 
 def test_open_folder_rejects_arbitrary_path_and_accepts_validated_destination(client, config, monkeypatch, tmp_path):
