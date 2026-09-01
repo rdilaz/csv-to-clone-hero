@@ -83,13 +83,14 @@ def test_combined_discovery_keeps_review_identity_out_of_best_matches(config):
     from tests.conftest import make_chart
 
     borderline = make_chart(
-        "Falling Down", "Atreyu", chart_id=27, charter="Harmonix", icon="rb2"
+        "The Blessing / Shukufuku", "YOASOBI", chart_id=27,
+        charter="Harmonix", icon="rb2",
     )
     borderline.pack_name = "Official Pack"
 
     class BorderlineCatalog(FakeCatalog):
         def candidates(self, artist, title):
-            return (borderline,) if (artist, title) == ("Atreyu", "Drowning") else ()
+            return (borderline,) if (artist, title) == ("YOASOBI", "Shukufuku") else ()
 
     db = Database(config.database_path)
     try:
@@ -97,7 +98,7 @@ def test_combined_discovery_keeps_review_identity_out_of_best_matches(config):
             config,
             db,
             [LibrarySnapshot("soundcloud", [
-                ProviderTrack("soundcloud", "atreyu", "Drowning", "Atreyu")
+                ProviderTrack("soundcloud", "yoasobi", "Shukufuku", "YOASOBI")
             ])],
             workspace_key="combined:title-review",
             catalog=BorderlineCatalog(borderline),

@@ -136,6 +136,42 @@ def test_live_same_artist_false_positives_cannot_be_best_matches(
 
 
 @pytest.mark.parametrize(
+    ("track_title", "chart_title", "plain_ratio", "ranking_score"),
+    [
+        ("Drowning", "Falling Down", 40.0, 70.0),
+        ("You Rock My World", "Rock With You", 46.6666667, 76.1904762),
+    ],
+)
+def test_plain_title_conflict_floor_ignores_token_set_inflation(
+    config, track_title, chart_title, plain_ratio, ranking_score
+):
+    result = score_candidate(
+        make_track(track_title, "Same Artist"),
+        _high_quality_chart(chart_title, "Same Artist"),
+        config,
+    )
+
+    assert result.match_factors["title"]["plain_similarity"] == pytest.approx(plain_ratio)
+    assert result.title_score == pytest.approx(ranking_score)
+    assert result.gate_factors["title_identity"] == "conflict"
+    assert result.eligibility == "INCOMPATIBLE"
+
+
+def test_plain_artist_conflict_floor_ignores_token_set_inflation(config):
+    result = score_candidate(
+        make_track("You", "Daryl Hall & John Oates"),
+        _high_quality_chart("You", "Tally Hall"),
+        config,
+    )
+
+    artist = result.match_factors["artist"]
+    assert artist["plain_similarity"] < config.matching.artist_conflict_threshold
+    assert result.artist_score >= config.matching.artist_conflict_threshold
+    assert result.gate_factors["artist_identity"] == "conflict"
+    assert result.eligibility == "INCOMPATIBLE"
+
+
+@pytest.mark.parametrize(
     ("track_artist", "track_title", "chart_artist", "chart_title"),
     [
         ("Daryl Hall & John Oates", "You Make My Dreams (Come True)", "Tally Hall", "You"),
@@ -214,8 +250,8 @@ def test_title_auto_artist_auto_allows_quality_recommendation(config):
 
 def test_title_review_artist_auto_never_recommended(config):
     result = score_candidate(
-        make_track("Drowning", "Atreyu"),
-        _high_quality_chart("Falling Down", "Atreyu"),
+        make_track("Ain’t No Thief", "Viagra Boys"),
+        _high_quality_chart("Ain’t Nice", "Viagra Boys"),
         config,
     )
     assert result.gate_factors["title_identity"] == "borderline"

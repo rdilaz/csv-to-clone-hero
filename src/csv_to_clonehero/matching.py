@@ -528,7 +528,7 @@ def _title_identity_evidence(
     track_tokens = _tokens(track_norm)
     chart_tokens = _tokens(chart_norm)
     containment = _contains_token_sequence(track_tokens, chart_tokens) or _contains_token_sequence(chart_tokens, track_tokens)
-    state = "strong" if auto else "conflict" if ranking_score < TITLE_IDENTITY_CONFLICT_THRESHOLD and not containment else "borderline"
+    state = "strong" if auto else "conflict" if plain_ratio < TITLE_IDENTITY_CONFLICT_THRESHOLD else "borderline"
     return {
         "state": state,
         "auto": auto,
@@ -581,7 +581,7 @@ def _artist_identity_evidence(
         or plain_ratio >= ARTIST_IDENTITY_PLAIN_AUTO_THRESHOLD
         or credit_prefix
     )
-    state = "strong" if auto else "conflict" if ranking_score < conflict_threshold else "borderline"
+    state = "strong" if auto else "conflict" if plain_ratio < conflict_threshold else "borderline"
     return {
         "state": state,
         "auto": auto,

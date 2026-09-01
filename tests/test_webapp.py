@@ -562,24 +562,24 @@ def test_title_conflict_cannot_be_selected_or_preflighted(config):
         assert "select at least one" in preview.get_json()["error"].casefold()
 
 
-def test_review_identity_is_best_available_and_never_strong(config):
+def test_plain_below_floor_identity_cannot_be_selected_or_preflighted(config):
     from csv_to_clonehero.combined_pipeline import discover_combined
     from csv_to_clonehero.providers.base import LibrarySnapshot, ProviderTrack
 
-    borderline = make_chart(
+    conflict = make_chart(
         "Falling Down", "Atreyu", chart_id=306,
         charter="Harmonix", icon="rb2",
     )
-    borderline.pack_name = "Official Pack"
+    conflict.pack_name = "Official Pack"
 
-    class BorderlineCatalog:
+    class ConflictCatalog:
         available = True
         diagnostic = ""
         snapshot_id = "title-review"
         chart_count = 1
 
         def candidates(self, artist, title):
-            return (borderline,) if (artist, title) == ("Atreyu", "Drowning") else ()
+            return (conflict,) if (artist, title) == ("Atreyu", "Drowning") else ()
 
         def artist_songs(self, _artist):
             return ()
@@ -591,6 +591,84 @@ def test_review_identity_is_best_available_and_never_strong(config):
             db,
             [LibrarySnapshot("soundcloud", [
                 ProviderTrack("soundcloud", "atreyu", "Drowning", "Atreyu")
+            ])],
+            workspace_key="combined:web-title-floor",
+            catalog=ConflictCatalog(),
+        )
+        workspace = int(db.get_workspace("combined:web-title-floor")["id"])
+        row = db.get_workspace_candidates(
+            workspace, kind="exact", include_rejected=True, current_only=True
+        )[0]
+        candidate_id = int(row["candidate_id"])
+        track_key = str(row["track_key"])
+        assert row["eligibility"] == "INCOMPATIBLE"
+    finally:
+        db.close()
+
+    app = create_app(config, source_factory=lambda cfg: [FakeSource()])
+    app.config["TESTING"] = True
+    with app.test_client() as http:
+        strong = http.post(
+            "/api/discovery/select-all",
+            json={"workspace_id": workspace, "scope": "strong"},
+        ).get_json()
+        assert strong["selected_count"] == 0
+        eligible = http.post(
+            "/api/discovery/select-all",
+            json={"workspace_id": workspace, "scope": "eligible"},
+        ).get_json()
+        assert eligible["selected_count"] == 0
+        direct = http.post(
+            "/api/discovery/select",
+            json={
+                "workspace_id": workspace,
+                "kind": "exact",
+                "track_id": track_key,
+                "candidate_id": candidate_id,
+            },
+        )
+        assert direct.status_code == 400
+        preview = http.post(
+            "/api/export/preview",
+            json={
+                "workspace_id": workspace,
+                "kind": "folder",
+                "path": str(config.base_dir / "Songs"),
+            },
+        )
+        assert preview.status_code == 400
+        assert "select at least one" in preview.get_json()["error"].casefold()
+
+
+def test_review_identity_is_best_available_and_never_strong(config):
+    from csv_to_clonehero.combined_pipeline import discover_combined
+    from csv_to_clonehero.providers.base import LibrarySnapshot, ProviderTrack
+
+    borderline = make_chart(
+        "The Blessing / Shukufuku", "YOASOBI", chart_id=307,
+        charter="Harmonix", icon="rb2",
+    )
+    borderline.pack_name = "Official Pack"
+
+    class BorderlineCatalog:
+        available = True
+        diagnostic = ""
+        snapshot_id = "title-review"
+        chart_count = 1
+
+        def candidates(self, artist, title):
+            return (borderline,) if (artist, title) == ("YOASOBI", "Shukufuku") else ()
+
+        def artist_songs(self, _artist):
+            return ()
+
+    db = Database(config.database_path)
+    try:
+        discover_combined(
+            config,
+            db,
+            [LibrarySnapshot("soundcloud", [
+                ProviderTrack("soundcloud", "yoasobi", "Shukufuku", "YOASOBI")
             ])],
             workspace_key="combined:web-title-review",
             catalog=BorderlineCatalog(),
