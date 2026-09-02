@@ -9,6 +9,8 @@ import pytest
 
 from csv_to_clonehero.config import AppConfig
 from csv_to_clonehero.database import Database
+from csv_to_clonehero.models import ChartCandidate
+from csv_to_clonehero.normalization import normalize_artist, normalize_title
 from csv_to_clonehero.server.jobs import JobManager, _job_payload
 from csv_to_clonehero.server.security import TokenCipher, generate_fernet_key
 from csv_to_clonehero.server.throttle import reset_global_gate_for_tests
@@ -57,10 +59,12 @@ def db(config, cipher):
     database.close()
 
 
-def _discovery_result(status="complete"):
+def _discovery_result(status="complete", error=None):
     from csv_to_clonehero.spotify_pipeline import DiscoveryResult, DiscoveryStats
 
-    return DiscoveryResult(status=status, phase="complete", stats=DiscoveryStats())
+    return DiscoveryResult(
+        status=status, phase="complete", error=error, stats=DiscoveryStats()
+    )
 
 
 def test_enqueue_and_status(config, db, cipher, monkeypatch):
@@ -188,6 +192,24 @@ def test_cancel_is_user_scoped_and_sets_event(config, db, cipher):
         manager.shutdown(timeout=2)
 
 
+def test_manager_startup_recovers_job_and_workspace_state(config, db, cipher):
+    workspace = db.get_workspace(Database.workspace_key_for_user("job-user"))
+    db.update_workspace(workspace["id"], status="running", phase="finding_charts")
+    db.update_workspace_progress(
+        workspace["id"], status="running", phase="finding_charts", message="working"
+    )
+    job = db.create_job(1, "discovery", workspace_key=workspace["workspace_key"])
+    db.update_job(job["id"], status="running", phase="finding_charts")
+
+    manager = JobManager(config, cipher, source_factory=lambda _cfg: [], auto_start=False)
+    try:
+        assert manager.get(job["id"]).status == "interrupted"
+        assert db.get_workspace(workspace["id"])["status"] == "interrupted"
+        assert db.get_workspace_progress(workspace["id"])["status"] == "interrupted"
+    finally:
+        manager.shutdown(timeout=2)
+
+
 def test_running_cancel_is_durable_and_wins_over_late_completion(config, db, cipher, monkeypatch):
     user = db.get_user("job-user")
     key = Database.workspace_key_for_user("job-user")
@@ -270,5 +292,232 @@ def test_worker_refreshes_preflight_that_expired_in_queue(config, db, cipher, mo
             time.sleep(0.05)
         assert manager.get(job.id).status == "complete"
         assert probes == [True]
+    finally:
+        manager.shutdown(timeout=2)
+
+
+def test_uploaded_soundcloud_branch_refreshes_selected_spotify_scope(
+    config, db, cipher, monkeypatch
+):
+    from csv_to_clonehero.providers.base import LibrarySnapshot, ProviderTrack
+    from csv_to_clonehero.spotify import LibraryImportResult, SpotifyLibraryRecord, SpotifyPlaylist
+
+    user = db.get_user("job-user")
+    workspace_key = Database.workspace_key_for_user("job-user")
+    workspace = db.get_workspace(workspace_key)
+    db.upsert_library_snapshot(
+        workspace["id"],
+        LibrarySnapshot(
+            "soundcloud",
+            [ProviderTrack("soundcloud", "sc-1", "Uploaded Song", "SC Artist")],
+            metadata={"import": "upload"},
+        ),
+    )
+    spotify_calls = []
+    chart_calls = []
+
+    class FakeClient:
+        def list_playlists(self):
+            return [SpotifyPlaylist("unselected", "Must Not Be Imported")]
+
+        def fetch_library(self, *, include_liked, playlists, on_progress=None):
+            spotify_calls.append((include_liked, [playlist.id for playlist in playlists]))
+            return LibraryImportResult([
+                SpotifyLibraryRecord("sp-1", "Spotify Song", ["SP Artist"], liked=True)
+            ])
+
+        def close(self):
+            pass
+
+    class FakeSource:
+        name = "enchor"
+        supports_direct_download = True
+        download_hash_verified = False
+
+        def search_song(self, artist, title):
+            chart_calls.append((artist, title))
+            chart_id = len(chart_calls)
+            return [ChartCandidate(
+                source=self.name,
+                chart_id=chart_id,
+                md5=f"{chart_id:032d}",
+                name=title,
+                artist=artist,
+                name_norm=normalize_title(title),
+                artist_norm=normalize_artist(artist),
+                instruments=["guitar"],
+                diff_guitar=3,
+            )]
+
+        def search_artist(self, artist):
+            raise AssertionError("two single-song artists should use bounded song searches")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("csv_to_clonehero.server.jobs.build_oauth", lambda *_args: object())
+    monkeypatch.setattr("csv_to_clonehero.server.jobs.build_spotify_client", lambda *_args: FakeClient())
+    manager = JobManager(config, cipher, source_factory=lambda _cfg: [FakeSource()], auto_start=False)
+    try:
+        job = manager.enqueue(int(user["id"]), "discovery", workspace_key=workspace_key)
+        manager._cancel_events[job.id] = threading.Event()
+        manager._run_discovery(job)
+
+        assert spotify_calls == [(True, [])]
+        assert set(chart_calls) == {
+            ("SC Artist", "Uploaded Song"),
+            ("SP Artist", "Spotify Song"),
+        }
+        tracks = db.get_library_tracks(workspace_id=workspace["id"])
+        assert {(track.primary_artist, track.title) for track in tracks} == {
+            ("SC Artist", "Uploaded Song"),
+            ("SP Artist", "Spotify Song"),
+        }
+        soundcloud = next(track for track in tracks if track.origin == "soundcloud")
+        assert soundcloud.spotify_id == "soundcloud:sc-1"
+        assert soundcloud.origin_metadata["providers"]["soundcloud"]["id"] == "sc-1"
+        current = manager.get(job.id)
+        assert current.status == "complete"
+        assert current.phase == "complete"
+        assert current.error in {"", None}
+        assert current.result["library_tracks"] == 2
+        assert {row["provider"] for row in db.get_source_summary(workspace["id"])} == {
+            "soundcloud", "spotify"
+        }
+    finally:
+        manager.shutdown(timeout=2)
+
+
+def test_neutral_library_safeguard_does_not_require_local_catalog(config, db):
+    from csv_to_clonehero.providers.base import LibrarySnapshot, ProviderTrack
+    from csv_to_clonehero.server.safeguards import validate_discovery_start
+
+    user = db.get_user("job-user")
+    workspace_key = Database.workspace_key_for_user("job-user")
+    workspace = db.get_workspace(workspace_key)
+    db.upsert_library_snapshot(
+        workspace["id"],
+        LibrarySnapshot(
+            "soundcloud",
+            [ProviderTrack("soundcloud", "sc-1", "Song", "Artist")],
+            metadata={"import": "upload"},
+        ),
+    )
+    with db._conn:
+        db._conn.execute(
+            "DELETE FROM workspace_scope WHERE workspace_id = ?", (workspace["id"],)
+        )
+    config.paths.catalog = "missing-catalog.jsonl"
+    assert not config.catalog_path.exists()
+
+    validation = validate_discovery_start(
+        db,
+        config,
+        user_id=int(user["id"]),
+        workspace_key=workspace_key,
+    )
+
+    assert validation.ok is True
+    assert validation.errors == ()
+
+
+def test_spotify_and_soundcloud_oauth_use_shared_prefetched_discovery(
+    config, db, cipher, monkeypatch
+):
+    from csv_to_clonehero.spotify import LibraryImportResult, SpotifyLibraryRecord
+
+    user = db.get_user("job-user")
+    workspace_key = Database.workspace_key_for_user("job-user")
+    workspace = db.get_workspace(workspace_key)
+    db.update_workspace(
+        workspace["id"],
+        metadata={
+            "soundcloud_scope": {"playlist_ids": ["sc-playlist"], "include_liked": False}
+        },
+    )
+    captured = {}
+
+    class FakeSpotifyClient:
+        def list_playlists(self):
+            return []
+
+        def fetch_library(self, *, include_liked, playlists, on_progress=None):
+            return LibraryImportResult([
+                SpotifyLibraryRecord("sp-1", "Spotify Song", ["SP Artist"], liked=True)
+            ])
+
+        def close(self):
+            pass
+
+    class FakeSoundCloudOAuth:
+        def close(self):
+            pass
+
+    class FakeSoundCloudClient:
+        def __init__(self, oauth, *, timeout):
+            self.oauth = oauth
+
+        def playlists(self):
+            return [{"id": "sc-playlist", "title": "SC Playlist"}]
+
+        def playlist_tracks(self, playlist_id):
+            assert playlist_id == "sc-playlist"
+            return [{"id": "sc-1", "title": "SoundCloud Song", "user": {"username": "SC Artist"}}]
+
+        def liked_tracks(self):
+            raise AssertionError("liked SoundCloud tracks were not selected")
+
+        def close(self):
+            pass
+
+    class FakeSource:
+        name = "enchor"
+
+        def close(self):
+            pass
+
+    source = FakeSource()
+
+    def shared_discovery(*args, **kwargs):
+        captured["sources"] = args[2]
+        captured["library"] = kwargs["prefetched_library"]
+        return _discovery_result("partial", "one bounded query failed")
+
+    monkeypatch.setattr("csv_to_clonehero.server.jobs.build_oauth", lambda *_args: object())
+    monkeypatch.setattr(
+        "csv_to_clonehero.server.jobs.build_spotify_client",
+        lambda *_args: FakeSpotifyClient(),
+    )
+    monkeypatch.setattr(
+        "csv_to_clonehero.server.jobs.build_soundcloud_oauth",
+        lambda *_args: FakeSoundCloudOAuth(),
+    )
+    monkeypatch.setattr(
+        "csv_to_clonehero.providers.soundcloud_api.SoundCloudClient",
+        FakeSoundCloudClient,
+    )
+    monkeypatch.setattr(
+        "csv_to_clonehero.spotify_pipeline.run_spotify_discovery", shared_discovery
+    )
+    manager = JobManager(
+        config, cipher, source_factory=lambda _config: [source], auto_start=False
+    )
+    try:
+        job = manager.enqueue(int(user["id"]), "discovery", workspace_key=workspace_key)
+        manager._cancel_events[job.id] = threading.Event()
+        manager._run_discovery(job)
+
+        assert captured["sources"] == [source]
+        assert {
+            (record["artists"][0], record["title"])
+            for record in captured["library"].records
+        } == {
+            ("SC Artist", "SoundCloud Song"),
+            ("SP Artist", "Spotify Song"),
+        }
+        current = manager.get(job.id)
+        assert current.status == "partial"
+        assert current.phase == "complete"
+        assert current.error == "one bounded query failed"
     finally:
         manager.shutdown(timeout=2)

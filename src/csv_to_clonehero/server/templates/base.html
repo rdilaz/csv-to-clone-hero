@@ -1,113 +1,68 @@
 <!doctype html>
 <html lang="en">
 <head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{% block title %}CSV to Clone Hero{% endblock %}</title>
-<style>
-:root {
-  --bg:#0e1117; --panel:#161b22; --border:#30363d; --text:#e6edf3;
-  --muted:#8b949e; --accent:#1f6feb; --accent-2:#3fb950; --warn:#d29922;
-}
-* { box-sizing:border-box; }
-body { margin:0; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
-  background:var(--bg); color:var(--text); line-height:1.5; }
-a { color:var(--accent); text-decoration:none; }
-a:hover { text-decoration:underline; }
-.wrap { max-width:960px; margin:0 auto; padding:0 16px; }
-header.top { border-bottom:1px solid var(--border); background:var(--panel); }
-header.top .wrap { display:flex; align-items:center; gap:16px; height:56px; }
-header.top .brand { font-weight:700; font-size:18px; color:var(--text); }
-header.top nav { margin-left:auto; display:flex; gap:16px; align-items:center; }
-.gofundme {
-  background:linear-gradient(90deg,#2b1a00,#4a2b00); border-bottom:1px solid var(--warn);
-  text-align:center; padding:10px 16px; font-size:14px;
-}
-.gofundme strong { color:var(--warn); }
-.gofundme a.btn { display:inline-block; margin-left:10px; background:var(--warn); color:#000;
-  padding:4px 12px; border-radius:999px; font-weight:700; }
-main { padding:28px 0; min-height:60vh; }
-.card { background:var(--panel); border:1px solid var(--border); border-radius:10px; padding:20px; }
-.btn { display:inline-block; background:var(--accent); color:#fff; border:none; border-radius:8px;
-  padding:10px 16px; font-size:15px; cursor:pointer; }
-.btn:disabled { opacity:.5; cursor:default; }
-.btn.ghost { background:transparent; border:1px solid var(--border); color:var(--text); }
-.field { margin-bottom:14px; }
-.muted { color:var(--muted); }
-.error { color:#f85149; }
-.bar { height:8px; background:#21262d; border-radius:999px; overflow:hidden; margin:10px 0; }
-.bar > span { display:block; height:100%; background:var(--accent-2); width:0; transition:width .4s; }
-.ad-banner { text-align:center; padding:8px 0; color:var(--muted); font-size:12px;
-  border:1px dashed var(--border); border-radius:8px; margin:18px 0; }
-footer { border-top:1px solid var(--border); margin-top:40px; padding:24px 0; color:var(--muted); }
-footer .wrap { display:flex; flex-wrap:wrap; gap:16px; align-items:center; font-size:13px; }
-footer nav { margin-left:auto; display:flex; gap:14px; }
-</style>
-{% block head %}{% endblock %}
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#0b0d0c">
+  <title>{% block title %}Riff{% endblock %}</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='public.css') }}">
+  {% block head %}{% endblock %}
 </head>
-<body>
-{% if config.monetization.gofundme_enabled %}
-<div class="gofundme">
-  <strong>Help for the Clone Hero creator.</strong>
-  <span>He is fighting cancer and every bit counts.</span>
-  {% if config.monetization.effective_gofundme_url %}
-  <a class="btn" href="{{ config.monetization.effective_gofundme_url }}" target="_blank" rel="noopener">Donate</a>
-  {% endif %}
-</div>
-{% endif %}
+<body data-authenticated="{{ 'true' if user else 'false' }}">
+  <a class="skip-link" href="#main-content">Skip to content</a>
 
-<header class="top">
-  <div class="wrap">
-    <a class="brand" href="/">CSV to Clone Hero</a>
-    <nav>
-      <a href="/about">Mission</a>
-      {% if user %}
-      <span class="muted">{{ user.display_name }}</span>
-      <button class="btn ghost" onclick="doLogout()">Sign out</button>
+  {% if config.monetization.gofundme_enabled %}
+  <aside class="cause-bar" aria-label="Community support">
+    <div class="shell cause-bar__inner">
+      <span><strong>Support the creator of Clone Hero.</strong> Help during his cancer fight.</span>
+      {% if config.monetization.effective_gofundme_url %}
+      <a href="{{ config.monetization.effective_gofundme_url }}" target="_blank" rel="noopener">Visit GoFundMe</a>
       {% endif %}
-    </nav>
-  </div>
-</header>
+    </div>
+  </aside>
+  {% endif %}
 
-<main class="wrap">
-{% block content %}{% endblock %}
-</main>
+  <header class="site-header">
+    <div class="shell site-header__inner">
+      <a class="brand" href="/" aria-label="Riff home">
+        <span class="brand__mark" aria-hidden="true"><i></i><i></i><i></i><i></i></span>
+        <span><strong>Riff</strong><small>music to Clone Hero</small></span>
+      </a>
+      <nav class="site-nav" aria-label="Primary navigation">
+        <a href="/about">Mission</a>
+        {% if user %}
+        <span class="user-name">{{ user.display_name }}</span>
+        <button class="text-button" id="logoutButton" type="button">Sign out</button>
+        {% endif %}
+      </nav>
+    </div>
+  </header>
 
-{% if config.monetization.ads_enabled %}
-<div class="wrap">
-  <div class="ad-banner">
-    {% if config.monetization.ad_banner_slot %}<div class="ad-slot" data-ad-slot="{{ config.monetization.ad_banner_slot }}"></div>{% else %}<span class="muted">Advertisement</span>{% endif %}
-  </div>
-</div>
-{% endif %}
+  <main class="shell main-content" id="main-content" tabindex="-1">
+    {% block content %}{% endblock %}
+  </main>
 
-<footer>
-  <div class="wrap">
-    <span>&copy; {{ now_year }} ryo. All rights reserved.</span>
-    <nav>
-      <a href="/terms">Terms</a>
-      <a href="/privacy">Privacy</a>
-      <a href="/dmca">Copyright / DMCA</a>
-      <a href="/about">About</a>
-    </nav>
-  </div>
-</footer>
-<script>
-async function api(path, opts) {
-  const r = await fetch(path, Object.assign({headers:{'Content-Type':'application/json'}}, opts));
-  if (r.status === 401) { window.location.href='/'; throw new Error('login'); }
-  const data = await r.json().catch(() => ({}));
-  if (!r.ok) {
-    const error = new Error(data.error || `Request failed (${r.status})`);
-    error.data = data; error.status = r.status; throw error;
-  }
-  return data;
-}
-async function doLogout() {
-  try { await api('/api/auth/logout', {method:'POST'}); } catch (e) {}
-  window.location.href='/';
-}
-</script>
-{% block scripts %}{% endblock %}
+  {% if config.monetization.ads_enabled %}
+  <aside class="shell ad-wrap" aria-label="Advertisement">
+    <div class="ad-banner">
+      {% if config.monetization.ad_banner_slot %}<div class="ad-slot" data-ad-slot="{{ config.monetization.ad_banner_slot }}"></div>{% else %}<span>Advertisement</span>{% endif %}
+    </div>
+  </aside>
+  {% endif %}
+
+  <footer class="site-footer">
+    <div class="shell site-footer__inner">
+      <span>&copy; {{ now_year }} ryo</span>
+      <span>Community charts via <a href="https://enchor.us" target="_blank" rel="noopener">Enchor</a></span>
+      <nav aria-label="Legal">
+        <a href="/terms">Terms</a>
+        <a href="/privacy">Privacy</a>
+        <a href="/dmca">DMCA</a>
+        <a href="/about">About</a>
+      </nav>
+    </div>
+  </footer>
+  <div class="sr-only" id="announcer" role="status" aria-live="polite" aria-atomic="true"></div>
+  <script src="{{ url_for('static', filename='public.js') }}" defer></script>
 </body>
 </html>

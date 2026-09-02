@@ -2098,7 +2098,7 @@ class Database:
                 metadata = _load_json(row["metadata_json"], {})
                 if not isinstance(metadata, dict):
                     metadata = {}
-                metadata.update({"interrupted": True, "resume_message": "The local app stopped; cached queries are resumable."})
+                metadata.update({"interrupted": True, "resume_message": "The service stopped; cached searches are resumable."})
                 self._conn.execute(
                     "UPDATE discovery_workspaces SET status = 'interrupted', phase = 'interrupted', metadata_json = ?, updated_at = ? WHERE id = ?",
                     (_json_text(metadata, {}), time.time(), row["id"]),
@@ -2985,6 +2985,23 @@ class Database:
             return None
         return row
 
+    def get_latest_exact_generation(self, workspace_id: int | str) -> sqlite3.Row | None:
+        """Return the newest exact scan regardless of terminal state."""
+        db_id = self._workspace_db_id(workspace_id)
+        return self._conn.execute(
+            """SELECT * FROM discovery_scans
+               WHERE workspace_id = ? AND kind = 'exact'
+               ORDER BY id DESC LIMIT 1""",
+            (db_id,),
+        ).fetchone()
+
+    def get_current_exact_generation(self, workspace_id: int | str) -> sqlite3.Row | None:
+        """Return the newest exact scan only when that scan completed."""
+        row = self.get_latest_exact_generation(workspace_id)
+        if row is None or str(row["status"] or "").lower() not in {"complete", "completed"}:
+            return None
+        return row
+
     def upsert_discovery_task(
         self,
         workspace_id: int | str,
@@ -3403,6 +3420,7 @@ class Database:
         include_rejected: bool = True,
         include_candidate_data: bool = True,
         current_only: bool = False,
+        generation_id: int | None = None,
     ) -> list[sqlite3.Row]:
         db_id = self._workspace_db_id(workspace_id)
         clauses = ["wc.workspace_id = ?"]
@@ -3423,6 +3441,14 @@ class Database:
                 "AND ds.kind = 'exact' AND ds.id = ?)"
             )
             params.append(int(generation["id"]) if generation is not None else -1)
+        elif generation_id is not None:
+            clauses.append(
+                "EXISTS (SELECT 1 FROM discovery_tasks dt "
+                "JOIN discovery_scans ds ON ds.id = dt.scan_id "
+                "WHERE dt.id = wc.task_id AND ds.workspace_id = wc.workspace_id "
+                "AND ds.kind = 'exact' AND ds.id = ?)"
+            )
+            params.append(int(generation_id))
         if not include_rejected:
             clauses.append("COALESCE(LOWER(wc.decision), '') NOT IN ('reject', 'rejected', 'incompatible')")
         candidate_json = "c.data_json AS candidate_json" if include_candidate_data else "'' AS candidate_json"
@@ -3585,7 +3611,12 @@ class Database:
         if check:
             breakdown = _load_json(check["breakdown_json"], {})
             gate_factors = breakdown.get("gate_factors", {}) if isinstance(breakdown, Mapping) else {}
-            if isinstance(gate_factors, Mapping) and gate_factors.get("hard_gate"):
+            factors = breakdown.get("factors", {}) if isinstance(breakdown, Mapping) else {}
+            nested_gates = factors.get("gates", {}) if isinstance(factors, Mapping) else {}
+            if any(
+                isinstance(gates, Mapping) and gates.get("hard_gate")
+                for gates in (gate_factors, nested_gates)
+            ):
                 raise ValueError("candidate is blocked by a hard compatibility gate")
             blocked = {"excluded", "incompatible", "reject", "rejected", "not_exportable"}
             if str(check["eligibility"] or "").lower() in blocked or str(check["decision"] or "").lower() in blocked:

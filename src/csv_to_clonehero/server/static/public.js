@@ -1,0 +1,619 @@
+(() => {
+  "use strict";
+
+  const $ = (selector, root = document) => root.querySelector(selector);
+  const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
+  const authenticated = document.body.dataset.authenticated === "true";
+  const app = $("#riffApp");
+  const state = {
+    journey: null,
+    scope: null,
+    jobId: null,
+    pollTimer: null,
+    activityOffset: 0,
+    activityTotal: 0,
+    reviewOffset: 0,
+    reviewTotal: 0,
+    reviewFilter: "recommended",
+    reviewSearch: "",
+    selected: 0,
+  };
+
+  async function api(path, options = {}) {
+    const headers = new Headers(options.headers || {});
+    if (options.body && !(options.body instanceof FormData)) headers.set("Content-Type", "application/json");
+    headers.set("X-Riff-Request", "1");
+    const response = await fetch(path, {...options, headers, credentials: "same-origin"});
+    const data = await response.json().catch(() => ({}));
+    if (response.status === 401) {
+      window.location.assign("/");
+      throw new Error("Your session ended. Sign in again to continue.");
+    }
+    if (!response.ok) {
+      const error = new Error(data.error || `Request failed (${response.status})`);
+      error.data = data;
+      error.status = response.status;
+      throw error;
+    }
+    return data;
+  }
+
+  function escapeHtml(value) {
+    return String(value ?? "").replace(/[&<>"']/g, char => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;"})[char]);
+  }
+
+  function announce(message) {
+    const node = $("#announcer");
+    if (!node) return;
+    node.textContent = "";
+    window.setTimeout(() => { node.textContent = message; }, 20);
+  }
+
+  function showError(message) {
+    const node = $("#appError");
+    if (!node) return;
+    node.textContent = message;
+    node.hidden = false;
+    node.focus?.();
+    announce(message);
+  }
+
+  function clearError() {
+    const node = $("#appError");
+    if (node) node.hidden = true;
+  }
+
+  function setButtonBusy(button, busy, busyText) {
+    if (!button) return;
+    if (button._riffLabel === undefined) button._riffLabel = button.innerHTML;
+    button.disabled = busy;
+    if (!button.classList.contains("cohort-card")) {
+      if (busy) button.textContent = busyText;
+      else button.innerHTML = button._riffLabel;
+    }
+    button.setAttribute("aria-busy", String(busy));
+  }
+
+  async function logout() {
+    try { await api("/api/auth/logout", {method: "POST", body: "{}"}); } catch (_) { /* redirect regardless */ }
+    window.location.assign("/");
+  }
+
+  async function uploadSoundCloud(form, messageNode) {
+    const input = $("input[type=file]", form);
+    const button = $("button[type=submit]", form);
+    if (!input?.files?.[0]) {
+      messageNode.textContent = "Choose a CSV or JSON export first.";
+      messageNode.classList.add("is-error");
+      return null;
+    }
+    messageNode.classList.remove("is-error");
+    messageNode.textContent = "Importing your SoundCloud music...";
+    setButtonBusy(button, true, "Importing...");
+    try {
+      const body = new FormData();
+      body.append("file", input.files[0]);
+      const result = await api("/api/sources/soundcloud/import", {method: "POST", body});
+      const count = Number(result.source?.tracks || 0).toLocaleString();
+      messageNode.textContent = `${count} SoundCloud songs imported.`;
+      announce(messageNode.textContent);
+      return result;
+    } catch (error) {
+      messageNode.textContent = error.message;
+      messageNode.classList.add("is-error");
+      return null;
+    } finally {
+      setButtonBusy(button, false);
+    }
+  }
+
+  function bindGuest() {
+    const form = $("#guestSoundcloudForm");
+    if (!form) return;
+    form.addEventListener("submit", async event => {
+      event.preventDefault();
+      const result = await uploadSoundCloud(form, $("#guestSoundcloudMessage"));
+      if (result) {
+        const songs = Number(result.combined?.tracks || 0).toLocaleString();
+        $("#guestSoundcloudMessage").textContent = `${songs} songs ready. Continue with Spotify to find charts.`;
+      }
+    });
+  }
+
+  const stages = ["add", "find", "confirm", "download", "done"];
+
+  function showStage(name, focus = false) {
+    const ids = {add: "stageAdd", find: "stageFind", confirm: "stageConfirm", download: "stageDownload", done: "stageDone"};
+    $("#stageLoading").hidden = true;
+    for (const [key, id] of Object.entries(ids)) $("#" + id).hidden = key !== name;
+    const current = stages.indexOf(name);
+    $$(".journey-steps li").forEach((item, index) => {
+      item.classList.toggle("is-current", index === current);
+      item.classList.toggle("is-complete", index < current);
+      if (index === current) item.setAttribute("aria-current", "step");
+      else item.removeAttribute("aria-current");
+    });
+    const currentStep = $$(".journey-steps li")[current];
+    currentStep?.scrollIntoView({behavior: "smooth", block: "nearest", inline: "center"});
+    if (focus) {
+      const heading = $("#" + ids[name] + " h1");
+      heading?.setAttribute("tabindex", "-1");
+      heading?.focus({preventScroll: false});
+    }
+  }
+
+  function hasSpotifyScope(scope) {
+    return Boolean(scope?.include_liked || scope?.playlist_ids?.length);
+  }
+
+  function isTerminal(job) {
+    return ["complete", "partial", "failed", "cancelled", "interrupted"].includes(job?.status);
+  }
+
+  async function restore() {
+    clearError();
+    try {
+      const journey = await api("/api/journey");
+      state.journey = journey;
+      renderSources(journey);
+      if (journey.download?.url) {
+        renderDone(journey.download, null);
+        return;
+      }
+      if (["queued", "running"].includes(journey.job?.status)) {
+        attachJob(journey.job.id);
+        return;
+      }
+      if (isTerminal(journey.job) || journey.review?.total > 0) {
+        await openConfirm(false);
+        if (["failed", "partial", "cancelled", "interrupted"].includes(journey.job?.status)) {
+          const copy = journey.job.status === "failed"
+            ? "The last search did not finish. Saved results are shown below; you can search again."
+            : "The last search was incomplete. Review saved results or search again for missing songs.";
+          showError(copy);
+        }
+        return;
+      }
+      await openAddMusic(false);
+    } catch (error) {
+      showStage("add");
+      showError(error.message || "Riff could not restore your library.");
+    }
+  }
+
+  async function openAddMusic(focus = true) {
+    showStage("add", focus);
+    try {
+      const [journey, scope, soundcloud] = await Promise.all([
+        api("/api/journey"),
+        api("/api/spotify/scope"),
+        api("/api/auth/soundcloud/status").catch(() => ({configured: false})),
+      ]);
+      state.journey = journey;
+      state.scope = scope;
+      renderSources(journey);
+      renderScope(scope);
+      await renderSoundCloudAuth(soundcloud);
+    } catch (error) {
+      showError(error.message || "Your music could not be loaded. Reload to try again.");
+    }
+  }
+
+  function renderScope(payload) {
+    const host = $("#spotifyChoices");
+    if (!host) return;
+    const saved = payload.workspace?.scope || {};
+    const selectedIds = new Set(saved.playlist_ids || []);
+    const rows = [
+      `<label><input id="includeLiked" type="checkbox" ${saved.include_liked ? "checked" : ""}><span>Liked Songs</span><small>${Number(payload.liked_count || 0).toLocaleString()}</small></label>`,
+      ...(payload.playlists || []).map(item => `<label><input class="spotify-playlist" type="checkbox" value="${escapeHtml(item.id)}" ${selectedIds.has(item.id) ? "checked" : ""}><span>${escapeHtml(item.name || "Untitled playlist")}</span><small>${Number(item.track_count || 0).toLocaleString()}</small></label>`),
+    ];
+    host.innerHTML = rows.join("") || "<p>No Spotify playlists were returned.</p>";
+    host.setAttribute("aria-busy", "false");
+    host.addEventListener("change", updateMusicTally);
+    updateMusicTally();
+  }
+
+  function renderSources(journey) {
+    const imported = (journey.sources || []).find(source => source.provider === "soundcloud");
+    const count = Number(imported?.tracks || 0);
+    const badge = $("#soundcloudCount");
+    if (badge) {
+      badge.textContent = count ? `${count.toLocaleString()} songs` : "Not added";
+      badge.classList.toggle("status-pill--quiet", !count);
+    }
+    updateMusicTally();
+  }
+
+  async function renderSoundCloudAuth(status) {
+    const host = $("#soundcloudOauth");
+    if (!host || !status.configured) return;
+    host.hidden = false;
+    if (!status.authenticated) return;
+    try {
+      const data = await api("/api/soundcloud/scope");
+      const saved = state.scope?.workspace?.soundcloud_scope || {};
+      const savedIds = new Set(saved.playlist_ids || []);
+      host.innerHTML = `<p class="fine-print">SoundCloud is connected. Choose what to include.</p>
+        <div class="choice-list">
+          <label><input id="soundcloudLiked" type="checkbox" ${saved.include_liked ? "checked" : ""}><span>Liked Tracks</span><small>${Number(data.liked_count || 0).toLocaleString()}</small></label>
+          ${(data.playlists || []).map(item => `<label><input class="soundcloud-playlist" type="checkbox" value="${escapeHtml(item.id)}" ${savedIds.has(String(item.id)) ? "checked" : ""}><span>${escapeHtml(item.title || item.name || "Untitled playlist")}</span></label>`).join("")}
+        </div>
+        <button class="button button--secondary" id="saveSoundcloudScope" type="button">Save SoundCloud selection</button>
+        <p class="form-message" id="soundcloudScopeMessage" role="status" aria-live="polite"></p>`;
+      $("#saveSoundcloudScope")?.addEventListener("click", saveSoundCloudScope);
+    } catch (_) {
+      host.innerHTML = "<p class=\"fine-print\">SoundCloud is connected, but its library could not be loaded. You can still use Spotify or upload an export.</p>";
+    }
+  }
+
+  async function saveSoundCloudScope() {
+    const button = $("#saveSoundcloudScope");
+    const message = $("#soundcloudScopeMessage");
+    setButtonBusy(button, true, "Saving...");
+    try {
+      await api("/api/soundcloud/scope", {method: "POST", body: JSON.stringify({
+        include_liked: Boolean($("#soundcloudLiked")?.checked),
+        playlist_ids: $$(".soundcloud-playlist:checked").map(input => input.value),
+      })});
+      message.textContent = "SoundCloud selection saved.";
+      announce(message.textContent);
+    } catch (error) {
+      message.textContent = error.message;
+      message.classList.add("is-error");
+    } finally {
+      setButtonBusy(button, false);
+    }
+  }
+
+  function currentScope() {
+    return {
+      include_liked: Boolean($("#includeLiked")?.checked),
+      playlist_ids: $$(".spotify-playlist:checked").map(input => input.value),
+    };
+  }
+
+  function updateMusicTally() {
+    const tally = $("#musicTally");
+    if (!tally) return;
+    const liked = $("#includeLiked")?.checked ? Number(state.scope?.liked_count || 0) : 0;
+    const playlistCount = $$(".spotify-playlist:checked").reduce((sum, input) => {
+      const count = Number(input.closest("label")?.querySelector("small")?.textContent?.replace(/,/g, "") || 0);
+      return sum + count;
+    }, 0);
+    const imported = Number(state.journey?.combined?.tracks || 0);
+    const estimated = liked + playlistCount;
+    const strong = tally.querySelector("strong");
+    const small = tally.querySelector("small");
+    if (estimated || imported) {
+      strong.textContent = `${(estimated || imported).toLocaleString()} ${estimated ? "Spotify tracks chosen" : "imported songs"}`;
+      small.textContent = imported && estimated ? `${imported.toLocaleString()} imported SoundCloud songs will also be included; duplicates are merged.` : "Duplicates are merged before matching.";
+    } else {
+      strong.textContent = "Choose music above";
+      small.textContent = "Liked Songs, playlists, or an optional SoundCloud export.";
+    }
+  }
+
+  async function importAuthenticatedSoundCloud(event) {
+    event.preventDefault();
+    const form = event.currentTarget;
+    const result = await uploadSoundCloud(form, $("#soundcloudMessage"));
+    if (!result) return;
+    state.journey.sources = result.sources || [];
+    state.journey.combined = result.combined || {};
+    renderSources(state.journey);
+  }
+
+  async function saveScopeIfChosen() {
+    const scope = currentScope();
+    if (!hasSpotifyScope(scope)) return false;
+    await api("/api/spotify/scope", {method: "POST", body: JSON.stringify(scope)});
+    return true;
+  }
+
+  async function ensurePreflight() {
+    let response = await api("/api/preflight");
+    if (!response.preflight?.usable) response = await api("/api/preflight", {method: "POST", body: "{}"});
+    if (!response.preflight?.usable) throw new Error(response.preflight?.message || "The community chart library is unavailable right now.");
+  }
+
+  async function startDiscovery() {
+    const button = $("#findChartsButton");
+    clearError();
+    setButtonBusy(button, true, "Preparing search...");
+    try {
+      const spotifyChosen = await saveScopeIfChosen();
+      const imported = Number(state.journey?.combined?.tracks || 0) > 0;
+      if (!spotifyChosen && !imported) throw new Error("Choose Liked Songs, a playlist, or import SoundCloud music first.");
+      showStage("find", true);
+      $("#progressMessage").textContent = "Checking the community chart library...";
+      await ensurePreflight();
+      const result = await api("/api/jobs", {method: "POST", body: JSON.stringify({kind: "discovery"})});
+      attachJob(result.job.id);
+    } catch (error) {
+      if (error.data?.job?.id) {
+        attachJob(error.data.job.id);
+        return;
+      }
+      showStage("add");
+      showError(error.message);
+    } finally {
+      setButtonBusy(button, false);
+    }
+  }
+
+  function attachJob(jobId) {
+    state.jobId = Number(jobId);
+    showStage("find");
+    if (state.pollTimer) window.clearInterval(state.pollTimer);
+    pollJob();
+    state.pollTimer = window.setInterval(pollJob, 1500);
+  }
+
+  function progressNumbers(job) {
+    const progress = job.progress || {};
+    const total = Number(progress.total_tracks || progress.total_work || progress.scoring_tasks_total || 0);
+    const done = Math.min(total || Infinity, Number(progress.processed_tracks || progress.completed_work || progress.scoring_tasks_completed || 0));
+    return {progress, total, done: Number.isFinite(done) ? done : 0, percent: total ? Math.min(100, Math.round(done / total * 100)) : 0};
+  }
+
+  async function pollJob() {
+    try {
+      const {job} = await api(`/api/jobs/${state.jobId}`);
+      renderProgress(job);
+      if ($("#activityDetails")?.open) loadActivity();
+      if (isTerminal(job)) {
+        window.clearInterval(state.pollTimer);
+        state.pollTimer = null;
+        state.journey = await api("/api/journey");
+        if (job.status === "failed") showError("The search stopped before it finished. Your completed work is saved; start again when ready.");
+        else if (job.status !== "complete") showError("The search was interrupted. Saved results are available, but some songs may still need checking.");
+        await openConfirm(true);
+      }
+    } catch (error) {
+      window.clearInterval(state.pollTimer);
+      state.pollTimer = null;
+      showError(error.message);
+    }
+  }
+
+  function renderProgress(job) {
+    const {progress, total, done, percent} = progressNumbers(job);
+    const disc = $("#progressDisc");
+    disc.style.setProperty("--progress", `${percent}%`);
+    if (total) disc.setAttribute("aria-valuenow", String(percent)); else disc.removeAttribute("aria-valuenow");
+    disc.setAttribute("aria-valuetext", total ? `${done} of ${total} songs checked` : "Preparing music");
+    $("#progressPercent").textContent = total ? `${percent}%` : "...";
+    $("#progressBar").style.width = `${percent}%`;
+    $("#progressCount").textContent = total ? `${done.toLocaleString()} of ${total.toLocaleString()} songs checked` : "Preparing your music";
+    const phases = {
+      queued: "Your search is waiting its turn. Riff searches carefully to protect the community service.",
+      starting: "Preparing your selected music...",
+      provider_import: "Loading your selected music...",
+      combine: "Merging duplicate songs...",
+      finding_charts: "Comparing songs with playable community charts...",
+    };
+    $("#progressMessage").textContent = phases[job.status === "queued" ? "queued" : job.phase] || job.message || "Finding charts...";
+    const current = progress.current_song;
+    $("#currentSong").textContent = typeof current === "string" ? current : current?.artist && current?.title ? `${current.artist} - ${current.title}` : "";
+  }
+
+  async function loadActivity() {
+    if (!state.jobId) return;
+    const params = new URLSearchParams({limit: "50", offset: String(state.activityOffset)});
+    const search = $("#activitySearch")?.value.trim();
+    if (search) params.set("search", search);
+    const data = await api(`/api/jobs/${state.jobId}/songs?${params}`);
+    state.activityTotal = Number(data.total || 0);
+    $("#activityList").innerHTML = (data.songs || []).map(song => `<li><strong>${escapeHtml(song.artist)} - ${escapeHtml(song.title)}</strong><span>${escapeHtml(activityLabel(song.classification || song.status))}</span></li>`).join("") || "<li>No song activity yet.</li>";
+    const page = Math.floor(state.activityOffset / 50) + 1;
+    $("#activityPage").textContent = `${page} / ${Math.max(1, Math.ceil(state.activityTotal / 50))}`;
+    $("#activityPrev").disabled = state.activityOffset === 0;
+    $("#activityNext").disabled = state.activityOffset + 50 >= state.activityTotal;
+  }
+
+  function activityLabel(value) {
+    return ({waiting: "Waiting", checking: "Checking", strong: "Best match", review: "Review", no_suitable: "No suitable chart", not_playable: "Not playable", no_catalog_candidate: "No chart found"})[value] || value || "Waiting";
+  }
+
+  async function cancelDiscovery() {
+    if (!state.jobId || !window.confirm("Cancel this search? Completed progress will remain saved.")) return;
+    try { await api(`/api/jobs/${state.jobId}/cancel`, {method: "POST", body: "{}"}); }
+    catch (error) { showError(error.message); }
+  }
+
+  async function openConfirm(focus = true) {
+    showStage("confirm", focus);
+    state.reviewOffset = 0;
+    await loadReview();
+  }
+
+  function reviewParams() {
+    const params = new URLSearchParams({limit: "25", offset: String(state.reviewOffset)});
+    if (state.reviewSearch) params.set("search", state.reviewSearch);
+    if (state.reviewFilter === "strong") params.set("state", "strong");
+    if (state.reviewFilter === "review") params.set("state", "review");
+    if (state.reviewFilter === "selected") params.set("selected", "true");
+    if (state.reviewFilter === "recommended") params.set("state", "strong,review");
+    return params;
+  }
+
+  async function loadReview() {
+    try {
+      const data = await api(`/api/workspace?${reviewParams()}`);
+      state.reviewTotal = Number(data.total || 0);
+      state.selected = Number(data.summary?.selection_count || 0);
+      const strong = Number(data.summary?.strong || 0);
+      const review = Number(data.summary?.review || 0);
+      const selectedStrong = Number(data.summary?.selected_strong || 0);
+      const selectedReview = Number(data.summary?.selected_review || 0);
+      $("#chartsFoundCount").textContent = (strong + review).toLocaleString();
+      $("#chartsFoundLabel").textContent = strong + review === 1 ? "song has a recommendation." : "songs have recommendations.";
+      $("#bestMatchCount").textContent = `${strong.toLocaleString()} ${strong === 1 ? "chart" : "charts"}`;
+      $("#allMatchCount").textContent = `${(strong + review).toLocaleString()} ${strong + review === 1 ? "chart" : "charts"}`;
+      $("#selectedCount").textContent = state.selected.toLocaleString();
+      $("#continueDownloadButton").disabled = state.selected < 1;
+      $("#selectBestButton").setAttribute("aria-pressed", String(
+        state.selected > 0 && state.selected === strong && selectedReview === 0
+      ));
+      $("#selectAllButton").setAttribute("aria-pressed", String(
+        review > 0 && state.selected === strong + review && selectedReview === review
+      ));
+      $("#reviewSummary").textContent = `${state.reviewTotal.toLocaleString()} in this view; ${Number(data.summary?.unavailable || 0).toLocaleString()} songs have no safe recommendation.`;
+      $("#reviewCards").innerHTML = (data.tracks || []).map(reviewCard).join("") || `<div class="empty-state">No recommendations match this view.</div>`;
+      bindReviewActions();
+      const page = Math.floor(state.reviewOffset / 25) + 1;
+      $("#reviewPage").textContent = `${page} / ${Math.max(1, Math.ceil(state.reviewTotal / 25))}`;
+      $("#reviewPrev").disabled = state.reviewOffset === 0;
+      $("#reviewNext").disabled = state.reviewOffset + 25 >= state.reviewTotal;
+    } catch (error) {
+      showError(error.message);
+    }
+  }
+
+  function reviewCard(track) {
+    const candidates = track.candidates || [];
+    const best = candidates.find(candidate => candidate.best) || candidates[0];
+    if (!best) return "";
+    const alternatives = candidates.filter(candidate => candidate !== best && ["strong", "needs_review"].includes(candidate.review?.state));
+    return `<article class="review-card">
+      <div class="review-card__song"><span class="eyebrow">YOUR MUSIC</span><h3>${escapeHtml(track.artist)} - ${escapeHtml(track.title)}</h3><p>${escapeHtml(track.album || "")}</p></div>
+      ${candidateSummary(best, true)}
+      <div class="review-card__action">${candidateAction(track, best)}</div>
+      ${alternatives.length ? `<details class="alternatives"><summary>Other chart versions (${alternatives.length})</summary>${alternatives.map(candidate => `<div class="alternative">${candidateSummary(candidate, false)}<div class="review-card__action">${candidateAction(track, candidate)}</div></div>`).join("")}</details>` : ""}
+    </article>`;
+  }
+
+  function candidateSummary(candidate, best) {
+    const review = candidate.review || {};
+    const concerns = review.concerns || [];
+    const version = candidate.pack_name || candidate.source || "Community chart";
+    return `<div class="review-card__chart">
+      <span class="match-badge ${review.state === "needs_review" ? "match-badge--review" : ""}">${best && review.state === "strong" ? "Best match" : review.state === "needs_review" ? "Best available" : escapeHtml(review.label || "Chart")}</span>
+      <h4>${escapeHtml(candidate.artist)} - ${escapeHtml(candidate.title)}</h4>
+      <p>${escapeHtml(version)}${candidate.charter ? ` · ${escapeHtml(candidate.charter)}` : ""}</p>
+      ${concerns.length ? `<details class="concern-details"><summary>${concerns.length} chart ${concerns.length === 1 ? "concern" : "concerns"}</summary><div>${concerns.map(item => `<p>${escapeHtml(item)}</p>`).join("")}</div></details>` : ""}
+    </div>`;
+  }
+
+  function candidateAction(track, candidate) {
+    if (candidate.selected) return `<button class="button button--secondary" type="button" data-selection="clear" data-track="${escapeHtml(track.track_key)}" data-candidate="${candidate.candidate_id}" aria-label="Clear selected chart for ${escapeHtml(track.title)}">Clear choice</button>`;
+    if (!candidate.review?.selectable) return `<button class="button button--secondary" type="button" disabled>Unavailable</button>`;
+    return `<button class="button button--secondary" type="button" data-selection="select" data-track="${escapeHtml(track.track_key)}" data-candidate="${candidate.candidate_id}">Select</button>`;
+  }
+
+  function bindReviewActions() {
+    $$('[data-selection]').forEach(button => button.addEventListener("click", () => updateSelection(button)));
+  }
+
+  async function updateSelection(button) {
+    setButtonBusy(button, true, "Saving...");
+    try {
+      await api("/api/selection", {method: "POST", body: JSON.stringify({track_key: button.dataset.track, candidate_id: Number(button.dataset.candidate), action: button.dataset.selection})});
+      announce(button.dataset.selection === "clear" ? "Chart choice cleared." : "Chart choice saved.");
+      await loadReview();
+    } catch (error) {
+      showError(error.message);
+      setButtonBusy(button, false);
+    }
+  }
+
+  async function bulkSelect(scope) {
+    const button = scope === "strong" ? $("#selectBestButton") : scope === "eligible" ? $("#selectAllButton") : $("#clearSelectionButton");
+    setButtonBusy(button, true, "Saving choices...");
+    try {
+      const payload = scope === "clear" ? {action: "clear"} : {action: "select", scope};
+      await api("/api/selection/bulk", {method: "POST", body: JSON.stringify(payload)});
+      $("#selectBestButton").setAttribute("aria-pressed", String(scope === "strong"));
+      $("#selectAllButton").setAttribute("aria-pressed", String(scope === "eligible"));
+      announce(scope === "clear" ? "Chart choices cleared." : "Chart choices saved.");
+      state.reviewOffset = 0;
+      await loadReview();
+    } catch (error) {
+      showError(error.message);
+    } finally {
+      setButtonBusy(button, false);
+    }
+  }
+
+  function openDownload() {
+    $("#downloadSelectionCount").textContent = state.selected.toLocaleString();
+    showStage("download", true);
+  }
+
+  async function prepareDownload() {
+    const button = $("#prepareDownloadButton");
+    const status = $("#downloadStatus");
+    clearError();
+    setButtonBusy(button, true, "Validating and packaging...");
+    status.textContent = "Riff is downloading and validating each selected chart. Keep this page open while the ZIP is prepared.";
+    try {
+      const result = await api("/api/download", {method: "POST", body: "{}"});
+      renderDone({...result.download, url: `/api/download/${result.download.token}`}, result.summary);
+    } catch (error) {
+      status.textContent = "";
+      showError(error.message);
+    } finally {
+      setButtonBusy(button, false);
+    }
+  }
+
+  function renderDone(download, summary) {
+    const link = $("#downloadLibraryLink");
+    link.href = download.url || `/api/download/${download.token}`;
+    if (summary) {
+      const ready = Number(summary.ready || summary.published || state.selected);
+      $("#doneSummary").textContent = `${ready.toLocaleString()} validated ${ready === 1 ? "chart is" : "charts are"} packaged. Download the ZIP, then add its song folders to Clone Hero.`;
+    }
+    const expires = Number(download.expires_at || 0);
+    $("#downloadExpiry").textContent = expires ? `This single-use link expires at ${new Date(expires * 1000).toLocaleTimeString([], {hour: "numeric", minute: "2-digit"})}.` : "This is a short-lived, single-use download link.";
+    showStage("done", true);
+    announce("Your Riff library is ready to download.");
+  }
+
+  async function prepareAgain() {
+    state.journey = await api("/api/journey");
+    state.selected = Number(state.journey.review?.selected || 0);
+    openDownload();
+  }
+
+  function debounce(callback, delay = 220) {
+    let timer;
+    return (...args) => {
+      window.clearTimeout(timer);
+      timer = window.setTimeout(() => callback(...args), delay);
+    };
+  }
+
+  function bindAuthenticated() {
+    $("#soundcloudForm")?.addEventListener("submit", importAuthenticatedSoundCloud);
+    $("#findChartsButton")?.addEventListener("click", startDiscovery);
+    $("#cancelJobButton")?.addEventListener("click", cancelDiscovery);
+    $("#activityDetails")?.addEventListener("toggle", event => { if (event.currentTarget.open) loadActivity(); });
+    $("#activitySearch")?.addEventListener("input", debounce(() => { state.activityOffset = 0; loadActivity(); }));
+    $("#activityPrev")?.addEventListener("click", () => { state.activityOffset = Math.max(0, state.activityOffset - 50); loadActivity(); });
+    $("#activityNext")?.addEventListener("click", () => { state.activityOffset += 50; loadActivity(); });
+    $("#selectBestButton")?.addEventListener("click", () => bulkSelect("strong"));
+    $("#selectAllButton")?.addEventListener("click", () => bulkSelect("eligible"));
+    $("#clearSelectionButton")?.addEventListener("click", () => bulkSelect("clear"));
+    $("#reviewSearch")?.addEventListener("input", debounce(event => { state.reviewSearch = event.target.value.trim(); state.reviewOffset = 0; loadReview(); }));
+    $$('[data-review-filter]').forEach(button => button.addEventListener("click", () => {
+      state.reviewFilter = button.dataset.reviewFilter;
+      state.reviewOffset = 0;
+      $$('[data-review-filter]').forEach(item => item.setAttribute("aria-pressed", String(item === button)));
+      loadReview();
+    }));
+    $("#reviewPrev")?.addEventListener("click", () => { state.reviewOffset = Math.max(0, state.reviewOffset - 25); loadReview(); });
+    $("#reviewNext")?.addEventListener("click", () => { state.reviewOffset += 25; loadReview(); });
+    $("#continueDownloadButton")?.addEventListener("click", openDownload);
+    $("#backToChartsButton")?.addEventListener("click", () => openConfirm(true));
+    $("#searchAgainButton")?.addEventListener("click", () => openAddMusic(true));
+    $("#prepareDownloadButton")?.addEventListener("click", prepareDownload);
+    $("#downloadLibraryLink")?.addEventListener("click", () => announce("Your browser download has started. Riff cannot confirm when your browser finishes saving it."));
+    $("#prepareAgainButton")?.addEventListener("click", prepareAgain);
+    restore();
+  }
+
+  $("#logoutButton")?.addEventListener("click", logout);
+  if (authenticated && app) bindAuthenticated(); else bindGuest();
+})();

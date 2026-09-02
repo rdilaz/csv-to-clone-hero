@@ -86,9 +86,11 @@ The public app in `server/web.py` follows this sequence:
 4. `server/jobs.py:JobManager` stores a durable job and runs jobs FIFO on one
    process-wide worker. `server/throttle.py:GlobalGate` prevents concurrent
    Enchor-bound work from multiplying requests from the shared server IP.
-5. `spotify_pipeline.py` imports the selected library, resolves paginated chart
-   queries, persists progress, and records candidates and explainable scores in
-   the user workspace.
+5. `server/jobs.py` normalizes the selected Spotify and optional SoundCloud
+   records into one canonical prefetched library. `spotify_pipeline.py` then
+   resolves bounded live chart queries, persists progress, and records
+   candidates and explainable scores in the user workspace. The public path
+   does not depend on the local catalog snapshot.
 6. Review endpoints change workspace selections only after checking ownership,
    candidate membership, score thresholds, and hard-gate eligibility.
 7. `server/downloads.py` asks `exporter.py:ExportService` to assemble a ZIP in

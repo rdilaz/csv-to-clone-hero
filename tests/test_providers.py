@@ -5,6 +5,8 @@ from __future__ import annotations
 from csv_to_clonehero.providers.base import ProviderTrack, merge_provider_tracks
 from csv_to_clonehero.providers.soundcloud import SoundCloudExportProvider
 from csv_to_clonehero.providers.soundcloud_api import SoundCloudClient, SoundCloudOAuth
+from csv_to_clonehero.providers.spotify import SpotifyLibraryProvider
+from csv_to_clonehero.spotify import LibraryImportResult, SpotifyLibraryRecord, SpotifyPlaylist
 
 
 def test_provider_union_preserves_ids_playlists_and_liked_status():
@@ -19,6 +21,28 @@ def test_provider_union_preserves_ids_playlists_and_liked_status():
     assert tracks[0].playlist_names == ["Favorites"]
     assert tracks[0].liked is True
     assert tracks[0].metadata["provenance"][0]["provider_id"] == "sc-9"
+
+
+def test_spotify_provider_explicit_empty_playlists_imports_liked_only():
+    calls = []
+
+    class Client:
+        def list_playlists(self):
+            return [SpotifyPlaylist("playlist-1", "Playlist One")]
+
+        def fetch_library(self, *, include_liked, playlists, on_progress=None):
+            calls.append((include_liked, [playlist.id for playlist in playlists]))
+            records = [SpotifyLibraryRecord("liked-1", "Liked Song", ["Artist"], liked=True)]
+            if playlists:
+                records.append(SpotifyLibraryRecord("playlist-track", "Playlist Song", ["Artist"]))
+            return LibraryImportResult(records)
+
+    snapshot = SpotifyLibraryProvider(Client()).import_library(
+        scope={"playlist_ids": [], "include_liked": True}
+    )
+
+    assert calls == [(True, [])]
+    assert [track.provider_id for track in snapshot.tracks] == ["liked-1"]
 
 
 def test_soundcloud_json_export_is_strict_and_normalized():

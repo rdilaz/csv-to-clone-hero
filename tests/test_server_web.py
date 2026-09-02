@@ -5,10 +5,8 @@ from __future__ import annotations
 import time
 import io
 import json
-import re
 import shutil
 import subprocess
-import tempfile
 from pathlib import Path
 
 import pytest
@@ -73,6 +71,7 @@ def app(config, monkeypatch):
     application = create_app(config)
     yield application
     application.extensions["jobs"].shutdown(timeout=2)
+    application.extensions["downloads"].close()
 
 
 @pytest.fixture
@@ -93,68 +92,81 @@ def test_landing_is_public(client):
     assert b"Get every song" not in r.data
     assert b"score the best match" not in r.data
     assert b"Enchor" in r.data
+    assert b"Riff" in r.data
+    assert b"Your music" in r.data
+    assert b"Community charts" in r.data
+    assert b"Clone Hero" in r.data
+    assert b"Songs folder" not in r.data
 
 
 def test_authenticated_review_shell_prioritizes_human_decisions(client):
     _sign_in(client)
     html = client.get("/").get_data(as_text=True)
 
-    assert "Review your matches" in html
-    assert "Advanced review settings" in html
-    assert '<details class="advanced-review">' in html
-    assert 'role="status" aria-live="polite"' in html
-    assert "Minimum match score" not in html
-    assert "eligibility" not in html
+    assert "CONFIRM CHARTS" in html
+    assert "Best Matches" in html
+    assert "All recommendations" in html
+    assert "Quick confirmation" in html
+    assert "Advanced review settings" not in html
+    assert "Selection cutoff" not in html
+    assert "Change folder" not in html
+    assert "local destination" not in html.casefold()
+    assert 'type="text" name="destination"' not in html
 
 
 def test_authenticated_shell_contains_bounded_matching_activity(client):
     _sign_in(client)
     html = client.get("/").get_data(as_text=True)
-    assert 'id="matchingProgress"' in html
+    assert 'id="stageFind"' in html
     assert 'id="activityList"' in html
-    assert 'id="reviewMatchesBtn"' in html
-    assert 'class="review-card"' not in html
+    assert 'id="stageDone"' in html
+    assert "You can close this page and come back" in html
+    assert "worker" not in html.casefold()
 
 
 def test_matching_template_javascript_parses():
     node = shutil.which("node")
     if node is None:
         pytest.skip("Node.js is not installed")
-    template = Path(__file__).parents[1] / "src/csv_to_clonehero/server/templates/index.html"
-    source = template.read_text(encoding="utf-8")
-    match = re.search(r"\{% else %\}.*?\{% endif %\}{% endblock %}", source, re.DOTALL)
-    assert match is not None
-    script = re.search(r"<script>(.*?)</script>", match.group(0), re.DOTALL)
-    assert script is not None
-    with tempfile.NamedTemporaryFile("w", suffix=".js", encoding="utf-8", delete=False) as handle:
-        handle.write(script.group(1))
-        path = handle.name
-    try:
-        result = subprocess.run([node, "--check", path], capture_output=True, text=True)
-        assert result.returncode == 0, result.stderr
-    finally:
-        Path(path).unlink(missing_ok=True)
+    script = Path(__file__).parents[1] / "src/csv_to_clonehero/server/static/public.js"
+    result = subprocess.run([node, "--check", script], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
 
 
-def test_anonymous_soundcloud_export_import_is_available_without_spotify_login(client):
+def test_public_shell_uses_csp_compatible_external_assets(client):
+    response = client.get("/")
+    html = response.get_data(as_text=True)
+    assert '<script src="/static/public.js" defer></script>' in html
+    assert '<link rel="stylesheet" href="/static/public.css">' in html
+    assert "<script>" not in html
+    assert " onclick=" not in html
+    csp = response.headers["Content-Security-Policy"]
+    assert "script-src 'self'" in csp
+    assert "style-src 'self'" in csp
+    assert "'unsafe-inline'" not in csp
+
+
+def test_anonymous_soundcloud_import_requires_spotify_session(client):
     response = client.post(
         "/api/sources/soundcloud/import",
         data={"file": (io.BytesIO(b"Track name,Artist name,Soundcloud - id\nArtist - Song,Artist,sc-1\n"), "export.csv")},
         content_type="multipart/form-data",
     )
-    assert response.status_code == 200
-    assert response.get_json()["combined"]["tracks"] == 1
-    assert client.get("/api/sources").status_code == 200
+    assert response.status_code == 401
+    assert client.get("/api/sources").status_code == 401
+    landing = client.get("/").get_data(as_text=True)
+    assert 'id="guestSoundcloudForm"' not in landing
+    assert "private Add Music step" in landing
 
 
-def test_anonymous_import_is_adopted_after_spotify_login(client, config):
+def test_authenticated_soundcloud_import_uses_owned_workspace(client, config):
+    _sign_in(client)
     response = client.post(
         "/api/sources/soundcloud/import",
         data={"file": (io.BytesIO(b"title,artist,id\nSong,Artist,sc-1\n"), "export.csv")},
         content_type="multipart/form-data",
     )
     assert response.status_code == 200
-    _sign_in(client)
     from csv_to_clonehero.database import Database
     from csv_to_clonehero.server.auth import user_workspace_key
 
@@ -178,6 +190,12 @@ def test_login_redirects_to_spotify(client, config):
     assert "accounts.spotify.com/authorize" in r.headers["Location"]
 
 
+def test_post_login_return_path_rejects_backslash_network_location(client):
+    client.get("/?next=/\\attacker.example")
+    with client.session_transaction() as session:
+        assert "next" not in session
+
+
 def test_oauth_callback_signs_in(client, config):
     state = "state-value"
     with client.session_transaction() as sess:
@@ -191,6 +209,40 @@ def test_oauth_callback_signs_in(client, config):
     assert me.get_json()["display_name"] == "Alice"
 
 
+def test_oauth_callback_rejects_empty_spotify_profile(client, config, monkeypatch):
+    import csv_to_clonehero.server.web as web
+    from csv_to_clonehero.database import Database
+
+    monkeypatch.setattr(web, "_fetch_profile", lambda _config, _token: {"id": "", "display_name": ""})
+    with client.session_transaction() as sess:
+        sess["oauth_state"] = "state-value"
+        sess["oauth_verifier"] = "verifier"
+        sess["oauth_redirect_uri"] = "cb"
+
+    response = client.get("/api/auth/spotify/callback?code=abc&state=state-value")
+
+    assert response.status_code == 502
+    assert b"please try again" in response.data
+    assert client.get("/api/me").status_code == 401
+    db = Database(config.database_path)
+    try:
+        assert db.get_user("") is None
+    finally:
+        db.close()
+
+
+def test_soundcloud_import_enforces_public_track_cap(client, config):
+    _sign_in(client)
+    config.server.max_scope_tracks = 1
+    response = client.post(
+        "/api/sources/soundcloud/import",
+        data={"file": (io.BytesIO(b"title,artist,id\nOne,Artist,1\nTwo,Artist,2\n"), "export.csv")},
+        content_type="multipart/form-data",
+    )
+    assert response.status_code == 422
+    assert "too many songs" in response.get_json()["error"]
+
+
 def test_logout_revokes_session(client, config):
     # sign in
     with client.session_transaction() as sess:
@@ -202,6 +254,27 @@ def test_logout_revokes_session(client, config):
     r = client.post("/api/auth/logout")
     assert r.status_code == 200
     assert client.get("/api/me").status_code == 401
+
+
+def test_production_mutations_require_same_origin_riff_request(client, config):
+    _sign_in(client)
+    config.server.enforce_secret_key = True
+    config.server.base_url = "https://riff.ryo-nd.com"
+
+    missing = client.post("/api/spotify/scope", json={"include_liked": True})
+    assert missing.status_code == 403
+    wrong = client.post(
+        "/api/spotify/scope",
+        json={"include_liked": True},
+        headers={"X-Riff-Request": "1", "Origin": "https://attacker.example"},
+    )
+    assert wrong.status_code == 403
+    accepted = client.post(
+        "/api/spotify/scope",
+        json={"include_liked": True},
+        headers={"X-Riff-Request": "1", "Origin": "https://riff.ryo-nd.com"},
+    )
+    assert accepted.status_code == 200
 
 
 def test_create_and_poll_job(client, config, monkeypatch):
@@ -227,6 +300,86 @@ def test_create_and_poll_job(client, config, monkeypatch):
         time.sleep(0.05)
     row = client.get(f"/api/jobs/{job_id}").get_json()["job"]
     assert row["status"] == "complete"
+
+
+def test_public_spotify_job_uses_current_matching_for_recommendations(
+    client, app, config, monkeypatch
+):
+    from csv_to_clonehero.spotify import LibraryImportResult, SpotifyLibraryRecord
+    from tests.conftest import make_chart
+
+    class Client:
+        def fetch_library(self, include_liked=True):
+            assert include_liked is True
+            return LibraryImportResult([
+                SpotifyLibraryRecord("exact", "The Only Exception", ["Paramore"]),
+                SpotifyLibraryRecord("false-positive", "Drowning", ["Atreyu"]),
+            ])
+
+        def close(self):
+            pass
+
+    class Source:
+        name = "test"
+        supports_direct_download = True
+
+        def search_song(self, artist, title):
+            chart_title = "Falling Down" if title == "Drowning" else title
+            chart = make_chart(chart_title, artist, chart_id=1 if title == "Drowning" else 2)
+            chart.source = self.name
+            chart.charter = "Harmonix"
+            chart.icon = "rb2"
+            chart.pack_name = "Official Pack"
+            chart.diff_band = 5
+            chart.difficulty_fields = {
+                "diff_band": 5, "diff_guitar": 3, "diff_bass": 3, "diff_drums": 3,
+            }
+            return [chart]
+
+        def search_artist(self, artist):
+            raise AssertionError("two single-track artists must use exact song searches")
+
+        def close(self):
+            pass
+
+    _sign_in(client)
+    _prepare_discovery(client, config)
+    oauth = object()
+    monkeypatch.setattr("csv_to_clonehero.server.jobs.build_oauth", lambda *_args: oauth)
+    monkeypatch.setattr(
+        "csv_to_clonehero.server.jobs.build_spotify_client",
+        lambda _config, value: Client() if value is oauth else pytest.fail("wrong OAuth"),
+    )
+    app.extensions["jobs"].source_factory = lambda _config: [Source()]
+
+    response = client.post("/api/jobs", json={"kind": "discovery"})
+    assert response.status_code == 202
+    job_id = response.get_json()["job"]["id"]
+    deadline = time.time() + 8
+    while time.time() < deadline:
+        job = client.get(f"/api/jobs/{job_id}").get_json()["job"]
+        if job["status"] in {"complete", "failed"}:
+            break
+        time.sleep(0.05)
+    assert job["status"] == "complete"
+
+    payload = client.get("/api/workspace").get_json()
+    tracks = {track["title"]: track for track in payload["tracks"]}
+    assert payload["summary"]["strong"] == 1
+    assert tracks["The Only Exception"]["review_state"] == "strong"
+    assert tracks["The Only Exception"]["candidates"][0]["title"] == "The Only Exception"
+    assert tracks["Drowning"]["review_state"] != "strong"
+    assert tracks["Drowning"]["candidates"] == []
+
+    selected = client.post("/api/selection/bulk", json={"scope": "strong"})
+    assert selected.status_code == 200
+    assert selected.get_json()["changed"] == 1
+    tracks = {
+        track["title"]: track
+        for track in client.get("/api/workspace").get_json()["tracks"]
+    }
+    assert tracks["The Only Exception"]["selected"] is True
+    assert tracks["Drowning"]["selected"] is False
 
 
 def test_matching_activity_endpoint_is_bounded_and_searchable(client, config):
@@ -362,16 +515,16 @@ def test_score_threshold_controls_selection_but_never_overrides_hard_gate(client
         from csv_to_clonehero.server.auth import user_workspace_key
 
         workspace = db.get_workspace(user_workspace_key("user-1"))
-        track = make_track("Song", "Artist", spotify_id="track-1")
+        track = make_track("Ain't No Thief", "Viagra Boys", spotify_id="track-1")
         db.upsert_spotify_tracks([track])
-        chart = make_chart("Song", "Artist", chart_id=78)
+        chart = make_chart("Ain't Nice", "Viagra Boys", chart_id=78)
         db.upsert_candidate(chart)
         db.upsert_workspace_candidate(
             workspace["id"], track.track_key, chart, score=60,
             eligibility="EXCLUDED", decision="REJECT",
             breakdown_json='{"gate_factors": {"hard_gate": false}}', kind="exact",
         )
-        hard = make_chart("Song", "Artist", chart_id=79)
+        hard = make_chart("Ain't No Thief", "Viagra Boys", chart_id=79)
         db.upsert_candidate(hard)
         db.upsert_workspace_candidate(
             workspace["id"], track.track_key, hard, score=99,
@@ -450,6 +603,42 @@ def test_bulk_selection_defaults_to_strong_and_can_explicitly_include_review(cli
         assert selected[0]["candidate_id"] != review_id
     finally:
         db.close()
+
+
+def test_bulk_cohorts_replace_instead_of_accumulate(client, config):
+    from csv_to_clonehero.database import Database
+    from tests.conftest import make_chart, make_track
+
+    _sign_in(client)
+    assert client.post("/api/spotify/scope", json={"include_liked": True}).status_code == 200
+    db = Database(config.database_path)
+    try:
+        workspace = db.get_workspace(Database.workspace_key_for_user("user-1"))
+        tracks = db.upsert_spotify_tracks([
+            make_track("Exact Song", "Exact Artist", "cohort-strong"),
+            make_track("Ain't No Thief", "Viagra Boys", "cohort-review"),
+        ])
+        db.replace_workspace_library_tracks(workspace["id"], tracks)
+        strong = make_chart("Exact Song", "Exact Artist", chart_id=821)
+        review = make_chart("Ain't Nice", "Viagra Boys", chart_id=822)
+        db.upsert_workspace_candidate(
+            workspace["id"], tracks[0].track_key, strong, score=95,
+            eligibility="RECOMMENDED", decision="AUTO_ACCEPT", kind="exact",
+        )
+        db.upsert_workspace_candidate(
+            workspace["id"], tracks[1].track_key, review, score=82,
+            eligibility="ELIGIBLE_REVIEW", decision="REVIEW", kind="exact",
+        )
+    finally:
+        db.close()
+
+    assert client.post("/api/selection/bulk", json={"scope": "eligible"}).get_json()["changed"] == 2
+    assert client.get("/api/workspace").get_json()["summary"]["selected"] == 2
+    assert client.post("/api/selection/bulk", json={"scope": "strong"}).get_json()["changed"] == 1
+    summary = client.get("/api/workspace").get_json()["summary"]
+    assert summary["selected"] == 1
+    assert summary["selected_strong"] == 1
+    assert summary["selected_review"] == 0
 
 
 def test_duplicate_start_returns_existing_job(client, app, config):
@@ -542,6 +731,204 @@ def test_workspace_empty_before_run(client, config):
     assert data["tracks"] == []
 
 
+def test_fresh_authenticated_sources_creates_user_scoped_workspace(client, config):
+    from csv_to_clonehero.database import Database
+    from csv_to_clonehero.server.auth import user_workspace_key
+
+    _sign_in(client)
+    response = client.get("/api/sources")
+
+    assert response.status_code == 200
+    workspace_id = response.get_json()["workspace_id"]
+    assert workspace_id > 0
+    db = Database(config.database_path)
+    try:
+        row = db.get_workspace(workspace_id)
+        assert row is not None
+        assert row["workspace_key"] == user_workspace_key("user-1")
+    finally:
+        db.close()
+
+
+def test_public_journey_restores_owned_workspace_state(client, app, config):
+    from csv_to_clonehero.database import Database
+    from csv_to_clonehero.providers.base import LibrarySnapshot, ProviderTrack
+    from csv_to_clonehero.server.auth import user_workspace_key
+    from tests.conftest import make_chart
+
+    _sign_in(client)
+    assert client.post("/api/spotify/scope", json={"include_liked": True}).status_code == 200
+    db = Database(config.database_path)
+    try:
+        workspace = db.get_workspace(user_workspace_key("user-1"))
+        snapshot = LibrarySnapshot(
+            "soundcloud",
+            [ProviderTrack("soundcloud", "sc-1", "Song", "Artist")],
+            metadata={"import": "upload"},
+        )
+        db.upsert_library_snapshot(workspace["id"], snapshot)
+        track_id = next(iter(db.get_workspace_library_track_ids(workspace["id"])))
+        track = next(track for track in db.get_spotify_tracks(True) if track.db_id == track_id)
+        chart = make_chart("Song", "Artist", chart_id=921)
+        db.upsert_workspace_candidate(
+            workspace["id"], track.track_key, chart, score=95,
+            eligibility="RECOMMENDED", decision="AUTO_ACCEPT", kind="exact",
+        )
+        db.select_workspace_candidate(workspace["id"], track.track_key, chart, kind="exact")
+        job = db.create_job(1, "discovery", workspace_key=workspace["workspace_key"])
+        db.update_job(int(job["id"]), status="complete", phase="complete")
+        workspace_id = int(workspace["id"])
+    finally:
+        db.close()
+    archive = app.extensions["downloads"].root / "journey.zip"
+    archive.write_bytes(b"zip")
+    token = app.extensions["downloads"].create(1, workspace_id, archive)["token"]
+
+    response = client.get("/api/journey")
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload["workspace"] == {
+        "id": workspace_id,
+        "status": payload["workspace_status"],
+        "phase": payload["workspace"]["phase"],
+        "updated_at": payload["workspace"]["updated_at"],
+    }
+    assert payload["spotify_scope"]["include_liked"] is True
+    assert payload["combined"]["tracks"] == 1
+    assert payload["sources"][0]["provider"] == "soundcloud"
+    assert payload["job"]["status"] == "complete"
+    assert "workspace_key" not in payload["job"]
+    assert payload["review"] == {
+        "strong": 1, "review": 0, "unavailable": 0, "selected": 1,
+        "selected_strong": 1, "selected_review": 0, "total": 1,
+    }
+    assert payload["download"]["token"] == token
+    assert payload["download"]["url"].endswith(token)
+    assert "path" not in payload["download"]
+
+
+def test_workspace_paging_search_filters_and_summary_are_bounded(client, config):
+    from csv_to_clonehero.database import Database
+    from csv_to_clonehero.server.auth import user_workspace_key
+    from tests.conftest import make_chart, make_track
+
+    _sign_in(client)
+    assert client.get("/api/sources").status_code == 200
+    db = Database(config.database_path)
+    try:
+        workspace = db.get_workspace(user_workspace_key("user-1"))
+        tracks = db.upsert_spotify_tracks([
+            make_track("Alpha", "Artist A", "page-a"),
+            make_track("Beta", "Artist B", "page-b"),
+            make_track("Gamma", "Artist C", "page-c"),
+        ])
+        db.replace_workspace_library_tracks(workspace["id"], tracks)
+        strong = make_chart("Alpha", "Artist A", chart_id=931, charter="Strong Charter")
+        review = make_chart("Beta Live", "Artist B", chart_id=932, charter="Review Charter")
+        db.upsert_workspace_candidate(
+            workspace["id"], tracks[0].track_key, strong, score=95,
+            eligibility="RECOMMENDED", decision="AUTO_ACCEPT", kind="exact",
+        )
+        db.upsert_workspace_candidate(
+            workspace["id"], tracks[1].track_key, review, score=80,
+            eligibility="ELIGIBLE_REVIEW", decision="REVIEW", kind="exact",
+        )
+        db.select_workspace_candidate(workspace["id"], tracks[0].track_key, strong, kind="exact")
+        db.update_workspace(workspace["id"], status="complete", phase="complete")
+    finally:
+        db.close()
+
+    first = client.get("/api/workspace?limit=1&offset=1").get_json()
+    assert first["limit"] == 1
+    assert first["offset"] == 1
+    assert first["total"] == 3
+    assert len(first["tracks"]) == 1
+    assert first["summary"] == {
+        "strong": 1, "review": 1, "unavailable": 1, "selected": 1,
+        "selected_strong": 1, "selected_review": 0,
+        "selection_count": 1, "total": 3,
+    }
+    bounded = client.get("/api/workspace?limit=999").get_json()
+    assert bounded["limit"] == 100
+    assert client.get("/api/workspace?review_state=needs_review").get_json()["total"] == 1
+    assert client.get("/api/workspace?state=review").get_json()["total"] == 1
+    assert client.get("/api/workspace?state=unavailable").get_json()["total"] == 1
+    selected = client.get("/api/workspace?selected=true").get_json()
+    assert selected["total"] == 1 and selected["tracks"][0]["title"] == "Alpha"
+    searched = client.get("/api/workspace?search=Review%20Charter").get_json()
+    assert searched["total"] == 1 and searched["tracks"][0]["title"] == "Beta"
+
+
+def test_workspace_projection_never_leaks_another_owner(client, config):
+    from csv_to_clonehero.database import Database
+    from tests.conftest import make_chart, make_track
+
+    _sign_in(client)
+    db = Database(config.database_path)
+    try:
+        other = db.upsert_user(spotify_user_id="other-user")
+        other_workspace = db.create_workspace(
+            workspace_key=Database.workspace_key_for_user(other["spotify_user_id"])
+        )
+        track = db.upsert_spotify_tracks([make_track("Private", "Other", "private-track")])[0]
+        db.replace_workspace_library_tracks(other_workspace, [track])
+        chart = make_chart("Private", "Other", chart_id=933)
+        db.upsert_workspace_candidate(
+            other_workspace, track.track_key, chart, score=99,
+            eligibility="RECOMMENDED", decision="AUTO_ACCEPT", kind="exact",
+        )
+    finally:
+        db.close()
+
+    payload = client.get("/api/workspace?search=Private").get_json()
+    assert payload["total"] == 0
+    assert payload["tracks"] == []
+
+
+def test_public_download_route_is_owner_scoped_and_single_use(
+    client, app, config, monkeypatch
+):
+    import csv_to_clonehero.server.web as web
+
+    _sign_in(client)
+    workspace_id = client.get("/api/journey").get_json()["workspace_id"]
+    archive = app.extensions["downloads"].root / "owner-only.zip"
+    archive.write_bytes(b"PK\x03\x04owner-only")
+    token = app.extensions["downloads"].create(1, workspace_id, archive)["token"]
+
+    monkeypatch.setattr(
+        web,
+        "_fetch_profile",
+        lambda _config, _token: {
+            "id": "user-2", "display_name": "Bob", "country": "US",
+            "product": "free", "href": "",
+        },
+    )
+    other = app.test_client()
+    _sign_in(other)
+    assert other.get(f"/api/download/{token}").status_code == 404
+    assert app.extensions["downloads"].resolve(token) is not None
+
+    owned = client.get(f"/api/download/{token}")
+    assert owned.status_code == 200
+    assert owned.data == b"PK\x03\x04owner-only"
+    assert client.get(f"/api/download/{token}").status_code in {404, 410}
+
+
+def test_browser_exporter_has_single_route(app):
+    rules = [rule for rule in app.url_map.iter_rules() if rule.rule == "/browser-exporter.js"]
+    assert len(rules) == 1
+
+
+def test_public_server_does_not_expose_local_catalog_or_expansion_apis(client):
+    _sign_in(client)
+    assert client.get("/api/catalog/summary").status_code == 404
+    assert client.get("/api/expansion/artists").status_code == 404
+    assert client.post("/api/expansion/artists/select", json={"artists": []}).status_code == 404
+    assert client.post("/api/expansion/score", json={}).status_code == 404
+
+
 def test_workspace_review_payload_uses_human_states_and_current_selection(client, config):
     from csv_to_clonehero.database import Database
     from tests.conftest import make_chart, make_track
@@ -552,13 +939,13 @@ def test_workspace_review_payload_uses_human_states_and_current_selection(client
     db = Database(config.database_path)
     try:
         workspace = db.get_workspace(user_workspace_key("user-1"))
-        track = make_track("Song", "Artist", spotify_id="review-track", album="Album")
+        track = make_track("Ain't No Thief", "Viagra Boys", spotify_id="review-track", album="Album")
         stored = db.upsert_spotify_tracks([track])[0]
         db.replace_workspace_library_tracks(workspace["id"], [stored])
 
-        strong = make_chart("Song", "Artist", chart_id=701)
-        review = make_chart("Song (Live)", "Artist", chart_id=702)
-        hard = make_chart("Song", "Artist", chart_id=703, instruments=[], diff_guitar=None)
+        strong = make_chart("Ain't No Thief", "Viagra Boys", chart_id=701)
+        review = make_chart("Ain't Nice", "Viagra Boys", chart_id=702)
+        hard = make_chart("Ain't No Thief", "Viagra Boys", chart_id=703, instruments=[], diff_guitar=None)
         db.upsert_workspace_candidate(
             workspace["id"], stored.track_key, strong, score=94,
             eligibility="RECOMMENDED", decision="AUTO_ACCEPT",
@@ -618,7 +1005,8 @@ def test_workspace_review_payload_uses_human_states_and_current_selection(client
     assert candidates[701]["selected"] is True
     assert candidates[701]["review"]["summary"]
     assert candidates[702]["review_label"] == "Needs review"
-    assert "live-version mismatch" in candidates[702]["review"]["summary"]
+    assert candidates[702]["review"]["summary"]
+    assert candidates[702]["review"]["why"]
     assert candidates[703]["review_label"] == "Not playable"
     assert candidates[703]["selectable"] is False
     assert "RECOMMENDED" not in item["review_summary"]
@@ -652,6 +1040,109 @@ def test_workspace_review_payload_is_honest_when_matching_is_incomplete(client, 
     partial = client.get("/api/workspace").get_json()["tracks"][0]
     assert partial["review_label"] == "Matching incomplete"
     assert "run the search again" in partial["review_summary"]
+
+
+@pytest.mark.parametrize(
+    ("track_title", "artist", "chart_title"),
+    [
+        ("Drowning", "Atreyu", "Falling Down"),
+        ("You Rock My World", "Michael Jackson", "Rock With You"),
+        ("Ain't No Thief", "Viagra Boys", "Ain't Nice"),
+    ],
+)
+def test_stale_false_positive_cannot_be_public_best_match_or_bulk_selected(
+    client, config, track_title, artist, chart_title
+):
+    from csv_to_clonehero.database import Database
+    from csv_to_clonehero.server.auth import user_workspace_key
+    from tests.conftest import make_chart, make_track
+
+    _sign_in(client)
+    assert client.post("/api/spotify/scope", json={"include_liked": True}).status_code == 200
+    db = Database(config.database_path)
+    try:
+        workspace = db.get_workspace(user_workspace_key("user-1"))
+        track = db.upsert_spotify_tracks([
+            make_track(track_title, artist, f"false-{chart_title}")
+        ])[0]
+        db.replace_workspace_library_tracks(workspace["id"], [track])
+        chart = make_chart(chart_title, artist, chart_id=970)
+        db.upsert_workspace_candidate(
+            workspace["id"], track.track_key, chart, score=100,
+            eligibility="RECOMMENDED", decision="AUTO_ACCEPT", kind="exact",
+        )
+        db.update_workspace(workspace["id"], status="complete", phase="complete")
+    finally:
+        db.close()
+
+    payload = client.get("/api/workspace").get_json()
+    assert payload["summary"]["strong"] == 0
+    assert payload["tracks"][0]["review_state"] != "strong"
+    selected = client.post("/api/selection/bulk", json={"scope": "strong"})
+    assert selected.status_code == 200
+    assert selected.get_json()["changed"] == 0
+
+
+def test_public_review_and_selection_use_latest_completed_scan(client, config):
+    from csv_to_clonehero.database import Database
+    from tests.conftest import make_chart, make_track
+
+    _sign_in(client)
+    assert client.post("/api/spotify/scope", json={"include_liked": True}).status_code == 200
+    db = Database(config.database_path)
+    try:
+        workspace = db.get_workspace(Database.workspace_key_for_user("user-1"))
+        track = db.upsert_spotify_tracks([make_track("Song", "Artist", "generation")])[0]
+        db.replace_workspace_library_tracks(workspace["id"], [track])
+        old_scan = db.create_discovery_scan(
+            workspace["id"], scan_key="old", kind="exact", status="complete"
+        )
+        old_task = db.upsert_discovery_task(
+            workspace["id"], scan_id=old_scan, source="test", kind="song", query_key="old"
+        )
+        stale = make_chart("Song", "Artist", chart_id=980)
+        db.upsert_workspace_candidate(
+            workspace["id"], track.track_key, stale, score=99,
+            eligibility="RECOMMENDED", decision="AUTO_ACCEPT", kind="exact", task_id=old_task,
+        )
+        current_scan = db.create_discovery_scan(
+            workspace["id"], scan_key="current", kind="exact", status="complete"
+        )
+        current_task = db.upsert_discovery_task(
+            workspace["id"], scan_id=current_scan, source="test", kind="song", query_key="current"
+        )
+        current = make_chart("Song", "Artist", chart_id=981)
+        db.upsert_workspace_candidate(
+            workspace["id"], track.track_key, current, score=98,
+            eligibility="RECOMMENDED", decision="AUTO_ACCEPT", kind="exact", task_id=current_task,
+        )
+        stale_id = stale.db_id
+    finally:
+        db.close()
+
+    payload = client.get("/api/workspace").get_json()
+    assert [item["chart_id"] for item in payload["tracks"][0]["candidates"]] == [981]
+    rejected = client.post("/api/selection", json={
+        "track_key": track.track_key, "candidate_id": stale_id, "action": "select",
+    })
+    assert rejected.status_code == 400
+    assert "does not belong" in rejected.get_json()["error"]
+
+    db = Database(config.database_path)
+    try:
+        db.create_discovery_scan(
+            workspace["id"], scan_key="incomplete", kind="exact", status="partial"
+        )
+    finally:
+        db.close()
+    incomplete = client.get("/api/workspace").get_json()
+    assert incomplete["tracks"][0]["candidates"] == []
+    rejected_current = client.post("/api/selection", json={
+        "track_key": track.track_key,
+        "candidate_id": current.db_id,
+        "action": "select",
+    })
+    assert rejected_current.status_code == 400
 
 
 def test_download_requires_selection(client, config):

@@ -198,6 +198,47 @@ def test_clear_workspace_candidates_scoped_and_global(tmp_path):
     db.close()
 
 
+def test_select_workspace_candidate_blocks_nested_production_hard_gate(tmp_path):
+    import json
+
+    from csv_to_clonehero.models import ChartCandidate
+
+    db = Database(tmp_path / "state.db")
+    ws = db.create_workspace(workspace_key="nested-gate")
+    db.upsert_spotify_tracks([{
+        "track_key": "spotify:nested", "spotify_id": "nested", "title": "Song",
+        "title_norm": "song", "artist_full": "Artist", "artist_norm": "artist",
+        "primary_artist": "Artist", "primary_artist_norm": "artist",
+    }])
+    chart = ChartCandidate(
+        source="test", chart_id=102, md5="c" * 32, name="Song", artist="Artist",
+        name_norm="song", artist_norm="artist", instruments=["guitar"], diff_guitar=3,
+    )
+    db.upsert_workspace_candidate(
+        ws,
+        "spotify:nested",
+        chart,
+        score=99,
+        eligibility="EXCLUDED",
+        decision="REJECT",
+        breakdown_json=json.dumps({
+            "factors": {
+                "gates": {
+                    "hard_gate": True,
+                    "hard_gate_reasons": ["artist identity conflict"],
+                }
+            }
+        }),
+        kind="exact",
+    )
+
+    with pytest.raises(ValueError, match="hard compatibility gate"):
+        db.select_workspace_candidate(
+            ws, "spotify:nested", chart, kind="exact", force=True
+        )
+    db.close()
+
+
 def _workspace_track(db, spotify_id="0001"):
     db.upsert_spotify_tracks([{
         "track_key": f"spotify:{spotify_id}", "spotify_id": spotify_id,

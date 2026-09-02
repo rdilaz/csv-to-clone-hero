@@ -14,8 +14,10 @@ import hashlib
 import hmac
 import json
 import logging
+import os
 import re
 import secrets
+import shutil
 import threading
 import time
 from pathlib import Path
@@ -60,27 +62,42 @@ class BrowserDownloads:
         self.config = config
         self.key = _signing_key(config, session_key)
         self.ttl_seconds = max(60, int(ttl_seconds))
-        self.root = config.resolve(getattr(getattr(config, "paths", None), "state_dir", "state")) / "downloads"
+        # Public staging follows the database volume, not the local app's
+        # configurable artifact state directory. In Docker this is /data.
+        self.root = config.state_path / "downloads"
         self.root.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
         self._index: dict[str, dict[str, Any]] = {}
-        self._sweep()
+        self._sweep_interval = max(0.0, float(sweep_interval))
+        self._closed = False
+        self._sweep(include_crash_state=True)
         self._timer: threading.Timer | None = None
-        if sweep_interval > 0:
-            self._timer = threading.Timer(sweep_interval, self._sweep_timer)
-            self._timer.daemon = True
-            self._timer.start()
+        self._schedule_sweep()
 
     def close(self) -> None:
-        if self._timer is not None:
-            self._timer.cancel()
+        with self._lock:
+            self._closed = True
+            timer = self._timer
             self._timer = None
+        if timer is not None:
+            timer.cancel()
+
+    def _schedule_sweep(self) -> None:
+        with self._lock:
+            if self._closed or self._sweep_interval <= 0:
+                return
+            timer = threading.Timer(self._sweep_interval, self._sweep_timer)
+            timer.daemon = True
+            self._timer = timer
+            timer.start()
 
     def _sweep_timer(self) -> None:
         try:
             self._sweep()
         finally:
-            self._timer = None
+            with self._lock:
+                self._timer = None
+            self._schedule_sweep()
 
     def _revoke_meta(self, meta: dict[str, Any] | None) -> None:
         if not meta:
@@ -95,7 +112,7 @@ class BrowserDownloads:
         if key:
             self._unlink_key(key)
 
-    def _sweep(self) -> None:
+    def _sweep(self, *, include_crash_state: bool = False) -> None:
         now = time.time()
         with self._lock:
             expired = [
@@ -113,6 +130,12 @@ class BrowserDownloads:
                     entry.unlink(missing_ok=True)
             except OSError:
                 pass
+        if include_crash_state:
+            # This is called during registry construction, before this process
+            # can own an assembly. Periodic sweeps must not race a long build.
+            for entry in self.root.glob(".assembly-*"):
+                if entry.is_dir():
+                    shutil.rmtree(entry, ignore_errors=True)
 
     def _unlink_key(self, key: str) -> None:
         path = self.root / _safe_basename(key)
@@ -137,6 +160,8 @@ class BrowserDownloads:
                 "expires_at": expires_at,
                 "size": archive_path.stat().st_size,
                 "signed": f"{key}.{expiry_int}",
+                "token": token,
+                "created_at": time.time(),
             }
         return {
             "token": token,
@@ -146,6 +171,15 @@ class BrowserDownloads:
         }
 
     def resolve(self, token: str) -> dict[str, Any] | None:
+        parsed = self._parse_token(token)
+        if parsed is None:
+            return None
+        key, expires_at = parsed
+        with self._lock:
+            meta = self._index.get(key)
+            return dict(meta) if meta is not None and expires_at >= time.time() else None
+
+    def _parse_token(self, token: str) -> tuple[str, int] | None:
         parts = token.split(".") if token else []
         if len(parts) != 3:
             return None
@@ -159,26 +193,65 @@ class BrowserDownloads:
             return None
         if expires_at < time.time():
             return None
-        with self._lock:
-            return self._index.get(key)
+        return key, expires_at
 
-    def stream(self, token: str):
-        meta = self.resolve(token)
+    def consume(self, token: str, *, user_id: int | None = None) -> dict[str, Any] | None:
+        """Atomically claim a valid token without deleting its ZIP yet."""
+        parsed = self._parse_token(token)
+        if parsed is None:
+            return None
+        key, expires_at = parsed
+        with self._lock:
+            meta = self._index.get(key)
+            if meta is None or expires_at < time.time():
+                return None
+            if user_id is not None and int(meta.get("user_id", -1)) != int(user_id):
+                return None
+            return self._index.pop(key)
+
+    def stream(self, token: str, *, user_id: int | None = None):
+        meta = self.consume(token, user_id=user_id)
         if meta is None:
             raise DownloadError("Download link is invalid or has expired; run the download again.")
         path = Path(meta["path"])
         if not path.is_file():
+            self._revoke_meta(meta)
             raise DownloadError("Download no longer exists; run the download again.")
-        name = f"clone-hero-charts-{meta['workspace_id']}.zip"
-        try:
-            with open(path, "rb") as fh:
-                while True:
-                    data = fh.read(1024 * 1024)
-                    if not data:
-                        break
-                    yield data
-        finally:
-            self.revoke(token)
+
+        def content():
+            try:
+                with open(path, "rb") as fh:
+                    while True:
+                        data = fh.read(1024 * 1024)
+                        if not data:
+                            break
+                        yield data
+            finally:
+                self._revoke_meta(meta)
+
+        return content()
+
+    def latest_for_user_workspace(
+        self, user_id: int, workspace_id: int
+    ) -> dict[str, Any] | None:
+        """Return safe metadata for the newest unconsumed owned download."""
+        self._sweep()
+        with self._lock:
+            matches = [
+                meta for meta in self._index.values()
+                if int(meta.get("user_id", -1)) == int(user_id)
+                and int(meta.get("workspace_id", -1)) == int(workspace_id)
+            ]
+            if not matches:
+                return None
+            meta = max(matches, key=lambda item: float(item.get("created_at", 0)))
+            return {
+                "token": meta["token"],
+                "expires_at": meta["expires_at"],
+                "ttl_seconds": self.ttl_seconds,
+                "size_bytes": meta["size"],
+                "created_at": meta["created_at"],
+            }
 
     def revoke(self, token: str) -> None:
         key = token.split(".", 1)[0] if "." in token else token
@@ -219,7 +292,7 @@ def build_archive(
     written to ``staging_dir`` under state; the caller is responsible for
     streaming then deleting it (BrowserDownloads does this).
     """
-    selections = _validated_selections(db, workspace_id)
+    selections = _validated_selections(db, workspace_id, config=config)
     source_map = {str(getattr(s, "name", "") or ""): s for s in (sources or ())}
     owned_sources: list[ChartSource] = []
     if not source_map:
@@ -228,7 +301,7 @@ def build_archive(
         owned_sources = build_sources(config)
         source_map = {str(getattr(s, "name", "") or ""): s for s in owned_sources}
     tracks = db.get_spotify_tracks(True)
-    track_map: dict[Any, ChartCandidate] = {}
+    track_map: dict[Any, Any] = {}
     for track in tracks:
         if getattr(track, "db_id", None) is not None:
             track_map[track.db_id] = track
@@ -238,7 +311,12 @@ def build_archive(
             track_map[track.track_key] = track
 
     staging_dir.mkdir(parents=True, exist_ok=True)
-    archive = staging_dir / f"charts-{workspace_id}-{secrets.token_hex(8)}.zip"
+    nonce = secrets.token_hex(8)
+    assembly_dir = staging_dir / f".assembly-{workspace_id}-{nonce}"
+    artifact_cache = assembly_dir / "artifacts"
+    assembly_dir.mkdir(parents=True, exist_ok=False)
+    temporary_archive = assembly_dir / "charts.zip"
+    archive = staging_dir / f"charts-{workspace_id}-{nonce}.zip"
     options = ExportOptions(
         managed_sync=False,
         continue_on_error=True,
@@ -260,16 +338,17 @@ def build_archive(
 
         return eligibility in {RECOMMENDED, ELIGIBLE_REVIEW}
 
-    service = ExportService(
-        config,
-        source_map,
-        artifact_cache_dir=getattr(config, "artifact_cache_path", None),
-        track_resolver=track_map,
-    )
+    service: ExportService | None = None
     try:
+        service = ExportService(
+            config,
+            source_map,
+            artifact_cache_dir=artifact_cache,
+            track_resolver=track_map,
+        )
         result = service.export_zip(
             selections,
-            archive,
+            temporary_archive,
             options=options,
             eligibility_checker=checker,
             progress=progress,
@@ -290,14 +369,16 @@ def build_archive(
             "bytes": result.output_bytes,
             "errors": [str(e) for e in result.errors or ()],
         }
-        if not result.success or archive.stat().st_size == 0:
-            archive.unlink(missing_ok=True)
+        if not result.success or temporary_archive.stat().st_size == 0:
             raise DownloadError(
                 "Could not assemble a download: " + ("; ".join(result.errors or ()) or "no charts exported")
             )
+        os.replace(temporary_archive, archive)
         return archive, summary
     finally:
-        service.close()
+        if service is not None:
+            service.close()
+        shutil.rmtree(assembly_dir, ignore_errors=True)
         for source in owned_sources:
             try:
                 source.close()
@@ -305,13 +386,32 @@ def build_archive(
                 pass
 
 
-def _validated_selections(db: Database, workspace_id: int) -> list[dict[str, Any]]:
+def _validated_selections(
+    db: Database,
+    workspace_id: int,
+    *,
+    config: AppConfig | None = None,
+) -> list[dict[str, Any]]:
     try:
         rows = db.list_workspace_selections(workspace_id)
     except ValueError as exc:
         raise DownloadError("No charts selected yet; pick at least one chart to download.") from exc
     if not rows:
         raise DownloadError("No charts selected yet; pick at least one chart to download.")
+    track_map = {
+        int(track.db_id): track
+        for track in db.get_spotify_tracks(True)
+        if track.db_id is not None
+    }
+    workspace_track_ids = db.get_workspace_library_track_ids(workspace_id)
+    minimum_score = db.get_workspace_minimum_score(workspace_id) if config is not None else 0.0
+    latest_generation = db.get_latest_exact_generation(workspace_id)
+    current_generation = db.get_current_exact_generation(workspace_id)
+    generation_id = (
+        int(current_generation["id"])
+        if current_generation is not None
+        else -1 if latest_generation is not None else None
+    )
     selections: list[dict[str, Any]] = []
     for row in rows:
         from dataclasses import fields
@@ -322,9 +422,40 @@ def _validated_selections(db: Database, workspace_id: int) -> list[dict[str, Any
             # Public discovery is exact-only. Retain legacy expansion state in
             # SQLite, but never let stale expansion choices enter an archive.
             continue
+        track_id = int(data.get("track_id") or 0)
+        if track_id not in workspace_track_ids:
+            continue
         candidate = db.get_candidate(int(data.get("candidate_id") or 0))
         if candidate is None:
             continue
+        current_rows = db.get_workspace_candidates(
+            workspace_id,
+            track_id=track_id,
+            kind="exact",
+            include_rejected=True,
+            include_candidate_data=False,
+            generation_id=generation_id,
+        )
+        if not any(
+            int(current["candidate_id"] or 0) == int(data.get("candidate_id") or 0)
+            for current in current_rows
+        ):
+            continue
+        current_eligibility = str(data.get("eligibility") or "RECOMMENDED")
+        current_score = data.get("score")
+        if config is not None:
+            from csv_to_clonehero.matching import ELIGIBLE_REVIEW, RECOMMENDED, score_candidate
+
+            track = track_map.get(int(data.get("track_id") or 0))
+            if track is None:
+                continue
+            breakdown = score_candidate(track, candidate, config)
+            current_eligibility = str(getattr(breakdown, "eligibility", "") or "")
+            if current_eligibility not in {RECOMMENDED, ELIGIBLE_REVIEW}:
+                continue
+            current_score = breakdown.final_score
+            if float(current_score or 0) < minimum_score:
+                continue
         selection = dict(data)
         selection["candidate_json"] = json.dumps(
             {item.name: getattr(candidate, item.name) for item in fields(candidate)},
@@ -333,7 +464,8 @@ def _validated_selections(db: Database, workspace_id: int) -> list[dict[str, Any
         )
         selection["candidate_id"] = data.get("candidate_id")
         selection["status"] = "selected"
-        selection["eligibility"] = data.get("eligibility") or "RECOMMENDED"
+        selection["eligibility"] = current_eligibility
+        selection["score"] = current_score
         selections.append(selection)
     if not selections:
         raise DownloadError("No downloadable charts in your selections.")

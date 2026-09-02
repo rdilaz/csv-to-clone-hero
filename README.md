@@ -108,7 +108,7 @@ Required environment variables (see [`.env.example`](.env.example)):
 | `SPOTIFY_CLIENT_ID` | public Spotify app id (PKCE, no secret) |
 | `SOUNDCLOUD_CLIENT_ID` | optional SoundCloud OAuth client id |
 | `SOUNDCLOUD_CLIENT_SECRET` | optional SoundCloud OAuth client secret |
-| `APP_BASE_URL` | public HTTPS origin, e.g. `https://charts.ryo-nd.com` |
+| `APP_BASE_URL` | public HTTPS origin, `https://riff.ryo-nd.com` |
 | `SECRET_KEY` | session signing key (`python -m csv_to_clonehero keys`) |
 | `TOKEN_ENCRYPTION_KEY` | Fernet key encrypting per-user refresh tokens |
 | `NOTIFICATIONS_API_KEY` | optional transactional email key |

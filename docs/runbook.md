@@ -59,16 +59,16 @@ curl -fsS http://127.0.0.1:8000/healthz
 Register this exact Spotify callback after choosing the public origin:
 
 ```text
-https://<public-host>/api/auth/spotify/callback
+https://riff.ryo-nd.com/api/auth/spotify/callback
 ```
 
-`APP_BASE_URL` and the registered callback must describe the same origin.
+Set `APP_BASE_URL=https://riff.ryo-nd.com`. The registered callback and the
+Cloudflare public hostname must use that exact origin.
 
 The Docker build includes the browser-exporter asset and Python package data.
-The large local `catalog/` snapshot is intentionally excluded; the public
-Spotify path uses bounded live Enchor searches and preflight. Any catalog-backed
-source-neutral workflow requires an operator-managed snapshot outside the image
-and a matching `paths.catalog` setting.
+The large local `catalog/` snapshot is intentionally excluded. Public Spotify,
+SoundCloud, and combined libraries all use the same bounded live Enchor search
+path and preflight; the catalog snapshot remains local-product state only.
 
 ## Routine Operations
 

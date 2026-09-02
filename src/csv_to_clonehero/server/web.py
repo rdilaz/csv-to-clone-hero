@@ -85,7 +85,7 @@ def create_app(
 
     from datetime import datetime
 
-    app.jinja_env.globals["now_year"] = lambda: str(datetime.now().year)
+    app.jinja_env.globals["now_year"] = str(datetime.now().year)
 
     jobs = JobManager(config, cipher, source_factory=source_factory)
     downloads = BrowserDownloads(config, secret_key)
@@ -111,6 +111,18 @@ def create_app(
                 db.close()
         # Public pages: landing + oauth + legal + about + download token route.
         g.authenticated = g.user is not None
+        if (
+            g.user is not None
+            and config.server.enforce_secret_key
+            and request.method in {"POST", "PUT", "PATCH", "DELETE"}
+            and request.path.startswith("/api/")
+        ):
+            origin = str(request.headers.get("Origin") or "").rstrip("/")
+            expected_origin = str(config.public_base_url or "").rstrip("/")
+            if request.headers.get("X-Riff-Request") != "1" or (
+                origin and expected_origin and origin != expected_origin
+            ):
+                return jsonify({"error": "request origin could not be verified"}), 403
         if _is_public_path(request.path):
             return
         if g.user is None:
@@ -124,7 +136,16 @@ def create_app(
         response.headers.setdefault("X-Frame-Options", "SAMEORIGIN")
         response.headers.setdefault("Referrer-Policy", "no-referrer")
         if not response.headers.get("Content-Security-Policy"):
-            response.headers["Content-Security-Policy"] = "default-src 'self'; img-src 'self' data: https:; style-src 'self' 'unsafe-inline'; script-src 'self'"
+            response.headers["Content-Security-Policy"] = (
+                "default-src 'self'; base-uri 'self'; connect-src 'self'; "
+                "font-src 'self'; form-action 'self'; frame-ancestors 'self'; "
+                "img-src 'self' data: https:; object-src 'none'; "
+                "style-src 'self'; script-src 'self'"
+            )
+        if secure:
+            response.headers.setdefault(
+                "Strict-Transport-Security", "max-age=31536000; includeSubDomains"
+            )
         return response
 
     # ---- helpers ------------------------------------------------------------
@@ -178,6 +199,7 @@ def create_app(
 
     @app.post("/api/sources/soundcloud/import")
     def import_soundcloud_export():
+        _require_user()
         uploaded = request.files.get("file") or request.files.get("files")
         if uploaded is None or not uploaded.filename:
             return jsonify({"error": "upload a SoundCloud CSV or JSON export"}), 400
@@ -190,6 +212,8 @@ def create_app(
                 return jsonify({"error": "SoundCloud export is too large"}), 413
             from csv_to_clonehero.providers.soundcloud import SoundCloudExportProvider
             provider = SoundCloudExportProvider.from_json(raw.decode("utf-8-sig")) if suffix == "json" else SoundCloudExportProvider.from_csv(raw.decode("utf-8-sig"))
+            if len(provider.import_library().tracks) > config.server.max_scope_tracks:
+                return jsonify({"error": "SoundCloud export contains too many songs."}), 422
             db = _user_db()
             try:
                 workspace = _request_workspace(db)
@@ -201,19 +225,14 @@ def create_app(
         except (UnicodeDecodeError, ValueError, json.JSONDecodeError) as exc:
             return jsonify({"error": str(exc)}), 422
 
-    @app.get("/browser-exporter.js")
-    def browser_exporter():
-        """Serve the optional, local-only SoundCloud userscript."""
-        asset = config.base_dir / "browser_export" / "soundcloud-exporter.user.js"
-        if not asset.is_file():
-            abort(404)
-        return send_file(asset, mimetype="text/javascript", as_attachment=True,
-                         download_name="soundcloud-exporter.user.js")
-
     @app.get("/")
     def index():
         next_path = request.args.get("next", "")
-        if next_path.startswith("/") and not next_path.startswith("//"):
+        if (
+            next_path.startswith("/")
+            and not next_path.startswith("//")
+            and "\\" not in next_path
+        ):
             session["next"] = next_path
         return render_template(
             "index.html",
@@ -275,14 +294,25 @@ def create_app(
                 code_verifier=verifier,
                 redirect_uri=redirect_uri or None,
             )
-        except Exception as exc:  # noqa: BLE001 - safe message to the browser
-            log.warning("oauth callback failed: %s", exc)
+        except Exception:  # noqa: BLE001 - safe message to the browser
+            log.warning("oauth callback failed")
             return render_template("error.html", message="Spotify sign-in was not completed; please try again."), 400
-        profile = _fetch_profile(config, token)
+        try:
+            profile = _fetch_profile(config, token)
+            spotify_user_id = str(profile.get("id") or "").strip()
+            if not spotify_user_id:
+                raise ValueError("Spotify profile has no user ID")
+        except Exception:  # noqa: BLE001 - safe OAuth/profile retry boundary
+            log.warning("oauth callback could not load a valid Spotify profile")
+            return render_template(
+                "error.html",
+                message="Spotify sign-in could not load your profile; please try again.",
+                config=config,
+            ), 502
         db = _user_db()
         try:
             user = db.upsert_user(
-                spotify_user_id=profile.get("id", ""),
+                spotify_user_id=spotify_user_id,
                 display_name=profile.get("display_name", ""),
                 country=profile.get("country", ""),
                 product=profile.get("product", ""),
@@ -296,8 +326,8 @@ def create_app(
             if anonymous_workspace_key:
                 db.adopt_workspace_key(
                     anonymous_workspace_key,
-                    user_workspace_key(profile.get("id", "")),
-                    name=profile.get("display_name", "") or profile.get("id", ""),
+                    user_workspace_key(spotify_user_id),
+                    name=profile.get("display_name", "") or spotify_user_id,
                 )
         finally:
             db.close()
@@ -608,6 +638,50 @@ def create_app(
         return jsonify({"job": _job_public(job)})
 
     # ---- workspace + review ---------------------------------------------------
+    @app.get("/api/journey")
+    def journey():
+        """Return the authenticated user's persisted public-workflow snapshot."""
+        user = _require_user()
+        db = _user_db()
+        try:
+            workspace_id = _ensure_workspace(db, user)
+            row = db.get_workspace(workspace_id)
+            minimum_score = db.get_workspace_minimum_score(workspace_id)
+            cards = _review_cards(config, db, workspace_id, minimum_score)
+            scope = db.get_workspace_scope_data(workspace_id)
+            source_rows = [
+                {
+                    "provider": source["provider"],
+                    "status": source["status"],
+                    "tracks": int(source["tracks"] or 0),
+                    "provenance": int(source["provenance"] or 0),
+                    "updated_at": source["updated_at"],
+                }
+                for source in db.get_source_summary(workspace_id)
+            ]
+            newest_jobs = jobs.list_for_user(int(user["id"]), limit=1)
+            download = downloads.latest_for_user_workspace(int(user["id"]), workspace_id)
+            if download is not None:
+                download["url"] = url_for("stream_download", token=download["token"])
+            return jsonify({
+                "workspace_id": workspace_id,
+                "workspace_status": str(row["status"] or "") if row is not None else "",
+                "workspace": {
+                    "id": workspace_id,
+                    "status": str(row["status"] or "") if row is not None else "",
+                    "phase": str(row["phase"] or "") if row is not None else "",
+                    "updated_at": row["updated_at"] if row is not None else None,
+                },
+                "spotify_scope": _public_scope(scope),
+                "sources": source_rows,
+                "combined": db.get_combined_summary(workspace_id),
+                "job": _job_mapping_public(newest_jobs[0]) if newest_jobs else None,
+                "review": _review_summary(cards),
+                "download": download,
+            })
+        finally:
+            db.close()
+
     @app.get("/api/workspace")
     def workspace():
         user = _require_user()
@@ -615,8 +689,49 @@ def create_app(
         try:
             workspace = _ensure_workspace(db, user)
             minimum_score = db.get_workspace_minimum_score(workspace) if workspace else 50.0
-            cards = _review_cards(db, workspace, minimum_score)
-            return jsonify({"workspace": workspace, "minimum_score": minimum_score, "tracks": cards})
+            cards = _review_cards(config, db, workspace, minimum_score)
+            summary = _review_summary(cards)
+            summary["selection_count"] = summary["selected"]
+            states = {
+                value.strip().casefold()
+                for raw in [*request.args.getlist("state"), *request.args.getlist("review_state")]
+                for value in raw.split(",")
+                if value.strip()
+            }
+            selected_arg = request.args.get("selected")
+            selected: bool | None = None
+            if selected_arg is not None:
+                normalized = selected_arg.strip().casefold()
+                if normalized in {"1", "true", "yes", "selected"}:
+                    selected = True
+                elif normalized in {"0", "false", "no", "unselected"}:
+                    selected = False
+                else:
+                    raise ValueError("selected must be true or false")
+            search = str(request.args.get("search") or request.args.get("query") or "").strip().casefold()[:200]
+            filtered = [
+                card for card in cards
+                if (
+                    not states
+                    or str(card.get("review_state") or "").casefold() in states
+                    or _card_review_bucket(card) in states
+                )
+                and (selected is None or bool(card.get("selected")) is selected)
+                and (not search or _card_matches_search(card, search))
+            ]
+            limit = min(100, max(1, int(request.args.get("limit", 50))))
+            offset = max(0, int(request.args.get("offset", 0)))
+            return jsonify({
+                "workspace": workspace,
+                "minimum_score": minimum_score,
+                "tracks": filtered[offset:offset + limit],
+                "total": len(filtered),
+                "offset": offset,
+                "limit": limit,
+                "summary": summary,
+            })
+        except (TypeError, ValueError):
+            return jsonify({"error": "invalid workspace paging or filter parameters"}), 400
         finally:
             db.close()
 
@@ -638,11 +753,13 @@ def create_app(
                 db.clear_workspace_selection(workspace, track_value, candidate_id=candidate_id, kind=candidate_kind, artist_norm=artist_norm)
             else:
                 threshold = db.get_workspace_minimum_score(workspace)
+                generation_id = _public_generation_id(db, workspace)
                 matching_rows = db.get_workspace_candidates(
                     workspace,
                     track_id=track_value,
                     kind=candidate_kind,
                     include_rejected=True,
+                    generation_id=generation_id,
                 )
                 candidate_row = next(
                     (row for row in matching_rows if int(row["candidate_id"]) == candidate_id),
@@ -650,6 +767,13 @@ def create_app(
                 )
                 if candidate_row is None:
                     raise ValueError("candidate does not belong to this workspace track")
+                candidate = db.get_candidate(candidate_id)
+                track = _track_by_id(db, candidate_row["track_id"])
+                current_eligibility, current_hard_gate, current_score, _current_quality, _current_breakdown = (
+                    _current_match(config, track, candidate)
+                )
+                if current_hard_gate or current_eligibility == "INCOMPATIBLE":
+                    raise ValueError("candidate is blocked by a hard compatibility gate")
                 if candidate_kind == "exact":
                     catalog_sources = list(jobs.source_factory(config))
                     try:
@@ -677,7 +801,7 @@ def create_app(
                                 source.close()
                             except Exception:
                                 pass
-                if float(candidate_row["score"] or 0) < threshold:
+                if current_score < threshold:
                     raise ValueError(f"candidate score is below the workspace threshold ({threshold:g})")
                 db.select_workspace_candidate(
                     workspace,
@@ -691,73 +815,6 @@ def create_app(
             return jsonify({"ok": True})
         except (TypeError, ValueError) as exc:
             return jsonify({"error": str(exc)}), 400
-        finally:
-            db.close()
-
-    @app.get("/api/catalog/summary")
-    def catalog_summary():
-        from csv_to_clonehero.catalog import load_enchor_catalog
-
-        catalog = load_enchor_catalog(config.catalog_path)
-        return jsonify({
-            "available": catalog.available,
-            "diagnostic": catalog.diagnostic,
-            "chart_count": catalog.chart_count if catalog.available else 0,
-            "artist_count": len(catalog.artists()) if catalog.available else 0,
-            "song_count": catalog.song_count if catalog.available else 0,
-            "snapshot_id": catalog.snapshot_id,
-        })
-
-    @app.get("/api/expansion/artists")
-    def expansion_artists():
-        from csv_to_clonehero.catalog import load_enchor_catalog
-        from csv_to_clonehero.combined_pipeline import rank_expansion_artists
-
-        db = _user_db()
-        try:
-            tracks = db.get_spotify_tracks(True)
-            catalog = load_enchor_catalog(config.catalog_path)
-            return jsonify({"available": catalog.available, "artists": rank_expansion_artists(catalog, tracks) if catalog.available else []})
-        finally:
-            db.close()
-
-    @app.post("/api/expansion/artists/select")
-    def select_expansion_artists():
-        user = _require_user()
-        payload = request.get_json(silent=True) or {}
-        values = payload.get("artists") or payload.get("artist_norms") or []
-        if not isinstance(values, list):
-            return jsonify({"error": "artists must be a list"}), 400
-        selected = sorted({str(value.get("artist_norm") or value.get("artist") if isinstance(value, dict) else value).strip().casefold() for value in values})
-        selected = [value for value in selected if value]
-        if len(selected) > config.expansion.max_artists_per_batch:
-            return jsonify({"error": "too many expansion artists selected"}), 400
-        db = _user_db()
-        try:
-            workspace = _ensure_workspace(db, user)
-            if not workspace:
-                return jsonify({"error": "choose a library scope first"}), 400
-            row = db.get_workspace(workspace)
-            metadata = _json_object(row["metadata_json"] if row is not None else "{}")
-            metadata["combined_expansion_artists"] = selected
-            db.update_workspace(workspace, metadata=metadata)
-            return jsonify({"ok": True, "artists": selected})
-        finally:
-            db.close()
-
-    @app.post("/api/expansion/score")
-    def score_expansion():
-        from csv_to_clonehero.combined_pipeline import expand_combined
-
-        user = _require_user()
-        db = _user_db()
-        try:
-            workspace = _ensure_workspace(db, user)
-            row = db.get_workspace(workspace) if workspace else None
-            metadata = _json_object(row["metadata_json"] if row is not None else "{}")
-            artists = metadata.get("combined_expansion_artists") or []
-            result = expand_combined(config, db, workspace, artists)
-            return jsonify({"ok": True, "result": vars(result)})
         finally:
             db.close()
 
@@ -846,13 +903,21 @@ def create_app(
                     scope = "eligible"
                 else:
                     return jsonify({"error": "bulk selection scope must be strong or eligible"}), 400
+                db.clear_workspace_selection(workspace, kind="exact")
                 requested = payload.get("track_ids")
                 if isinstance(requested, (str, bytes)):
                     requested = [requested]
                 requested_ids = {str(value) for value in requested} if requested is not None else None
                 needle = str(payload.get("search") or payload.get("query") or "").strip().casefold()
                 grouped: dict[Any, Any] = {}
-                rows = db.get_workspace_candidates(workspace, kind="exact", include_rejected=True)
+                current_values: dict[tuple[int, int], tuple[str, float, float]] = {}
+                generation_id = _public_generation_id(db, workspace)
+                rows = db.get_workspace_candidates(
+                    workspace,
+                    kind="exact",
+                    include_rejected=True,
+                    generation_id=generation_id,
+                )
                 for row in rows:
                     data = dict(row)
                     if requested_ids is not None and not {
@@ -861,14 +926,23 @@ def create_app(
                         str(data.get("track_key")),
                     } & requested_ids:
                         continue
-                    eligibility = str(data.get("eligibility") or "").upper()
+                    candidate = db.get_candidate(int(data.get("candidate_id") or 0))
+                    track = _track_by_id(db, data.get("track_id"))
+                    eligibility, hard_gate, score, quality, _breakdown = _current_match(
+                        config, track, candidate
+                    )
+                    if hard_gate:
+                        continue
                     if eligibility not in allowed:
                         continue
-                    try:
-                        score = float(data.get("score") or 0)
-                    except (TypeError, ValueError):
-                        score = 0.0
-                    if scope == "eligible" and score < threshold:
+                    current_key = (
+                        int(data.get("track_id") or 0),
+                        int(data.get("candidate_id") or 0),
+                    )
+                    current_values[current_key] = (
+                        eligibility, score, quality
+                    )
+                    if score < threshold:
                         continue
                     if needle and needle not in " ".join(
                         str(data.get(key) or "")
@@ -884,14 +958,14 @@ def create_app(
                     prior = grouped.get(key)
                     if prior is None or (
                         score,
-                        float(data.get("quality") or 0),
+                        quality,
                         -int(data.get("candidate_id") or 0),
                     ) > (
-                        float(prior["score"] or 0),
-                        float(prior["quality"] or 0),
+                        current_values[(int(prior["track_id"]), int(prior["candidate_id"]))][1],
+                        current_values[(int(prior["track_id"]), int(prior["candidate_id"]))][2],
                         -int(prior["candidate_id"] or 0),
                     ):
-                        grouped[key] = row
+                        grouped[key] = data
                 for row in grouped.values():
                     try:
                         db.select_workspace_candidate(
@@ -954,8 +1028,8 @@ def create_app(
             meta = downloads.resolve(token)
             if meta is None or int(meta.get("user_id", -1)) != int(user["id"]):
                 abort(404)
-            filename = f"clone-hero-charts-{meta['workspace_id']}.zip"
-            generator = downloads.stream(token)
+            filename = "riff-library.zip"
+            generator = downloads.stream(token, user_id=int(user["id"]))
             return _zip_response(generator, filename, meta.get("size", 0))
         except DownloadError:
             return jsonify({"error": "Download expired; run it again."}), 410
@@ -984,8 +1058,6 @@ def _is_public_path(path: str) -> bool:
         "/browser-exporter.js",
         "/about",
     }:
-        return True
-    if path in {"/api/sources", "/api/library/summary", "/api/sources/soundcloud/import"}:
         return True
     if path.startswith(("/terms", "/privacy", "/dmca")):
         return True
@@ -1055,12 +1127,12 @@ def _fetch_profile(config: AppConfig, token: Any) -> dict[str, Any]:
     import httpx
 
     headers = {"Authorization": f"Bearer {token.access_token}"}
-    try:
-        response = httpx.get("https://api.spotify.com/v1/me", headers=headers, timeout=20)
-        response.raise_for_status()
-        return response.json()
-    except Exception:  # noqa: BLE001
-        return {"id": "", "display_name": ""}
+    response = httpx.get("https://api.spotify.com/v1/me", headers=headers, timeout=20)
+    response.raise_for_status()
+    profile = response.json()
+    if not isinstance(profile, dict):
+        raise ValueError("Spotify profile response is invalid")
+    return profile
 
 
 def _public_user(user: Any) -> dict[str, Any] | None:
@@ -1100,17 +1172,156 @@ def _ensure_workspace(db: Database, user: Any) -> int:
     row = db.get_workspace(key)
     if row is not None:
         return int(row["id"])
-    return 0
+    return int(db.create_workspace(
+        workspace_key=key,
+        name=str(user["display_name"] or user["spotify_user_id"]),
+        kind="exact",
+        status="created",
+        phase="source_setup",
+        metadata={"workflow": "public_exact"},
+    ))
+
+
+def _track_by_id(db: Database, track_id: Any) -> Any | None:
+    try:
+        expected = int(track_id)
+    except (TypeError, ValueError):
+        return None
+    return next(
+        (track for track in db.get_spotify_tracks(True) if int(track.db_id or 0) == expected),
+        None,
+    )
+
+
+def _public_generation_id(db: Database, workspace_id: int) -> int | None:
+    """Use -1 to fail closed when the newest public scan is not complete."""
+    latest = db.get_latest_exact_generation(workspace_id)
+    if latest is None:
+        return None
+    current = db.get_current_exact_generation(workspace_id)
+    return int(current["id"]) if current is not None else -1
+
+
+def _current_match(
+    config: AppConfig,
+    track: Any,
+    candidate: Any,
+) -> tuple[str, bool, float, float, dict[str, Any]]:
+    """Reapply the current matcher before any public recommendation or choice."""
+    if track is None or candidate is None:
+        return "INCOMPATIBLE", True, 0.0, 0.0, {
+            "eligibility": "INCOMPATIBLE",
+            "reasons": ["song or chart metadata is unavailable"],
+            "factors": {"gates": {"hard_gate": True}},
+        }
+    try:
+        from csv_to_clonehero.matching import score_candidate
+
+        scored = score_candidate(track, candidate, config)
+        breakdown = scored.as_dict() if hasattr(scored, "as_dict") else {}
+        if not isinstance(breakdown, dict):
+            breakdown = {}
+        eligibility = str(getattr(scored, "eligibility", "") or "EXCLUDED").upper()
+        gates = getattr(scored, "gate_factors", {}) or {}
+        return (
+            eligibility,
+            bool(gates.get("hard_gate")),
+            float(getattr(scored, "final_score", 0.0) or 0.0),
+            float(getattr(scored, "quality", 0.0) or 0.0),
+            breakdown,
+        )
+    except Exception:  # noqa: BLE001 - fail closed at the public trust boundary
+        log.warning("current public match evaluation failed", exc_info=True)
+        return "INCOMPATIBLE", True, 0.0, 0.0, {
+            "eligibility": "INCOMPATIBLE",
+            "reasons": ["current compatibility check could not be completed"],
+            "factors": {"gates": {"hard_gate": True}},
+        }
+
+
+def _public_scope(scope: dict[str, Any] | None) -> dict[str, Any] | None:
+    if scope is None:
+        return None
+    return {
+        "playlist_ids": list(scope.get("playlist_ids") or []),
+        "include_liked": bool(scope.get("include_liked")),
+        "track_ids": list(scope.get("track_ids") or []),
+        "updated_at": scope.get("updated_at"),
+    }
+
+
+def _review_summary(cards: list[dict[str, Any]]) -> dict[str, int]:
+    strong = sum(card.get("review_state") == "strong" for card in cards)
+    review = sum(card.get("review_state") == "needs_review" for card in cards)
+    selected_strong = sum(
+        bool(card.get("selected")) and card.get("review_state") == "strong"
+        for card in cards
+    )
+    selected_review = sum(
+        bool(card.get("selected")) and card.get("review_state") == "needs_review"
+        for card in cards
+    )
+    return {
+        "strong": strong,
+        "review": review,
+        "unavailable": len(cards) - strong - review,
+        "selected": selected_strong + selected_review,
+        "selected_strong": selected_strong,
+        "selected_review": selected_review,
+        "total": len(cards),
+    }
+
+
+def _card_matches_search(card: dict[str, Any], needle: str) -> bool:
+    values = [card.get("artist"), card.get("title")]
+    for candidate in card.get("candidates") or []:
+        values.extend(
+            candidate.get(key)
+            for key in ("artist", "title", "chart_id", "charter")
+        )
+    return needle in " ".join(str(value or "") for value in values).casefold()
+
+
+def _card_review_bucket(card: dict[str, Any]) -> str:
+    state = str(card.get("review_state") or "").casefold()
+    if state == "strong":
+        return "strong"
+    if state == "needs_review":
+        return "review"
+    return "unavailable"
+
+
+def _job_mapping_public(job: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: job.get(key)
+        for key in (
+            "id", "kind", "status", "phase", "message", "error", "progress",
+            "created_at", "started_at", "finished_at",
+            "cancel_requested", "heartbeat_at",
+        )
+    }
 
 
 def _review_cards(
+    config: AppConfig,
     db: Database,
     workspace: int,
     minimum_score: float = 50.0,
 ) -> list[dict[str, Any]]:
     if not workspace:
         return []
-    rows = db.get_workspace_candidates(workspace, kind="exact", include_rejected=True)
+    generation_id = _public_generation_id(db, workspace)
+    rows = db.get_workspace_candidates(
+        workspace,
+        kind="exact",
+        include_rejected=True,
+        generation_id=generation_id,
+    )
+    tracks_by_id = {
+        int(track.db_id): track
+        for track in db.get_spotify_tracks(True)
+        if track.db_id is not None
+    }
     by_track: dict[int, list[dict[str, Any]]] = {}
     for row in rows:
         data = dict(row) if hasattr(row, "keys") else {}
@@ -1120,11 +1331,11 @@ def _review_cards(
         candidate = db.get_candidate(int(data.get("candidate_id") or 0))
         if candidate is None:
             continue
-        breakdown = {}
-        try:
-            breakdown = json.loads(data.get("breakdown_json") or "{}")
-        except (TypeError, ValueError):
-            breakdown = {}
+        current_eligibility, _hard_gate, current_score, current_quality, breakdown = _current_match(
+            config,
+            tracks_by_id.get(int(tid)),
+            candidate,
+        )
         item = {
             "candidate_id": data.get("candidate_id"),
             "source": candidate.source,
@@ -1139,11 +1350,11 @@ def _review_cards(
             "url": candidate.url,
             "reference": candidate.reference,
             "supports_download": bool(candidate.supports_download),
-            "score": round(float(data.get("score") or 0), 1),
-            "quality": round(float(data.get("quality") or 0), 1),
+            "score": round(current_score, 1),
+            "quality": round(current_quality, 1),
             # Raw fields remain available to existing API consumers. The
             # ``review`` object is the only shape the human-facing UI needs.
-            "eligibility": data.get("eligibility") or breakdown.get("eligibility") or "",
+            "eligibility": current_eligibility,
             "explanation": breakdown.get("explanation") or "",
             "selected": bool(data.get("selected")),
         }
@@ -1155,6 +1366,7 @@ def _review_cards(
         item["review_label"] = item["review"]["label"]
         item["review_summary"] = item["review"]["summary"]
         item["selectable"] = item["review"]["selectable"]
+        item["selected"] = bool(item["selected"] and item["selectable"])
         item["selection_action"] = item["review"]["action"]
         by_track.setdefault(int(tid), []).append(item)
 

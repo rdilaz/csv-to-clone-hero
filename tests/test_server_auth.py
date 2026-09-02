@@ -86,9 +86,9 @@ def test_build_oauth_uses_encrypted_store(config, cipher, monkeypatch):
 
 def test_oauth_redirect_uses_public_base_url(monkeypatch):
     monkeypatch.setenv("SPOTIFY_CLIENT_ID", "c")
-    monkeypatch.setenv("APP_BASE_URL", "https://charts.ryo-nd.com")
+    monkeypatch.setenv("APP_BASE_URL", "https://riff.ryo-nd.com")
     config = AppConfig()
-    assert config.spotify_redirect_uri == "https://charts.ryo-nd.com/api/auth/spotify/callback"
+    assert config.spotify_redirect_uri == "https://riff.ryo-nd.com/api/auth/spotify/callback"
 
 
 def test_oauth_redirect_loopback_when_no_public_url(monkeypatch):

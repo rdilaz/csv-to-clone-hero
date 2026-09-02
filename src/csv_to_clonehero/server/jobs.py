@@ -158,10 +158,16 @@ class JobManager:
         db = Database(self.config.database_path)
         try:
             recovered = db.recover_running_jobs()
+            recovered_discovery = db.recover_interrupted_discovery()
         finally:
             db.close()
         if recovered:
             log.warning("marked %s orphaned background job(s) interrupted", recovered)
+        if recovered_discovery:
+            log.warning(
+                "marked %s orphaned discovery workspace(s) interrupted",
+                recovered_discovery,
+            )
 
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
@@ -331,20 +337,6 @@ class JobManager:
         client: Any | None = None
         soundcloud_client: Any | None = None
         try:
-            def on_combined_progress(payload: Mapping[str, Any]) -> None:
-                data = dict(payload)
-                message = str(data.pop("message", "") or data.get("phase", "")).strip()
-                # The song row is already durable. Avoid a second SQLite write
-                # for the transient "checking" notification; the next poll
-                # observes the row and the current_song field remains in the
-                # last job snapshot when a terminal song update is emitted.
-                if data.get("phase") == "finding_charts" and "song_status" not in data:
-                    return
-                self._mark(
-                    job.id, status="running", phase=str(data.get("phase") or "matching"),
-                    message=message, progress=data, heartbeat_at=time.time(),
-                )
-
             validation = validate_discovery_start(
                 db,
                 self.config,
@@ -358,57 +350,71 @@ class JobManager:
             if user is None:
                 raise RuntimeError("user no longer exists")
             workspace = db.get_workspace(job.workspace_key)
-            if workspace is not None and db.get_neutral_library_tracks(int(workspace["id"])):
-                from csv_to_clonehero.combined_pipeline import discover_combined
-                from csv_to_clonehero.providers.base import LibrarySnapshot, ProviderTrack
-                grouped: dict[str, list[ProviderTrack]] = {}
-                for row in db.get_track_provenance(int(workspace["id"])):
-                    provider = str(row["provider"])
-                    grouped.setdefault(provider, []).append(ProviderTrack(
-                        provider=provider, provider_id=str(row["provider_id"]), title=str(row["title"]),
-                        artist=str(row["artist"]), album=str(row["album"] or ""), liked=bool(row["liked"]),
-                        isrc=str(row["isrc"] or ""), url=str(row["url"] or ""),
-                        metadata=_json_object(row["metadata_json"], {}),
-                    ))
-                self._mark(job.id, status="running", phase="combine", message="Combining imported sources locally")
-                combined = discover_combined(
-                    self.config, db, [LibrarySnapshot(name, tracks) for name, tracks in grouped.items()],
-                    workspace_key=job.workspace_key, workspace_name="Combined library",
-                    on_progress=on_combined_progress,
-                    cancellation_event=self._cancel_events[job.id],
+            workspace_id = int(workspace["id"]) if workspace is not None else None
+            metadata = _json_object(workspace["metadata_json"] if workspace is not None else "{}")
+            spotify_scope = (
+                db.get_workspace_scope_data(workspace_id)
+                if workspace_id is not None
+                else None
+            ) or metadata.get("spotify_scope")
+            soundcloud_scope = metadata.get("soundcloud_scope")
+            persisted_tracks = _provider_tracks_from_provenance(db, workspace_id)
+            has_persisted_soundcloud = any(
+                track.provider == "soundcloud" for track in persisted_tracks
+            )
+            has_uploaded_soundcloud = any(
+                str(row["provider"]) == "soundcloud"
+                and str(row["source_key"]) != "api"
+                for row in (
+                    db.get_source_summary(workspace_id)
+                    if workspace_id is not None
+                    else []
                 )
-                self._mark(job.id, status=combined.status, phase=combined.phase, message="Combined catalog discovery complete.", result=vars(combined))
-                return
+            )
+            combined_provider_discovery = (
+                has_persisted_soundcloud or _scope_selected(soundcloud_scope)
+            )
+
+            if combined_provider_discovery and _scope_selected(spotify_scope):
+                from csv_to_clonehero.providers.spotify import SpotifyLibraryProvider
+
+                self._mark(job.id, status="running", phase="provider_import", message="Loading current Spotify selection")
+                oauth = build_oauth(self.config, job.user_id, self.cipher)
+                client = build_spotify_client(self.config, oauth)
+                spotify_snapshot = SpotifyLibraryProvider(client).import_library(scope=spotify_scope)
+                if workspace_id is None:
+                    raise RuntimeError("discovery workspace no longer exists")
+                db.upsert_library_snapshot(workspace_id, spotify_snapshot, scope=spotify_scope)
+
+            if _scope_selected(soundcloud_scope) and not has_uploaded_soundcloud:
+                from csv_to_clonehero.providers.soundcloud_api import SoundCloudAPIProvider, SoundCloudClient
+
+                self._mark(job.id, status="running", phase="provider_import", message="Loading current SoundCloud selection")
+                soundcloud_oauth = build_soundcloud_oauth(self.config, job.user_id)
+                soundcloud_client = SoundCloudClient(
+                    soundcloud_oauth,
+                    timeout=float(self.config.network.timeout_seconds or 20),
+                )
+                soundcloud_snapshot = SoundCloudAPIProvider(soundcloud_client).import_library(scope=soundcloud_scope)
+                if workspace_id is None:
+                    raise RuntimeError("discovery workspace no longer exists")
+                db.upsert_library_snapshot(workspace_id, soundcloud_snapshot, scope=soundcloud_scope)
+
+            prefetched_library = None
+            if combined_provider_discovery and workspace_id is not None:
+                current_provider_tracks = _provider_tracks_from_provenance(db, workspace_id)
+                if current_provider_tracks:
+                    prefetched_library = _provider_library_result(current_provider_tracks)
+
             self._mark(
                 job.id,
                 status="running",
                 phase="starting",
-                message=f"Building Spotify session for {user['display_name'] or user['spotify_user_id']}",
+                message=f"Preparing discovery for {user['display_name'] or user['spotify_user_id']}",
             )
-            oauth = build_oauth(self.config, job.user_id, self.cipher)
-            client = build_spotify_client(self.config, oauth)
-            workspace = db.get_workspace(job.workspace_key)
-            metadata = _json_object(workspace["metadata_json"] if workspace is not None else "{}")
-            soundcloud_scope = metadata.get("soundcloud_scope")
-            if isinstance(soundcloud_scope, dict) and (
-                soundcloud_scope.get("playlist_ids") or soundcloud_scope.get("include_liked")
-            ):
-                from csv_to_clonehero.combined_pipeline import discover_combined
-                from csv_to_clonehero.providers.soundcloud_api import SoundCloudAPIProvider, SoundCloudClient
-                from csv_to_clonehero.providers.spotify import SpotifyLibraryProvider
-
-                spotify_snapshot = SpotifyLibraryProvider(client).import_library(scope=metadata.get("spotify_scope") or {})
-                soundcloud_oauth = build_soundcloud_oauth(self.config, job.user_id)
-                soundcloud_client = SoundCloudClient(soundcloud_oauth, timeout=float(self.config.network.timeout_seconds or 20))
-                soundcloud_snapshot = SoundCloudAPIProvider(soundcloud_client).import_library(scope=soundcloud_scope)
-                combined = discover_combined(
-                    self.config, db, [spotify_snapshot, soundcloud_snapshot],
-                    workspace_key=job.workspace_key, workspace_name=user["spotify_user_id"],
-                    on_progress=on_combined_progress,
-                    cancellation_event=self._cancel_events[job.id],
-                )
-                self._mark(job.id, status="complete", phase="complete", message="Combined catalog discovery complete.", result=vars(combined))
-                return
+            if prefetched_library is None:
+                oauth = build_oauth(self.config, job.user_id, self.cipher)
+                client = build_spotify_client(self.config, oauth)
             sources = self.source_factory(self.config)
 
             def on_progress(payload: Mapping[str, Any]) -> None:
@@ -432,6 +438,7 @@ class JobManager:
                 db,
                 sources,
                 client,
+                prefetched_library=prefetched_library,
                 workspace_key=job.workspace_key or None,
                 workspace_name=user["spotify_user_id"],
                 on_progress=on_progress,
@@ -529,6 +536,147 @@ def _default_source_factory(config: AppConfig) -> list[ChartSource]:
     from csv_to_clonehero.sources import build_sources
 
     return build_sources(config)
+
+
+def _scope_selected(scope: Any) -> bool:
+    return isinstance(scope, Mapping) and bool(
+        scope.get("playlist_ids") or scope.get("include_liked")
+    )
+
+
+def _provider_tracks_from_provenance(
+    db: Database, workspace_id: int | None
+) -> list[Any]:
+    if workspace_id is None:
+        return []
+    from csv_to_clonehero.providers.base import ProviderTrack
+
+    tracks = []
+    for row in db.get_track_provenance(workspace_id):
+        tracks.append(ProviderTrack(
+            provider=str(row["provider"]),
+            provider_id=str(row["provider_id"]),
+            title=str(row["title"]),
+            artist=str(row["artist"]),
+            album=str(row["album"] or ""),
+            liked=bool(row["liked"]),
+            isrc=str(row["isrc"] or ""),
+            url=str(row["url"] or ""),
+            metadata=_json_object(row["metadata_json"]),
+        ))
+    return tracks
+
+
+def _provider_library_result(provider_tracks: list[Any]) -> Any:
+    """Adapt approved provider records to the shared discovery import shape."""
+    from csv_to_clonehero.providers.base import merge_provider_tracks
+    from csv_to_clonehero.spotify import LibraryCounts, LibraryImportResult, SpotifyPlaylist
+
+    ordered = sorted(
+        provider_tracks,
+        key=lambda track: (
+            track.dedupe_key,
+            track.provider != "spotify",
+            track.provider,
+            track.provider_id,
+        ),
+    )
+    provenance_by_key: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for track in ordered:
+        provenance_by_key.setdefault(track.dedupe_key, []).append({
+            "provider": track.provider,
+            "provider_id": track.provider_id,
+            "playlist_ids": list(track.playlist_ids),
+            "playlist_names": list(track.playlist_names),
+            "liked": bool(track.liked),
+            "album": track.album,
+            "isrc": track.isrc,
+            "url": track.url,
+            "metadata": dict(track.metadata),
+        })
+
+    records: list[dict[str, Any]] = []
+    playlist_models: dict[str, str] = {}
+    playlist_item_count = 0
+    liked_count = 0
+    for track in merge_provider_tracks(ordered):
+        provenance = provenance_by_key[track.dedupe_key]
+        spotify = next(
+            (item for item in provenance if item["provider"] == "spotify"),
+            None,
+        )
+        identity = spotify or provenance[0]
+        provider_id = str(identity["provider_id"])
+        record_id = (
+            provider_id
+            if identity["provider"] == "spotify"
+            else f"{identity['provider']}:{provider_id}"
+        )
+        playlists: list[dict[str, str]] = []
+        seen_playlists: set[str] = set()
+        for item in provenance:
+            ids = list(item["playlist_ids"])
+            names = list(item["playlist_names"])
+            for index in range(max(len(ids), len(names))):
+                raw_id = ids[index] if index < len(ids) else names[index]
+                playlist_id = (
+                    raw_id
+                    if item["provider"] == "spotify"
+                    else f"{item['provider']}:{raw_id}"
+                )
+                if playlist_id in seen_playlists:
+                    continue
+                seen_playlists.add(playlist_id)
+                playlist = {
+                    "id": playlist_id,
+                    "name": names[index] if index < len(names) else raw_id,
+                }
+                playlists.append(playlist)
+                playlist_models.setdefault(playlist_id, playlist["name"])
+        metadata = dict(track.metadata)
+        metadata["provenance"] = provenance
+        metadata["providers"] = {
+            item["provider"]: {
+                "id": item["provider_id"],
+                "liked": item["liked"],
+                "playlist_ids": item["playlist_ids"],
+                "playlist_names": item["playlist_names"],
+                "url": item["url"],
+                "metadata": item["metadata"],
+            }
+            for item in provenance
+        }
+        liked = any(bool(item["liked"]) for item in provenance)
+        liked_count += int(liked)
+        playlist_item_count += len(playlists)
+        records.append({
+            "spotify_id": record_id,
+            "track_key": f"{track.artist_norm}|{track.title_norm}",
+            "title": track.title,
+            "artists": [track.artist],
+            "album": track.album,
+            "playlists": playlists,
+            "liked": liked,
+            "duration_ms": track.duration_ms,
+            "isrc": track.isrc,
+            "url": str(spotify["url"] if spotify else ""),
+            "origin": str(identity["provider"]),
+            "origin_metadata": metadata,
+        })
+    counts = LibraryCounts(
+        playlist_count=len(playlist_models),
+        playlist_item_count=playlist_item_count,
+        liked_item_count=liked_count,
+        included_count=len(records),
+    )
+    return LibraryImportResult(
+        records=records,
+        playlists=[
+            SpotifyPlaylist(playlist_id, name)
+            for playlist_id, name in playlist_models.items()
+        ],
+        counts=counts,
+    )
 
 
 def _stats_payload(stats: Any) -> dict[str, Any]:

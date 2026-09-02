@@ -6,7 +6,6 @@ import time
 from dataclasses import asdict, dataclass
 from typing import Any, Callable
 
-from csv_to_clonehero.catalog import load_enchor_catalog
 from csv_to_clonehero.config import AppConfig
 from csv_to_clonehero.database import Database, _load_json
 from csv_to_clonehero.server.auth import user_workspace_key
@@ -177,15 +176,10 @@ def validate_discovery_start(
     scope = db.get_workspace_scope_data(int(workspace["id"])) if workspace is not None else None
     if not has_neutral_library and (scope is None or not (scope.get("playlist_ids") or scope.get("include_liked"))):
         errors.append("Choose at least one Spotify playlist or Liked Songs before starting.")
-    elif len(scope.get("playlist_ids") or []) > config.server.max_scope_playlists:
+    elif scope is not None and len(scope.get("playlist_ids") or []) > config.server.max_scope_playlists:
         errors.append("The selected playlist scope is too large.")
-    elif len(scope.get("track_ids") or []) > config.server.max_scope_tracks:
+    elif scope is not None and len(scope.get("track_ids") or []) > config.server.max_scope_tracks:
         errors.append("The selected track scope is too large.")
-
-    if has_neutral_library and not load_enchor_catalog(config.catalog_path).available:
-        errors.append(
-            "A complete local Enchor catalog is required for imported library discovery."
-        )
 
     preflight = get_enchor_preflight(db)
     if not preflight.get("usable"):
