@@ -28,6 +28,10 @@ def _track(provider: str, identifier: str, artist: str, title: str) -> ProviderT
     return ProviderTrack(provider=provider, provider_id=identifier, artist=artist, title=title)
 
 
+def _is_focused(locator) -> bool:
+    return bool(locator.evaluate("element => document.activeElement === element"))
+
+
 @pytest.fixture
 def browser_page(config, request):
     from werkzeug.serving import make_server
@@ -77,9 +81,9 @@ def test_no_source_drawer_and_coming_soon_tiles(browser_page):
     page.get_by_role("button", name="Open Spotify source").focus()
     page.keyboard.press("Enter")
     assert page.get_by_role("dialog", name="Spotify").is_visible()
-    assert page.get_by_role("button", name="Close source sheet").is_focused()
+    assert _is_focused(page.get_by_role("button", name="Close source sheet"))
     page.keyboard.press("Escape")
-    assert page.get_by_role("button", name="Open Spotify source").is_focused()
+    assert _is_focused(page.get_by_role("button", name="Open Spotify source"))
 
 
 @pytest.mark.music_ready
@@ -105,7 +109,7 @@ def test_mobile_music_ready_has_no_horizontal_overflow_and_sheet(browser_page):
     assert page.get_by_role("dialog", name="Spotify").is_visible()
     assert page.evaluate("document.documentElement.scrollWidth <= document.documentElement.clientWidth")
     page.keyboard.press("Escape")
-    assert page.get_by_role("button", name="Manage music sources").is_focused()
+    assert _is_focused(page.get_by_role("button", name="Manage music sources"))
 
 
 @pytest.fixture
@@ -158,7 +162,11 @@ def matching_browser_page(config, request, monkeypatch):
                 browser = pw.chromium.launch(headless=True)
             except Exception as exc:
                 pytest.skip(f"Chromium is not installed: {exc}")
-            page = browser.new_page(viewport={"width": 390 if request.node.get_closest_marker("mobile") else 1440, "height": 844 if request.node.get_closest_marker("mobile") else 900})
+            mobile = bool(request.node.get_closest_marker("mobile"))
+            page = browser.new_page(
+                viewport={"width": 390 if mobile else 1440, "height": 844 if mobile else 900},
+                has_touch=mobile,
+            )
             page.goto(f"http://127.0.0.1:{server.server_port}/", wait_until="domcontentloaded")
             page.wait_for_selector("#main-content", timeout=5000)
             yield page
@@ -166,6 +174,24 @@ def matching_browser_page(config, request, monkeypatch):
     finally:
         server.shutdown()
         thread.join(timeout=2)
+
+
+def _route_review_concerns(page, concerns):
+    """Replace only the rendered candidate concerns in the real review payload."""
+
+    def handler(route):
+        response = route.fetch()
+        payload = response.json()
+        for card in payload.get("tracks", []):
+            for candidate in card.get("candidates", []):
+                candidate.setdefault("review", {})["concerns"] = list(concerns)
+        route.fulfill(
+            status=response.status,
+            content_type="application/json",
+            body=json.dumps(payload),
+        )
+
+    page.route("**/api/review?*", handler)
 
 
 @pytest.mark.parametrize("matching_browser_page", ["matching_restoring"], indirect=True)
@@ -190,7 +216,7 @@ def test_browser_matching_running_is_composed_on_mobile(matching_browser_page):
 @pytest.mark.mobile
 def test_browser_charts_found_selects_and_rehydrates_best_cohort(matching_browser_page):
     page = matching_browser_page
-    assert page.locator("[data-test='charts-found']").is_visible()
+    page.locator("[data-test='charts-found']").wait_for()
     assert page.get_by_text("We found charts for 1 of your songs.").is_visible()
     assert page.get_by_role("heading", name="1 Best matches").is_visible()
     assert page.get_by_role("heading", name="1 recommendations").is_visible()
@@ -230,6 +256,82 @@ def test_browser_charts_found_selects_and_rehydrates_best_cohort(matching_browse
 
 
 @pytest.mark.parametrize("matching_browser_page", ["charts_found"], indirect=True)
+def test_browser_chart_concern_indicator_requires_a_reported_reason(matching_browser_page):
+    page = matching_browser_page
+    _route_review_concerns(page, ["", "   ", None])
+
+    page.get_by_role("button", name="Use 1 best matches").click()
+    page.get_by_role("heading", name="A few representative charts").wait_for()
+    assert page.locator(".chart-concern").count() == 0
+    assert page.locator(".concern-trigger").count() == 0
+
+
+@pytest.mark.parametrize("matching_browser_page", ["charts_found"], indirect=True)
+def test_browser_chart_concerns_expose_every_reason_on_hover_and_focus(matching_browser_page):
+    page = matching_browser_page
+    concerns = ["Possible live-version mismatch.", "Only one instrument is available."]
+    _route_review_concerns(page, concerns)
+
+    page.get_by_role("button", name="Use 1 best matches").click()
+    trigger = page.get_by_role("button", name="2 chart issues", exact=True)
+    trigger.wait_for()
+    popover = page.locator("#" + trigger.get_attribute("aria-describedby"))
+    assert popover.get_attribute("role") == "tooltip"
+    assert popover.is_visible() is False
+
+    trigger.hover()
+    popover.wait_for(state="visible")
+    for concern in concerns:
+        assert popover.get_by_text(concern, exact=True).is_visible()
+    page.keyboard.press("Escape")
+    popover.wait_for(state="hidden")
+
+    page.locator(".found-head h1").hover()
+    page.get_by_role("checkbox", name="Use Song by Artist").focus()
+    page.keyboard.press("Tab")
+    popover.wait_for(state="visible")
+    assert _is_focused(trigger)
+    assert trigger.evaluate("element => getComputedStyle(element).outlineStyle !== 'none'")
+    page.keyboard.press("Escape")
+    popover.wait_for(state="hidden")
+    assert _is_focused(trigger)
+    page.keyboard.press("Enter")
+    popover.wait_for(state="visible")
+    assert "is-open" in (trigger.locator("..").get_attribute("class") or "").split()
+    page.keyboard.press("Enter")
+    popover.wait_for(state="hidden")
+    page.keyboard.press("Enter")
+    popover.wait_for(state="visible")
+    page.keyboard.press("Tab")
+    popover.wait_for(state="hidden")
+
+
+@pytest.mark.parametrize("matching_browser_page", ["charts_found"], indirect=True)
+@pytest.mark.mobile
+def test_browser_chart_concern_popover_opens_by_touch_without_mobile_overflow(matching_browser_page):
+    page = matching_browser_page
+    assert page.viewport_size == {"width": 390, "height": 844}
+    concerns = ["Possible live-version mismatch.", "Only one instrument is available."]
+    _route_review_concerns(page, concerns)
+
+    page.get_by_role("button", name="Use 1 best matches").click()
+    trigger = page.get_by_role("button", name="2 chart issues", exact=True)
+    trigger.tap()
+    popover = page.locator("#" + trigger.get_attribute("aria-controls"))
+    popover.wait_for(state="visible")
+    assert "is-open" in (trigger.locator("..").get_attribute("class") or "").split()
+    bounds = popover.bounding_box()
+    assert bounds is not None
+    assert bounds["x"] >= 0
+    assert bounds["x"] + bounds["width"] <= 390
+    assert page.evaluate("document.documentElement.scrollWidth <= document.documentElement.clientWidth")
+
+    page.locator(".found-head h1").tap()
+    popover.wait_for(state="hidden")
+    assert "is-open" not in (trigger.locator("..").get_attribute("class") or "").split()
+
+
+@pytest.mark.parametrize("matching_browser_page", ["charts_found"], indirect=True)
 def test_browser_failed_cohort_mutation_keeps_truthful_state(matching_browser_page):
     page = matching_browser_page
     page.route(
@@ -266,7 +368,7 @@ def test_browser_failed_row_mutation_rehydrates_saved_checkbox(matching_browser_
         ),
     )
 
-    checkbox.uncheck()
+    checkbox.click()
     alert = page.get_by_role("alert")
     alert.wait_for()
     assert "saved choice was restored" in alert.inner_text()
@@ -289,12 +391,12 @@ def test_browser_continue_uses_real_preflight_and_changed_folder(matching_browse
         continue_button.click()
     preview = preview_info.value.json()
     assert preview["ok"] is True
-    page.get_by_role("heading", name="Ready to add 1 songs").wait_for()
+    page.get_by_role("heading", name="Ready to add 1 song").wait_for()
     assert page.locator("[data-test='preflight-selected']").inner_text() == str(preview["selected_chart_count"])
     assert page.locator("[data-test='preflight-reusable']").inner_text() == str(preview["reusable_count"])
     assert page.locator("[data-test='preflight-required']").inner_text() == str(preview["download_required_count"])
     assert page.locator("[data-test='preflight-destination']").inner_text() == preview["destination"]
-    assert page.get_by_role("button", name="Download library").count() == 0
+    assert page.get_by_role("button", name="Download library").is_visible()
 
     chosen = str(Path(preview["destination"]).parent / "Dedicated Test Songs")
     page.route(
@@ -318,6 +420,53 @@ def test_browser_continue_uses_real_preflight_and_changed_folder(matching_browse
     assert page.get_by_text("1 selected", exact=True).is_visible()
     assert page.get_by_role("button", name="Continue with 1 charts").is_visible()
     assert page.evaluate("document.documentElement.scrollWidth <= document.documentElement.clientWidth")
+
+
+@pytest.mark.parametrize("matching_browser_page", ["charts_found"], indirect=True)
+@pytest.mark.mobile
+def test_browser_pending_destination_visual_is_neutral(matching_browser_page):
+    page = matching_browser_page
+    page.get_by_role("button", name="Use 1 best matches").click()
+    preview = {
+        "ok": True,
+        "selected_chart_count": 1,
+        "eligible_chart_count": 1,
+        "reusable_count": 0,
+        "download_required_count": 1,
+        "invalid_count": 0,
+        "estimated_bytes": 1024,
+        "available_bytes": 1024 * 1024,
+        "destination": "C:\\Test\\Songs",
+        "errors": [],
+        "warnings": [],
+    }
+    page.evaluate(
+        """payload => {
+          const originalFetch = window.fetch.bind(window);
+          window.fetch = (input, options) => {
+            if (!String(input).includes('/api/export/preview')) return originalFetch(input, options);
+            return new Promise(resolve => {
+              window.__finishPreview = () => resolve(new Response(JSON.stringify(payload), {
+                status: 200,
+                headers: {'Content-Type': 'application/json'}
+              }));
+            });
+          };
+        }""",
+        preview,
+    )
+
+    page.get_by_role("button", name="Continue with 1 charts").click()
+    page.locator("[data-test='download-preflight']").wait_for()
+    folder = page.locator("[data-test='destination-visual'] .folder-card")
+    assert "needs-attention" not in (folder.get_attribute("class") or "").split()
+    assert folder.locator(".folder-check").count() == 0
+    assert "!" not in folder.inner_text()
+    assert page.evaluate("document.documentElement.scrollWidth <= document.documentElement.clientWidth")
+
+    page.evaluate("window.__finishPreview()")
+    page.locator("[data-test='download-ready']").wait_for()
+    assert "is-ready" in (page.locator(".folder-card").get_attribute("class") or "").split()
 
 
 @pytest.mark.parametrize("matching_browser_page", ["charts_found"], indirect=True)
@@ -346,10 +495,14 @@ def test_browser_preflight_failure_is_not_ready_and_preserves_selection(matching
     )
 
     page.get_by_role("button", name="Continue with 1 charts").click()
+    preflight_error = page.locator("[data-test='download-preflight-error']")
     page.get_by_role("heading", name="Your library needs one more check").wait_for()
-    assert page.get_by_text("A persisted selection is no longer current.").is_visible()
+    assert preflight_error.get_by_text("A persisted selection is no longer current.").is_visible()
     assert page.get_by_text("Ready for download").count() == 0
     assert page.locator("[data-test='preflight-selected']").inner_text() == "1"
+    folder = page.locator("[data-test='destination-visual'] .folder-card")
+    assert "needs-attention" in (folder.get_attribute("class") or "").split()
+    assert folder.locator(".folder-check").inner_text() == "!"
     page.get_by_role("button", name="Change chart choices").click()
     assert page.get_by_text("1 selected", exact=True).is_visible()
 
@@ -358,6 +511,62 @@ def _reach_download_ready(page):
     page.get_by_role("button", name="Use 1 best matches").click()
     page.get_by_role("button", name="Continue with 1 charts").click()
     page.locator("[data-test='download-ready']").wait_for()
+
+
+def _running_export_status(destination, *, done=0, current="Checking download sizes", failed=0, invalid=0):
+    item_status = "failed" if failed else "invalid" if invalid else "validated" if done else "pending"
+    return {
+        "running": True,
+        "status": "running",
+        "workspace_id": 1,
+        "destination": destination,
+        "done": done,
+        "total": 1,
+        "current": current,
+        "started_at": time.time() - 2,
+        "items": {
+            "selected": 1,
+            "completed": 0,
+            "downloading": 0,
+            "retrying": 0,
+            "failed": failed,
+            "invalid": invalid,
+            "cancelled": 0,
+            "remaining": 0 if failed or invalid else 1,
+            "items": [{"status": item_status, "result": item_status if failed or invalid else ""}],
+        },
+    }
+
+
+def _complete_export_status(destination):
+    return {
+        "running": False,
+        "status": "complete",
+        "workspace_id": 1,
+        "destination": destination,
+        "items": {
+            "selected": 1,
+            "completed": 1,
+            "failed": 0,
+            "invalid": 0,
+            "cancelled": 0,
+            "remaining": 0,
+            "items": [{"status": "published", "result": "downloaded"}],
+        },
+        "result": {
+            "success": True,
+            "status": "success",
+            "selected": 1,
+            "ready": 1,
+            "added": 1,
+            "already_present": 0,
+            "failed": 0,
+            "invalid": 0,
+            "cancelled_items": 0,
+            "remaining": 0,
+            "destination": destination,
+        },
+    }
 
 
 @pytest.mark.parametrize("matching_browser_page", ["charts_found"], indirect=True)
@@ -379,6 +588,204 @@ def test_browser_export_start_rejection_stays_download_ready(matching_browser_pa
     assert "already running" in alert.inner_text()
     assert page.locator("[data-test='download-ready']").is_visible()
     assert page.locator("[data-test='export-running']").count() == 0
+
+
+@pytest.mark.parametrize("matching_browser_page", ["charts_found"], indirect=True)
+@pytest.mark.mobile
+def test_browser_building_polls_keep_flow_dom_and_ready_progress_truthful(matching_browser_page):
+    page = matching_browser_page
+    assert page.viewport_size == {"width": 390, "height": 844}
+    _reach_download_ready(page)
+    destination = page.locator("[data-test='preflight-destination']").inner_text()
+    state = {"polls": 0, "allow_second": False, "terminal": False}
+
+    def start_handler(route):
+        payload = json.loads(route.request.post_data or "{}")
+        route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps({
+                "started": True,
+                "kind": "folder",
+                "workspace_id": payload["workspace_id"],
+                "destination": payload["path"],
+            }),
+        )
+
+    def status_handler(route):
+        state["polls"] += 1
+        if state["terminal"]:
+            payload = _complete_export_status(destination)
+        elif state["polls"] == 1 or not state["allow_second"]:
+            payload = _running_export_status(destination)
+        else:
+            payload = _running_export_status(
+                destination,
+                done=1,
+                current="Writing files",
+            )
+        route.fulfill(status=200, content_type="application/json", body=json.dumps(payload))
+
+    page.route("**/api/spotify/export/start", start_handler)
+    page.route("**/api/export/status?*", status_handler)
+    page.get_by_role("button", name="Download library").click()
+    page.locator("[data-test='export-running']").wait_for()
+    page.evaluate("""() => {
+      window.__persistentFlowNode = document.querySelector('.flow-node-one');
+      window.__flowAnimationTime = window.__persistentFlowNode.getAnimations()[0].currentTime;
+    }""")
+    state["allow_second"] = True
+
+    page.get_by_role("heading", name="Adding charts to your Songs folder").wait_for()
+    assert state["polls"] >= 2
+    assert page.evaluate("window.__persistentFlowNode === document.querySelector('.flow-node-one')")
+    assert page.evaluate("document.querySelector('.flow-node-one').getAnimations()[0].currentTime > window.__flowAnimationTime")
+    assert page.get_by_text("0%", exact=True).is_visible()
+    assert page.get_by_text("ready", exact=True).count() >= 1
+    assert page.get_by_text("100%", exact=True).count() == 0
+    assert "processed" not in page.locator("[data-test='export-running']").inner_text().casefold()
+    progress = page.locator("[data-export-progress]")
+    assert progress.get_attribute("aria-label") == "Charts ready"
+    assert progress.get_attribute("aria-valuenow") == "0"
+    assert progress.get_attribute("aria-valuemax") == "1"
+    assert page.locator("[data-export-warning]:visible").count() == 0
+    assert "!" not in page.locator(".songs-folder-target").inner_text()
+    assert page.evaluate("document.documentElement.scrollWidth <= document.documentElement.clientWidth")
+
+    state["terminal"] = True
+    page.locator("[data-test='export-complete']").wait_for()
+    assert page.get_by_role("heading", name="1 song is ready to play").is_visible()
+    assert page.locator("[data-test='export-running']").count() == 0
+
+
+@pytest.mark.parametrize("matching_browser_page", ["charts_found"], indirect=True)
+def test_browser_ready_percentage_stays_below_100_until_every_chart_is_ready(matching_browser_page):
+    page = matching_browser_page
+    selections = {
+        "items": [
+            {"kind": "exact", "track_key": f"artist|song-{index}"}
+            for index in range(200)
+        ]
+    }
+    status = {
+        "running": True,
+        "status": "running",
+        "workspace_id": 1,
+        "destination": "C:\\Test\\Songs",
+        "done": 200,
+        "total": 200,
+        "current": "Writing files",
+        "started_at": time.time() - 2,
+        "items": {
+            "selected": 200,
+            "completed": 199,
+            "downloading": 0,
+            "retrying": 0,
+            "failed": 0,
+            "invalid": 0,
+            "cancelled": 0,
+            "remaining": 1,
+            "items": [],
+        },
+    }
+    page.route(
+        "**/api/discovery/selections?*",
+        lambda route: route.fulfill(status=200, content_type="application/json", body=json.dumps(selections)),
+    )
+    page.route(
+        "**/api/export/status?*",
+        lambda route: route.fulfill(status=200, content_type="application/json", body=json.dumps(status)),
+    )
+
+    page.reload(wait_until="domcontentloaded")
+    page.locator("[data-test='export-running']").wait_for()
+    assert page.get_by_text("199 / 200 ready", exact=True).is_visible()
+    assert page.get_by_text("99%", exact=True).is_visible()
+    assert page.get_by_text("100%", exact=True).count() == 0
+    assert page.locator("[data-export-progress]").get_attribute("aria-valuetext") == "99% ready, 199 of 200 charts ready"
+
+
+@pytest.mark.parametrize("matching_browser_page", ["charts_found"], indirect=True)
+def test_browser_download_warning_appears_only_for_real_item_failures(matching_browser_page):
+    page = matching_browser_page
+    _reach_download_ready(page)
+    destination = page.locator("[data-test='preflight-destination']").inner_text()
+
+    page.route(
+        "**/api/spotify/export/start",
+        lambda route: route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps({"started": True, "kind": "folder", "workspace_id": 1, "destination": destination}),
+        ),
+    )
+    page.route(
+        "**/api/export/status?*",
+        lambda route: route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps(_running_export_status(destination, done=1, failed=1)),
+        ),
+    )
+    page.get_by_role("button", name="Download library").click()
+    warning = page.locator("[data-export-warning]")
+    warning.wait_for(state="visible")
+    assert " ".join(warning.inner_text().split()) == "! 1 couldn’t be added"
+    assert warning.get_attribute("aria-label") == "Warning: 1 chart couldn’t be added"
+    assert warning.locator(".counter-warning-mark").is_visible()
+    assert "!" not in page.locator(".songs-folder-target").inner_text()
+    assert page.get_by_text("Some charts couldn’t be added.", exact=True).is_visible()
+    assert "is-warning" in (page.locator("[data-export-reassurance-mark]").get_attribute("class") or "").split()
+
+    page.emulate_media(reduced_motion="reduce")
+    assert page.evaluate("matchMedia('(prefers-reduced-motion: reduce)').matches")
+    assert page.locator(".flow-node-one").evaluate("element => getComputedStyle(element).animationIterationCount") == "1"
+
+
+@pytest.mark.parametrize("matching_browser_page", ["charts_found"], indirect=True)
+def test_browser_terminal_failure_after_outputs_are_ready_exposes_the_error(matching_browser_page):
+    page = matching_browser_page
+    _reach_download_ready(page)
+    destination = page.locator("[data-test='preflight-destination']").inner_text()
+    failed = _complete_export_status(destination)
+    failed.update({
+        "status": "failed",
+        "error": "The library manifest could not be written.",
+    })
+    failed["result"].update({
+        "success": False,
+        "status": "failed",
+        "errors": ["The library manifest could not be written."],
+    })
+    terminal = {"payload": failed}
+    page.route(
+        "**/api/spotify/export/start",
+        lambda route: route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps({"started": True, "kind": "folder", "workspace_id": 1, "destination": destination}),
+        ),
+    )
+    page.route(
+        "**/api/export/status?*",
+        lambda route: route.fulfill(status=200, content_type="application/json", body=json.dumps(terminal["payload"])),
+    )
+
+    page.get_by_role("button", name="Download library").click()
+    page.locator("[data-test='export-failed']").wait_for()
+    assert page.get_by_role("heading", name="1 song is ready, but finishing failed").is_visible()
+    assert page.get_by_text("The library manifest could not be written.").is_visible()
+    assert page.get_by_text("Completed chart files remain in your Songs folder.").is_visible()
+    assert page.get_by_text("0 couldn’t be added", exact=True).count() == 0
+
+    partial = _complete_export_status(destination)
+    partial["status"] = "partial"
+    partial["result"].update({"status": "partial", "failed": 1})
+    terminal["payload"] = partial
+    page.reload(wait_until="domcontentloaded")
+    page.locator("[data-test='export-complete']").wait_for()
+    assert page.get_by_role("heading", name="1 song is ready to play").is_visible()
+    assert page.get_by_text("0 couldn’t be added", exact=True).count() == 0
 
 
 @pytest.mark.parametrize("matching_browser_page", ["charts_found"], indirect=True)
@@ -476,7 +883,7 @@ def test_browser_export_cancel_resume_and_complete_use_live_status(matching_brow
     assert state["cancel_polls"] >= 2
     page.get_by_role("button", name="Resume download").click()
     page.locator("[data-test='export-complete']").wait_for()
-    assert page.get_by_role("heading", name="1 songs are ready to play").is_visible()
+    assert page.get_by_role("heading", name="1 song is ready to play").is_visible()
     assert page.get_by_text("1 already available", exact=True).is_visible()
     assert state["starts"] == 2
     assert page.evaluate("document.documentElement.scrollWidth <= document.documentElement.clientWidth")
@@ -486,11 +893,11 @@ def test_browser_export_cancel_resume_and_complete_use_live_status(matching_brow
 @pytest.mark.parametrize("matching_browser_page", ["charts_found"], indirect=True)
 def test_browser_unknown_progress_partial_retry_and_failed_states(matching_browser_page):
     page = matching_browser_page
+    requests = []
+    page.on("request", lambda request: requests.append(request.url))
     _reach_download_ready(page)
     destination = page.locator("[data-test='preflight-destination']").inner_text()
-    requests = []
     state = {"starts": 0, "phase": "unknown"}
-    page.on("request", lambda request: requests.append(request.url))
 
     def start_handler(route):
         payload = json.loads(route.request.post_data or "{}")
@@ -522,8 +929,12 @@ def test_browser_unknown_progress_partial_retry_and_failed_states(matching_brows
     page.route("**/api/export/status?*", status_handler)
     page.get_by_role("button", name="Download library").click()
     page.locator("[data-test='export-running']").wait_for()
-    assert page.locator(".building-percent").count() == 0
-    assert page.locator(".building-progress[role='progressbar']").count() == 0
+    assert page.get_by_text("Preparing", exact=True).is_visible()
+    assert page.get_by_text("100%", exact=True).count() == 0
+    progress = page.locator(".building-progress[role='progressbar']")
+    assert progress.get_attribute("aria-label") == "Preparing chart progress"
+    assert progress.get_attribute("aria-valuenow") is None
+    assert "is-indeterminate" in (progress.get_attribute("class") or "").split()
     assert "ETA" not in page.locator("[data-test='export-running']").inner_text()
 
     state["phase"] = "partial"
@@ -535,6 +946,7 @@ def test_browser_unknown_progress_partial_retry_and_failed_states(matching_brows
     assert page.get_by_text("The source could not provide this chart.").is_visible()
     assert page.locator("[data-test='export-complete']").count() == 0
     assert state["starts"] == 2
+    page.wait_for_timeout(100)
     assert sum("/api/export/preview" in url for url in requests) >= 2
 
 

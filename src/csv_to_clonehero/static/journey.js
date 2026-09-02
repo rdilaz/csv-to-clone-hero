@@ -332,8 +332,28 @@
     return String(value || "Chart").replace(/[_-]+/g, " ").replace(/\b\w/g, function (letter) { return letter.toUpperCase(); });
   }
 
+  function reviewConcerns(candidate) {
+    const values = candidate && candidate.review && Array.isArray(candidate.review.concerns)
+      ? candidate.review.concerns : [];
+    return values.reduce(function (concerns, value) {
+      const concern = String(value == null ? "" : value).trim();
+      if (concern && !concerns.includes(concern)) concerns.push(concern);
+      return concerns;
+    }, []);
+  }
+
+  function concernPopover(concerns, index) {
+    if (!concerns.length) return "";
+    const id = "chart-concerns-" + index;
+    const label = concerns.length === 1 ? "Chart issue" : number(concerns.length) + " chart issues";
+    const reasons = concerns.length === 1
+      ? '<p>' + escapeHtml(concerns[0]) + '</p>'
+      : '<ul>' + concerns.map(function (concern) { return '<li>' + escapeHtml(concern) + '</li>'; }).join("") + '</ul>';
+    return '<div class="chart-concern"><button type="button" class="concern-trigger" data-action="toggle-concern" aria-controls="' + id + '" aria-describedby="' + id + '"><span class="concern-mark" aria-hidden="true">!</span><span>' + label + '</span></button><div class="concern-popover" id="' + id + '" role="tooltip"><strong>Why this chart needs attention</strong>' + reasons + '</div></div>';
+  }
+
   function chartRows() {
-    return model.review.tracks.map(function (card) {
+    return model.review.tracks.map(function (card, index) {
       const selected = selectionMatchesCard(card);
       const recommended = recommendationCandidate(card);
       const candidate = displayedCandidate(card) || recommended || {};
@@ -343,11 +363,10 @@
       const tier = tierState === "strong" ? "Best match" : "Best available";
       const chartTitle = candidate.candidate_title || candidate.title || candidate.name || "Recommended chart";
       const charter = String(candidate.charter || "").trim();
-      const concerns = candidate.review && Array.isArray(candidate.review.concerns) ? candidate.review.concerns : [];
-      const concern = concerns.length ? String(concerns[0]) : "";
+      const concerns = reviewConcerns(candidate);
       const source = sourceLabel(candidate.source);
       const accessible = "Use " + String(card.title || "this song") + " by " + String(card.artist || "unknown artist");
-      return '<div class="chart-row' + (selected ? " is-row-selected" : "") + '" data-track-key="' + escapeHtml(card.track_key) + '" aria-busy="' + (pending ? "true" : "false") + '"><label class="row-check"><input type="checkbox" data-row-selection data-track-key="' + escapeHtml(card.track_key) + '" aria-label="' + escapeHtml(accessible) + '"' + (selected ? " checked" : "") + (disabled ? ' disabled aria-disabled="true"' : '') + '><span class="custom-check" aria-hidden="true">' + icons.check + '</span></label><span class="chart-art" aria-hidden="true">' + escapeHtml(source.charAt(0)) + '</span><div class="chart-song"><strong>' + escapeHtml(card.title) + '</strong><small>' + escapeHtml(card.artist) + '</small></div><div class="chart-tags"><span class="source-tag">' + escapeHtml(source) + '</span><span class="tier-tag ' + (tierState === "strong" ? "tier-best" : "tier-available") + '">' + tier + '</span></div><div class="chart-version"><span>' + escapeHtml(chartTitle) + '</span>' + (charter ? '<small>Chart by ' + escapeHtml(charter) + '</small>' : '') + (concern ? '<em class="concern-label"><span aria-hidden="true">!</span>' + escapeHtml(concern) + '</em>' : '') + (pending ? '<strong class="row-pending" role="status">Saving...</strong>' : '') + '</div></div>';
+      return '<div class="chart-row' + (selected ? " is-row-selected" : "") + '" data-track-key="' + escapeHtml(card.track_key) + '" aria-busy="' + (pending ? "true" : "false") + '"><label class="row-check"><input type="checkbox" data-row-selection data-track-key="' + escapeHtml(card.track_key) + '" aria-label="' + escapeHtml(accessible) + '"' + (selected ? " checked" : "") + (disabled ? ' disabled aria-disabled="true"' : '') + '><span class="custom-check" aria-hidden="true">' + icons.check + '</span></label><span class="chart-art" aria-hidden="true">' + escapeHtml(source.charAt(0)) + '</span><div class="chart-song"><strong>' + escapeHtml(card.title) + '</strong><small>' + escapeHtml(card.artist) + '</small></div><div class="chart-tags"><span class="source-tag">' + escapeHtml(source) + '</span><span class="tier-tag ' + (tierState === "strong" ? "tier-best" : "tier-available") + '">' + tier + '</span></div><div class="chart-version"><span>' + escapeHtml(chartTitle) + '</span>' + (charter ? '<small>Chart by ' + escapeHtml(charter) + '</small>' : '') + concernPopover(concerns, index) + (pending ? '<strong class="row-pending" role="status">Saving...</strong>' : '') + '</div></div>';
     }).join("");
   }
 
@@ -416,16 +435,21 @@
     return '<div><dt>' + label + '</dt><dd' + (testName ? ' data-test="' + testName + '"' : '') + '>' + value + '</dd></div>';
   }
 
-  function folderVisual(preflight, ready) {
+  function folderVisual(preflight, state) {
     const destination = String(preflight && preflight.destination || model.preflightDestination || "Songs folder");
-    return '<div class="songs-folder-visual" data-test="destination-visual"><div class="folder-halo"></div><div class="folder-card' + (ready ? " is-ready" : " needs-attention") + '"><span class="folder-icon">' + icons.folder + '</span><span><small>Destination</small><strong>' + escapeHtml(destinationName(destination)) + '</strong></span><span class="folder-check" aria-hidden="true">' + (ready ? icons.check : "!") + '</span></div></div>';
+    const ready = state === "ready";
+    const warning = state === "warning";
+    const indicator = ready
+      ? '<span class="folder-check" aria-hidden="true">' + icons.check + '</span>'
+      : warning ? '<span class="folder-check" aria-hidden="true">!</span>' : "";
+    return '<div class="songs-folder-visual" data-test="destination-visual"><div class="folder-halo"></div><div class="folder-card' + (ready ? " is-ready" : warning ? " needs-attention" : "") + '"><span class="folder-icon">' + icons.folder + '</span><span><small>Destination</small><strong>' + escapeHtml(destinationName(destination)) + '</strong></span>' + indicator + '</div></div>';
   }
 
   function downloadReady() {
     const preflight = model.preflight;
     const persistedCount = exactSelectionItems().length;
     if (model.pendingAction === "preflight" && !preflight) {
-      return shell('<section class="ready-download-stage stage-section" data-test="download-preflight" aria-busy="true"><div class="download-ready-copy"><p class="overline">Download</p><h1>Checking your library</h1><p class="lead-copy">Validating your selected charts, destination, and available space.</p><div class="preflight-wait" role="status"><span></span>Running real download preflight...</div></div>' + folderVisual(null, false) + '</section>', "Download");
+      return shell('<section class="ready-download-stage stage-section" data-test="download-preflight" aria-busy="true"><div class="download-ready-copy"><p class="overline">Download</p><h1>Checking your library</h1><p class="lead-copy">Validating your selected charts, destination, and available space.</p><div class="preflight-wait" role="status"><span></span>Running real download preflight...</div></div>' + folderVisual(null, "neutral") + '</section>', "Download");
     }
 
     const ready = Boolean(preflight && preflight.ok);
@@ -458,9 +482,9 @@
       ? '<button class="button primary" data-action="start-export"' + (busy ? ' disabled aria-disabled="true"' : '') + '>' + (starting ? "Starting download..." : "Download library " + icons.download) + '</button>'
       : "";
     if (ready) {
-      return shell('<section class="ready-download-stage stage-section" data-test="download-ready"><div class="download-ready-copy"><p class="overline">Download</p><h1>Ready to add <span>' + number(selected) + '</span> songs</h1><p class="lead-copy">Your chart choices and destination passed every current check.</p><dl class="download-facts">' + facts + '</dl>' + notice + issueList + '<div class="download-ready-status"><span class="enough-mark">' + icons.check + '</span><span><strong>Ready for download</strong><small>No chart files have been downloaded yet.</small></span></div><div class="download-actions">' + start + '<button class="button secondary" data-action="change-folder"' + (busy ? ' disabled aria-disabled="true"' : '') + '>' + (choosing ? "Choosing folder..." : "Change folder") + '</button><button class="text-link quiet-back" data-action="back-to-charts"' + (busy ? ' disabled aria-disabled="true"' : '') + '>Change chart choices ' + icons.arrow + '</button></div></div>' + folderVisual(preflight, true) + '</section>', "Download");
+      return shell('<section class="ready-download-stage stage-section" data-test="download-ready"><div class="download-ready-copy"><p class="overline">Download</p><h1>Ready to add <span>' + number(selected) + '</span> ' + (selected === 1 ? "song" : "songs") + '</h1><p class="lead-copy">Your chart choices and destination passed every current check.</p><dl class="download-facts">' + facts + '</dl>' + notice + issueList + '<div class="download-ready-status"><span class="enough-mark">' + icons.check + '</span><span><strong>Ready for download</strong><small>No chart files have been downloaded yet.</small></span></div><div class="download-actions">' + start + '<button class="button secondary" data-action="change-folder"' + (busy ? ' disabled aria-disabled="true"' : '') + '>' + (choosing ? "Choosing folder..." : "Change folder") + '</button><button class="text-link quiet-back" data-action="back-to-charts"' + (busy ? ' disabled aria-disabled="true"' : '') + '>Change chart choices ' + icons.arrow + '</button></div></div>' + folderVisual(preflight, "ready") + '</section>', "Download");
     }
-    return shell('<section class="ready-download-stage stage-section" data-test="download-preflight-error"><div class="download-ready-copy"><p class="overline">Download</p><h1>Your library needs one more check</h1><p class="lead-copy">No chart files were downloaded. Your selected charts are still saved.</p><dl class="download-facts">' + facts + '</dl>' + notice + issueList + '<div class="download-actions"><button class="button secondary" data-action="retry-preflight"' + (choosing ? ' disabled aria-disabled="true"' : '') + '>Retry preflight</button><button class="button quiet" data-action="change-folder"' + (choosing ? ' disabled aria-disabled="true"' : '') + '>' + (choosing ? "Choosing folder..." : "Change folder") + '</button><button class="text-link quiet-back" data-action="back-to-charts"' + (choosing ? ' disabled aria-disabled="true"' : '') + '>Change chart choices ' + icons.arrow + '</button></div></div>' + folderVisual(preflight, false) + '</section>', "Download");
+    return shell('<section class="ready-download-stage stage-section" data-test="download-preflight-error"><div class="download-ready-copy"><p class="overline">Download</p><h1>Your library needs one more check</h1><p class="lead-copy">No chart files were downloaded. Your selected charts are still saved.</p><dl class="download-facts">' + facts + '</dl>' + notice + issueList + '<div class="download-actions"><button class="button secondary" data-action="retry-preflight"' + (choosing ? ' disabled aria-disabled="true"' : '') + '>Retry preflight</button><button class="button quiet" data-action="change-folder"' + (choosing ? ' disabled aria-disabled="true"' : '') + '>' + (choosing ? "Choosing folder..." : "Change folder") + '</button><button class="text-link quiet-back" data-action="back-to-charts"' + (choosing ? ' disabled aria-disabled="true"' : '') + '>Change chart choices ' + icons.arrow + '</button></div></div>' + folderVisual(preflight, "warning") + '</section>', "Download");
   }
 
   function knownNumber() {
@@ -486,33 +510,47 @@
     const itemSummary = payload.items || {};
     const itemRows = Array.isArray(itemSummary.items) ? itemSummary.items : [];
     const result = payload.result || {};
-    const total = knownNumber(
-      Number(payload.total) > 0 ? payload.total : null,
-      Number(itemSummary.selected) > 0 ? itemSummary.selected : null,
-      result.selected
+    const preflightSelected = model.preflight && model.preflight.selected_chart_count;
+    const persistedSelected = exactSelectionItems().length;
+    const expectedSelected = knownNumber(
+      Number(preflightSelected) > 0 ? preflightSelected : null,
+      persistedSelected > 0 ? persistedSelected : null,
+      Number(result.selected) > 0 ? result.selected : null
+    );
+    const itemSelected = knownNumber(itemSummary.selected);
+    const selected = knownNumber(
+      result.selected,
+      expectedSelected,
+      itemSelected,
+      Number(payload.total) > 0 ? payload.total : null
     );
     const itemReady = knownNumber(itemSummary.completed, 0);
     const ready = Math.max(knownNumber(result.ready, 0), itemReady);
-    const processed = Math.max(itemReady, knownNumber(payload.done, 0));
+    const running = ["building", "cancelling"].includes(exportState(payload));
     const itemAdded = itemRows.filter(function (item) {
       return item.status === "published" && item.result !== "already_present";
     }).length;
     const itemAvailable = itemRows.filter(function (item) {
       return item.status === "duplicate" || item.result === "already_present";
     }).length;
-    const added = knownNumber(result.added, itemAdded, 0);
-    const alreadyAvailable = knownNumber(result.already_present, itemAvailable, 0);
-    const failed = knownNumber(result.failed, itemSummary.failed, 0);
-    const invalid = knownNumber(result.invalid, itemSummary.invalid, 0);
-    const cancelled = knownNumber(result.cancelled_items, itemSummary.cancelled, 0);
-    let remaining = knownNumber(result.remaining);
-    if (remaining == null && Number(itemSummary.selected) > 0) remaining = knownNumber(itemSummary.remaining, 0);
-    if (remaining == null && total != null) remaining = Math.max(0, total - ready - failed - invalid);
+    const added = running ? itemAdded : knownNumber(result.added, itemAdded, 0);
+    const alreadyAvailable = running ? itemAvailable : knownNumber(result.already_present, itemAvailable, 0);
+    const failed = knownNumber(itemSummary.failed, 0);
+    const invalid = knownNumber(itemSummary.invalid, 0);
+    const cancelled = running
+      ? knownNumber(itemSummary.cancelled, 0)
+      : knownNumber(result.cancelled_items, itemSummary.cancelled, 0);
+    let remaining = running
+      ? (itemSelected != null && itemSelected > 0 ? knownNumber(itemSummary.remaining, 0) : null)
+      : knownNumber(result.remaining, itemSummary.remaining);
+    if (remaining == null && !running && selected != null) remaining = Math.max(0, selected - ready);
+    const progressTotal = running && expectedSelected != null && expectedSelected > 0 && itemSelected === expectedSelected
+      ? expectedSelected : null;
     return {
-      total: total,
-      selected: knownNumber(result.selected, total, itemSummary.selected),
+      selected: selected,
       ready: ready,
-      processed: processed,
+      progressReady: progressTotal == null ? null : Math.max(0, Math.min(progressTotal, itemReady)),
+      progressTotal: progressTotal,
       added: added,
       alreadyAvailable: alreadyAvailable,
       failed: failed,
@@ -540,29 +578,159 @@
       || "Preparing selected charts";
   }
 
-  function downloadRunning() {
-    const status = model.exportStatus || {};
+  function exportRunningView(status) {
     const counts = exportCounts(status);
     const state = exportState(status);
     const cancelling = state === "cancelling";
-    const totalKnown = counts.total != null && counts.total > 0;
-    const percent = totalKnown ? Math.max(0, Math.min(100, Math.round((counts.processed / counts.total) * 100))) : null;
-    const countCopy = totalKnown
-      ? '<strong>' + number(counts.ready) + '</strong> / ' + number(counts.total) + ' ready'
-      : '<strong>' + number(counts.ready) + '</strong> ready';
-    const percentCopy = percent == null ? "" : '<div class="building-percent"><strong>' + number(percent) + '%</strong><span>processed</span></div>';
-    const progress = percent == null
-      ? '<div class="building-progress is-indeterminate" aria-label="Progress total is not available"><span></span></div>'
-      : '<div class="building-progress" role="progressbar" aria-label="Charts processed" aria-valuemin="0" aria-valuemax="' + counts.total + '" aria-valuenow="' + counts.processed + '"><span style="width:' + percent + '%"></span></div>';
+    const determinate = counts.progressTotal != null && counts.progressTotal > 0;
+    const percent = determinate
+      ? counts.progressReady >= counts.progressTotal
+        ? 100
+        : Math.max(0, Math.min(99, Math.round((counts.progressReady / counts.progressTotal) * 100)))
+      : null;
     const transfers = counts.downloading + counts.retrying;
-    const transferCopy = transfers > 0
-      ? '<span class="in-progress"><span class="status-symbol" aria-hidden="true"></span>' + number(transfers) + ' active</span>'
+    const failures = counts.failed + counts.invalid;
+    return {
+      cancelling: cancelling,
+      determinate: determinate,
+      ready: determinate ? counts.progressReady : null,
+      total: determinate ? counts.progressTotal : null,
+      percent: percent,
+      activity: exportActivity(status.current, cancelling),
+      activityLabel: cancelling ? "Stopping safely" : "Current activity",
+      activityDetail: cancelling ? "Completed songs are being kept" : "Each chart is validated before it is added",
+      transfers: transfers,
+      added: counts.added,
+      alreadyAvailable: counts.alreadyAvailable,
+      failures: failures,
+      remaining: counts.remaining == null ? "Not available" : number(counts.remaining),
+      elapsed: status.started_at ? elapsed(Math.max(0, Date.now() / 1000 - Number(status.started_at))) : "Not available",
+      reassuranceWarning: failures > 0,
+      reassuranceTitle: failures > 0 ? "Some charts couldn’t be added." : cancelling ? "Stopping safely." : "No action needed.",
+      reassuranceDetail: failures > 0 ? "Completed charts are safe. Retry unavailable charts after this step finishes." : cancelling ? "Charts already completed will stay in your Songs folder." : "Keep the app running; you can leave this screen.",
+      error: model.exportError,
+      stopDisabled: cancelling || model.pendingAction === "cancel"
+    };
+  }
+
+  function exportGoalComplete(status) {
+    const state = exportState(status);
+    if (state === "complete") return true;
+    if (state !== "partial") return false;
+    const payload = status || {};
+    const result = payload.result || {};
+    const items = payload.items || {};
+    const selected = knownNumber(result.selected, items.selected);
+    const ready = knownNumber(result.ready, items.completed, 0);
+    return selected != null && selected > 0 && ready >= selected;
+  }
+
+  function readyProgressText(view) {
+    return view.percent + "% ready, " + view.ready + " of " + view.total + " " + (view.total === 1 ? "chart" : "charts") + " ready";
+  }
+
+  function downloadRunning() {
+    const status = model.exportStatus || {};
+    const view = exportRunningView(status);
+    const countValue = view.determinate ? number(view.ready) : "";
+    const countCopy = view.determinate ? " / " + number(view.total) + " ready" : "Preparing selected charts";
+    const progressAttributes = view.determinate
+      ? ' aria-label="Charts ready" aria-valuemin="0" aria-valuemax="' + view.total + '" aria-valuenow="' + view.ready + '" aria-valuetext="' + readyProgressText(view) + '"'
+      : ' aria-label="Preparing chart progress"';
+    const warningLabel = view.failures > 0
+      ? "Warning: " + number(view.failures) + (view.failures === 1 ? " chart couldn’t" : " charts couldn’t") + " be added"
       : "";
-    const remaining = counts.remaining == null ? "Not available" : number(counts.remaining);
-    const elapsedCopy = status.started_at ? elapsed(Math.max(0, Date.now() / 1000 - Number(status.started_at))) : "Not available";
-    const error = model.exportError ? '<p class="build-inline-error" role="alert">' + escapeHtml(model.exportError) + '</p>' : "";
-    const stop = '<button class="button quiet stop-safe" data-action="cancel-export"' + (cancelling || model.pendingAction === "cancel" ? ' disabled aria-disabled="true"' : '') + '>' + (cancelling || model.pendingAction === "cancel" ? "Stopping safely..." : "Stop safely") + '</button>';
-    return shell('<section class="building-stage stage-section" data-test="export-' + (cancelling ? "cancelling" : "running") + '" aria-live="polite"><header class="building-head"><div><p class="overline">Download</p><h1>Building your Clone Hero library</h1><p class="building-count">' + countCopy + '</p></div>' + percentCopy + '</header>' + progress + '<div class="flow-visual" aria-hidden="true"><div class="flow-orbit flow-orbit-one"></div><div class="flow-orbit flow-orbit-two"></div><span class="flow-node flow-node-one"></span><span class="flow-node flow-node-two"></span><span class="flow-node flow-node-three"></span><div class="flow-line"></div><div class="songs-folder-target"><span>' + icons.folder + '</span><strong>Songs</strong><small>library</small></div></div><div class="download-now"><span class="activity-mark">' + icons.download + '<i aria-hidden="true"></i></span><div class="download-now-copy"><small>' + (cancelling ? "Stopping safely" : "Current activity") + '</small><h2>' + escapeHtml(exportActivity(status.current, cancelling)) + '</h2><p>' + (cancelling ? "Completed songs are being kept" : "Each chart is validated before it is added") + '</p></div>' + transferCopy + '</div><div class="download-counters"><span><strong>' + number(counts.added) + '</strong> downloaded</span><span><strong>' + number(counts.alreadyAvailable) + '</strong> already available</span><span class="counter-warning"><strong>' + number(counts.failed + counts.invalid) + '</strong> couldn’t be added</span><span><strong>' + remaining + '</strong> remaining</span></div><div class="building-reassurance"><span class="reassurance-mark">' + icons.check + '</span><span><strong>' + (cancelling ? "Stopping safely." : "No action needed.") + '</strong><small>' + (cancelling ? "Charts already completed will stay in your Songs folder." : "Keep the app running; you can leave this screen.") + '</small></span><p class="elapsed"><span>Elapsed</span><strong>' + elapsedCopy + '</strong></p></div>' + error + stop + '</section>', "Download");
+    const stop = '<button class="button quiet stop-safe" data-action="cancel-export"' + (view.stopDisabled ? ' disabled aria-disabled="true"' : '') + '>' + (view.stopDisabled ? "Stopping safely..." : "Stop safely") + '</button>';
+    return shell(
+      '<section class="building-stage stage-section" data-test="export-' + (view.cancelling ? "cancelling" : "running") + '">' +
+      '<header class="building-head"><div><p class="overline">Download</p><h1>Building your Clone Hero library</h1><p class="building-count" role="status" aria-live="polite" aria-atomic="true"><strong data-export-ready' + (view.determinate ? "" : " hidden") + '>' + countValue + '</strong><span data-export-count-copy>' + countCopy + '</span></p></div>' +
+      '<div class="building-percent' + (view.determinate ? "" : " is-preparing") + '" data-export-percent-wrap><strong data-export-percent>' + (view.determinate ? number(view.percent) + "%" : "Preparing") + '</strong><span data-export-percent-label>' + (view.determinate ? "ready" : "charts") + '</span></div></header>' +
+      '<div class="building-progress' + (view.determinate ? "" : " is-indeterminate") + '" data-export-progress role="progressbar"' + progressAttributes + '><span data-export-progress-fill' + (view.determinate ? ' style="width:' + view.percent + '%"' : "") + '></span></div>' +
+      '<div class="flow-visual" aria-hidden="true"><div class="flow-orbit flow-orbit-one"></div><div class="flow-orbit flow-orbit-two"></div><span class="flow-node flow-node-one"></span><span class="flow-node flow-node-two"></span><span class="flow-node flow-node-three"></span><div class="flow-line"></div><div class="songs-folder-target"><span>' + icons.folder + '</span><strong>Songs</strong><small>library</small></div></div>' +
+      '<div class="download-now"><span class="activity-mark">' + icons.download + '<i aria-hidden="true"></i></span><div class="download-now-copy"><small data-export-activity-label>' + view.activityLabel + '</small><h2 data-export-activity>' + escapeHtml(view.activity) + '</h2><p data-export-activity-detail>' + view.activityDetail + '</p></div><span class="in-progress" data-export-transfers' + (view.transfers > 0 ? "" : " hidden") + '><span class="status-symbol" aria-hidden="true"></span><span data-export-transfer-count>' + number(view.transfers) + '</span> active</span></div>' +
+      '<div class="download-counters"><span><strong data-export-added>' + number(view.added) + '</strong> added</span><span><strong data-export-available>' + number(view.alreadyAvailable) + '</strong> already available</span><span class="counter-warning" data-export-warning role="status" aria-label="' + escapeHtml(warningLabel) + '"' + (view.failures > 0 ? "" : " hidden") + '><span class="counter-warning-mark" aria-hidden="true">!</span><strong data-export-failures>' + number(view.failures) + '</strong> couldn’t be added</span><span><strong data-export-remaining>' + view.remaining + '</strong> remaining</span></div>' +
+      '<div class="building-reassurance"><span class="reassurance-mark' + (view.reassuranceWarning ? " is-warning" : "") + '" data-export-reassurance-mark aria-hidden="true">' + (view.reassuranceWarning ? "!" : icons.check) + '</span><span><strong data-export-reassurance-title>' + view.reassuranceTitle + '</strong><small data-export-reassurance-detail>' + view.reassuranceDetail + '</small></span><p class="elapsed"><span>Elapsed</span><strong data-export-elapsed>' + view.elapsed + '</strong></p></div>' +
+      '<p class="build-inline-error" data-export-error role="alert"' + (view.error ? "" : " hidden") + '>' + escapeHtml(view.error) + '</p>' + stop + '</section>',
+      "Download"
+    );
+  }
+
+  function updateText(container, selector, value) {
+    const element = container.querySelector(selector);
+    if (element && element.textContent !== String(value)) element.textContent = String(value);
+    return element;
+  }
+
+  function updateDownloadRunning() {
+    const status = model.exportStatus || {};
+    const view = exportRunningView(status);
+    const testName = "export-" + (view.cancelling ? "cancelling" : "running");
+    const section = app.querySelector(".building-stage");
+    if (!section || section.getAttribute("data-test") !== testName) return false;
+
+    const ready = updateText(section, "[data-export-ready]", view.determinate ? number(view.ready) : "");
+    if (ready) ready.hidden = !view.determinate;
+    updateText(section, "[data-export-count-copy]", view.determinate ? " / " + number(view.total) + " ready" : "Preparing selected charts");
+
+    const percentWrap = section.querySelector("[data-export-percent-wrap]");
+    if (percentWrap) percentWrap.classList.toggle("is-preparing", !view.determinate);
+    updateText(section, "[data-export-percent]", view.determinate ? number(view.percent) + "%" : "Preparing");
+    updateText(section, "[data-export-percent-label]", view.determinate ? "ready" : "charts");
+
+    const progress = section.querySelector("[data-export-progress]");
+    const fill = section.querySelector("[data-export-progress-fill]");
+    if (progress) {
+      progress.classList.toggle("is-indeterminate", !view.determinate);
+      progress.setAttribute("aria-label", view.determinate ? "Charts ready" : "Preparing chart progress");
+      ["aria-valuemin", "aria-valuemax", "aria-valuenow", "aria-valuetext"].forEach(function (attribute) {
+        if (!view.determinate) progress.removeAttribute(attribute);
+      });
+      if (view.determinate) {
+        progress.setAttribute("aria-valuemin", "0");
+        progress.setAttribute("aria-valuemax", String(view.total));
+        progress.setAttribute("aria-valuenow", String(view.ready));
+        progress.setAttribute("aria-valuetext", readyProgressText(view));
+      }
+    }
+    if (fill) fill.style.width = view.determinate ? view.percent + "%" : "";
+
+    updateText(section, "[data-export-activity-label]", view.activityLabel);
+    updateText(section, "[data-export-activity]", view.activity);
+    updateText(section, "[data-export-activity-detail]", view.activityDetail);
+    const transfers = section.querySelector("[data-export-transfers]");
+    if (transfers) transfers.hidden = view.transfers < 1;
+    updateText(section, "[data-export-transfer-count]", number(view.transfers));
+    updateText(section, "[data-export-added]", number(view.added));
+    updateText(section, "[data-export-available]", number(view.alreadyAvailable));
+    updateText(section, "[data-export-failures]", number(view.failures));
+    updateText(section, "[data-export-remaining]", view.remaining);
+
+    const warning = section.querySelector("[data-export-warning]");
+    if (warning) {
+      warning.hidden = view.failures < 1;
+      warning.setAttribute("aria-label", view.failures > 0 ? "Warning: " + number(view.failures) + (view.failures === 1 ? " chart couldn’t" : " charts couldn’t") + " be added" : "");
+    }
+    const reassuranceMark = section.querySelector("[data-export-reassurance-mark]");
+    if (reassuranceMark) {
+      const markerChanged = reassuranceMark.classList.contains("is-warning") !== view.reassuranceWarning;
+      reassuranceMark.classList.toggle("is-warning", view.reassuranceWarning);
+      if (markerChanged) reassuranceMark.innerHTML = view.reassuranceWarning ? "!" : icons.check;
+    }
+    updateText(section, "[data-export-reassurance-title]", view.reassuranceTitle);
+    updateText(section, "[data-export-reassurance-detail]", view.reassuranceDetail);
+    updateText(section, "[data-export-elapsed]", view.elapsed);
+
+    const error = updateText(section, "[data-export-error]", view.error);
+    if (error) error.hidden = !view.error;
+    const stop = section.querySelector("[data-action='cancel-export']");
+    if (stop) {
+      stop.disabled = view.stopDisabled;
+      stop.textContent = view.stopDisabled ? "Stopping safely..." : "Stop safely";
+      if (view.stopDisabled) stop.setAttribute("aria-disabled", "true");
+      else stop.removeAttribute("aria-disabled");
+    }
+    app.setAttribute("aria-busy", "true");
+    return true;
   }
 
   function terminalIssue(status) {
@@ -577,14 +745,15 @@
     const status = model.exportStatus || {};
     const counts = exportCounts(status);
     let state = exportState(status);
-    if (state === "failed" && counts.ready > 0) state = "partial";
     const destination = String(status.destination || status.result && status.result.destination || model.preflightDestination || "");
     const selected = counts.selected == null ? exactSelectionItems().length : counts.selected;
-    const notReady = Math.max(0, selected - counts.ready, counts.failed + counts.invalid + counts.cancelled);
+    const notReady = Math.max(0, selected - counts.ready);
+    if (state === "partial" && notReady === 0) state = "complete";
+    if (state === "failed" && counts.ready > 0 && notReady > 0) state = "partial";
     const destinationDetail = destination ? '<p class="done-destination"><span>Destination</span><strong>' + escapeHtml(destination) + '</strong></p>' : "";
     const changeChoices = '<button class="text-link" data-action="back-to-charts">Change chart choices ' + icons.arrow + '</button>';
     let visual = icons.check;
-    let heading = '<span>' + number(counts.ready) + '</span> songs are ready to play';
+    let heading = '<span>' + number(counts.ready) + '</span> ' + (counts.ready === 1 ? "song is" : "songs are") + ' ready to play';
     let body = '<p class="done-instruction">In Clone Hero or YARG, scan your Songs folder.</p>';
     let actions = changeChoices;
     let className = "is-complete";
@@ -592,22 +761,22 @@
 
     if (state === "partial") {
       visual = number(notReady);
-      heading = '<span>' + number(counts.ready) + '</span> songs are ready';
+      heading = '<span>' + number(counts.ready) + '</span> ' + (counts.ready === 1 ? "song is" : "songs are") + ' ready';
       body = '<p class="done-issue"><strong>' + number(notReady) + '</strong> couldn’t be added</p><p class="done-instruction">Completed charts are safe. Retry only the remaining work.</p>';
       actions = '<button class="button secondary" data-action="retry-export">Retry remaining</button>' + changeChoices;
       className = "is-partial";
       testName = "export-partial";
     } else if (["cancelled", "interrupted"].includes(state)) {
       visual = number(counts.ready);
-      heading = '<span>' + number(counts.ready) + '</span> charts are already ready';
+      heading = '<span>' + number(counts.ready) + '</span> ' + (counts.ready === 1 ? "chart is" : "charts are") + ' already ready';
       body = '<p class="done-issue"><strong>' + number(counts.remaining == null ? notReady : counts.remaining) + '</strong> remain</p><p class="done-instruction">Completed charts were kept. Resume only when you are ready.</p>';
       actions = '<button class="button primary" data-action="resume-export">Resume download ' + icons.download + '</button>' + changeChoices;
       className = "is-recovery";
       testName = "export-" + state;
     } else if (state === "failed") {
       visual = "!";
-      heading = 'Build failed';
-      body = '<p class="done-instruction">' + escapeHtml(terminalIssue(status)) + '</p><p class="done-issue"><strong>' + number(selected) + '</strong> charts selected</p>';
+      heading = counts.ready > 0 ? '<span>' + number(counts.ready) + '</span> ' + (counts.ready === 1 ? "song is" : "songs are") + ' ready, but finishing failed' : 'Build failed';
+      body = '<p class="done-instruction">' + escapeHtml(terminalIssue(status)) + '</p>' + (counts.ready > 0 ? '<p class="done-issue">Completed chart files remain in your Songs folder.</p>' : '<p class="done-issue"><strong>' + number(selected) + '</strong> ' + (selected === 1 ? "chart" : "charts") + ' selected</p>');
       actions = '<button class="button secondary" data-action="retry-export">Try again</button>' + changeChoices;
       className = "is-failed";
       testName = "export-failed";
@@ -665,7 +834,7 @@
     else if (snapshot.matching && snapshot.matching.state !== "music_ready") content = matchingVisual(snapshot);
     else if (snapshot.operation && snapshot.operation.state === "importing") content = importing(snapshot);
     else content = snapshot.music.canonical_count ? musicReady(snapshot) : sourcesEmpty(snapshot);
-    const terminalDone = lifecycle && exportState(model.exportStatus) === "complete";
+    const terminalDone = lifecycle && exportGoalComplete(model.exportStatus);
     const stage = snapshot.matching && snapshot.matching.state === "charts_found" ? (terminalDone ? "Done" : model.downloadView ? "Download" : "Confirm charts") : snapshot.matching && snapshot.matching.state !== "music_ready" ? "Find charts" : snapshot.operation.state === "importing" ? "Add music" : snapshot.music.canonical_count ? "Music ready" : "Add music";
     app.innerHTML = '<header class="topbar"><div class="brand"><span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span><span class="brand-name">Riff</span><span class="brand-divider" aria-hidden="true"></span><span class="brand-context">music to Clone Hero</span></div><div class="stage-label"><span class="stage-pip" aria-hidden="true"></span><span id="stage-label">' + stage + '</span></div></header>' + content.slice(content.indexOf("<main"));
     app.setAttribute("aria-busy", matchingActive(snapshot) || ["preflight", "folder", "export-start", "cancel"].includes(model.pendingAction) || lifecycle && ["building", "cancelling"].includes(exportState(model.exportStatus)) ? "true" : "false");
@@ -694,6 +863,18 @@
 
   function focusables(container) {
     return Array.from(container.querySelectorAll("button:not(:disabled), input:not(:disabled), [href], [tabindex]:not([tabindex='-1'])"));
+  }
+
+  function setConcernOpen(concern, open) {
+    if (!concern) return;
+    concern.classList.toggle("is-open", open);
+    if (open) concern.classList.remove("is-dismissed");
+  }
+
+  function closeConcernPopovers(except) {
+    app.querySelectorAll(".chart-concern.is-open").forEach(function (concern) {
+      if (concern !== except) setConcernOpen(concern, false);
+    });
   }
 
   function cancelReviewRequest() {
@@ -843,6 +1024,7 @@
   async function loadExportStatus(options) {
     const settings = options || {};
     if (!model.snapshot || !model.snapshot.workspace_id) return null;
+    const previousState = exportState(model.exportStatus);
     if (model.exportController) model.exportController.abort();
     const controller = new AbortController();
     model.exportController = controller;
@@ -862,14 +1044,18 @@
       } else if (settings.rehydrate) {
         model.exportStatus = null;
       }
-      if (settings.render !== false) render(false);
+      if (settings.render !== false) {
+        const updated = state === previousState && ["building", "cancelling"].includes(state)
+          ? updateDownloadRunning() : false;
+        if (!updated) render(false);
+      }
       if (["building", "cancelling"].includes(state)) scheduleExportPoll();
       return status;
     } catch (error) {
       if (error.name === "AbortError" || revision !== model.exportRevision) return null;
       if (model.exportStatus && ["building", "cancelling"].includes(exportState(model.exportStatus))) {
         model.exportError = "Live progress could not be refreshed. Retrying automatically.";
-        if (settings.render !== false) render(false);
+        if (settings.render !== false && !updateDownloadRunning()) render(false);
         scheduleExportPoll();
       }
       return null;
@@ -1315,6 +1501,8 @@
   app.addEventListener("click", function (event) {
     const backdrop = event.target.closest(".sheet-backdrop");
     if (backdrop && event.target === backdrop) { model.overlay = null; render(false); return; }
+    const concernTrigger = event.target.closest("[data-action='toggle-concern']");
+    closeConcernPopovers(concernTrigger && concernTrigger.closest(".chart-concern"));
     const target = event.target.closest("[data-action]");
     if (!target || !app.contains(target)) return;
     const action = target.dataset.action;
@@ -1336,6 +1524,16 @@
       loadReview(true);
     }
     else if (action === "load-more-review") { loadReview(false); }
+    else if (action === "toggle-concern") {
+      const concern = target.closest(".chart-concern");
+      if (!concern) return;
+      if (concern.classList.contains("is-open") && !concern.classList.contains("is-dismissed")) {
+        setConcernOpen(concern, false);
+        concern.classList.add("is-dismissed");
+      } else {
+        setConcernOpen(concern, true);
+      }
+    }
     else if (action === "continue-download") { runPreflight(); }
     else if (action === "retry-preflight") { runPreflight(model.preflightDestination || undefined); }
     else if (action === "change-folder") { changeFolder(); }
@@ -1365,7 +1563,32 @@
     updateRowSelection(checkbox.dataset.trackKey, checkbox.checked);
   });
 
+  app.addEventListener("focusout", function (event) {
+    const concern = event.target.closest(".chart-concern");
+    if (!concern || event.relatedTarget == null || concern.contains(event.relatedTarget)) return;
+    setConcernOpen(concern, false);
+    concern.classList.remove("is-dismissed");
+  });
+
+  app.addEventListener("pointerout", function (event) {
+    const concern = event.target.closest(".chart-concern.is-dismissed");
+    if (!concern || concern.contains(event.relatedTarget) || concern.contains(document.activeElement)) return;
+    concern.classList.remove("is-dismissed");
+  });
+
   document.addEventListener("keydown", function (event) {
+    const activeConcern = document.activeElement && document.activeElement.closest
+      ? document.activeElement.closest(".chart-concern") : null;
+    const openConcern = app.querySelector(".chart-concern.is-open");
+    const hoveredConcern = app.querySelector(".chart-concern:hover");
+    if (event.key === "Escape" && (activeConcern || openConcern || hoveredConcern)) {
+      event.preventDefault();
+      closeConcernPopovers();
+      if (activeConcern) activeConcern.classList.add("is-dismissed");
+      else if (openConcern) openConcern.classList.add("is-dismissed");
+      else hoveredConcern.classList.add("is-dismissed");
+      return;
+    }
     if (event.key === "Escape" && (model.overlay || model.formatOpen)) {
       event.preventDefault();
       const opener = model.opener;

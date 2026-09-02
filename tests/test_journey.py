@@ -226,8 +226,8 @@ def test_journey_preserves_lan_access_token_model(config):
         response = client.get("/?access_token=private-token", environ_base={"REMOTE_ADDR": "192.168.1.2"})
         assert response.status_code == 200
         html = response.get_data(as_text=True)
-        assert "static/journey.css?v=2.5.1&amp;access_token=private-token" in html
-        assert "static/journey.js?v=2.5.1&amp;access_token=private-token" in html
+        assert "static/journey.css?v=2.5.2&amp;access_token=private-token" in html
+        assert "static/journey.js?v=2.5.2&amp;access_token=private-token" in html
         api = client.get("/api/journey?access_token=private-token", environ_base={"REMOTE_ADDR": "192.168.1.2"})
         assert api.status_code == 200
 
