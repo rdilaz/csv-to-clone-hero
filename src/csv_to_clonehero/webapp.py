@@ -50,7 +50,12 @@ from csv_to_clonehero.diagnostics import (
     redact_diagnostic_text,
     write_journey_failure,
 )
-from csv_to_clonehero.exporter import ExportOptions, ExportService
+from csv_to_clonehero.exporter import (
+    ExportManifest,
+    ExportOptions,
+    ExportService,
+    ManifestRecord,
+)
 from csv_to_clonehero.filesystem import destination_path, is_within, sanitize_component
 from csv_to_clonehero.library_inventory import InventoryLimits, scan_library
 from csv_to_clonehero.matching import (
@@ -6888,6 +6893,41 @@ def create_app(
             return error
         return _perform_export(kind, payload, workspace, destination, progress=progress)
 
+    def _trusted_export_ownership(
+        db: Database,
+        destination: str,
+    ) -> tuple[ManifestRecord, ...]:
+        """Load destination-scoped historical ownership without trusting paths."""
+        destination_key = os.path.normcase(str(Path(destination).expanduser().resolve()))
+        records: list[ManifestRecord] = []
+        seen: set[tuple[str, str, str, str]] = set()
+        for row in db.list_export_records():
+            value = row["manifest_json"]
+            if not value:
+                continue
+            try:
+                payload = json.loads(value) if isinstance(value, str) else value
+                manifest = ExportManifest.from_dict(payload)
+                manifest_key = os.path.normcase(
+                    str(Path(manifest.destination).expanduser().resolve())
+                )
+            except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if manifest.kind != "folder" or manifest_key != destination_key:
+                continue
+            for record in manifest.records:
+                key = (
+                    record.target_relpath.replace("\\", "/").casefold(),
+                    record.sha256,
+                    record.source.casefold(),
+                    str(record.chart_id),
+                )
+                if key in seen:
+                    continue
+                seen.add(key)
+                records.append(record)
+        return tuple(records)
+
     def _perform_export(
         kind: str,
         payload: Mapping[str, Any],
@@ -6971,6 +7011,7 @@ def create_app(
                     or 0
                 ),
                 cancellation_event=cancellation_event,
+                ownership_records=_trusted_export_ownership(db, destination),
             )
             provider = app.config.get("SPOTIFY_ARTIFACT_PROVIDER")
             service = ExportService(
@@ -7165,6 +7206,7 @@ def create_app(
                 continue_on_error=True,
                 artifact_retries=int(payload.get("artifact_retries", 2) or 0),
                 download_workers=int(payload.get("download_workers", 3) or 1),
+                ownership_records=_trusted_export_ownership(db, destination),
             )
             service = ExportService(
                 config,

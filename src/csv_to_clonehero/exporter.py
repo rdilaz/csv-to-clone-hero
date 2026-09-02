@@ -485,6 +485,10 @@ class ExportOptions:
     # Match the normal library safety gate when the default validator is used.
     # ``None`` means inherit config.instruments.require_five_fret_guitar.
     require_five_fret_guitar: bool | None = None
+    # Trusted destination-relative ownership history supplied by the caller.
+    # The exporter remains database-independent and revalidates every path/hash.
+    ownership_records: tuple[ManifestRecord, ...] = ()
+    ownership_root: Path | None = field(default=None, repr=False)
 
 
 @dataclass
@@ -2027,6 +2031,12 @@ class ExportService:
             ):
                 reusable_path = item.target_path
             if reusable_path is None:
+                owned = self._owned_artifact_paths(
+                    item, root, options.ownership_records
+                )
+                if owned:
+                    reusable_path = owned[0][1]
+            if reusable_path is None:
                 continue
             try:
                 self._verify_artifact(reusable_path, item, options)
@@ -2107,6 +2117,52 @@ class ExportService:
         if legacy == item.artifact_key:
             return (item.artifact_key,)
         return (item.artifact_key, legacy)
+
+    @staticmethod
+    def _ownership_matches(item: Any, record: ManifestRecord) -> bool:
+        artifact_key = str(getattr(item, "artifact_key", "") or "")
+        if artifact_key and record.artifact_key and artifact_key == record.artifact_key:
+            return True
+        source = str(
+            getattr(item, "source_name", "")
+            or getattr(item, "source", "")
+            or ""
+        )
+        chart_id = getattr(item, "chart_id", None)
+        return bool(
+            source
+            and source.casefold() == record.source.casefold()
+            and chart_id is not None
+            and str(chart_id) == str(record.chart_id)
+        )
+
+    def _owned_artifact_paths(
+        self,
+        item: Any,
+        root: Path,
+        records: Iterable[ManifestRecord],
+    ) -> list[tuple[ManifestRecord, Path]]:
+        """Return only root-confined Riff-owned files whose recorded hash holds."""
+        found: list[tuple[ManifestRecord, Path]] = []
+        seen: set[str] = set()
+        for record in records:
+            if not self._ownership_matches(item, record):
+                continue
+            try:
+                path = _safe_path(root, record.target_relpath)
+            except ValueError:
+                continue
+            key = _path_key(record.target_relpath)
+            if key in seen or not path.is_file() or path.is_symlink():
+                continue
+            seen.add(key)
+            try:
+                actual = _hash_file(path, "sha256")
+            except OSError:
+                continue
+            if hmac.compare_digest(actual.lower(), record.sha256.lower()):
+                found.append((record, path))
+        return found
 
     def _cache_delete(self, key: str) -> None:
         method = getattr(self.artifact_cache, "delete", None)
@@ -2228,6 +2284,23 @@ class ExportService:
                     return verified
                 except ExportError:
                     self._cache_delete(key)
+
+            if options.ownership_root is not None:
+                for record, owned_path in self._owned_artifact_paths(
+                    item,
+                    options.ownership_root,
+                    options.ownership_records,
+                ):
+                    try:
+                        verified = self._verify_artifact(owned_path, item, options)
+                        if not hmac.compare_digest(
+                            verified.sha256.lower(), record.sha256.lower()
+                        ):
+                            continue
+                        stored = self._cache_put(item.artifact_key, owned_path)
+                        return self._verify_artifact(stored, item, options)
+                    except (OSError, ExportError):
+                        continue
 
             part = self._staging_root / f"{item.artifact_key or uuid.uuid4().hex}.sng.part"
             part.unlink(missing_ok=True)
@@ -2586,6 +2659,42 @@ class ExportService:
             generated_at=_utc_now(),
         )
 
+    def _remove_owned_artifact_duplicates(
+        self,
+        item_result: ExportItemResult,
+        artifact: VerifiedArtifact,
+        *,
+        root: Path,
+        target: Path,
+        records: Iterable[ManifestRecord],
+    ) -> None:
+        """Remove redundant Riff-owned copies only after target verification."""
+        if not target.is_file() or target.is_symlink():
+            return
+        try:
+            target_hash = _hash_file(target, "sha256")
+        except OSError:
+            return
+        if not hmac.compare_digest(target_hash.lower(), artifact.sha256.lower()):
+            return
+        target_key = os.path.normcase(str(target.resolve()))
+        for record, old_path in self._owned_artifact_paths(item_result, root, records):
+            if os.path.normcase(str(old_path.resolve())) == target_key:
+                continue
+            # `_owned_artifact_paths` just re-hashed this exact regular file
+            # against the trusted record. No filename or inventory match is
+            # sufficient to reach this unlink boundary.
+            try:
+                old_path.unlink()
+            except OSError as exc:
+                item_result.warnings.append(
+                    f"could not remove prior Riff-owned duplicate {record.target_relpath}: {exc}"
+                )
+            else:
+                item_result.warnings.append(
+                    f"removed prior Riff-owned duplicate: {record.target_relpath}"
+                )
+
     def _publish_folder(
         self,
         preflight: PreflightResult,
@@ -2601,7 +2710,9 @@ class ExportService:
             root.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
             return False, [f"cannot create destination root: {exc}"]
-        owned = {_path_key(record.target_relpath) for record in (prior.records if prior else ())}
+        prior_records = tuple(prior.records if prior else ())
+        ownership_records = tuple(options.ownership_records) + prior_records
+        owned = {_path_key(record.target_relpath) for record in prior_records}
         actual_total = sum(artifact.size_bytes for artifact in artifacts.values())
         budget = options.budget_bytes
         if budget is None and self.config is not None:
@@ -2652,6 +2763,13 @@ class ExportService:
                     item_result.source_hash = artifact.source_hash
                     item_result.source_hash_algorithm = artifact.source_hash_algorithm
                     item_result.playable_note_count = artifact.playable_note_count
+                    self._remove_owned_artifact_duplicates(
+                        item_result,
+                        artifact,
+                        root=root,
+                        target=target,
+                        records=ownership_records,
+                    )
                     continue
                 if _path_key(item_result.target_relpath) not in owned or not options.overwrite_owned:
                     item_result.status = "failed"
@@ -2696,6 +2814,13 @@ class ExportService:
             item_result.source_hash = artifacts[index].source_hash
             item_result.source_hash_algorithm = artifacts[index].source_hash_algorithm
             item_result.playable_note_count = artifacts[index].playable_note_count
+            self._remove_owned_artifact_duplicates(
+                item_result,
+                artifacts[index],
+                root=root,
+                target=target,
+                records=ownership_records,
+            )
         return bool(
             not errors
             or any(item_result.status == "published" for item_result in results)
@@ -2876,6 +3001,7 @@ class ExportService:
         item_progress = item_progress or on_item
         values = _consume_selections(selections)
         root = Path(destination_root).expanduser().resolve()
+        opts.ownership_root = root
         manifest_file = self._manifest_path(root, opts, manifest_path)
         preflight = self._prepare(values, root, mode="folder", options=opts, eligibility_checker=eligibility_checker, progress=progress)
         results = self._initial_results(preflight)

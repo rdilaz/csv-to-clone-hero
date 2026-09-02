@@ -8,6 +8,7 @@ import zipfile
 
 from csv_to_clonehero.exporter import ExportOptions, ExportSelection, ExportService
 from csv_to_clonehero.database import Database
+from csv_to_clonehero.filesystem import destination_path
 from csv_to_clonehero.models import DownloadInfo
 from csv_to_clonehero.sources.base import SourceError
 
@@ -255,6 +256,172 @@ def test_already_completed_chart_is_not_redownloaded(config, tmp_path):
     assert source.downloads == [selection.candidate.md5]
     assert second.items[0].result == "already_present"
     assert second.preflight.reusable_count == 1
+    assert len(list((tmp_path / "Songs").rglob("*.sng"))) == 1
+
+
+def test_owned_artifact_changed_target_relocates_to_one_physical_copy(config, tmp_path):
+    content = valid_sng_bytes("Relocated")
+    selection = _selection(
+        "Relocated", content, chart_id=51,
+        selection_id=1, target_relpath="Old/Relocated.sng",
+    )
+    source = OfflineSource({selection.candidate.md5: content})
+    service = ExportService(config, [source])
+    first = service.export_folder([selection], tmp_path / "Songs", options=_options())
+    ownership = tuple(first.manifest.records)
+    first.manifest_path.unlink()
+
+    selection.selection_id = 999
+    selection.target_relpath = "New/Relocated.sng"
+    second = service.export_folder(
+        [selection],
+        tmp_path / "Songs",
+        options=_options(ownership_records=ownership),
+    )
+    third = service.export_folder(
+        [selection],
+        tmp_path / "Songs",
+        options=_options(ownership_records=ownership),
+    )
+    service.close()
+
+    assert first.success and second.success and third.success
+    assert source.downloads == [selection.candidate.md5]
+    assert not (tmp_path / "Songs" / "Old" / "Relocated.sng").exists()
+    assert (tmp_path / "Songs" / "New" / "Relocated.sng").read_bytes() == content
+    assert len(list((tmp_path / "Songs").rglob("*.sng"))) == 1
+    assert [record.target_relpath for record in second.manifest.records] == ["New/Relocated.sng"]
+    assert [record.target_relpath for record in third.manifest.records] == ["New/Relocated.sng"]
+
+
+def test_changed_owned_file_is_preserved_and_not_claimed(config, tmp_path):
+    content = valid_sng_bytes("Owned original")
+    changed = valid_sng_bytes("User changed")
+    selection = _selection(
+        "Owned original", content, chart_id=52,
+        target_relpath="Old/Owned.sng",
+    )
+    source = OfflineSource({selection.candidate.md5: content})
+    service = ExportService(config, [source])
+    first = service.export_folder([selection], tmp_path / "Songs", options=_options())
+    ownership = tuple(first.manifest.records)
+    first.manifest_path.unlink()
+    old = tmp_path / "Songs" / "Old" / "Owned.sng"
+    old.write_bytes(changed)
+
+    selection.target_relpath = "New/Owned.sng"
+    second = service.export_folder(
+        [selection],
+        tmp_path / "Songs",
+        options=_options(ownership_records=ownership),
+    )
+    service.close()
+
+    assert second.success
+    assert old.read_bytes() == changed
+    assert (tmp_path / "Songs" / "New" / "Owned.sng").read_bytes() == content
+    assert [record.target_relpath for record in second.manifest.records] == ["New/Owned.sng"]
+
+
+def test_identical_non_riff_file_elsewhere_is_never_removed(config, tmp_path):
+    content = valid_sng_bytes("Unowned")
+    selection = _selection(
+        "Unowned", content, chart_id=53,
+        target_relpath="Old/Owned.sng",
+    )
+    source = OfflineSource({selection.candidate.md5: content})
+    service = ExportService(config, [source])
+    first = service.export_folder([selection], tmp_path / "Songs", options=_options())
+    ownership = tuple(first.manifest.records)
+    first.manifest_path.unlink()
+    unowned = tmp_path / "Songs" / "User Library" / "Unowned.sng"
+    unowned.parent.mkdir(parents=True)
+    unowned.write_bytes(content)
+
+    selection.target_relpath = "New/Owned.sng"
+    second = service.export_folder(
+        [selection],
+        tmp_path / "Songs",
+        options=_options(ownership_records=ownership),
+    )
+    service.close()
+
+    assert second.success
+    assert unowned.read_bytes() == content
+    assert not (tmp_path / "Songs" / "Old" / "Owned.sng").exists()
+    assert (tmp_path / "Songs" / "New" / "Owned.sng").is_file()
+
+
+def test_cancelled_relocation_keeps_last_valid_owned_copy(config, tmp_path):
+    content = valid_sng_bytes("Cancel relocation")
+    selection = _selection(
+        "Cancel relocation", content, chart_id=54,
+        target_relpath="Old/Cancel.sng",
+    )
+    source = OfflineSource({selection.candidate.md5: content})
+    service = ExportService(config, [source])
+    first = service.export_folder([selection], tmp_path / "Songs", options=_options())
+    ownership = tuple(first.manifest.records)
+    first.manifest_path.unlink()
+    selection.target_relpath = "New/Cancel.sng"
+    cancelled = threading.Event()
+    cancelled.set()
+
+    result = service.export_folder(
+        [selection],
+        tmp_path / "Songs",
+        options=_options(ownership_records=ownership, cancellation_event=cancelled),
+    )
+    service.close()
+
+    assert result.cancelled
+    assert (tmp_path / "Songs" / "Old" / "Cancel.sng").read_bytes() == content
+    assert not (tmp_path / "Songs" / "New" / "Cancel.sng").exists()
+
+
+def test_failed_new_publication_keeps_prior_valid_owned_copy(config, tmp_path):
+    content = valid_sng_bytes("Failed relocation")
+    selection = _selection(
+        "Failed relocation", content, chart_id=55,
+        target_relpath="Old/Failed.sng",
+    )
+    source = OfflineSource({selection.candidate.md5: content})
+    service = ExportService(config, [source])
+    first = service.export_folder([selection], tmp_path / "Songs", options=_options())
+    ownership = tuple(first.manifest.records)
+    first.manifest_path.unlink()
+    blocked_parent = tmp_path / "Songs" / "Blocked"
+    blocked_parent.write_text("not a directory", encoding="utf-8")
+    selection.target_relpath = "Blocked/Failed.sng"
+
+    result = service.export_folder(
+        [selection],
+        tmp_path / "Songs",
+        options=_options(ownership_records=ownership),
+    )
+    service.close()
+
+    assert not result.success
+    assert (tmp_path / "Songs" / "Old" / "Failed.sng").read_bytes() == content
+    assert not (blocked_parent / "Failed.sng").exists()
+
+
+def test_ambiguous_audit_cases_use_candidate_metadata_for_canonical_targets(config):
+    cases = [
+        ("Juice WRLD", "Sexual Healing", "Sexual Healing", "Wagsii"),
+        ("Justin Bieber", "Boyfriend", "Believe", "Diego'nt"),
+        ("Her's", "Low Beam", "Invitation to Her's", "7777villain"),
+        ("Oliver Tree (feat. Blink 182)", "Let Me Down", "Let Me Down Single", "Chainsaw Octopus"),
+    ]
+    for index, (artist, title, album, charter) in enumerate(cases, start=1):
+        candidate = make_chart(title, artist, chart_id=550 + index, charter=charter)
+        candidate.album = album
+        relative = destination_path(config, candidate, "exact", track=None)
+        assert relative.parts == (
+            artist,
+            album,
+            f"{artist} - {title} [{charter}].sng",
+        )
 
 
 def test_duplicate_authoritative_md5_downloads_once(config, tmp_path):

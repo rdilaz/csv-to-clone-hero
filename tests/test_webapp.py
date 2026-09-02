@@ -2334,6 +2334,100 @@ def test_journey_folder_preflight_is_no_write_and_exposes_destination_truth(conf
     assert list(config.base_dir.rglob("*.sng")) == []
 
 
+def test_local_export_uses_trusted_history_to_relocate_owned_artifact(config, tmp_path):
+    import hashlib
+
+    from csv_to_clonehero.exporter import ExportManifest, ManifestRecord
+    from csv_to_clonehero.filesystem import destination_path
+    from tests.conftest import valid_sng_bytes
+
+    content = valid_sng_bytes("Owned history")
+    digest = hashlib.md5(content).hexdigest()
+    chart = make_chart("Song", "Artist", chart_id=301, md5=digest)
+    source = FakeSource(files={digest: content})
+    app = create_app(config, source_factory=lambda cfg: [source])
+    app.config["TESTING"] = True
+    root = tmp_path / "Songs"
+
+    with app.test_client() as http:
+        workspace = http.get("/api/sources").get_json()["workspace_id"]
+        track = seed_local_workspace(config, workspace)
+        db = Database(config.database_path)
+        try:
+            db.upsert_candidate(chart)
+            row = next(
+                candidate
+                for candidate in db.get_workspace_candidates(
+                    workspace,
+                    track_id=track.track_key,
+                    kind="exact",
+                    include_rejected=True,
+                    current_only=True,
+                )
+                if int(candidate["chart_id"]) == 301
+            )
+            candidate_id = int(row["candidate_id"])
+            old_relpath = "Old Artist/Old Album/Old.sng"
+            old_path = root / old_relpath
+            old_path.parent.mkdir(parents=True)
+            old_path.write_bytes(content)
+            record = ManifestRecord(
+                source="test",
+                chart_id=301,
+                sha256=hashlib.sha256(content).hexdigest(),
+                bytes_count=len(content),
+                target_relpath=old_relpath,
+            )
+            export_id = db.create_export_record(
+                workspace,
+                export_key="owned-history",
+                kind="folder",
+                destination=str(root),
+                status="success",
+            )
+            db.update_export_record(
+                export_id,
+                manifest_json=ExportManifest(
+                    records=[record], destination=str(root.resolve()), kind="folder"
+                ).to_dict(),
+            )
+        finally:
+            db.close()
+
+        selected = http.post(
+            "/api/discovery/select",
+            json={
+                "workspace_id": workspace,
+                "kind": "exact",
+                "track_id": track.track_key,
+                "candidate_id": candidate_id,
+            },
+        )
+        assert selected.status_code == 200
+        preview = http.post(
+            "/api/export/preview",
+            json={"workspace_id": workspace, "kind": "folder", "path": str(root)},
+        ).get_json()
+        expected = destination_path(config, chart, "exact", track=track)
+        assert preview["reusable_count"] == 1
+        assert preview["items"][0]["target_relpath"] == expected.as_posix()
+
+        exported = http.post(
+            "/api/export/folder",
+            json={"workspace_id": workspace, "kind": "folder", "path": str(root)},
+        )
+        assert exported.status_code == 200
+        payload = exported.get_json()
+        assert payload["success"] is True
+        assert source.downloads == []
+        assert old_path.exists() is False
+        assert (root / expected).read_bytes() == content
+        assert len(list(root.rglob("*.sng"))) == 1
+        assert [item["target_relpath"] for item in payload["manifest"]["records"]] == [
+            expected.as_posix()
+        ]
+
+
 def test_duplicate_build_request_preserves_active_build(client):
     job = _set_active_export(client.application, done=2, total=4)
     try:
