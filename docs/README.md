@@ -6,6 +6,9 @@
   secrets, catalog snapshots, and retention rules.
 - [`runbook.md`](runbook.md): single-host Docker, Cloudflare, backups, restore,
   rollback, and incident checks.
+- [`adr/0001-source-neutral-master-catalog.md`](adr/0001-source-neutral-master-catalog.md):
+  provider-policy findings, neutral catalog identity/schema, and source-coverage
+  gates for RhythmVerse and Custom Songs Central.
 - [`../CONTRIBUTING.md`](../CONTRIBUTING.md): development setup, tests, and
   change boundaries.
 - [`../SECURITY.md`](../SECURITY.md): secret handling and vulnerability reports.
