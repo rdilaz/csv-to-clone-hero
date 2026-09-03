@@ -725,7 +725,8 @@ class EnchorSource:
                     )
                 if response.status_code != 200:
                     raise SourceError(
-                        f"Download of {candidate.name!r} failed: HTTP {response.status_code}"
+                        f"Download of {candidate.name!r} failed: HTTP {response.status_code}",
+                        status=response.status_code,
                     )
                 content_type = (response.headers.get("Content-Type") or "").split(";")[0].strip().lower()
                 if content_type in {"text/html", "application/json", "text/plain"}:

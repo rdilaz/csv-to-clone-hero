@@ -28,6 +28,7 @@ SECRET_KEY_ENV = "SECRET_KEY"  # session-cookie signing key
 TOKEN_ENCRYPTION_KEY_ENV = "TOKEN_ENCRYPTION_KEY"  # Fernet key for refresh tokens
 APP_BASE_URL_ENV = "APP_BASE_URL"  # public HTTPS origin
 DATABASE_URL_ENV = "DATABASE_URL"  # optional absolute sqlite path override
+CATALOG_PATH_ENV = "CATALOG_PATH"  # operator-managed catalog on persistent state
 NOTIFICATIONS_API_KEY_ENV = "NOTIFICATIONS_API_KEY"  # transactional email key
 GOFUNDME_URL_ENV = "GOFUNDME_URL"
 
@@ -544,8 +545,9 @@ class ServerConfig(BaseModel):
     max_content_length: int = 50 * 1024 * 1024
     enchor_preflight_ttl_seconds: int = 3600
     max_scope_playlists: int = 200
-    max_scope_tracks: int = 10000
-    enable_expansion: bool = False
+    max_scope_tracks: int = 50000
+    max_library_tracks: int = Field(default=50000, ge=1, le=100000)
+    enable_expansion: bool = True
     session: SessionsConfig = Field(default_factory=SessionsConfig)
 
     @property
@@ -692,7 +694,7 @@ class AppConfig(BaseModel):
     @property
     def catalog_path(self) -> Path:
         """Location of the optional generated Enchor metadata snapshot."""
-        return self._resolve_expanded(self.paths.catalog)
+        return self._resolve_expanded(os.environ.get(CATALOG_PATH_ENV, "").strip() or self.paths.catalog)
 
     @property
     def public_base_url(self) -> str:

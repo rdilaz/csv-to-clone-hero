@@ -11,7 +11,7 @@ from csv_to_clonehero.config import AppConfig
 from csv_to_clonehero.database import Database
 from csv_to_clonehero.models import ChartCandidate
 from csv_to_clonehero.normalization import normalize_artist, normalize_title
-from csv_to_clonehero.server.jobs import JobManager, _job_payload
+from csv_to_clonehero.server.jobs import JobManager, _job_payload, _live_yield_audit
 from csv_to_clonehero.server.security import TokenCipher, generate_fernet_key
 from csv_to_clonehero.server.throttle import reset_global_gate_for_tests
 from csv_to_clonehero.sources.enchor import PREFLIGHT_VERSION
@@ -521,3 +521,278 @@ def test_spotify_and_soundcloud_oauth_use_shared_prefetched_discovery(
         assert current.error == "one bounded query failed"
     finally:
         manager.shutdown(timeout=2)
+
+
+def test_expansion_job_uses_catalog_without_chart_source_searches(
+    config, db, cipher, monkeypatch
+):
+    from csv_to_clonehero.providers.base import LibrarySnapshot, ProviderTrack
+    from tests.conftest import make_chart
+
+    user = db.get_user("job-user")
+    key = Database.workspace_key_for_user("job-user")
+    workspace = db.get_workspace(key)
+    db.upsert_library_snapshot(
+        workspace["id"],
+        LibrarySnapshot("soundcloud", [
+            ProviderTrack("soundcloud", "known", "Known", "Artist")
+        ]),
+    )
+    generation = db.create_discovery_scan(
+        workspace["id"],
+        scan_key="catalog-exact",
+        kind="exact",
+        status="complete",
+        metadata={"workflow": "combined_catalog"},
+    )
+    db.update_workspace(
+        workspace["id"], status="complete", phase="complete",
+        metadata={"workflow": "public_catalog"},
+    )
+    chart = make_chart("More", "Artist", chart_id=700)
+
+    class Catalog:
+        available = True
+        diagnostic = ""
+        snapshot_id = "catalog-fixture"
+        chart_count = 1
+
+        def artist_songs(self, artist):
+            return (("more", (chart,)),) if artist == "artist" else ()
+
+    monkeypatch.setattr(
+        "csv_to_clonehero.catalog.load_enchor_catalog", lambda *args, **kwargs: Catalog()
+    )
+    source_calls = []
+
+    def forbidden_sources(_config):
+        source_calls.append(True)
+        raise AssertionError("expansion must not construct chart sources")
+
+    manager = JobManager(
+        config, cipher, source_factory=forbidden_sources, auto_start=False
+    )
+    try:
+        job = manager.enqueue(
+            int(user["id"]),
+            "expansion",
+            workspace_key=key,
+            initial_progress={
+                "artists": ["artist"],
+                "exact_generation_id": generation,
+            },
+        )
+        manager._run_job(job)
+
+        completed = manager.get(job.id)
+        assert completed.status == "complete"
+        assert completed.result["network_requests"] == 0
+        assert completed.result["recommendations"] == 1
+        assert source_calls == []
+        rows = db.get_workspace_candidates(workspace["id"], kind="expansion")
+        assert [row["chart_id"] for row in rows] == [700]
+    finally:
+        manager.shutdown(timeout=2)
+
+
+def test_public_exact_catalog_mode_constructs_no_search_source(
+    config, db, cipher, monkeypatch
+):
+    from csv_to_clonehero.spotify import LibraryImportResult, SpotifyLibraryRecord
+    from tests.conftest import make_chart
+
+    user = db.get_user("job-user")
+    key = Database.workspace_key_for_user("job-user")
+    chart = make_chart("Song", "Artist", chart_id=801)
+
+    class Catalog:
+        available = True
+        diagnostic = ""
+        snapshot_id = "public-catalog"
+        sha256 = "catalog-checksum"
+        validation_fingerprint = "ledger"
+        chart_count = 1
+        known_chart_count = 1
+        manifest = {
+            "snapshot_id": snapshot_id,
+            "sha256": sha256,
+            "validation_fingerprint": validation_fingerprint,
+            "chart_count": 1,
+        }
+
+        def candidates(self, artist, title):
+            return (chart,) if (artist, title) == ("Artist", "Song") else ()
+
+        def artist_songs(self, artist):
+            return (("song", (chart,)),) if artist == "artist" else ()
+
+    class FakeClient:
+        def list_playlists(self):
+            return []
+
+        def fetch_library(self, *, include_liked, playlists, on_progress=None):
+            assert include_liked is True
+            return LibraryImportResult([
+                SpotifyLibraryRecord("sp-1", "Song", ["Artist"], liked=True)
+            ])
+
+        def close(self):
+            pass
+
+    catalog = Catalog()
+    monkeypatch.setattr("csv_to_clonehero.catalog.load_enchor_catalog", lambda *args, **kwargs: catalog)
+    monkeypatch.setattr("csv_to_clonehero.server.safeguards.load_enchor_catalog", lambda *args, **kwargs: catalog)
+    monkeypatch.setattr("csv_to_clonehero.server.jobs.build_oauth", lambda *_args: object())
+    monkeypatch.setattr("csv_to_clonehero.server.jobs.build_spotify_client", lambda *_args: FakeClient())
+    source_calls = []
+
+    def forbidden_sources(_config):
+        source_calls.append(True)
+        raise AssertionError("catalog matching must not construct a live search source")
+
+    manager = JobManager(config, cipher, source_factory=forbidden_sources, auto_start=False)
+    try:
+        job = manager.enqueue(int(user["id"]), "discovery", workspace_key=key)
+        manager._cancel_events[job.id] = threading.Event()
+        manager._run_discovery(job)
+        current = manager.get(job.id)
+        assert source_calls == []
+        assert current.status == "complete"
+        assert current.result["discovery_mode"] == "catalog"
+        assert current.result["yield_total"] == 1
+        assert current.result["yield_histogram"]["recommended_strong"] == 1
+    finally:
+        manager.shutdown(timeout=2)
+
+
+def test_catalog_import_limit_rejects_before_snapshot_persistence(
+    config, db, cipher, monkeypatch
+):
+    from csv_to_clonehero.spotify import LibraryImportResult, SpotifyLibraryRecord
+    from tests.conftest import make_chart
+
+    config.server.max_library_tracks = 1
+    user = db.get_user("job-user")
+    key = Database.workspace_key_for_user("job-user")
+    chart = make_chart("One", "Artist", chart_id=811)
+
+    class Catalog:
+        available = True
+        diagnostic = ""
+        snapshot_id = "limit-catalog"
+        sha256 = "limit-checksum"
+        validation_fingerprint = ""
+        chart_count = 1
+        known_chart_count = 1
+        manifest = {"snapshot_id": snapshot_id, "sha256": sha256, "chart_count": 1}
+
+        def candidates(self, artist, title):
+            return (chart,)
+
+        def artist_songs(self, artist):
+            return ()
+
+    class FakeClient:
+        def list_playlists(self):
+            return []
+
+        def fetch_library(self, **_kwargs):
+            return LibraryImportResult([
+                SpotifyLibraryRecord("sp-1", "One", ["Artist"], liked=True),
+                SpotifyLibraryRecord("sp-2", "Two", ["Artist"], liked=True),
+            ])
+
+        def close(self):
+            pass
+
+    catalog = Catalog()
+    monkeypatch.setattr("csv_to_clonehero.catalog.load_enchor_catalog", lambda *args, **kwargs: catalog)
+    monkeypatch.setattr("csv_to_clonehero.server.safeguards.load_enchor_catalog", lambda *args, **kwargs: catalog)
+    monkeypatch.setattr("csv_to_clonehero.server.jobs.build_oauth", lambda *_args: object())
+    monkeypatch.setattr("csv_to_clonehero.server.jobs.build_spotify_client", lambda *_args: FakeClient())
+    manager = JobManager(config, cipher, source_factory=lambda _config: [], auto_start=False)
+    try:
+        job = manager.enqueue(int(user["id"]), "discovery", workspace_key=key)
+        manager._cancel_events[job.id] = threading.Event()
+        with pytest.raises(ValueError, match="safe limit"):
+            manager._run_discovery(job)
+        workspace = db.get_workspace(key)
+        assert db.get_neutral_library_tracks(workspace["id"]) == []
+    finally:
+        manager.shutdown(timeout=2)
+
+
+def test_spotify_only_live_fallback_refreshes_instead_of_using_stale_provenance(
+    config, db, cipher, monkeypatch
+):
+    from csv_to_clonehero.providers.base import LibrarySnapshot, ProviderTrack
+    from csv_to_clonehero.spotify import LibraryImportResult, SpotifyLibraryRecord
+
+    user = db.get_user("job-user")
+    key = Database.workspace_key_for_user("job-user")
+    workspace = db.get_workspace(key)
+    db.upsert_library_snapshot(
+        workspace["id"],
+        LibrarySnapshot("spotify", [ProviderTrack("spotify", "old", "Old", "Artist")]),
+    )
+    config.paths.catalog = "missing-catalog.jsonl"
+    searched = []
+
+    class FakeClient:
+        def fetch_library(self, **_kwargs):
+            return LibraryImportResult([
+                SpotifyLibraryRecord("new", "New", ["Artist"], liked=True)
+            ])
+
+        def close(self):
+            pass
+
+    class FakeSource:
+        name = "enchor"
+
+        def search_song(self, artist, title):
+            searched.append((artist, title))
+            return []
+
+        def search_artist(self, artist):
+            raise AssertionError("one song should not use artist search")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("csv_to_clonehero.server.jobs.build_oauth", lambda *_args: object())
+    monkeypatch.setattr("csv_to_clonehero.server.jobs.build_spotify_client", lambda *_args: FakeClient())
+    manager = JobManager(config, cipher, source_factory=lambda _config: [FakeSource()], auto_start=False)
+    try:
+        job = manager.enqueue(int(user["id"]), "discovery", workspace_key=key)
+        manager._cancel_events[job.id] = threading.Event()
+        manager._run_discovery(job)
+        assert searched == [("Artist", "New")]
+        assert manager.get(job.id).result["discovery_mode"] == "live_fallback"
+    finally:
+        manager.shutdown(timeout=2)
+
+
+def test_live_yield_audit_keeps_failure_evidence_song_specific(config, db):
+    from tests.conftest import make_track
+
+    workspace = db.get_workspace(Database.workspace_key_for_user("job-user"))
+    tracks = [make_track("Failed", "Artist"), make_track("Absent", "Artist")]
+    db.replace_tracks(tracks, {"yield.csv": 2})
+    db.replace_workspace_library_tracks(workspace["id"], tracks)
+    db.initialize_discovery_song_progress(workspace["id"], tracks)
+    db.update_discovery_song_progress(
+        workspace["id"], tracks[0].track_key, status="complete",
+        classification="incomplete_evidence",
+        reason="live provider failure or truncated evidence",
+    )
+    db.update_discovery_song_progress(
+        workspace["id"], tracks[1].track_key, status="complete",
+        classification="no_catalog_candidate",
+        reason="no plausible catalog candidate",
+    )
+    stats = type("Stats", (), {"partial": True, "query_errors": 1})()
+    audit = _live_yield_audit(config, db, workspace["id"], stats)
+    assert audit["yield_total"] == 2
+    assert audit["yield_histogram"]["incomplete_evidence"] == 1
+    assert audit["yield_histogram"]["no_plausible_catalog_candidate"] == 1

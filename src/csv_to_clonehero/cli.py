@@ -1,6 +1,6 @@
 """Command-line interface.
 
-Commands: scan, search, expand, plan, build, report, doctor, reset-cache, catalog-export.
+Commands: scan, search, expand, plan, build, report, doctor, reset-cache, catalog-export, catalog-validate.
 """
 
 from __future__ import annotations
@@ -39,6 +39,39 @@ def cmd_catalog_export(config, args) -> int:
         for item in sources:
             item.close()
     console.print(f"[green]Wrote {result['chart_count']:,} charts to {result['path']}[/green]")
+    return 0
+
+
+def cmd_catalog_validate(config, args) -> int:
+    """Run a deliberately bounded, resumable artifact-validation batch."""
+    from csv_to_clonehero.catalog_validation import validate_catalog_artifacts, validation_summary
+
+    db = _open_db(config)
+    sources = []
+    try:
+        if args.status:
+            result = {"states": validation_summary(db), "attempted": 0}
+        else:
+            sources = _open_sources(config)
+            result = validate_catalog_artifacts(
+                config,
+                db,
+                sources,
+                states=args.state or ("UNVERIFIED",),
+                limit=args.limit,
+            )
+    except Exception as exc:
+        console.print(f"[red]Catalog validation failed: {exc}[/red]")
+        return 2
+    finally:
+        for source in sources:
+            source.close()
+        db.close()
+    states = result["states"]
+    console.print(
+        f"Checked {result['attempted']:,} charts | "
+        + " | ".join(f"{name}: {states.get(name, 0):,}" for name in ("VERIFIED", "UNVERIFIED", "REJECTED", "UNAVAILABLE"))
+    )
     return 0
 
 
@@ -509,6 +542,11 @@ def build_parser() -> argparse.ArgumentParser:
     catalog.add_argument("--output", type=Path, default=None)
     catalog.add_argument("--checkpoint", type=Path, default=None)
 
+    validate = sub.add_parser("catalog-validate", help="validate a bounded catalog artifact batch")
+    validate.add_argument("--state", action="append", choices=("VERIFIED", "UNVERIFIED", "REJECTED", "UNAVAILABLE"), default=None)
+    validate.add_argument("--limit", type=int, default=100, help="maximum charts to download (hard-capped at 1000)")
+    validate.add_argument("--status", action="store_true", help="show ledger counts without downloading")
+
     web = sub.add_parser("web", help="start the web interface")
     web.add_argument("--port", type=int, default=8765)
     web.add_argument("--host", default="127.0.0.1", help="bind address; non-loopback requires --lan")
@@ -559,6 +597,7 @@ def main(argv: list[str] | None = None) -> int:
         "doctor": cmd_doctor,
         "reset-cache": cmd_reset_cache,
         "catalog-export": cmd_catalog_export,
+        "catalog-validate": cmd_catalog_validate,
         "web": cmd_web,
         "keys": cmd_keys,
         "serve": cmd_serve,

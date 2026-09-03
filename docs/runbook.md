@@ -29,6 +29,7 @@ values are:
 | `SPOTIFY_CLIENT_ID` | Spotify public PKCE application ID |
 | `SECRET_KEY` | Stable Flask/session signing key |
 | `TOKEN_ENCRYPTION_KEY` | Stable Fernet key for encrypted refresh tokens |
+| `CATALOG_PATH` | Complete catalog on persistent state; default `/data/catalog/enchor.jsonl` |
 
 Optional values configure SoundCloud OAuth, transactional email, and the
 GoFundMe link. For SoundCloud in production, set an explicit HTTPS
@@ -66,9 +67,25 @@ Set `APP_BASE_URL=https://riff.ryo-nd.com`. The registered callback and the
 Cloudflare public hostname must use that exact origin.
 
 The Docker build includes the browser-exporter asset and Python package data.
-The large local `catalog/` snapshot is intentionally excluded. Public Spotify,
-SoundCloud, and combined libraries all use the same bounded live Enchor search
-path and preflight; the catalog snapshot remains local-product state only.
+The large generated catalog is intentionally excluded from Git and the image.
+Place it at `/data/catalog/enchor.jsonl` in the persistent volume (or set
+`CATALOG_PATH`). Replace it atomically. A complete checksum-valid snapshot uses
+local matching and sends zero Enchor search POSTs; the bounded live path and
+preflight are used only as a fail-safe when the snapshot is unavailable.
+
+Generate the snapshot in an operator workspace, verify it, then copy it into
+the stopped container volume or another atomic staging path:
+
+```bash
+python -m csv_to_clonehero catalog-export --output /data/catalog/enchor.jsonl
+python -m csv_to_clonehero catalog-validate --status
+python -m csv_to_clonehero catalog-validate --limit 100
+```
+
+`catalog-validate` checkpoints every verdict in SQLite and validates at most
+100 charts by default (hard maximum 1,000 per invocation). It never starts an
+unbounded full-catalog download crawl. Back up the catalog and validation
+ledger with `/data`.
 
 ## Routine Operations
 
@@ -127,6 +144,8 @@ an older image after a schema change.
 - Repeated Enchor HTTP 429 responses indicate too much concurrency, another
   running instance, or an overly aggressive request delay. Reduce concurrency;
   do not add workers.
+- `/api/preflight` reports `mode=catalog` when the persistent snapshot is
+  checksum-valid, or `mode=live_fallback` with a catalog diagnostic otherwise.
 - Watch job statuses for `partial`, `failed`, `cancelled`, and `interrupted`.
   Cached successful queries remain resumable.
 - Public chart ZIPs are short-lived and single-use. They are assembled in

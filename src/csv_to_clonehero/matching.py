@@ -753,6 +753,10 @@ def _spotify_identifier(value: Any) -> str:
     match = re.search(r"open\.spotify\.com/track/([A-Za-z0-9]+)", text, re.IGNORECASE)
     if match:
         return match.group(1)
+    if re.match(r"^[A-Za-z][A-Za-z0-9_-]*:", text):
+        # Provider-qualified identities keep neutral-library rows stable, but
+        # they are not Spotify song evidence.
+        return ""
     # Explicit Spotify-id fields may contain the bare base-62 ID.  Numeric
     # chart IDs are deliberately ignored by the caller's context.
     return text

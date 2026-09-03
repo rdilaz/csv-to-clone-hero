@@ -113,6 +113,17 @@
   `server/throttle.GlobalGate`, so a single shared IP never exceeds Enchor's
   rate cap. Email-on-completion is optional/best-effort
   (`server/notifications`, resend|smtp|log).
+- Public exact discovery is catalog-first: `CATALOG_PATH` should point at the
+  complete checksum-valid snapshot on persistent `/data`. It reuses
+  `combined_pipeline.py` and makes zero Enchor search POSTs; the bounded live
+  pipeline is fail-safe only. The final cross-provider deduplicated library is
+  hard-capped at 50,000 songs, above the observed 17k-class dogfood library.
+- Public artist expansion is an explicit second-stage catalog job. It uses no
+  Enchor search requests, preserves exact/expansion review separation, and
+  applies the normal expansion gates and caps.
+- `chart_artifact_validations` is the global durable validation ledger.
+  `REJECTED`/`UNAVAILABLE` identities remain auditable but are excluded from
+  catalog eligibility; `catalog-validate` is bounded and restart-safe.
 - Public chart downloads are browser-only: `server/downloads.build_archive`
   assembles a ZIP from workspace selections into transient staging, and
   `server/downloads.BrowserDownloads` hands it over via a short-lived, signed,

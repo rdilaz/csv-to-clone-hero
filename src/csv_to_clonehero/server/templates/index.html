@@ -125,6 +125,7 @@
         <p class="kicker">FIND CHARTS</p>
         <h1 id="findTitle">Finding your Clone Hero charts.</h1>
         <p id="progressMessage" class="lede" role="status" aria-live="polite">Preparing your music...</p>
+        <p class="progress-eta"><span>Estimated time left</span><strong id="progressEta">Estimating...</strong></p>
         <div class="thin-progress" aria-hidden="true"><span id="progressBar"></span></div>
         <p class="progress-count" id="progressCount">Starting...</p>
         <p class="current-song" id="currentSong"></p>
@@ -177,6 +178,23 @@
       <div id="reviewCards" aria-live="polite"></div>
       <div class="pager" id="reviewPager"><button class="button button--secondary" id="reviewPrev" type="button">Previous</button><span id="reviewPage"></span><button class="button button--secondary" id="reviewNext" type="button">Next</button></div>
     </section>
+    {% if config.server.enable_expansion %}
+    <section class="expansion-panel" id="expansionPanel" aria-labelledby="expansionTitle">
+      <div class="expansion-panel__heading">
+        <div><p class="kicker">OPTIONAL</p><h2 id="expansionTitle">Add more songs by artists you already love.</h2></div>
+        <p>Choose artists from your imported music. Riff only uses verified catalog coverage, skips every song already in your library, and keeps these choices separate from exact matches.</p>
+      </div>
+      <div class="expansion-choices" id="expansionChoices" aria-live="polite"><p>Loading eligible artists...</p></div>
+      <div class="expansion-actions">
+        <button class="button button--secondary" id="startExpansionButton" type="button" disabled>Find more songs by selected artists</button>
+        <p id="expansionStatus" role="status" aria-live="polite"></p>
+      </div>
+      <div class="expansion-results" id="expansionResults" hidden>
+        <div class="review-toolbar"><div><h2>Expansion recommendations</h2><p><span id="expansionResultCount">0</span> additional songs available</p></div></div>
+        <div id="expansionCards"></div>
+      </div>
+    </section>
+    {% endif %}
     <div class="primary-action">
       <button class="button button--large" id="continueDownloadButton" type="button" disabled>Continue with selected charts</button>
       <button class="text-button" id="searchAgainButton" type="button">Search again</button>

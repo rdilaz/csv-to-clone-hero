@@ -17,6 +17,10 @@
     reviewFilter: "recommended",
     reviewSearch: "",
     selected: 0,
+    exactSelected: 0,
+    expansionSelected: 0,
+    expansionJobId: null,
+    expansionPollTimer: null,
     selectionMode: "none",
   };
 
@@ -161,13 +165,18 @@
         renderDone(journey.download, null);
         return;
       }
+      if (["queued", "running"].includes(journey.job?.status) && journey.job?.kind === "expansion") {
+        await openConfirm(false);
+        attachExpansionJob(journey.job.id);
+        return;
+      }
       if (["queued", "running"].includes(journey.job?.status)) {
         attachJob(journey.job.id);
         return;
       }
       if (isTerminal(journey.job) || journey.review?.total > 0) {
         await openConfirm(false);
-        if (["failed", "partial", "cancelled", "interrupted"].includes(journey.job?.status)) {
+        if (journey.job?.kind !== "expansion" && ["failed", "partial", "cancelled", "interrupted"].includes(journey.job?.status)) {
           const copy = journey.job.status === "failed"
             ? "The last search did not finish. Saved results are shown below; you can search again."
             : "The last search was incomplete. Review saved results or search again for missing songs.";
@@ -375,22 +384,134 @@
   function progressNumbers(job) {
     const progress = job.progress || {};
     const pairs = [
-      [progress.completed_work, progress.total_work, "checks"],
       [progress.processed_tracks, progress.total_tracks, "songs"],
-      [progress.scoring_tasks_completed, progress.scoring_tasks_total, "checks"],
       [progress.completed_tracks, progress.total_tracks, "songs"],
+      [progress.completed_work, progress.total_work, "checks"],
+      [progress.scoring_tasks_completed, progress.scoring_tasks_total, "checks"],
       [progress.completed_tasks, progress.total_tasks, "queries"],
     ];
     for (const [rawDone, rawTotal, unit] of pairs) {
+      if (rawDone === undefined || rawDone === null || rawDone === "") continue;
       const total = Number(rawTotal || 0);
       if (!Number.isFinite(total) || total <= 0) continue;
       const value = Number(rawDone || 0);
-      const done = Math.min(total, Number.isFinite(value) ? value : 0);
+      const done = Math.max(0, Math.min(total, Number.isFinite(value) ? value : 0));
       const calculated = Math.min(100, Math.round(done / total * 100));
       const percent = !isTerminal(job) && calculated === 100 ? 99 : calculated;
       return {progress, total, done, percent, unit};
     }
     return {progress, total: 0, done: 0, percent: 0, unit: "checks"};
+  }
+
+  function firstFinite(sources, names) {
+    for (const source of sources) {
+      for (const name of names) {
+        const raw = source?.[name];
+        if (raw === undefined || raw === null || raw === "") continue;
+        const value = Number(raw);
+        if (Number.isFinite(value) && value >= 0) return value;
+      }
+    }
+    return null;
+  }
+
+  function elapsedSeconds(job, progress) {
+    const direct = firstFinite([progress, job], ["elapsed_seconds", "elapsed"]);
+    if (direct !== null) return direct;
+    for (const source of [progress, job]) {
+      for (const name of ["started_at", "start_time", "start_timestamp"]) {
+        const raw = source?.[name];
+        if (raw === undefined || raw === null || raw === "") continue;
+        const numeric = Number(raw);
+        const started = Number.isFinite(numeric)
+          ? numeric / (numeric > 1e12 ? 1000 : 1)
+          : Date.parse(String(raw)) / 1000;
+        const elapsed = Date.now() / 1000 - started;
+        if (Number.isFinite(elapsed) && elapsed >= 0) return elapsed;
+      }
+    }
+    return null;
+  }
+
+  function remainingSeconds(value) {
+    if (value === undefined || value === null || value === "") return null;
+    const numeric = Number(value);
+    const timestamp = Number.isFinite(numeric) ? numeric : Date.parse(String(value));
+    if (!Number.isFinite(timestamp) || timestamp < 0) return null;
+    const seconds = !Number.isFinite(numeric) || numeric > 1e9
+      ? timestamp / (timestamp > 1e12 ? 1000 : 1) - Date.now() / 1000
+      : timestamp;
+    return Number.isFinite(seconds) && seconds >= 0 ? Math.min(seconds, 30 * 86400) : null;
+  }
+
+  function firstRemaining(sources, names) {
+    for (const source of sources) {
+      for (const name of names) {
+        const value = remainingSeconds(source?.[name]);
+        if (value !== null) return value;
+      }
+    }
+    return null;
+  }
+
+  function roundedMinutes(seconds) {
+    const minutes = Math.max(1, seconds / 60);
+    if (minutes < 10) return Math.max(1, Math.round(minutes));
+    if (minutes < 30) return Math.round(minutes / 5) * 5;
+    return Math.round(minutes / 10) * 10;
+  }
+
+  function roundedHours(seconds) {
+    const hours = Math.max(1, seconds / 3600);
+    if (hours < 3) return Math.round(hours * 2) / 2;
+    if (hours < 12) return Math.round(hours);
+    return Math.round(hours / 2) * 2;
+  }
+
+  function friendlyEta(lower, upper = lower) {
+    lower = Math.max(0, Math.min(lower, 30 * 86400));
+    upper = Math.max(lower, Math.min(upper, 30 * 86400));
+    if (upper <= 45) return "Less than a minute";
+    const materialRange = upper - lower >= Math.max(60, ((lower + upper) / 2) * .2);
+    if (upper < 5400) {
+      const low = roundedMinutes(lower);
+      const high = roundedMinutes(upper);
+      if (materialRange && high > low) return `About ${low}-${high} minutes`;
+      const minutes = roundedMinutes((lower + upper) / 2);
+      return minutes === 1 ? "About a minute" : `About ${minutes} minutes`;
+    }
+    const low = roundedHours(lower);
+    const high = roundedHours(upper);
+    if (materialRange && high > low) return `About ${low}-${high} hours`;
+    const hours = roundedHours((lower + upper) / 2);
+    return hours === 1 ? "About an hour" : `About ${hours} hours`;
+  }
+
+  function progressEta(job, progress, total, done) {
+    if (!total || done < 3) return "Estimating...";
+    if (done >= total) return "Almost done";
+
+    const sources = [progress, job];
+    const elapsed = elapsedSeconds(job, progress);
+    const providedRate = firstFinite(sources, ["observed_songs_per_second", "completion_rate", "rate", "tracks_per_second", "songs_per_second", "items_per_second"]);
+    let lower = firstRemaining(sources, ["eta_lower_seconds", "eta_lower", "eta_seconds_lower"]);
+    let upper = firstRemaining(sources, ["eta_upper_seconds", "eta_upper", "eta_seconds_upper"]);
+    const estimatedCompleted = firstFinite(sources, ["estimated_completed_seconds"]);
+    const estimatedLower = firstRemaining(sources, ["estimated_lower_seconds"]);
+    const estimatedUpper = firstRemaining(sources, ["estimated_upper_seconds"]);
+    if (lower === null && estimatedLower !== null) lower = Math.max(0, estimatedLower - (estimatedCompleted || 0));
+    if (upper === null && estimatedUpper !== null) upper = Math.max(0, estimatedUpper - (estimatedCompleted || 0));
+    if ((elapsed === null || elapsed < 5) && !(providedRate > 0) && lower === null && upper === null) return "Estimating...";
+    if (lower !== null || upper !== null) return friendlyEta(lower ?? upper, upper ?? lower);
+
+    const observedRate = elapsed !== null && elapsed >= 5 ? done / elapsed : 0;
+    const rate = observedRate > 0 ? observedRate : providedRate;
+    if (!Number.isFinite(rate) || rate <= 0) return "Estimating...";
+    const estimate = (total - done) / rate;
+    if (!Number.isFinite(estimate) || estimate < 0) return "Estimating...";
+
+    const uncertainty = Math.min(.5, Math.max(.08, 1 / Math.sqrt(done)));
+    return friendlyEta(estimate * (1 - uncertainty), estimate * (1 + uncertainty));
   }
 
   async function pollJob() {
@@ -422,12 +543,17 @@
     $("#progressPercent").textContent = total ? `${percent}%` : "...";
     $("#progressBar").style.width = `${percent}%`;
     $("#progressCount").textContent = total ? `${done.toLocaleString()} of ${total.toLocaleString()} ${unit} complete` : "Preparing your music";
+    $("#progressEta").textContent = progressEta(job, progress, total, done);
     const phases = {
       queued: "Your search is waiting its turn. Riff searches carefully to protect the community service.",
       starting: "Preparing your selected music...",
       provider_import: "Loading your selected music...",
       combine: "Merging duplicate songs...",
+      catalog_prepare: "Preparing the community chart catalog...",
       finding_charts: "Comparing songs with playable community charts...",
+      spotify_sync: "Loading your selected music...",
+      source_search: "Checking the community chart library...",
+      scoring: "Comparing songs with playable community charts...",
     };
     $("#progressMessage").textContent = phases[job.status === "queued" ? "queued" : job.phase] || job.message || "Finding charts...";
     const current = progress.current_song;
@@ -461,7 +587,7 @@
   async function openConfirm(focus = true) {
     showStage("confirm", focus);
     state.reviewOffset = 0;
-    await loadReview();
+    await Promise.all([loadReview(), loadExpansion()]);
   }
 
   function reviewParams() {
@@ -478,24 +604,20 @@
     try {
       const data = await api(`/api/workspace?${reviewParams()}`);
       state.reviewTotal = Number(data.total || 0);
-      state.selected = Number(data.summary?.selection_count || 0);
+      state.exactSelected = Number(data.summary?.selection_count || 0);
       const strong = Number(data.summary?.strong || 0);
       const review = Number(data.summary?.review || 0);
       $("#chartsFoundCount").textContent = (strong + review).toLocaleString();
       $("#chartsFoundLabel").textContent = strong + review === 1 ? "song has a recommendation." : "songs have recommendations.";
       $("#bestMatchCount").textContent = `${strong.toLocaleString()} ${strong === 1 ? "chart" : "charts"}`;
       $("#allMatchCount").textContent = `${(strong + review).toLocaleString()} ${strong + review === 1 ? "chart" : "charts"}`;
-      $("#selectedCount").textContent = state.selected.toLocaleString();
-      $("#continueDownloadButton").disabled = state.selected < 1;
-      if (state.selected < 1) state.selectionMode = "none";
+      if (state.exactSelected < 1 && state.expansionSelected < 1) state.selectionMode = "none";
       else if (state.selectionMode === "none") state.selectionMode = "custom";
       $("#selectBestButton").setAttribute("aria-pressed", String(state.selectionMode === "strong"));
       $("#selectAllButton").setAttribute("aria-pressed", String(state.selectionMode === "eligible"));
       const modeLabels = {strong: "Best Matches preset", eligible: "All recommendations preset", custom: "Custom choices", none: "No selection preset"};
       $("#selectionMode").textContent = modeLabels[state.selectionMode];
-      $("#continueDownloadButton").textContent = state.selected
-        ? `Continue with ${state.selected.toLocaleString()} selected ${state.selected === 1 ? "chart" : "charts"}`
-        : "Continue with selected charts";
+      refreshSelectionUi();
       $("#reviewSummary").textContent = `${state.reviewTotal.toLocaleString()} in this view; ${Number(data.summary?.unavailable || 0).toLocaleString()} songs have no safe recommendation.`;
       $("#reviewCards").innerHTML = (data.tracks || []).map(reviewCard).join("") || `<div class="empty-state">No recommendations match this view.</div>`;
       bindReviewActions();
@@ -506,6 +628,15 @@
     } catch (error) {
       showError(error.message);
     }
+  }
+
+  function refreshSelectionUi() {
+    state.selected = state.exactSelected + state.expansionSelected;
+    $("#selectedCount").textContent = state.selected.toLocaleString();
+    $("#continueDownloadButton").disabled = state.selected < 1;
+    $("#continueDownloadButton").textContent = state.selected
+      ? `Continue with ${state.selected.toLocaleString()} selected ${state.selected === 1 ? "chart" : "charts"}`
+      : "Continue with selected charts";
   }
 
   function reviewCard(track) {
@@ -576,6 +707,138 @@
     }
   }
 
+  async function loadExpansion() {
+    const panel = $("#expansionPanel");
+    if (!panel) return;
+    const choices = $("#expansionChoices");
+    const status = $("#expansionStatus");
+    const start = $("#startExpansionButton");
+    try {
+      const [artistData, resultData] = await Promise.all([
+        api("/api/expansion/artists"),
+        api("/api/expansion/results"),
+      ]);
+      const artists = artistData.artists || [];
+      if (!artistData.available) {
+        choices.innerHTML = `<p class="empty-state">${escapeHtml(artistData.reason || "Artist expansion is not available yet.")}</p>`;
+        start.disabled = true;
+      } else {
+        choices.innerHTML = artists.map(artist => `<label>
+          <input type="checkbox" value="${escapeHtml(artist.artist_norm)}" ${artist.selected ? "checked" : ""}>
+          <span><strong>${escapeHtml(artist.artist)}</strong><small>${Number(artist.eligible_songs || 0).toLocaleString()} eligible songs · up to ${Number(artist.cap || 0).toLocaleString()} recommended</small></span>
+        </label>`).join("") || `<p class="empty-state">No imported artists have additional eligible catalog songs.</p>`;
+        start.disabled = artists.length === 0;
+        choices.onchange = () => {
+          const count = $$("input:checked", choices).length;
+          start.disabled = count === 0 || count > Number(artistData.max_artists || 25);
+          status.textContent = count > Number(artistData.max_artists || 25)
+            ? `Choose no more than ${Number(artistData.max_artists || 25)} artists.`
+            : `${count.toLocaleString()} ${count === 1 ? "artist" : "artists"} selected.`;
+        };
+      }
+      const cards = resultData.songs || [];
+      state.expansionSelected = Number(resultData.summary?.selected || 0);
+      refreshSelectionUi();
+      $("#expansionResults").hidden = cards.length === 0;
+      $("#expansionResultCount").textContent = Number(resultData.total || 0).toLocaleString();
+      $("#expansionCards").innerHTML = cards.map(expansionCard).join("");
+      bindExpansionActions();
+      const job = artistData.job;
+      if (job && ["queued", "running"].includes(job.status)) {
+        status.textContent = job.message || "Preparing expansion recommendations...";
+        start.disabled = true;
+        if (!state.expansionPollTimer) attachExpansionJob(job.id);
+      } else if (job?.status === "complete" && cards.length) {
+        status.textContent = `${Number(resultData.total || 0).toLocaleString()} additional songs are ready to review.`;
+      }
+    } catch (error) {
+      choices.innerHTML = `<p class="empty-state">${escapeHtml(error.message || "Expansion choices could not be loaded.")}</p>`;
+      start.disabled = true;
+    }
+  }
+
+  function expansionCard(song) {
+    const candidates = song.candidates || [];
+    const primary = candidates.find(candidate => candidate.selected) || candidates[0];
+    if (!primary) return "";
+    const alternatives = candidates.filter(candidate => candidate !== primary);
+    return `<article class="review-card review-card--expansion">
+      <div class="review-card__song"><span class="eyebrow">ARTIST EXPANSION</span><h3>${escapeHtml(song.artist)} - ${escapeHtml(song.title)}</h3><p>Not in your imported library</p></div>
+      ${candidateSummary(primary, Boolean(primary.best))}
+      <div class="review-card__action">${expansionCandidateAction(song, primary)}</div>
+      ${alternatives.length ? `<details class="alternatives"><summary>Other chart versions (${alternatives.length})</summary>${alternatives.map(candidate => `<div class="alternative">${candidateSummary(candidate, false)}<div class="review-card__action">${expansionCandidateAction(song, candidate)}</div></div>`).join("")}</details>` : ""}
+    </article>`;
+  }
+
+  function expansionCandidateAction(song, candidate) {
+    if (candidate.selected) return `<button class="button button--secondary" type="button" data-expansion-selection="clear" data-artist="${escapeHtml(candidate.artist_norm)}" data-candidate="${candidate.candidate_id}">Clear choice</button>`;
+    if (!candidate.selectable) return `<button class="button button--secondary" type="button" disabled>Unavailable</button>`;
+    return `<button class="button button--secondary" type="button" data-expansion-selection="select" data-artist="${escapeHtml(candidate.artist_norm)}" data-candidate="${candidate.candidate_id}">Select</button>`;
+  }
+
+  function bindExpansionActions() {
+    $$('[data-expansion-selection]').forEach(button => button.addEventListener("click", async () => {
+      setButtonBusy(button, true, "Saving...");
+      try {
+        await api("/api/selection", {method: "POST", body: JSON.stringify({
+          kind: "expansion",
+          artist_norm: button.dataset.artist,
+          candidate_id: Number(button.dataset.candidate),
+          action: button.dataset.expansionSelection,
+        })});
+        state.selectionMode = "custom";
+        await loadExpansion();
+      } catch (error) {
+        showError(error.message);
+        setButtonBusy(button, false);
+      }
+    }));
+  }
+
+  async function startExpansion() {
+    const button = $("#startExpansionButton");
+    const selected = $$("#expansionChoices input:checked").map(input => input.value);
+    clearError();
+    setButtonBusy(button, true, "Starting...");
+    try {
+      const result = await api("/api/expansion", {method: "POST", body: JSON.stringify({artists: selected})});
+      attachExpansionJob(result.job.id);
+    } catch (error) {
+      showError(error.message);
+      setButtonBusy(button, false);
+    }
+  }
+
+  function attachExpansionJob(jobId) {
+    state.expansionJobId = Number(jobId);
+    if (state.expansionPollTimer) window.clearInterval(state.expansionPollTimer);
+    pollExpansionJob();
+    state.expansionPollTimer = window.setInterval(pollExpansionJob, 1200);
+  }
+
+  async function pollExpansionJob() {
+    const status = $("#expansionStatus");
+    try {
+      const {job} = await api(`/api/jobs/${state.expansionJobId}`);
+      const done = Number(job.progress?.completed_artists || 0);
+      const total = Number(job.progress?.total_artists || 0);
+      status.textContent = job.status === "queued"
+        ? "Expansion is queued and will start shortly."
+        : job.message || (total ? `${done} of ${total} artists prepared.` : "Preparing artist recommendations...");
+      if (isTerminal(job)) {
+        window.clearInterval(state.expansionPollTimer);
+        state.expansionPollTimer = null;
+        state.expansionJobId = null;
+        if (job.status !== "complete") showError(job.error || "Artist expansion did not finish.");
+        await loadExpansion();
+      }
+    } catch (error) {
+      window.clearInterval(state.expansionPollTimer);
+      state.expansionPollTimer = null;
+      showError(error.message);
+    }
+  }
+
   function openDownload() {
     $("#downloadSelectionCount").textContent = state.selected.toLocaleString();
     showStage("download", true);
@@ -613,7 +876,12 @@
 
   async function prepareAgain() {
     state.journey = await api("/api/journey");
-    state.selected = Number(state.journey.review?.selected || 0);
+    state.exactSelected = Number(state.journey.review?.selected || 0);
+    if ($("#expansionPanel")) {
+      const expansion = await api("/api/expansion/results").catch(() => ({summary: {selected: 0}}));
+      state.expansionSelected = Number(expansion.summary?.selected || 0);
+    }
+    refreshSelectionUi();
     openDownload();
   }
 
@@ -647,6 +915,7 @@
     }));
     $("#reviewPrev")?.addEventListener("click", () => { state.reviewOffset = Math.max(0, state.reviewOffset - 25); loadReview(); });
     $("#reviewNext")?.addEventListener("click", () => { state.reviewOffset += 25; loadReview(); });
+    $("#startExpansionButton")?.addEventListener("click", startExpansion);
     $("#continueDownloadButton")?.addEventListener("click", openDownload);
     $("#backToChartsButton")?.addEventListener("click", () => openConfirm(true));
     $("#searchAgainButton")?.addEventListener("click", () => openAddMusic(true));

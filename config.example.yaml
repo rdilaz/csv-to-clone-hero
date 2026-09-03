@@ -33,8 +33,10 @@ server:
   base_url_env: APP_BASE_URL
   enchor_preflight_ttl_seconds: 3600
   max_scope_playlists: 200
-  max_scope_tracks: 10000
-  enable_expansion: false
+  max_scope_tracks: 50000
+  # Applied to the final deduplicated Spotify/SoundCloud library before match work.
+  max_library_tracks: 50000
+  enable_expansion: true
   secret_key_env: SECRET_KEY
   enforce_secret_key: true
   database_url_env: DATABASE_URL

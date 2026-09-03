@@ -209,6 +209,64 @@ def test_public_download_ignores_stale_expansion_selection(config):
         db.close()
 
 
+def test_public_archive_includes_and_revalidates_exact_and_expansion_separately(config):
+    from csv_to_clonehero.database import Database
+    from tests.conftest import FakeSource, make_chart, make_track, valid_sng_bytes
+
+    exact_bytes = valid_sng_bytes("Known")
+    expansion_bytes = valid_sng_bytes("More")
+    exact_md5 = hashlib.md5(exact_bytes).hexdigest()
+    expansion_md5 = hashlib.md5(expansion_bytes).hexdigest()
+    db = Database(config.database_path)
+    try:
+        workspace = db.create_workspace(workspace_key="exact-plus-expansion")
+        track = db.upsert_spotify_tracks([
+            make_track("Known", "Artist", "known-track")
+        ])[0]
+        db.replace_workspace_library_tracks(workspace, [track])
+        generation = db.create_discovery_scan(
+            workspace, scan_key="current", kind="exact", status="complete",
+            metadata={"workflow": "combined_catalog"},
+        )
+        task = db.upsert_discovery_task(
+            workspace, scan_id=generation, source="test", query_key="known", status="complete"
+        )
+        exact = make_chart("Known", "Artist", chart_id=210, md5=exact_md5)
+        expansion = make_chart("More", "Artist", chart_id=211, md5=expansion_md5)
+        db.upsert_workspace_candidate(
+            workspace, track.track_key, exact, score=99,
+            eligibility="RECOMMENDED", decision="AUTO_ACCEPT", kind="exact", task_id=task,
+        )
+        db.upsert_workspace_candidate(
+            workspace, None, expansion, score=82,
+            eligibility="ELIGIBLE_REVIEW", decision="AUTO_ACCEPT", kind="expansion",
+            artist_norm="artist", metadata={"exact_generation_id": generation},
+        )
+        db.select_workspace_candidate(workspace, track.track_key, exact, kind="exact")
+        db.select_workspace_candidate(
+            workspace, None, expansion, kind="expansion", artist_norm="artist"
+        )
+        source = FakeSource(files={exact_md5: exact_bytes, expansion_md5: expansion_bytes})
+
+        validated = _validated_selections(db, workspace, config=config)
+        assert {row["kind"] for row in validated} == {"exact", "expansion"}
+        archive, summary = build_archive(
+            config, db, workspace, [source], config.state_path / "downloads"
+        )
+        assert summary["published"] == 2
+        with zipfile.ZipFile(archive) as built:
+            assert sum(name.endswith(".sng") for name in built.namelist()) == 2
+
+        expansion.instruments = []
+        expansion.diff_guitar = None
+        expansion.difficulty_fields = {}
+        db.upsert_candidate(expansion)
+        remaining = _validated_selections(db, workspace, config=config)
+        assert [row["kind"] for row in remaining] == ["exact"]
+    finally:
+        db.close()
+
+
 def test_build_archive_uses_and_removes_ephemeral_artifact_cache(config):
     from csv_to_clonehero.database import Database
     from tests.conftest import FakeSource, make_chart, make_track, valid_sng_bytes

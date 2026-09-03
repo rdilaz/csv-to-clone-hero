@@ -20,6 +20,7 @@ import secrets
 import shutil
 import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
@@ -32,6 +33,7 @@ from csv_to_clonehero.sources.base import ChartSource
 log = logging.getLogger(__name__)
 
 _DEFAULT_TTL_SECONDS = 15 * 60
+_MAX_RETAINED_PER_WORKSPACE = 3
 
 
 class DownloadError(Exception):
@@ -68,6 +70,7 @@ class BrowserDownloads:
         self.root.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
         self._index: dict[str, dict[str, Any]] = {}
+        self._active_builds: set[int] = set()
         self._sweep_interval = max(0.0, float(sweep_interval))
         self._closed = False
         self._sweep(include_crash_state=True)
@@ -163,12 +166,39 @@ class BrowserDownloads:
                 "token": token,
                 "created_at": time.time(),
             }
+            retained = sorted(
+                (
+                    (old_key, meta)
+                    for old_key, meta in self._index.items()
+                    if int(meta.get("user_id", -1)) == int(user_id)
+                    and int(meta.get("workspace_id", -1)) == int(workspace_id)
+                ),
+                key=lambda item: float(item[1].get("created_at", 0)),
+                reverse=True,
+            )
+            for old_key, meta in retained[_MAX_RETAINED_PER_WORKSPACE:]:
+                self._index.pop(old_key, None)
+                self._revoke_meta(meta)
         return {
             "token": token,
             "expires_at": expires_at,
             "ttl_seconds": self.ttl_seconds,
             "size_bytes": archive_path.stat().st_size,
         }
+
+    @contextmanager
+    def building(self, workspace_id: int):
+        """Allow at most one archive assembly per workspace."""
+        workspace_id = int(workspace_id)
+        with self._lock:
+            if workspace_id in self._active_builds:
+                raise DownloadError("A library download is already being prepared.")
+            self._active_builds.add(workspace_id)
+        try:
+            yield
+        finally:
+            with self._lock:
+                self._active_builds.discard(workspace_id)
 
     def resolve(self, token: str) -> dict[str, Any] | None:
         parsed = self._parse_token(token)
@@ -353,6 +383,49 @@ def build_archive(
             eligibility_checker=checker,
             progress=progress,
         )
+        artifact_refs = {
+            (str(item.get("source") or "").casefold(), int(item.get("chart_id") or 0)):
+                str((json.loads(item.get("candidate_json") or "{}") or {}).get("md5") or "")
+            for item in selections
+        }
+
+        for item in result.items:
+            try:
+                identity = (str(item.source).casefold(), int(item.chart_id))
+            except (TypeError, ValueError):
+                continue
+            artifact_ref = artifact_refs.get(identity, "")
+            if item.status == "published":
+                db.record_chart_artifact_validation(
+                    *identity,
+                    artifact_ref=artifact_ref,
+                    state="VERIFIED",
+                    validator_version="sng-playability-v1",
+                    artifact_sha256=item.sha256,
+                    size_bytes=item.bytes_count,
+                    playable_note_count=item.playable_note_count,
+                )
+            elif item.status == "invalid":
+                db.record_chart_artifact_validation(
+                    *identity,
+                    artifact_ref=artifact_ref,
+                    state="REJECTED",
+                    validator_version="sng-playability-v1",
+                    reason_code="ARTIFACT_VALIDATION_FAILED",
+                    reason=item.failure,
+                )
+            elif item.status == "failed":
+                existing = db.get_chart_artifact_validation(*identity)
+                if existing is None or str(existing["state"]) != "VERIFIED":
+                    lowered = str(item.failure or "").casefold()
+                    unavailable = "http 404" in lowered or "http 410" in lowered
+                    db.record_chart_artifact_validation(
+                        *identity,
+                        artifact_ref=artifact_ref,
+                        state="UNAVAILABLE" if unavailable else "UNVERIFIED",
+                        reason_code="SOURCE_UNAVAILABLE" if unavailable else "TRANSIENT_DOWNLOAD_FAILURE",
+                        reason=item.failure,
+                    )
         summary = {
             "success": bool(result.success),
             "published": result.published_count,
@@ -412,50 +485,107 @@ def _validated_selections(
         if current_generation is not None
         else -1 if latest_generation is not None else None
     )
+    imported_identities = {
+        (str(row["normalized_artist"]), str(row["normalized_title"]))
+        for row in db.get_neutral_library_tracks(workspace_id)
+    }
+    imported_identities.update({
+        (track.primary_artist_norm, track.title_norm)
+        for track in track_map.values()
+        if track.db_id in workspace_track_ids
+    })
     selections: list[dict[str, Any]] = []
-    for row in rows:
+    seen_expansion_songs: set[tuple[str, str]] = set()
+    for row in reversed(rows):
         from dataclasses import fields
 
         data = dict(row) if hasattr(row, "keys") else {}
         kind = str(data.get("kind") or "exact").casefold()
-        if kind != "exact":
-            # Public discovery is exact-only. Retain legacy expansion state in
-            # SQLite, but never let stale expansion choices enter an archive.
+        if kind not in {"exact", "expansion"}:
             continue
-        track_id = int(data.get("track_id") or 0)
-        if track_id not in workspace_track_ids:
+        if kind == "expansion" and (config is None or not config.server.enable_expansion):
             continue
         candidate = db.get_candidate(int(data.get("candidate_id") or 0))
         if candidate is None:
             continue
-        current_rows = db.get_workspace_candidates(
-            workspace_id,
-            track_id=track_id,
-            kind="exact",
-            include_rejected=True,
-            include_candidate_data=False,
-            generation_id=generation_id,
-        )
-        if not any(
-            int(current["candidate_id"] or 0) == int(data.get("candidate_id") or 0)
-            for current in current_rows
-        ):
+        if not db.is_chart_artifact_eligible(candidate.source, candidate.chart_id):
             continue
         current_eligibility = str(data.get("eligibility") or "RECOMMENDED")
         current_score = data.get("score")
-        if config is not None:
-            from csv_to_clonehero.matching import ELIGIBLE_REVIEW, RECOMMENDED, score_candidate
-
-            track = track_map.get(int(data.get("track_id") or 0))
-            if track is None:
+        if kind == "exact":
+            track_id = int(data.get("track_id") or 0)
+            if track_id not in workspace_track_ids:
                 continue
-            breakdown = score_candidate(track, candidate, config)
+            current_rows = db.get_workspace_candidates(
+                workspace_id,
+                track_id=track_id,
+                kind="exact",
+                include_rejected=True,
+                include_candidate_data=False,
+                generation_id=generation_id,
+            )
+            if not any(
+                int(current["candidate_id"] or 0) == int(data.get("candidate_id") or 0)
+                for current in current_rows
+            ):
+                continue
+            if config is not None:
+                from csv_to_clonehero.matching import ELIGIBLE_REVIEW, RECOMMENDED, score_candidate
+
+                track = track_map.get(track_id)
+                if track is None:
+                    continue
+                breakdown = score_candidate(track, candidate, config)
+                current_eligibility = str(getattr(breakdown, "eligibility", "") or "")
+                if current_eligibility not in {RECOMMENDED, ELIGIBLE_REVIEW}:
+                    continue
+                current_score = breakdown.final_score
+        else:
+            if generation_id is None or generation_id < 0:
+                continue
+            artist_norm = str(data.get("artist_norm") or "")
+            current_rows = db.get_workspace_candidates(
+                workspace_id,
+                kind="expansion",
+                include_rejected=True,
+                include_candidate_data=False,
+            )
+            current = next((
+                item for item in current_rows
+                if int(item["candidate_id"] or 0) == int(data.get("candidate_id") or 0)
+                and str(item["artist_norm"] or "") == artist_norm
+            ), None)
+            if current is None:
+                continue
+            metadata = json.loads(str(current["metadata_json"] or "{}"))
+            if int(metadata.get("exact_generation_id") or 0) != generation_id:
+                continue
+            from csv_to_clonehero.matching import ELIGIBLE_REVIEW, RECOMMENDED, score_expansion_candidate
+            from csv_to_clonehero.normalization import normalize_artist, normalize_title
+
+            if (
+                normalize_artist(str(candidate.artist or "")),
+                normalize_title(str(candidate.name or "")),
+            ) in imported_identities:
+                continue
+            expansion_identity = (
+                normalize_artist(str(candidate.artist or "")),
+                normalize_title(str(candidate.name or "")),
+            )
+            breakdown = score_expansion_candidate(artist_norm, candidate, config)
             current_eligibility = str(getattr(breakdown, "eligibility", "") or "")
-            if current_eligibility not in {RECOMMENDED, ELIGIBLE_REVIEW}:
+            if (
+                bool(getattr(breakdown, "gate_factors", {}).get("hard_gate"))
+                or current_eligibility not in {RECOMMENDED, ELIGIBLE_REVIEW}
+            ):
                 continue
             current_score = breakdown.final_score
-            if float(current_score or 0) < minimum_score:
+        if config is not None and float(current_score or 0) < minimum_score:
+            continue
+        if kind == "expansion":
+            if expansion_identity in seen_expansion_songs:
                 continue
+            seen_expansion_songs.add(expansion_identity)
         selection = dict(data)
         selection["candidate_json"] = json.dumps(
             {item.name: getattr(candidate, item.name) for item in fields(candidate)},
@@ -469,4 +599,4 @@ def _validated_selections(
         selections.append(selection)
     if not selections:
         raise DownloadError("No downloadable charts in your selections.")
-    return selections
+    return list(reversed(selections))

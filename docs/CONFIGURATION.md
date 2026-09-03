@@ -52,17 +52,25 @@ after delivery or expiry.
 
 ## Catalog Snapshot
 
-The optional local `catalog/enchor.jsonl` file is a generated, metadata-only
-snapshot. It must have a complete header and matching SHA-256 checksum before
-it can provide negative filtering. Generate or replace it with:
+The `catalog/enchor.jsonl` file is a generated, metadata-only snapshot. It must
+have a complete header and matching SHA-256 checksum before it can provide
+negative filtering. Public production should set `CATALOG_PATH` to persistent
+state (normally `/data/catalog/enchor.jsonl`). Generate or replace it with:
 
 ```powershell
 python -m csv_to_clonehero catalog-export
+python -m csv_to_clonehero catalog-validate --status
+python -m csv_to_clonehero catalog-validate --limit 100
 ```
 
 The snapshot and its `.partial`/checkpoint files are ignored by Git because a
 full snapshot is too large for a normal GitHub repository. Keep its provenance,
 refresh date, and distribution method in operator records.
+
+Artifact validation is deliberately bounded and restart-safe. The global ledger
+keeps `VERIFIED`, `UNVERIFIED`, `REJECTED`, and `UNAVAILABLE` identities and
+their reasons. Rejected identities are retained for audit but excluded from the
+eligible catalog index. The command hard-caps one invocation at 1,000 charts.
 
 ## Production Secrets
 

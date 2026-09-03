@@ -16,7 +16,7 @@ from typing import Any
 
 from csv_to_clonehero.models import ChartCandidate, Track
 
-SCHEMA_VERSION = 17
+SCHEMA_VERSION = 18
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);
@@ -442,6 +442,7 @@ CREATE TABLE IF NOT EXISTS discovery_song_progress (
     candidate_count INTEGER NOT NULL DEFAULT 0,
     provenance TEXT NOT NULL DEFAULT '',
     classification TEXT NOT NULL DEFAULT '',
+    reason TEXT NOT NULL DEFAULT '',
     updated_at REAL NOT NULL,
     PRIMARY KEY (workspace_id, track_key)
 );
@@ -782,6 +783,31 @@ CREATE TABLE IF NOT EXISTS source_preflights (
     error TEXT NOT NULL DEFAULT '',
     metadata_json TEXT NOT NULL DEFAULT '{}'
 );
+
+CREATE TABLE IF NOT EXISTS chart_artifact_validations (
+    source TEXT NOT NULL,
+    chart_id INTEGER NOT NULL,
+    artifact_ref TEXT NOT NULL DEFAULT '',
+    state TEXT NOT NULL DEFAULT 'UNVERIFIED'
+        CHECK(state IN ('VERIFIED', 'UNVERIFIED', 'REJECTED', 'UNAVAILABLE')),
+    validator_version TEXT NOT NULL DEFAULT '',
+    artifact_sha256 TEXT NOT NULL DEFAULT '',
+    size_bytes INTEGER NOT NULL DEFAULT 0,
+    format TEXT NOT NULL DEFAULT '',
+    playable_note_count INTEGER NOT NULL DEFAULT 0,
+    validation_json TEXT NOT NULL DEFAULT '{}',
+    reason_code TEXT NOT NULL DEFAULT '',
+    reason TEXT NOT NULL DEFAULT '',
+    http_status INTEGER,
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    first_seen_at REAL NOT NULL,
+    last_seen_at REAL NOT NULL,
+    checked_at REAL,
+    updated_at REAL NOT NULL,
+    PRIMARY KEY(source, chart_id)
+);
+CREATE INDEX IF NOT EXISTS idx_chart_artifact_validations_state
+    ON chart_artifact_validations(state);
 
 CREATE INDEX IF NOT EXISTS idx_user_sessions_expires ON user_sessions(expires_at);
 CREATE INDEX IF NOT EXISTS idx_background_jobs_user ON background_jobs(user_id, status);
@@ -1176,6 +1202,7 @@ class Database:
                 ("discovery_workspaces", "library_matching_fingerprint", "TEXT NOT NULL DEFAULT ''"),
                 ("discovery_workspaces", "candidate_revision", "INTEGER NOT NULL DEFAULT 0"),
                 ("matching_scan_cache", "candidate_revision", "INTEGER NOT NULL DEFAULT 0"),
+                ("discovery_song_progress", "reason", "TEXT NOT NULL DEFAULT ''"),
             ):
                 self._ensure_column(table, column, definition)
             # Older query rows predate the explicit returned-count field.  This
@@ -3590,6 +3617,11 @@ class Database:
             raise ValueError("candidate is required")
         resolved_track = self._resolve_track_value(track_id)
         candidate_id = self._candidate_db_id(candidate)
+        candidate_row = self.get_candidate(candidate_id)
+        if candidate_row is not None and not self.is_chart_artifact_eligible(
+            candidate_row.source, candidate_row.chart_id
+        ):
+            raise ValueError("candidate artifact is rejected or unavailable")
         if resolved_track is None and kind == "exact":
             raise ValueError("exact selection requires a Spotify track")
         if kind == "exact":
@@ -3631,7 +3663,6 @@ class Database:
                 score = check["score"]
             if not explanation:
                 explanation = check["breakdown_json"] or ""
-        candidate_row = self.get_candidate(candidate_id)
         if score is None and candidate_row is not None:
             score = 0.0
         now = time.time()
@@ -4007,7 +4038,7 @@ class Database:
         row = self._conn.execute("SELECT COUNT(*) AS count FROM workspace_candidates WHERE workspace_id=? AND kind='exact'", (db_id,)).fetchone()
         return int(row["count"] or 0)
 
-    def workspace_current_candidate_digest(self, workspace_id: int | str, track_key: str | None = None) -> tuple[int, str, set[int]]:
+    def workspace_current_candidate_digest(self, workspace_id: int | str, track_key: str | None = None) -> tuple[int, str, set[tuple[str, int]]]:
         """Digest exact relationships limited to the current progress tracks."""
         db_id = self._workspace_db_id(workspace_id)
         params: list[Any] = [db_id]
@@ -4016,18 +4047,19 @@ class Database:
             clause = " AND t.track_key=?"
             params.append(str(track_key))
         rows = self._conn.execute(
-            """SELECT t.track_key,wc.candidate_id,wc.score,wc.quality,wc.decision,wc.eligibility,wc.breakdown_json,wc.metadata_json
+            """SELECT t.track_key,wc.candidate_id,c.source,c.chart_id,wc.score,wc.quality,wc.decision,wc.eligibility,wc.breakdown_json,wc.metadata_json
                FROM workspace_candidates wc JOIN spotify_tracks t ON t.id=wc.track_id
+               JOIN candidate_charts c ON c.id=wc.candidate_id
                JOIN discovery_song_progress dsp ON dsp.workspace_id=wc.workspace_id AND dsp.track_key=t.track_key
                WHERE wc.workspace_id=? AND wc.kind='exact'""" + clause + " ORDER BY t.track_key,wc.candidate_id,wc.score,wc.quality,wc.decision,wc.eligibility,wc.breakdown_json,wc.metadata_json", params)
         digest = hashlib.sha256()
-        ids: set[int] = set()
+        ids: set[tuple[str, int]] = set()
         count = 0
         for row in rows:
             digest.update(json.dumps(tuple(row), sort_keys=True, default=str).encode("utf-8"))
             digest.update(b"\n")
             count += 1
-            ids.add(int(row["candidate_id"]))
+            ids.add((str(row["source"]), int(row["chart_id"])))
         return count, digest.hexdigest(), ids
 
     def assign_current_progress_candidates_to_task(self, workspace_id: int | str, task_id: int) -> int:
@@ -4253,7 +4285,7 @@ class Database:
         self, workspace_id: int | str, track_key: str, **values: Any
     ) -> None:
         db_id = self._workspace_db_id(workspace_id)
-        allowed = {"status", "candidate_count", "provenance", "classification"}
+        allowed = {"status", "candidate_count", "provenance", "classification", "reason"}
         assignments = [f"{key} = ?" for key in values if key in allowed]
         params = [values[key] for key in values if key in allowed]
         assignments.append("updated_at = ?")
@@ -4273,8 +4305,8 @@ class Database:
         now = time.time()
         with self._conn:
             for track_key, values in rows:
-                assignments = [f"{key} = ?" for key in values if key in {"status", "candidate_count", "provenance", "classification"}]
-                params = [values[key] for key in values if key in {"status", "candidate_count", "provenance", "classification"}]
+                assignments = [f"{key} = ?" for key in values if key in {"status", "candidate_count", "provenance", "classification", "reason"}]
+                params = [values[key] for key in values if key in {"status", "candidate_count", "provenance", "classification", "reason"}]
                 assignments.append("updated_at = ?")
                 params.extend([now, db_id, str(track_key)])
                 self._conn.execute("UPDATE discovery_song_progress SET " + ", ".join(assignments) + " WHERE workspace_id = ? AND track_key = ?", params)
@@ -4312,6 +4344,29 @@ class Database:
             (db_id,),
         ).fetchone()
         return {key: int(row[key] or 0) for key in ("total", "completed", "checking", "strong", "review", "no_suitable", "not_playable", "no_catalog_candidate")}
+
+    def get_discovery_song_yield_summary(self, workspace_id: int | str) -> dict[str, Any]:
+        """Aggregate terminal song classes and reasons without a page-size cap."""
+        db_id = self._workspace_db_id(workspace_id)
+        rows = self._conn.execute(
+            """SELECT classification,reason,COUNT(*) AS count
+               FROM discovery_song_progress
+               WHERE workspace_id=? AND status='complete'
+               GROUP BY classification,reason""",
+            (db_id,),
+        )
+        classifications: dict[str, int] = {}
+        reasons: dict[str, int] = {}
+        total = 0
+        for row in rows:
+            count = int(row["count"] or 0)
+            classification = str(row["classification"] or "")
+            reason = str(row["reason"] or "")
+            classifications[classification] = classifications.get(classification, 0) + count
+            if reason:
+                reasons[reason] = reasons.get(reason, 0) + count
+            total += count
+        return {"total": total, "classifications": classifications, "reasons": reasons}
 
     def count_discovery_song_progress(
         self, workspace_id: int | str, *, search: str = ""
@@ -5540,6 +5595,154 @@ class Database:
         }
 
     # ------------------------------------------------------------- candidates
+    def observe_chart_artifact(
+        self,
+        source: str,
+        chart_id: int,
+        artifact_ref: str = "",
+    ) -> sqlite3.Row:
+        """Remember a source identity without erasing prior validation evidence."""
+        source = str(source).strip().casefold()
+        chart_id = int(chart_id)
+        artifact_ref = str(artifact_ref or "")
+        now = time.time()
+        with self._conn:
+            existing = self._conn.execute(
+                "SELECT artifact_ref FROM chart_artifact_validations WHERE source=? AND chart_id=?",
+                (source, chart_id),
+            ).fetchone()
+            if existing is None:
+                self._conn.execute(
+                    """INSERT INTO chart_artifact_validations
+                       (source,chart_id,artifact_ref,state,first_seen_at,last_seen_at,updated_at)
+                       VALUES(?,?,?,'UNVERIFIED',?,?,?)""",
+                    (source, chart_id, artifact_ref, now, now, now),
+                )
+            elif str(existing["artifact_ref"] or "") != artifact_ref:
+                self._conn.execute(
+                    """UPDATE chart_artifact_validations SET artifact_ref=?,state='UNVERIFIED',
+                       validator_version='',artifact_sha256='',size_bytes=0,format='',
+                       playable_note_count=0,validation_json='{}',reason_code='',reason='',
+                       http_status=NULL,checked_at=NULL,last_seen_at=?,updated_at=?
+                       WHERE source=? AND chart_id=?""",
+                    (artifact_ref, now, now, source, chart_id),
+                )
+            else:
+                self._conn.execute(
+                    "UPDATE chart_artifact_validations SET last_seen_at=?,updated_at=? WHERE source=? AND chart_id=?",
+                    (now, now, source, chart_id),
+                )
+        row = self.get_chart_artifact_validation(source, chart_id)
+        assert row is not None
+        return row
+
+    def record_chart_artifact_validation(
+        self,
+        source: str,
+        chart_id: int,
+        *,
+        artifact_ref: str = "",
+        state: str,
+        validator_version: str = "",
+        artifact_sha256: str = "",
+        size_bytes: int = 0,
+        format: str = "",
+        playable_note_count: int = 0,
+        validation: Mapping[str, Any] | None = None,
+        reason_code: str = "",
+        reason: str = "",
+        http_status: int | None = None,
+    ) -> sqlite3.Row:
+        """Persist one restart-safe artifact verdict while retaining identity."""
+        normalized_state = str(state).strip().upper()
+        if normalized_state not in {"VERIFIED", "UNVERIFIED", "REJECTED", "UNAVAILABLE"}:
+            raise ValueError("invalid chart artifact validation state")
+        self.observe_chart_artifact(source, chart_id, artifact_ref)
+        source = str(source).strip().casefold()
+        now = time.time()
+        with self._conn:
+            self._conn.execute(
+                """UPDATE chart_artifact_validations SET state=?,validator_version=?,
+                   artifact_sha256=?,size_bytes=?,format=?,playable_note_count=?,
+                   validation_json=?,reason_code=?,reason=?,http_status=?,
+                   attempt_count=attempt_count+1,checked_at=?,updated_at=?
+                   WHERE source=? AND chart_id=?""",
+                (
+                    normalized_state,
+                    str(validator_version or ""),
+                    str(artifact_sha256 or ""),
+                    max(0, int(size_bytes or 0)),
+                    str(format or ""),
+                    max(0, int(playable_note_count or 0)),
+                    _json_text(validation or {}, {}),
+                    str(reason_code or ""),
+                    str(reason or "")[:1000],
+                    http_status,
+                    now,
+                    now,
+                    source,
+                    int(chart_id),
+                ),
+            )
+        row = self.get_chart_artifact_validation(source, chart_id)
+        assert row is not None
+        return row
+
+    def get_chart_artifact_validation(self, source: str, chart_id: int) -> sqlite3.Row | None:
+        return self._conn.execute(
+            "SELECT * FROM chart_artifact_validations WHERE source=? AND chart_id=?",
+            (str(source).strip().casefold(), int(chart_id)),
+        ).fetchone()
+
+    def list_chart_artifact_validations(
+        self,
+        *,
+        states: Iterable[str] | None = None,
+        source: str = "",
+        after_chart_id: int = 0,
+        limit: int | None = None,
+    ) -> list[sqlite3.Row]:
+        clauses = ["chart_id > ?"]
+        params: list[Any] = [max(0, int(after_chart_id))]
+        normalized_states = sorted({str(value).upper() for value in (states or ())})
+        if normalized_states:
+            clauses.append("state IN (" + ",".join("?" for _ in normalized_states) + ")")
+            params.extend(normalized_states)
+        if source:
+            clauses.append("source=?")
+            params.append(str(source).strip().casefold())
+        sql = "SELECT * FROM chart_artifact_validations WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY source,chart_id"
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(max(1, int(limit)))
+        return list(self._conn.execute(sql, params))
+
+    def get_blocked_chart_identities(self) -> set[tuple[str, int]]:
+        return {
+            (str(row["source"]), int(row["chart_id"]))
+            for row in self._conn.execute(
+                "SELECT source,chart_id FROM chart_artifact_validations WHERE state IN ('REJECTED','UNAVAILABLE')"
+            )
+        }
+
+    def chart_validation_fingerprint(self) -> str:
+        """Fingerprint only ledger rows that alter catalog eligibility."""
+        digest = hashlib.sha256()
+        for row in self._conn.execute(
+            """SELECT source,chart_id,artifact_ref,state,validator_version
+               FROM chart_artifact_validations
+               WHERE state IN ('REJECTED','UNAVAILABLE')
+               ORDER BY source,chart_id"""
+        ):
+            digest.update(json.dumps(tuple(row), separators=(",", ":")).encode("utf-8"))
+            digest.update(b"\n")
+        return digest.hexdigest()
+
+    def is_chart_artifact_eligible(self, source: str, chart_id: int) -> bool:
+        row = self.get_chart_artifact_validation(source, chart_id)
+        return row is None or str(row["state"]) not in {"REJECTED", "UNAVAILABLE"}
+
     def upsert_candidate(self, candidate: ChartCandidate | Mapping[str, Any] | Any) -> ChartCandidate:
         candidate = _coerce_candidate(candidate)
         data = _as_mapping(candidate)
@@ -5634,6 +5837,7 @@ class Database:
                 (candidate.source, candidate.chart_id),
             ).fetchone()
         candidate.db_id = row["id"]
+        self.observe_chart_artifact(candidate.source, candidate.chart_id, candidate.md5 or "")
         return candidate
 
     def get_candidate(self, db_id: int) -> ChartCandidate | None:

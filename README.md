@@ -79,7 +79,9 @@ and register `<tunnel>/api/auth/spotify/callback` as a redirect URI.
 
 The `server/` package is the public product: real Spotify login, per-user
 identity, background jobs, and browser-only ZIP downloads. Public discovery
-requires Spotify sign-in and a fresh Enchor preflight. See
+uses a complete checksum-valid catalog from persistent server state and makes
+no Enchor search requests in that mode. A bounded live search remains a
+fail-safe when the snapshot is unavailable. See
 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) and
 [`docs/runbook.md`](docs/runbook.md).
 
@@ -113,6 +115,7 @@ Required environment variables (see [`.env.example`](.env.example)):
 | `TOKEN_ENCRYPTION_KEY` | Fernet key encrypting per-user refresh tokens |
 | `NOTIFICATIONS_API_KEY` | optional transactional email key |
 | `GOFUNDME_URL` | optional GoFundMe campaign URL |
+| `CATALOG_PATH` | persistent complete Enchor snapshot (Docker: `/data/catalog/enchor.jsonl`) |
 
 Never put secrets in `config.yaml` — it is gitignored and untracked.
 
@@ -196,6 +199,7 @@ python -m csv_to_clonehero report         # regenerate reports
 python -m csv_to_clonehero doctor         # check setup
 python -m csv_to_clonehero reset-cache    # clear search cache
 python -m csv_to_clonehero catalog-export # acquire a local Enchor metadata snapshot
+python -m csv_to_clonehero catalog-validate --limit 100 # resumable artifact validation batch
 ```
 
 ---

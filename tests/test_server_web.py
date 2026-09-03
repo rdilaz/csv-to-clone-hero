@@ -928,12 +928,103 @@ def test_browser_exporter_has_single_route(app):
     assert len(rules) == 1
 
 
-def test_public_server_does_not_expose_local_catalog_or_expansion_apis(client):
+def test_public_server_hides_expansion_apis_when_disabled(client, config):
     _sign_in(client)
+    config.server.enable_expansion = False
     assert client.get("/api/catalog/summary").status_code == 404
     assert client.get("/api/expansion/artists").status_code == 404
     assert client.post("/api/expansion/artists/select", json={"artists": []}).status_code == 404
     assert client.post("/api/expansion/score", json={}).status_code == 404
+
+
+def test_public_expansion_choices_job_review_and_selection_are_separate(
+    client, app, config, monkeypatch
+):
+    from csv_to_clonehero.database import Database
+    from csv_to_clonehero.providers.base import LibrarySnapshot, ProviderTrack
+    from tests.conftest import make_chart
+
+    _sign_in(client)
+    client.get("/api/sources")
+    db = Database(config.database_path)
+    try:
+        workspace = db.get_workspace(Database.workspace_key_for_user("user-1"))
+        db.upsert_library_snapshot(
+            workspace["id"],
+            LibrarySnapshot("soundcloud", [
+                ProviderTrack("soundcloud", "known", "Known", "Artist")
+            ]),
+        )
+        generation = db.create_discovery_scan(
+            workspace["id"], scan_key="catalog-exact", kind="exact", status="complete",
+            metadata={"workflow": "combined_catalog"},
+        )
+        db.update_workspace(
+            workspace["id"], status="complete", phase="complete",
+            metadata={"workflow": "public_catalog"},
+        )
+    finally:
+        db.close()
+
+    known = make_chart("Known", "Artist", chart_id=750)
+    more = make_chart("More", "Artist", chart_id=751)
+
+    class Catalog:
+        available = True
+        diagnostic = ""
+        snapshot_id = "web-catalog"
+        chart_count = 2
+
+        def artist_songs(self, artist):
+            return (("known", (known,)), ("more", (more,))) if artist == "artist" else ()
+
+    monkeypatch.setattr(
+        "csv_to_clonehero.catalog.load_enchor_catalog", lambda *args, **kwargs: Catalog()
+    )
+    app.extensions["jobs"].source_factory = lambda _config: pytest.fail(
+        "catalog expansion constructed a ChartSource"
+    )
+
+    choices = client.get("/api/expansion/artists")
+    assert choices.status_code == 200
+    choice = choices.get_json()["artists"][0]
+    assert choice["artist_norm"] == "artist"
+    assert choice["eligible_songs"] == 1
+
+    started = client.post("/api/expansion", json={"artists": ["artist"]})
+    assert started.status_code == 202
+    job_id = started.get_json()["job"]["id"]
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        job = client.get(f"/api/jobs/{job_id}").get_json()["job"]
+        if job["status"] in {"complete", "failed"}:
+            break
+        time.sleep(0.05)
+    assert job["status"] == "complete"
+    assert job["result"]["network_requests"] == 0
+
+    results = client.get("/api/expansion/results").get_json()
+    assert results["total"] == 1
+    candidate = results["songs"][0]["candidates"][0]
+    selected = client.post("/api/selection", json={
+        "kind": "expansion",
+        "artist_norm": "artist",
+        "candidate_id": candidate["candidate_id"],
+        "action": "select",
+    })
+    assert selected.status_code == 200
+    assert client.get("/api/expansion/results").get_json()["summary"]["selected"] == 1
+
+    assert client.post("/api/selection/bulk", json={"action": "clear"}).status_code == 200
+    db = Database(config.database_path)
+    try:
+        expansion = db.list_workspace_selections(workspace["id"], kind="expansion")
+        assert len(expansion) == 1
+        assert int(json.loads(db.get_workspace_candidates(
+            workspace["id"], kind="expansion"
+        )[0]["metadata_json"])["exact_generation_id"]) == generation
+    finally:
+        db.close()
 
 
 def test_workspace_review_payload_uses_human_states_and_current_selection(client, config):
