@@ -1747,10 +1747,11 @@ def _score_exact_track(
     source_by_name: Mapping[str, ChartSource],
     *,
     catalog: bool,
-) -> tuple[bool, bool]:
-    """Score all candidates for one track; return ``(had_error, has_eligible)``."""
+) -> tuple[bool, bool, dict[str, Any]]:
+    """Score one track and return query plus song-level terminal evidence."""
     by_identity: dict[tuple[str, int], tuple[ChartCandidate, list[tuple[int | None, _QuerySpec]]]] = {}
     had_error = False
+    truncated = False
     for spec in specs:
         outcome = outcomes.get(spec.key)
         if outcome is None:
@@ -1761,6 +1762,7 @@ def _score_exact_track(
             error = f"{spec.source_name} {spec.kind} query for {track.title}: {outcome.error}"
             db.record_error("spotify_discovery", error, track.track_key)
             continue
+        truncated = truncated or bool(outcome.cap_reached)
         for candidate in outcome.candidates:
             identity = (str(candidate.source), _chart_id(candidate))
             existing = by_identity.get(identity)
@@ -1770,6 +1772,8 @@ def _score_exact_track(
                 existing[1].append((outcome.task_id, spec))
 
     has_eligible = False
+    states: list[str] = []
+    hard_reasons: list[str] = []
     shortlisted = _shortlist_exact_candidates(config, track, by_identity.values())
     for candidate, origins in shortlisted:
         source = source_by_name.get(str(candidate.source))
@@ -1781,6 +1785,8 @@ def _score_exact_track(
             breakdown = _scoring_error(exc)
             db.record_error("spotify_discovery_score", _error_text(exc), track.track_key)
         eligibility, reasons = _score_eligibility(breakdown, config)
+        states.append(eligibility)
+        hard_reasons.extend(str(reason) for reason in reasons if reason)
         ctx.note_exact_score(track, candidate, eligibility)
         if eligibility in {RECOMMENDED, ELIGIBLE_REVIEW}:
             has_eligible = True
@@ -1829,7 +1835,48 @@ def _score_exact_track(
                     breakdown_json=breakdown_json,
                     metadata={**metadata, "query_key": extra_spec.key},
                 )
-    return had_error, has_eligible
+    if RECOMMENDED in states:
+        classification, reason = "strong", ""
+    elif ELIGIBLE_REVIEW in states:
+        classification, reason = "review", ""
+    elif had_error or truncated:
+        classification, reason = "incomplete_evidence", "live provider failure or truncated evidence"
+    elif states and all(state == INCOMPATIBLE for state in states):
+        classification = "not_playable"
+        joined = " | ".join(value.casefold() for value in hard_reasons)
+        reason = (
+            "no required 5-fret guitar" if "no 5-fret" in joined
+            else "no playable chart content" if "no playable chart content" in joined
+            else "artist identity conflict" if "artist conflict" in joined
+            else "title identity/version conflict" if "title conflict" in joined
+            else "severe source issue/modchart" if "modchart" in joined or "severe source issue" in joined
+            else "hard compatibility gate"
+        )
+    elif states:
+        classification, reason = "no_suitable", "below safe score threshold"
+    else:
+        classification, reason = "no_catalog_candidate", "no plausible catalog candidate"
+    return had_error, has_eligible, {
+        "classification": classification,
+        "reason": reason,
+        "candidate_count": len(by_identity),
+        "incomplete": had_error or truncated,
+    }
+
+
+def _merge_live_song_evidence(*values: Mapping[str, Any]) -> dict[str, Any]:
+    priorities = {
+        "strong": 6,
+        "review": 5,
+        "incomplete_evidence": 4,
+        "no_suitable": 3,
+        "not_playable": 2,
+        "no_catalog_candidate": 1,
+    }
+    result = max(values, key=lambda value: priorities.get(str(value.get("classification")), 0))
+    merged = dict(result)
+    merged["candidate_count"] = max(int(value.get("candidate_count") or 0) for value in values)
+    return merged
 
 
 def _ensure_workspace(
@@ -2192,7 +2239,20 @@ def run_spotify_discovery(
             selected_playlist_ids,
         )
         ctx.check_cancelled()
+        from csv_to_clonehero.database import _normalise_spotify_track
+
+        canonical_count = len({
+            _normalise_spotify_track(record)[0].track_key
+            for record in library.records
+        })
+        library_limit = int(getattr(config.server, "max_library_tracks", 50000) or 50000)
+        if canonical_count > library_limit:
+            raise ValueError(
+                f"The deduplicated library has {canonical_count:,} songs; "
+                f"the safe limit is {library_limit:,}."
+            )
         stored = db.replace_spotify_library(library, workspace_id=actual_workspace_id)
+        db.initialize_discovery_song_progress(actual_workspace_id, stored)
         stats.playlists = len(library.playlists)
         stats.library_items = len(library.outcomes) or int(
             getattr(getattr(library, "counts", None), "total_item_count", 0) or 0
@@ -2266,11 +2326,12 @@ def run_spotify_discovery(
 
         ctx.set_phase("scoring", "Scoring exact-song candidates")
         fallback_tracks: list[Track] = []
+        song_evidence: dict[str, dict[str, Any]] = {}
         for track in searchable_tracks:
             ctx.check_cancelled()
             specs = specs_by_track.get(track.track_key, [])
             catalog = bool(track_specs.get(track.track_key, ("song", "", ""))[0] == "artist")
-            had_error, has_eligible = _score_exact_track(
+            had_error, has_eligible, evidence = _score_exact_track(
                 ctx,
                 config,
                 db,
@@ -2280,6 +2341,7 @@ def run_spotify_discovery(
                 source_by_name,
                 catalog=catalog,
             )
+            song_evidence[track.track_key] = evidence
             ctx.track_finished(track)
             all_queries_failed = bool(specs) and all(
                 outcomes.get(spec.key) is not None and outcomes[spec.key].error
@@ -2289,6 +2351,15 @@ def run_spotify_discovery(
                 resume_interrupted and all_queries_failed
             ):
                 fallback_tracks.append(track)
+            else:
+                db.update_discovery_song_progress(
+                    actual_workspace_id,
+                    track.track_key,
+                    status="complete",
+                    candidate_count=int(evidence["candidate_count"]),
+                    classification=str(evidence["classification"]),
+                    reason=str(evidence["reason"]),
+                )
 
         if fallback_tracks:
             stats.fallback_tracks = len(fallback_tracks)
@@ -2321,7 +2392,7 @@ def run_spotify_discovery(
             )
             ctx.set_phase("scoring", "Scoring per-song fallback candidates")
             for track in fallback_tracks:
-                _score_exact_track(
+                _had_error, _has_eligible, fallback_evidence = _score_exact_track(
                     ctx,
                     config,
                     db,
@@ -2331,7 +2402,31 @@ def run_spotify_discovery(
                     source_by_name,
                     catalog=False,
                 )
+                initial_evidence = song_evidence[track.track_key]
+                evidence = (
+                    fallback_evidence
+                    if initial_evidence.get("incomplete") and not fallback_evidence.get("incomplete")
+                    else _merge_live_song_evidence(initial_evidence, fallback_evidence)
+                )
+                db.update_discovery_song_progress(
+                    actual_workspace_id,
+                    track.track_key,
+                    status="complete",
+                    candidate_count=int(evidence["candidate_count"]),
+                    classification=str(evidence["classification"]),
+                    reason=str(evidence["reason"]),
+                )
                 ctx.track_finished(track)
+
+        for track in tracks:
+            if track.track_key not in song_evidence:
+                db.update_discovery_song_progress(
+                    actual_workspace_id,
+                    track.track_key,
+                    status="complete",
+                    classification="no_catalog_candidate",
+                    reason="no plausible catalog candidate",
+                )
 
         ctx.set_phase("complete", "Finalizing exact-song discovery")
         stats.total_queries = ctx.task_total

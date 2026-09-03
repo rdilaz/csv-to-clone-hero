@@ -2,7 +2,7 @@ import hashlib
 import json
 from dataclasses import asdict
 
-from csv_to_clonehero.catalog import CatalogLoadError, EnchorCatalog, export_catalog
+from csv_to_clonehero.catalog import CatalogLoadError, EnchorCatalog, export_catalog, load_enchor_catalog
 from csv_to_clonehero.models import ChartCandidate
 from csv_to_clonehero.normalization import normalize_artist, normalize_title
 
@@ -191,3 +191,39 @@ def test_artist_songs_uses_indexed_artist_pool(tmp_path):
     assert [(title, [row.chart_id for row in rows]) for title, rows in catalog.artist_songs("Artist")] == [
         (normalize_title("First"), [1])
     ]
+
+
+def test_same_path_snapshot_replacement_refreshes_cache_identity(tmp_path):
+    path = tmp_path / "catalog.jsonl"
+    write_snapshot(path, [candidate(1, "Artist", "First")])
+    first = load_enchor_catalog(path)
+    write_snapshot(path, [candidate(2, "Artist", "Other")])
+    second = load_enchor_catalog(path)
+    assert second is not first
+    assert first.sha256 != second.sha256
+    assert second.has_chart(2)
+    assert not second.has_chart(1)
+
+
+def test_catalog_cache_retains_only_current_full_catalog(tmp_path):
+    path = tmp_path / "catalog.jsonl"
+    write_snapshot(path, [candidate(1, "Artist", "First")])
+    load_enchor_catalog.cache_clear()
+
+    first = load_enchor_catalog(path, validation_fingerprint="ledger-a")
+    eligibility_changed = load_enchor_catalog(
+        path,
+        excluded_identities={("enchor", 1)},
+        validation_fingerprint="ledger-b",
+    )
+    assert eligibility_changed is not first
+    assert not eligibility_changed.has_chart(1)
+    assert load_enchor_catalog.cache_info().currsize == 1
+
+    write_snapshot(path, [candidate(2, "Artist", "Second")])
+    snapshot_changed = load_enchor_catalog(
+        path, validation_fingerprint="ledger-b"
+    )
+    assert snapshot_changed is not eligibility_changed
+    assert snapshot_changed.has_chart(2)
+    assert load_enchor_catalog.cache_info().currsize == 1

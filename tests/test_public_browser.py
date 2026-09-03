@@ -63,6 +63,13 @@ def _assert_no_overflow(page):
     )
 
 
+def _assert_in_viewport(page, selector):
+    box = page.locator(selector).bounding_box()
+    assert box is not None
+    assert box["y"] >= 0
+    assert box["y"] + box["height"] <= page.evaluate("window.innerHeight")
+
+
 def _capture(page, name):
     root = os.environ.get("RIFF_BROWSER_EVIDENCE_DIR", "").strip()
     if not root:
@@ -97,6 +104,72 @@ def test_public_landing_mobile_and_desktop(public_server):
                 page.close()
         finally:
             browser.close()
+
+
+@pytest.mark.parametrize(
+    "viewport",
+    [{"width": 390, "height": 844}, {"width": 1440, "height": 900}],
+)
+def test_running_find_eta_restores_without_overflow(public_server, viewport):
+    _app, base_url, cookie_name, cookie = public_server
+    job_polls = {"count": 0}
+
+    def route_api(route):
+        path = route.request.url.split(base_url, 1)[-1]
+        if path == "/api/journey":
+            payload = {
+                "workspace_id": 1,
+                "workspace_status": "running",
+                "workspace": {"id": 1, "status": "running", "phase": "finding_charts"},
+                "sources": [],
+                "combined": {"tracks": 100, "artists": 20},
+                "job": {"id": 9, "status": "running", "phase": "finding_charts"},
+                "review": {"strong": 0, "review": 0, "unavailable": 0, "selected": 0, "total": 0},
+                "download": None,
+            }
+        elif path == "/api/jobs/9":
+            job_polls["count"] += 1
+            early = job_polls["count"] == 1
+            payload = {"job": {
+                "id": 9,
+                "status": "running",
+                "phase": "finding_charts",
+                "progress": {
+                    "total_tracks": 100,
+                    "processed_tracks": 1 if early else 10,
+                    "total_work": 100,
+                    "completed_work": 80 if early else 90,
+                    "elapsed_seconds": 2 if early else 20,
+                },
+            }}
+        else:
+            payload = {"error": f"unexpected mocked request: {path}"}
+        route.fulfill(status=200, content_type="application/json", body=json.dumps(payload))
+
+    with playwright.sync_playwright() as runtime:
+        try:
+            browser = runtime.chromium.launch(headless=True)
+        except Exception as exc:
+            pytest.skip(f"Chromium is not installed: {exc}")
+        context = browser.new_context(viewport=viewport)
+        context.add_cookies([{"name": cookie_name, "value": cookie, "url": base_url}])
+        page = context.new_page()
+        page.route("**/api/**", route_api)
+        page.goto(base_url + "/", wait_until="networkidle")
+
+        playwright.expect(page.get_by_text("1 of 100 songs complete", exact=True)).to_be_visible()
+        assert page.locator("#progressEta").inner_text() == "Estimating..."
+        playwright.expect(page.get_by_text("10 of 100 songs complete", exact=True)).to_be_visible(timeout=3000)
+        assert page.locator("#progressEta").inner_text() == "About 2-4 minutes"
+        _assert_in_viewport(page, "#progressEta")
+        _assert_no_overflow(page)
+
+        page.reload(wait_until="networkidle")
+        playwright.expect(page.get_by_text("10 of 100 songs complete", exact=True)).to_be_visible()
+        assert page.locator("#progressEta").inner_text() == "About 2-4 minutes"
+        _assert_in_viewport(page, "#progressEta")
+        _assert_no_overflow(page)
+        browser.close()
 
 
 @pytest.mark.parametrize(
@@ -193,8 +266,8 @@ def test_public_authenticated_journey_to_download_ready(
             payload, status = {"job": {"id": 9, "status": "queued", "phase": "queued"}}, 202
         elif path == "/api/jobs/9":
             job_polls["count"] += 1
-            if job_polls["count"] == 1:
-                payload = {"job": {"id": 9, "status": "running", "phase": "finding_charts", "message": "Matching", "progress": {"total_tracks": 133, "completed_tracks": 133, "total_work": 180, "completed_work": 140}}}
+            if job_polls["count"] <= 2:
+                payload = {"job": {"id": 9, "status": "running", "phase": "finding_charts", "message": "Matching", "progress": {"total_tracks": 200, "completed_tracks": 50, "total_work": 180, "completed_work": 140, "elapsed_seconds": 100}}}
             else:
                 payload = {"job": {"id": 9, "status": "complete", "phase": "complete", "message": "Matching complete", "progress": {"total_tracks": 1, "processed_tracks": 1}}}
             status = 200
@@ -230,8 +303,11 @@ def test_public_authenticated_journey_to_download_ready(
         page.locator('input[value="playlist-unknown"]').check()
         page.get_by_label("Liked Songs").check()
         page.get_by_role("button", name="Find Clone Hero charts").click()
-        playwright.expect(page.get_by_text("140 of 180 checks complete", exact=True)).to_be_visible()
-        assert page.locator("#progressPercent").inner_text() == "78%"
+        playwright.expect(page.get_by_text("50 of 200 songs complete", exact=True)).to_be_visible()
+        assert page.locator("#progressPercent").inner_text() == "25%"
+        assert page.locator("#progressEta").inner_text() == "About 4-6 minutes"
+        _assert_in_viewport(page, "#progressEta")
+        _assert_no_overflow(page)
         page.get_by_role("heading", name="1 song has a recommendation.").wait_for()
         scope_posts = [json.loads(body or "{}") for method, path, body in api_calls if method == "POST" and path == "/api/spotify/scope"]
         assert scope_posts and scope_posts[-1]["playlist_ids"] == ["playlist-unknown"]
@@ -275,4 +351,110 @@ def test_public_authenticated_journey_to_download_ready(
         assert page.get_by_text("Scan Songs.", exact=True).is_visible()
         _assert_no_overflow(page)
         _capture(page, f"done-{viewport['width']}x{viewport['height']}.png")
+        browser.close()
+
+
+def test_public_expansion_confirm_and_reload_in_browser(public_server):
+    _app, base_url, cookie_name, cookie = public_server
+    expansion_started = {"value": False}
+    expansion_selected = {"value": False}
+
+    def route_api(route):
+        request = route.request
+        path = request.url.split(base_url, 1)[-1]
+        method = request.method
+        if path == "/api/journey":
+            job = (
+                {"id": 12, "kind": "expansion", "status": "complete", "phase": "complete"}
+                if expansion_started["value"]
+                else {"id": 9, "kind": "discovery", "status": "complete", "phase": "complete"}
+            )
+            payload, status = {
+                "workspace_id": 1,
+                "workspace_status": "complete",
+                "workspace": {"id": 1, "status": "complete", "phase": "complete"},
+                "sources": [],
+                "combined": {"tracks": 1, "artists": 1},
+                "job": job,
+                "review": {"strong": 0, "review": 0, "unavailable": 1, "selected": 0, "total": 1},
+                "download": None,
+            }, 200
+        elif path.startswith("/api/workspace?"):
+            payload, status = {
+                "workspace": 1, "tracks": [], "total": 0, "offset": 0, "limit": 25,
+                "summary": {"strong": 0, "review": 0, "unavailable": 1, "selected": 0, "selection_count": 0, "total": 1},
+            }, 200
+        elif path == "/api/expansion/artists":
+            payload, status = {
+                "available": True,
+                "max_artists": 25,
+                "artists": [{
+                    "artist": "Paramore", "artist_norm": "paramore",
+                    "eligible_songs": 8, "eligible_charts": 10,
+                    "imported_songs": 2, "cap": 25,
+                    "selected": expansion_started["value"],
+                }],
+                "job": ({"id": 12, "kind": "expansion", "status": "complete"} if expansion_started["value"] else None),
+            }, 200
+        elif path == "/api/expansion/results":
+            candidate = {
+                "candidate_id": 51, "source": "enchor", "chart_id": 510,
+                "artist": "Paramore", "title": "Decode", "charter": "Community Charter",
+                "pack_name": "Full band", "artist_norm": "paramore", "kind": "expansion",
+                "score": 92, "quality": 20, "selected": expansion_selected["value"],
+                "selectable": True, "best": True,
+                "review": {"state": "strong", "label": "Recommended expansion", "concerns": [], "selectable": True},
+            }
+            payload, status = {
+                "songs": [{
+                    "song_key": "paramore|decode", "artist": "Paramore", "title": "Decode",
+                    "artist_norm": "paramore", "selected": expansion_selected["value"],
+                    "candidates": [candidate],
+                }],
+                "total": 1,
+                "summary": {"total": 1, "selected": int(expansion_selected["value"])},
+            }, 200
+        elif path == "/api/expansion" and method == "POST":
+            assert json.loads(request.post_data or "{}")["artists"] == ["paramore"]
+            expansion_started["value"] = True
+            payload, status = {"job": {"id": 12, "kind": "expansion", "status": "queued"}}, 202
+        elif path == "/api/jobs/12":
+            payload, status = {"job": {
+                "id": 12, "kind": "expansion", "status": "complete", "phase": "complete",
+                "message": "Artist recommendations are ready.",
+                "progress": {"completed_artists": 1, "total_artists": 1, "network_requests": 0},
+            }}, 200
+        elif path == "/api/selection" and method == "POST":
+            body = json.loads(request.post_data or "{}")
+            assert body["kind"] == "expansion"
+            expansion_selected["value"] = body["action"] == "select"
+            payload, status = {"ok": True}, 200
+        else:
+            payload, status = {"error": f"unexpected mocked request: {method} {path}"}, 500
+        route.fulfill(status=status, content_type="application/json", body=json.dumps(payload))
+
+    with playwright.sync_playwright() as runtime:
+        try:
+            browser = runtime.chromium.launch(headless=True)
+        except Exception as exc:
+            pytest.skip(f"Chromium is not installed: {exc}")
+        context = browser.new_context(viewport={"width": 390, "height": 844}, has_touch=True)
+        context.add_cookies([{"name": cookie_name, "value": cookie, "url": base_url}])
+        page = context.new_page()
+        page.route("**/api/**", route_api)
+        page.goto(base_url + "/", wait_until="networkidle")
+
+        playwright.expect(page.get_by_role("heading", name="Add more songs by artists you already love.")).to_be_visible()
+        page.get_by_label("Paramore", exact=False).check()
+        page.get_by_role("button", name="Find more songs by selected artists").click()
+        playwright.expect(page.locator(".review-card--expansion")).to_contain_text("Decode")
+        page.locator('[data-expansion-selection="select"]').click()
+        playwright.expect(page.get_by_text("1 charts selected", exact=True)).to_be_visible()
+        assert page.get_by_role("button", name="Continue with 1 selected chart").is_enabled()
+        _assert_no_overflow(page)
+
+        page.reload(wait_until="networkidle")
+        assert page.get_by_label("Paramore", exact=False).is_checked()
+        playwright.expect(page.get_by_text("Selected chart", exact=True)).to_be_visible()
+        _assert_no_overflow(page)
         browser.close()

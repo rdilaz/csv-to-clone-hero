@@ -16,7 +16,7 @@ from typing import Any
 
 from csv_to_clonehero.models import ChartCandidate, Track
 
-SCHEMA_VERSION = 17
+SCHEMA_VERSION = 19
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);
@@ -442,6 +442,7 @@ CREATE TABLE IF NOT EXISTS discovery_song_progress (
     candidate_count INTEGER NOT NULL DEFAULT 0,
     provenance TEXT NOT NULL DEFAULT '',
     classification TEXT NOT NULL DEFAULT '',
+    reason TEXT NOT NULL DEFAULT '',
     updated_at REAL NOT NULL,
     PRIMARY KEY (workspace_id, track_key)
 );
@@ -783,6 +784,60 @@ CREATE TABLE IF NOT EXISTS source_preflights (
     metadata_json TEXT NOT NULL DEFAULT '{}'
 );
 
+CREATE TABLE IF NOT EXISTS chart_artifact_validations (
+    source TEXT NOT NULL,
+    chart_id INTEGER NOT NULL,
+    catalog_snapshot_id TEXT NOT NULL DEFAULT '',
+    catalog_row_hash TEXT NOT NULL DEFAULT '',
+    artifact_ref TEXT NOT NULL DEFAULT '',
+    state TEXT NOT NULL DEFAULT 'UNVERIFIED'
+        CHECK(state IN ('VERIFIED', 'UNVERIFIED', 'REJECTED', 'UNAVAILABLE')),
+    validator_version TEXT NOT NULL DEFAULT '',
+    artifact_sha256 TEXT NOT NULL DEFAULT '',
+    size_bytes INTEGER NOT NULL DEFAULT 0,
+    format TEXT NOT NULL DEFAULT '',
+    playable_note_count INTEGER NOT NULL DEFAULT 0,
+    validation_json TEXT NOT NULL DEFAULT '{}',
+    reason_code TEXT NOT NULL DEFAULT '',
+    reason TEXT NOT NULL DEFAULT '',
+    http_status INTEGER,
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    first_seen_at REAL NOT NULL,
+    last_seen_at REAL NOT NULL,
+    checked_at REAL,
+    updated_at REAL NOT NULL,
+    PRIMARY KEY(source, chart_id)
+);
+CREATE INDEX IF NOT EXISTS idx_chart_artifact_validations_state
+    ON chart_artifact_validations(state);
+
+CREATE TABLE IF NOT EXISTS chart_artifact_validation_history (
+    id INTEGER PRIMARY KEY,
+    source TEXT NOT NULL,
+    chart_id INTEGER NOT NULL,
+    catalog_snapshot_id TEXT NOT NULL DEFAULT '',
+    catalog_row_hash TEXT NOT NULL DEFAULT '',
+    artifact_ref TEXT NOT NULL DEFAULT '',
+    state TEXT NOT NULL,
+    validator_version TEXT NOT NULL DEFAULT '',
+    artifact_sha256 TEXT NOT NULL DEFAULT '',
+    size_bytes INTEGER NOT NULL DEFAULT 0,
+    format TEXT NOT NULL DEFAULT '',
+    playable_note_count INTEGER NOT NULL DEFAULT 0,
+    validation_json TEXT NOT NULL DEFAULT '{}',
+    reason_code TEXT NOT NULL DEFAULT '',
+    reason TEXT NOT NULL DEFAULT '',
+    http_status INTEGER,
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    first_seen_at REAL NOT NULL,
+    last_seen_at REAL NOT NULL,
+    checked_at REAL,
+    updated_at REAL NOT NULL,
+    archived_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_chart_artifact_validation_history_identity
+    ON chart_artifact_validation_history(source, chart_id, id);
+
 CREATE INDEX IF NOT EXISTS idx_user_sessions_expires ON user_sessions(expires_at);
 CREATE INDEX IF NOT EXISTS idx_background_jobs_user ON background_jobs(user_id, status);
 """
@@ -798,6 +853,21 @@ def _as_mapping(value: Any) -> dict[str, Any]:
     if isinstance(values, dict):
         return dict(values)
     return {}
+
+
+def _catalog_candidate_row_hash(value: Any) -> str:
+    supplied = str(getattr(value, "_catalog_row_hash", "") or "")
+    if supplied:
+        return supplied
+    data = _as_mapping(value)
+    for field_name in (
+        "db_id", "artwork_url", "artwork_id", "issues",
+        "diff_guitarghl_coop", "diff_rhythmghl",
+    ):
+        data.pop(field_name, None)
+    return hashlib.sha256(
+        json.dumps(data, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+    ).hexdigest()
 
 
 def _first_value(data: Mapping[str, Any], *names: str, default: Any = None) -> Any:
@@ -1176,8 +1246,17 @@ class Database:
                 ("discovery_workspaces", "library_matching_fingerprint", "TEXT NOT NULL DEFAULT ''"),
                 ("discovery_workspaces", "candidate_revision", "INTEGER NOT NULL DEFAULT 0"),
                 ("matching_scan_cache", "candidate_revision", "INTEGER NOT NULL DEFAULT 0"),
+                ("discovery_song_progress", "reason", "TEXT NOT NULL DEFAULT ''"),
+                ("chart_artifact_validations", "catalog_snapshot_id", "TEXT NOT NULL DEFAULT ''"),
+                ("chart_artifact_validations", "catalog_row_hash", "TEXT NOT NULL DEFAULT ''"),
             ):
                 self._ensure_column(table, column, definition)
+            self._conn.execute(
+                """CREATE INDEX IF NOT EXISTS idx_chart_artifact_validations_batch
+                   ON chart_artifact_validations(
+                       catalog_snapshot_id,state,source,checked_at,chart_id
+                   )"""
+            )
             # Older query rows predate the explicit returned-count field.  This
             # is intentionally version-gated: opening a current DB is read-only
             # during startup and cannot contend with a discovery worker.
@@ -3590,6 +3669,11 @@ class Database:
             raise ValueError("candidate is required")
         resolved_track = self._resolve_track_value(track_id)
         candidate_id = self._candidate_db_id(candidate)
+        candidate_row = self.get_candidate(candidate_id)
+        if candidate_row is not None and not self.is_chart_artifact_eligible(
+            candidate_row.source, candidate_row.chart_id
+        ):
+            raise ValueError("candidate artifact is rejected or unavailable")
         if resolved_track is None and kind == "exact":
             raise ValueError("exact selection requires a Spotify track")
         if kind == "exact":
@@ -3631,7 +3715,6 @@ class Database:
                 score = check["score"]
             if not explanation:
                 explanation = check["breakdown_json"] or ""
-        candidate_row = self.get_candidate(candidate_id)
         if score is None and candidate_row is not None:
             score = 0.0
         now = time.time()
@@ -4007,7 +4090,7 @@ class Database:
         row = self._conn.execute("SELECT COUNT(*) AS count FROM workspace_candidates WHERE workspace_id=? AND kind='exact'", (db_id,)).fetchone()
         return int(row["count"] or 0)
 
-    def workspace_current_candidate_digest(self, workspace_id: int | str, track_key: str | None = None) -> tuple[int, str, set[int]]:
+    def workspace_current_candidate_digest(self, workspace_id: int | str, track_key: str | None = None) -> tuple[int, str, set[tuple[str, int]]]:
         """Digest exact relationships limited to the current progress tracks."""
         db_id = self._workspace_db_id(workspace_id)
         params: list[Any] = [db_id]
@@ -4016,18 +4099,19 @@ class Database:
             clause = " AND t.track_key=?"
             params.append(str(track_key))
         rows = self._conn.execute(
-            """SELECT t.track_key,wc.candidate_id,wc.score,wc.quality,wc.decision,wc.eligibility,wc.breakdown_json,wc.metadata_json
+            """SELECT t.track_key,wc.candidate_id,c.source,c.chart_id,wc.score,wc.quality,wc.decision,wc.eligibility,wc.breakdown_json,wc.metadata_json
                FROM workspace_candidates wc JOIN spotify_tracks t ON t.id=wc.track_id
+               JOIN candidate_charts c ON c.id=wc.candidate_id
                JOIN discovery_song_progress dsp ON dsp.workspace_id=wc.workspace_id AND dsp.track_key=t.track_key
                WHERE wc.workspace_id=? AND wc.kind='exact'""" + clause + " ORDER BY t.track_key,wc.candidate_id,wc.score,wc.quality,wc.decision,wc.eligibility,wc.breakdown_json,wc.metadata_json", params)
         digest = hashlib.sha256()
-        ids: set[int] = set()
+        ids: set[tuple[str, int]] = set()
         count = 0
         for row in rows:
             digest.update(json.dumps(tuple(row), sort_keys=True, default=str).encode("utf-8"))
             digest.update(b"\n")
             count += 1
-            ids.add(int(row["candidate_id"]))
+            ids.add((str(row["source"]), int(row["chart_id"])))
         return count, digest.hexdigest(), ids
 
     def assign_current_progress_candidates_to_task(self, workspace_id: int | str, task_id: int) -> int:
@@ -4253,7 +4337,7 @@ class Database:
         self, workspace_id: int | str, track_key: str, **values: Any
     ) -> None:
         db_id = self._workspace_db_id(workspace_id)
-        allowed = {"status", "candidate_count", "provenance", "classification"}
+        allowed = {"status", "candidate_count", "provenance", "classification", "reason"}
         assignments = [f"{key} = ?" for key in values if key in allowed]
         params = [values[key] for key in values if key in allowed]
         assignments.append("updated_at = ?")
@@ -4273,8 +4357,8 @@ class Database:
         now = time.time()
         with self._conn:
             for track_key, values in rows:
-                assignments = [f"{key} = ?" for key in values if key in {"status", "candidate_count", "provenance", "classification"}]
-                params = [values[key] for key in values if key in {"status", "candidate_count", "provenance", "classification"}]
+                assignments = [f"{key} = ?" for key in values if key in {"status", "candidate_count", "provenance", "classification", "reason"}]
+                params = [values[key] for key in values if key in {"status", "candidate_count", "provenance", "classification", "reason"}]
                 assignments.append("updated_at = ?")
                 params.extend([now, db_id, str(track_key)])
                 self._conn.execute("UPDATE discovery_song_progress SET " + ", ".join(assignments) + " WHERE workspace_id = ? AND track_key = ?", params)
@@ -4312,6 +4396,29 @@ class Database:
             (db_id,),
         ).fetchone()
         return {key: int(row[key] or 0) for key in ("total", "completed", "checking", "strong", "review", "no_suitable", "not_playable", "no_catalog_candidate")}
+
+    def get_discovery_song_yield_summary(self, workspace_id: int | str) -> dict[str, Any]:
+        """Aggregate terminal song classes and reasons without a page-size cap."""
+        db_id = self._workspace_db_id(workspace_id)
+        rows = self._conn.execute(
+            """SELECT classification,reason,COUNT(*) AS count
+               FROM discovery_song_progress
+               WHERE workspace_id=? AND status='complete'
+               GROUP BY classification,reason""",
+            (db_id,),
+        )
+        classifications: dict[str, int] = {}
+        reasons: dict[str, int] = {}
+        total = 0
+        for row in rows:
+            count = int(row["count"] or 0)
+            classification = str(row["classification"] or "")
+            reason = str(row["reason"] or "")
+            classifications[classification] = classifications.get(classification, 0) + count
+            if reason:
+                reasons[reason] = reasons.get(reason, 0) + count
+            total += count
+        return {"total": total, "classifications": classifications, "reasons": reasons}
 
     def count_discovery_song_progress(
         self, workspace_id: int | str, *, search: str = ""
@@ -5540,6 +5647,501 @@ class Database:
         }
 
     # ------------------------------------------------------------- candidates
+    def _archive_chart_artifact_validation(self, row: sqlite3.Row, archived_at: float) -> None:
+        self._conn.execute(
+            """INSERT INTO chart_artifact_validation_history
+               (source,chart_id,catalog_snapshot_id,catalog_row_hash,artifact_ref,state,
+                validator_version,artifact_sha256,size_bytes,format,
+                playable_note_count,validation_json,reason_code,reason,
+                http_status,attempt_count,first_seen_at,last_seen_at,checked_at,
+                updated_at,archived_at)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                row["source"], row["chart_id"], row["catalog_snapshot_id"],
+                row["catalog_row_hash"], row["artifact_ref"], row["state"], row["validator_version"],
+                row["artifact_sha256"], row["size_bytes"], row["format"],
+                row["playable_note_count"], row["validation_json"],
+                row["reason_code"], row["reason"], row["http_status"],
+                row["attempt_count"], row["first_seen_at"], row["last_seen_at"],
+                row["checked_at"], row["updated_at"], archived_at,
+            ),
+        )
+
+    def _adjust_catalog_validation_counts(
+        self,
+        catalog_snapshot_id: str,
+        old_state: str | None,
+        new_state: str | None,
+    ) -> None:
+        if not catalog_snapshot_id or old_state == new_state:
+            return
+        key = "chart_artifact_catalog_counts"
+        row = self._conn.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+        payload = _load_json(row["value"], {}) if row else {}
+        if not isinstance(payload, dict) or payload.get("snapshot_id") != catalog_snapshot_id:
+            return
+        counts = payload.get("counts")
+        if not isinstance(counts, dict):
+            return
+        if old_state:
+            counts[old_state] = max(0, int(counts.get(old_state, 0)) - 1)
+        if new_state:
+            counts[new_state] = int(counts.get(new_state, 0)) + 1
+        self._conn.execute(
+            """INSERT INTO meta(key,value) VALUES(?,?)
+               ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
+            (key, json.dumps(payload, sort_keys=True)),
+        )
+
+    def observe_chart_artifact(
+        self,
+        source: str,
+        chart_id: int,
+        artifact_ref: str = "",
+        *,
+        catalog_snapshot_id: str = "",
+    ) -> sqlite3.Row:
+        """Remember a source identity without erasing prior validation evidence."""
+        source = str(source).strip().casefold()
+        chart_id = int(chart_id)
+        artifact_ref = str(artifact_ref or "")
+        catalog_snapshot_id = str(catalog_snapshot_id or "")
+        now = time.time()
+        with self._conn:
+            existing = self._conn.execute(
+                "SELECT * FROM chart_artifact_validations WHERE source=? AND chart_id=?",
+                (source, chart_id),
+            ).fetchone()
+            if existing is None:
+                self._conn.execute(
+                    """INSERT INTO chart_artifact_validations
+                       (source,chart_id,catalog_snapshot_id,artifact_ref,state,
+                        first_seen_at,last_seen_at,updated_at)
+                       VALUES(?,?,?,?,'UNVERIFIED',?,?,?)""",
+                    (source, chart_id, catalog_snapshot_id, artifact_ref, now, now, now),
+                )
+                self._adjust_catalog_validation_counts(
+                    catalog_snapshot_id, None, "UNVERIFIED"
+                )
+            elif str(existing["artifact_ref"] or "") != artifact_ref:
+                self._archive_chart_artifact_validation(existing, now)
+                next_snapshot_id = catalog_snapshot_id
+                self._adjust_catalog_validation_counts(
+                    str(existing["catalog_snapshot_id"] or ""),
+                    str(existing["state"] or ""),
+                    "UNVERIFIED" if next_snapshot_id == existing["catalog_snapshot_id"] else None,
+                )
+                if next_snapshot_id != str(existing["catalog_snapshot_id"] or ""):
+                    self._adjust_catalog_validation_counts(
+                        next_snapshot_id, None, "UNVERIFIED"
+                    )
+                self._conn.execute(
+                    """UPDATE chart_artifact_validations SET catalog_snapshot_id=?,
+                       catalog_row_hash='',artifact_ref=?,state='UNVERIFIED',
+                       validator_version='',artifact_sha256='',size_bytes=0,format='',
+                       playable_note_count=0,validation_json='{}',reason_code='',reason='',
+                       http_status=NULL,checked_at=NULL,last_seen_at=?,updated_at=?
+                       WHERE source=? AND chart_id=?""",
+                    (next_snapshot_id, artifact_ref, now, now, source, chart_id),
+                )
+            else:
+                old_snapshot_id = str(existing["catalog_snapshot_id"] or "")
+                if catalog_snapshot_id and catalog_snapshot_id != old_snapshot_id:
+                    self._archive_chart_artifact_validation(existing, now)
+                    state = str(existing["state"] or "")
+                    self._adjust_catalog_validation_counts(old_snapshot_id, state, None)
+                    self._adjust_catalog_validation_counts(catalog_snapshot_id, None, state)
+                self._conn.execute(
+                    """UPDATE chart_artifact_validations
+                       SET catalog_snapshot_id=CASE WHEN ?!='' THEN ? ELSE catalog_snapshot_id END,
+                           catalog_row_hash=CASE
+                               WHEN ?!='' AND ?!=catalog_snapshot_id THEN ''
+                               ELSE catalog_row_hash END,
+                           last_seen_at=?,updated_at=?
+                       WHERE source=? AND chart_id=?""",
+                    (
+                        catalog_snapshot_id, catalog_snapshot_id,
+                        catalog_snapshot_id, catalog_snapshot_id,
+                        now, now, source, chart_id,
+                    ),
+                )
+        row = self.get_chart_artifact_validation(source, chart_id)
+        assert row is not None
+        return row
+
+    def record_chart_artifact_validation(
+        self,
+        source: str,
+        chart_id: int,
+        *,
+        artifact_ref: str = "",
+        state: str,
+        validator_version: str = "",
+        artifact_sha256: str = "",
+        size_bytes: int = 0,
+        format: str = "",
+        playable_note_count: int = 0,
+        validation: Mapping[str, Any] | None = None,
+        reason_code: str = "",
+        reason: str = "",
+        http_status: int | None = None,
+        catalog_snapshot_id: str = "",
+    ) -> sqlite3.Row:
+        """Persist one restart-safe artifact verdict while retaining identity."""
+        normalized_state = str(state).strip().upper()
+        if normalized_state not in {"VERIFIED", "UNVERIFIED", "REJECTED", "UNAVAILABLE"}:
+            raise ValueError("invalid chart artifact validation state")
+        source = str(source).strip().casefold()
+        chart_id = int(chart_id)
+        artifact_ref = str(artifact_ref or "")
+        catalog_snapshot_id = str(catalog_snapshot_id or "")
+        validator_version = str(validator_version or "")
+        artifact_sha256 = str(artifact_sha256 or "")
+        size_bytes = max(0, int(size_bytes or 0))
+        format = str(format or "")
+        playable_note_count = max(0, int(playable_note_count or 0))
+        validation_json = _json_text(validation or {}, {})
+        reason_code = str(reason_code or "")
+        reason = str(reason or "")[:1000]
+        now = time.time()
+        with self._conn:
+            existing = self._conn.execute(
+                "SELECT * FROM chart_artifact_validations WHERE source=? AND chart_id=?",
+                (source, chart_id),
+            ).fetchone()
+            material = (
+                artifact_ref, normalized_state, validator_version, artifact_sha256,
+                size_bytes, format, playable_note_count, validation_json,
+                reason_code, reason, http_status,
+            )
+            if existing is None:
+                self._conn.execute(
+                    """INSERT INTO chart_artifact_validations
+                       (source,chart_id,catalog_snapshot_id,artifact_ref,state,
+                        validator_version,artifact_sha256,size_bytes,format,
+                        playable_note_count,validation_json,reason_code,reason,
+                        http_status,attempt_count,first_seen_at,last_seen_at,
+                        checked_at,updated_at)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,?,?,?,?)""",
+                    (
+                        source, chart_id, catalog_snapshot_id, artifact_ref,
+                        normalized_state, validator_version, artifact_sha256,
+                        size_bytes, format, playable_note_count, validation_json,
+                        reason_code, reason, http_status, now, now, now, now,
+                    ),
+                )
+                self._adjust_catalog_validation_counts(
+                    catalog_snapshot_id, None, normalized_state
+                )
+            else:
+                next_snapshot_id = (
+                    catalog_snapshot_id
+                    if catalog_snapshot_id
+                    else "" if str(existing["artifact_ref"] or "") != artifact_ref
+                    else str(existing["catalog_snapshot_id"] or "")
+                )
+                previous = (
+                    str(existing["artifact_ref"] or ""), str(existing["state"] or ""),
+                    str(existing["validator_version"] or ""),
+                    str(existing["artifact_sha256"] or ""), int(existing["size_bytes"] or 0),
+                    str(existing["format"] or ""), int(existing["playable_note_count"] or 0),
+                    str(existing["validation_json"] or "{}"),
+                    str(existing["reason_code"] or ""), str(existing["reason"] or ""),
+                    existing["http_status"],
+                )
+                old_snapshot_id = str(existing["catalog_snapshot_id"] or "")
+                if previous != material or next_snapshot_id != old_snapshot_id:
+                    self._archive_chart_artifact_validation(existing, now)
+                if str(existing["state"] or "") != normalized_state or next_snapshot_id != old_snapshot_id:
+                    self._adjust_catalog_validation_counts(
+                        old_snapshot_id,
+                        str(existing["state"] or ""),
+                        normalized_state if next_snapshot_id == old_snapshot_id else None,
+                    )
+                    if next_snapshot_id != old_snapshot_id:
+                        self._adjust_catalog_validation_counts(
+                            next_snapshot_id, None, normalized_state
+                        )
+                self._conn.execute(
+                    """UPDATE chart_artifact_validations SET
+                       catalog_snapshot_id=?,
+                       catalog_row_hash=CASE
+                           WHEN artifact_ref!=? OR catalog_snapshot_id!=? THEN ''
+                           ELSE catalog_row_hash END,
+                       artifact_ref=?,state=?,validator_version=?,artifact_sha256=?,
+                       size_bytes=?,format=?,playable_note_count=?,validation_json=?,
+                       reason_code=?,reason=?,http_status=?,attempt_count=attempt_count+1,
+                       last_seen_at=?,checked_at=?,updated_at=?
+                       WHERE source=? AND chart_id=?""",
+                    (
+                        next_snapshot_id, artifact_ref, next_snapshot_id, artifact_ref,
+                        normalized_state, validator_version, artifact_sha256,
+                        size_bytes, format, playable_note_count, validation_json,
+                        reason_code, reason, http_status, now, now, now, source, chart_id,
+                    ),
+                )
+        row = self.get_chart_artifact_validation(source, chart_id)
+        assert row is not None
+        return row
+
+    def get_chart_artifact_validation(self, source: str, chart_id: int) -> sqlite3.Row | None:
+        return self._conn.execute(
+            "SELECT * FROM chart_artifact_validations WHERE source=? AND chart_id=?",
+            (str(source).strip().casefold(), int(chart_id)),
+        ).fetchone()
+
+    def get_chart_artifact_validation_history(
+        self, source: str, chart_id: int
+    ) -> list[sqlite3.Row]:
+        return list(self._conn.execute(
+            """SELECT * FROM chart_artifact_validation_history
+               WHERE source=? AND chart_id=? ORDER BY id""",
+            (str(source).strip().casefold(), int(chart_id)),
+        ))
+
+    def list_chart_artifact_validations(
+        self,
+        *,
+        states: Iterable[str] | None = None,
+        source: str = "",
+        sources: Iterable[str] | None = None,
+        catalog_snapshot_id: str = "",
+        after_chart_id: int = 0,
+        limit: int | None = None,
+    ) -> list[sqlite3.Row]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if int(after_chart_id) > 0:
+            clauses.append("chart_id > ?")
+            params.append(int(after_chart_id))
+        normalized_states = sorted({str(value).upper() for value in (states or ())})
+        if len(normalized_states) > 1 and limit is not None:
+            rows: list[sqlite3.Row] = []
+            for state in normalized_states:
+                rows.extend(self.list_chart_artifact_validations(
+                    states=(state,), source=source, sources=sources,
+                    catalog_snapshot_id=catalog_snapshot_id,
+                    after_chart_id=after_chart_id, limit=limit,
+                ))
+            rows.sort(key=lambda row: (
+                row["checked_at"] is not None,
+                float(row["checked_at"] or 0),
+                str(row["source"]),
+                int(row["chart_id"]),
+                str(row["state"]),
+            ))
+            return rows[:max(1, int(limit))]
+        if normalized_states:
+            clauses.append("state IN (" + ",".join("?" for _ in normalized_states) + ")")
+            params.extend(normalized_states)
+        if source:
+            clauses.append("source=?")
+            params.append(str(source).strip().casefold())
+        normalized_sources = sorted({
+            str(value).strip().casefold() for value in (sources or ()) if str(value).strip()
+        })
+        if len(normalized_sources) == 1:
+            clauses.append("source=?")
+            params.append(normalized_sources[0])
+        elif normalized_sources:
+            clauses.append("source IN (" + ",".join("?" for _ in normalized_sources) + ")")
+            params.extend(normalized_sources)
+        if catalog_snapshot_id:
+            clauses.append("catalog_snapshot_id=?")
+            params.append(str(catalog_snapshot_id))
+        sql = "SELECT * FROM chart_artifact_validations"
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        single_source = bool(source) or len(normalized_sources) == 1
+        sql += " ORDER BY checked_at,chart_id" if single_source else " ORDER BY source,checked_at,chart_id"
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(max(1, int(limit)))
+        return list(self._conn.execute(sql, params))
+
+    def get_chart_artifact_validation_counts(
+        self, *, catalog_snapshot_id: str = ""
+    ) -> dict[str, int]:
+        counts = {state: 0 for state in ("VERIFIED", "UNVERIFIED", "REJECTED", "UNAVAILABLE")}
+        if catalog_snapshot_id:
+            row = self._conn.execute(
+                "SELECT value FROM meta WHERE key='chart_artifact_catalog_counts'"
+            ).fetchone()
+            payload = _load_json(row["value"], {}) if row else {}
+            if isinstance(payload, dict) and payload.get("snapshot_id") == catalog_snapshot_id:
+                stored = payload.get("counts")
+                if isinstance(stored, dict):
+                    return {state: int(stored.get(state, 0)) for state in counts}
+        sql = "SELECT state,COUNT(*) AS count FROM chart_artifact_validations"
+        params: tuple[Any, ...] = ()
+        if catalog_snapshot_id:
+            sql += " WHERE catalog_snapshot_id=?"
+            params = (str(catalog_snapshot_id),)
+        sql += " GROUP BY state"
+        for row in self._conn.execute(sql, params):
+            counts[str(row["state"])] = int(row["count"] or 0)
+        return counts
+
+    def sync_catalog_artifacts(
+        self,
+        catalog_snapshot_id: str,
+        candidates: Iterable[Any],
+    ) -> dict[str, int | bool]:
+        """Bulk-seed one catalog snapshot once; preserve changed artifacts."""
+        snapshot_id = str(catalog_snapshot_id or "")
+        if not snapshot_id:
+            raise ValueError("catalog snapshot identity is required")
+        marker_key = "chart_artifact_catalog_seed"
+        if self.get_meta(marker_key) == snapshot_id:
+            return {"synchronized": False, "inserted": 0, "changed": 0}
+        values = [
+            (
+                str(getattr(candidate, "source", "") or "").strip().casefold(),
+                int(getattr(candidate, "chart_id")),
+                str(getattr(candidate, "md5", "") or ""),
+                _catalog_candidate_row_hash(candidate),
+            )
+            for candidate in candidates
+        ]
+        now = time.time()
+        with self._conn:
+            self._conn.execute(
+                """CREATE TEMP TABLE IF NOT EXISTS chart_artifact_catalog_seed_rows (
+                   source TEXT NOT NULL, chart_id INTEGER NOT NULL,
+                   artifact_ref TEXT NOT NULL, catalog_row_hash TEXT NOT NULL,
+                   PRIMARY KEY(source,chart_id))"""
+            )
+            self._conn.execute("DELETE FROM chart_artifact_catalog_seed_rows")
+            self._conn.executemany(
+                """INSERT OR REPLACE INTO chart_artifact_catalog_seed_rows
+                   (source,chart_id,artifact_ref,catalog_row_hash) VALUES(?,?,?,?)""",
+                values,
+            )
+            changed = int(self._conn.execute(
+                """SELECT COUNT(*) AS count FROM chart_artifact_validations current
+                   JOIN chart_artifact_catalog_seed_rows seed
+                     ON seed.source=current.source AND seed.chart_id=current.chart_id
+                   WHERE current.catalog_snapshot_id!=?
+                      OR seed.artifact_ref!=current.artifact_ref
+                      OR seed.catalog_row_hash!=current.catalog_row_hash""",
+                (snapshot_id,),
+            ).fetchone()["count"] or 0)
+            self._conn.execute(
+                """INSERT INTO chart_artifact_validation_history
+                   (source,chart_id,catalog_snapshot_id,catalog_row_hash,artifact_ref,state,
+                    validator_version,artifact_sha256,size_bytes,format,
+                    playable_note_count,validation_json,reason_code,reason,
+                    http_status,attempt_count,first_seen_at,last_seen_at,checked_at,
+                    updated_at,archived_at)
+                   SELECT current.source,current.chart_id,current.catalog_snapshot_id,
+                          current.catalog_row_hash,current.artifact_ref,current.state,current.validator_version,
+                          current.artifact_sha256,current.size_bytes,current.format,
+                          current.playable_note_count,current.validation_json,
+                          current.reason_code,current.reason,current.http_status,
+                          current.attempt_count,current.first_seen_at,current.last_seen_at,
+                          current.checked_at,current.updated_at,?
+                     FROM chart_artifact_validations current
+                     JOIN chart_artifact_catalog_seed_rows seed
+                       ON seed.source=current.source AND seed.chart_id=current.chart_id
+                    WHERE current.catalog_snapshot_id!=?
+                       OR seed.artifact_ref!=current.artifact_ref
+                       OR seed.catalog_row_hash!=current.catalog_row_hash""",
+                (now, snapshot_id),
+            )
+            self._conn.execute(
+                """UPDATE chart_artifact_validations SET
+                   artifact_ref=(SELECT seed.artifact_ref FROM chart_artifact_catalog_seed_rows seed
+                                 WHERE seed.source=chart_artifact_validations.source
+                                   AND seed.chart_id=chart_artifact_validations.chart_id),
+                   catalog_snapshot_id=?,
+                   catalog_row_hash=(SELECT seed.catalog_row_hash FROM chart_artifact_catalog_seed_rows seed
+                                     WHERE seed.source=chart_artifact_validations.source
+                                       AND seed.chart_id=chart_artifact_validations.chart_id),
+                   state='UNVERIFIED',validator_version='',
+                   artifact_sha256='',size_bytes=0,format='',playable_note_count=0,
+                   validation_json='{}',reason_code='',reason='',http_status=NULL,
+                   checked_at=NULL,last_seen_at=?,updated_at=?
+                   WHERE EXISTS (SELECT 1 FROM chart_artifact_catalog_seed_rows seed
+                                 WHERE seed.source=chart_artifact_validations.source
+                                   AND seed.chart_id=chart_artifact_validations.chart_id
+                                   AND (seed.artifact_ref!=chart_artifact_validations.artifact_ref
+                                        OR seed.catalog_row_hash!=chart_artifact_validations.catalog_row_hash))""",
+                (snapshot_id, now, now),
+            )
+            self._conn.execute(
+                """UPDATE chart_artifact_validations SET catalog_snapshot_id=?,
+                   catalog_row_hash=(SELECT seed.catalog_row_hash FROM chart_artifact_catalog_seed_rows seed
+                                     WHERE seed.source=chart_artifact_validations.source
+                                       AND seed.chart_id=chart_artifact_validations.chart_id),
+                   last_seen_at=?,updated_at=?
+                   WHERE EXISTS (SELECT 1 FROM chart_artifact_catalog_seed_rows seed
+                                 WHERE seed.source=chart_artifact_validations.source
+                                   AND seed.chart_id=chart_artifact_validations.chart_id)""",
+                (snapshot_id, now, now),
+            )
+            inserted = int(self._conn.execute(
+                """SELECT COUNT(*) AS count FROM chart_artifact_catalog_seed_rows seed
+                   WHERE NOT EXISTS (SELECT 1 FROM chart_artifact_validations current
+                                     WHERE current.source=seed.source
+                                       AND current.chart_id=seed.chart_id)"""
+            ).fetchone()["count"] or 0)
+            self._conn.execute(
+                """INSERT INTO chart_artifact_validations
+                   (source,chart_id,catalog_snapshot_id,catalog_row_hash,artifact_ref,state,
+                    first_seen_at,last_seen_at,updated_at)
+                   SELECT seed.source,seed.chart_id,?,seed.catalog_row_hash,
+                          seed.artifact_ref,'UNVERIFIED',?,?,?
+                     FROM chart_artifact_catalog_seed_rows seed
+                    WHERE NOT EXISTS (SELECT 1 FROM chart_artifact_validations current
+                                      WHERE current.source=seed.source
+                                        AND current.chart_id=seed.chart_id)""",
+                (snapshot_id, now, now, now),
+            )
+            self._conn.execute(
+                """INSERT INTO meta(key,value) VALUES(?,?)
+                   ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
+                (marker_key, snapshot_id),
+            )
+            counts = {state: 0 for state in ("VERIFIED", "UNVERIFIED", "REJECTED", "UNAVAILABLE")}
+            for row in self._conn.execute(
+                """SELECT state,COUNT(*) AS count FROM chart_artifact_validations
+                   WHERE catalog_snapshot_id=? GROUP BY state""",
+                (snapshot_id,),
+            ):
+                counts[str(row["state"])] = int(row["count"] or 0)
+            self._conn.execute(
+                """INSERT INTO meta(key,value) VALUES('chart_artifact_catalog_counts',?)
+                   ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
+                (json.dumps({"snapshot_id": snapshot_id, "counts": counts}, sort_keys=True),),
+            )
+            self._conn.execute("DELETE FROM chart_artifact_catalog_seed_rows")
+        return {"synchronized": True, "inserted": inserted, "changed": changed}
+
+    def get_blocked_chart_identities(self) -> set[tuple[str, int]]:
+        return {
+            (str(row["source"]), int(row["chart_id"]))
+            for row in self._conn.execute(
+                "SELECT source,chart_id FROM chart_artifact_validations WHERE state IN ('REJECTED','UNAVAILABLE')"
+            )
+        }
+
+    def chart_validation_fingerprint(self) -> str:
+        """Fingerprint only ledger rows that alter catalog eligibility."""
+        digest = hashlib.sha256()
+        for row in self._conn.execute(
+            """SELECT source,chart_id,artifact_ref,state,validator_version
+               FROM chart_artifact_validations
+               WHERE state IN ('REJECTED','UNAVAILABLE')
+               ORDER BY source,chart_id"""
+        ):
+            digest.update(json.dumps(tuple(row), separators=(",", ":")).encode("utf-8"))
+            digest.update(b"\n")
+        return digest.hexdigest()
+
+    def is_chart_artifact_eligible(self, source: str, chart_id: int) -> bool:
+        row = self.get_chart_artifact_validation(source, chart_id)
+        return row is None or str(row["state"]) not in {"REJECTED", "UNAVAILABLE"}
+
     def upsert_candidate(self, candidate: ChartCandidate | Mapping[str, Any] | Any) -> ChartCandidate:
         candidate = _coerce_candidate(candidate)
         data = _as_mapping(candidate)
@@ -5634,6 +6236,7 @@ class Database:
                 (candidate.source, candidate.chart_id),
             ).fetchone()
         candidate.db_id = row["id"]
+        self.observe_chart_artifact(candidate.source, candidate.chart_id, candidate.md5 or "")
         return candidate
 
     def get_candidate(self, db_id: int) -> ChartCandidate | None:

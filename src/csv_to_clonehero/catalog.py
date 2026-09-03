@@ -58,11 +58,22 @@ class CatalogLoadError(ValueError):
 class EnchorCatalog:
     """Indexed, immutable-in-process catalog snapshot."""
 
-    def __init__(self, path: Path | str = DEFAULT_CATALOG_PATH) -> None:
+    def __init__(
+        self,
+        path: Path | str = DEFAULT_CATALOG_PATH,
+        *,
+        excluded_identities: frozenset[tuple[str, int]] = frozenset(),
+        validation_fingerprint: str = "",
+    ) -> None:
         self.path = Path(path)
+        self.excluded_identities = frozenset(
+            (str(source), int(chart_id)) for source, chart_id in excluded_identities
+        )
+        self.validation_fingerprint = str(validation_fingerprint or "")
         self.complete = False
         self.diagnostic = "catalog unavailable"
         self.snapshot_id = ""
+        self.sha256 = ""
         self.load_seconds = 0.0
         self._artists: set[str] = set()
         self._songs: dict[tuple[str, str], list[ChartCandidate]] = defaultdict(list)
@@ -77,7 +88,8 @@ class EnchorCatalog:
         self._title_forms_by_key: dict[tuple[str, str], tuple[str, ...]] = {}
         self._artist_fuzzy_cache: dict[tuple[str, int], tuple[str, ...]] = {}
         self._title_fuzzy_cache: dict[tuple[str, int], tuple[str, ...]] = {}
-        self._chart_identities: set[tuple[str, int]] = set()
+        self._chart_identities: dict[tuple[str, int], ChartCandidate] = {}
+        self._known_chart_identities: set[tuple[str, int]] = set()
         started = time.perf_counter()
         self._load()
         self.load_seconds = time.perf_counter() - started
@@ -89,6 +101,29 @@ class EnchorCatalog:
     @property
     def chart_count(self) -> int:
         return sum(len(rows) for rows in self._songs.values())
+
+    @property
+    def known_chart_count(self) -> int:
+        return len(self._known_chart_identities)
+
+    @property
+    def cache_identity(self) -> str:
+        return ":".join(
+            value for value in (self.sha256, self.validation_fingerprint) if value
+        )
+
+    @property
+    def manifest(self) -> dict[str, Any]:
+        if not self.available:
+            raise CatalogLoadError(self.diagnostic)
+        return {
+            "snapshot_id": self.snapshot_id,
+            "sha256": self.sha256,
+            "chart_count": self.chart_count,
+            "known_chart_count": self.known_chart_count,
+            "format_version": FORMAT_VERSION,
+            "validation_fingerprint": self.validation_fingerprint,
+        }
 
     @property
     def song_count(self) -> int:
@@ -111,8 +146,33 @@ class EnchorCatalog:
             return False
         return (str(source), chart_id) in self._chart_identities
 
+    def has_known_chart(self, chart_id: int, source: str = "enchor") -> bool:
+        try:
+            chart_id = int(chart_id)
+        except (TypeError, ValueError):
+            return False
+        return (str(source), chart_id) in self._known_chart_identities
+
     def artists(self) -> tuple[str, ...]:
         return tuple(sorted(self._artists))
+
+    def charts(self) -> tuple[ChartCandidate, ...]:
+        """Return every indexed chart in deterministic source/id order."""
+        return tuple(sorted(
+            self._chart_identities.values(),
+            key=lambda chart: (str(chart.source), int(chart.chart_id)),
+        ))
+
+    def iter_charts(self):
+        """Iterate indexed charts without materializing or sorting the catalog."""
+        return iter(self._chart_identities.values())
+
+    def get_chart(self, source: str, chart_id: int) -> ChartCandidate | None:
+        try:
+            identity = (str(source), int(chart_id))
+        except (TypeError, ValueError):
+            return None
+        return self._chart_identities.get(identity)
 
     def artist_songs(self, artist: str) -> tuple[tuple[str, tuple[ChartCandidate, ...]], ...]:
         key = normalize_artist(artist)
@@ -379,18 +439,27 @@ class EnchorCatalog:
                 if not isinstance(candidate_data, Mapping):
                     raise CatalogLoadError("catalog row has no candidate object")
                 candidate = ChartCandidate(**{k: v for k, v in candidate_data.items() if k in ChartCandidate.__dataclass_fields__})
+                candidate._catalog_row_hash = hashlib.sha256(  # type: ignore[attr-defined]
+                    json.dumps(
+                        dict(candidate_data), sort_keys=True, separators=(",", ":"),
+                        default=str,
+                    ).encode("utf-8")
+                ).hexdigest()
                 if not candidate.chart_id:
                     raise CatalogLoadError("catalog row has no chart id")
                 identity = (str(candidate.source), int(candidate.chart_id))
-                if identity in self._chart_identities:
+                if identity in self._known_chart_identities:
                     raise CatalogLoadError("catalog contains duplicate chart identity")
+                self._known_chart_identities.add(identity)
+                if identity in self.excluded_identities:
+                    continue
                 song_key = _row_key(candidate.artist, candidate.name)
                 self._artists.add(song_key[0])
                 self._songs[song_key].append(candidate)
                 self._artist_forms_by_key[song_key] = retrieval_artist_forms(candidate.artist)
                 self._title_forms_by_key[song_key] = retrieval_title_forms(candidate.name)
                 self._songs_by_artist[song_key[0]].add(song_key)
-                self._chart_identities.add(identity)
+                self._chart_identities[identity] = candidate
                 for alias in retrieval_artist_forms(candidate.artist):
                     self._artist_aliases[alias].add(song_key)
                 for alias in retrieval_title_forms(candidate.name):
@@ -408,11 +477,12 @@ class EnchorCatalog:
                         reported = int(reported)
                     except (TypeError, ValueError) as exc:
                         raise CatalogLoadError(f"catalog header has invalid {header_key}") from exc
-                    if reported != self.chart_count:
+                    if reported != self.known_chart_count:
                         raise CatalogLoadError(
                             f"catalog {header_key} does not match chart rows"
                         )
             self.snapshot_id = str(header.get("snapshot_id") or expected[:16])
+            self.sha256 = expected
             self.complete = True
             self.diagnostic = ""
         except (OSError, json.JSONDecodeError, TypeError, KeyError, ValueError, CatalogLoadError) as exc:
@@ -420,10 +490,43 @@ class EnchorCatalog:
             self.diagnostic = f"catalog unavailable: {exc}"
 
 
-@lru_cache(maxsize=4)
-def load_enchor_catalog(path: Path | str = DEFAULT_CATALOG_PATH) -> EnchorCatalog:
-    """Load one immutable snapshot once per process."""
-    return EnchorCatalog(Path(path).resolve())
+@lru_cache(maxsize=1)
+def _load_enchor_catalog_cached(
+    path: str,
+    modified_ns: int,
+    size: int,
+    excluded_identities: tuple[tuple[str, int], ...],
+    validation_fingerprint: str,
+) -> EnchorCatalog:
+    del modified_ns, size
+    return EnchorCatalog(
+        path,
+        excluded_identities=frozenset(excluded_identities),
+        validation_fingerprint=validation_fingerprint,
+    )
+
+
+def load_enchor_catalog(
+    path: Path | str = DEFAULT_CATALOG_PATH,
+    *,
+    excluded_identities: set[tuple[str, int]] | frozenset[tuple[str, int]] = frozenset(),
+    validation_fingerprint: str = "",
+) -> EnchorCatalog:
+    """Load an immutable snapshot, refreshing after atomic same-path replacement."""
+    resolved = Path(path).resolve()
+    try:
+        stat = resolved.stat()
+        modified_ns, size = stat.st_mtime_ns, stat.st_size
+    except OSError:
+        modified_ns, size = 0, 0
+    blocked = tuple(sorted((str(source), int(chart_id)) for source, chart_id in excluded_identities))
+    return _load_enchor_catalog_cached(
+        str(resolved), modified_ns, size, blocked, str(validation_fingerprint or "")
+    )
+
+
+load_enchor_catalog.cache_clear = _load_enchor_catalog_cached.cache_clear  # type: ignore[attr-defined]
+load_enchor_catalog.cache_info = _load_enchor_catalog_cached.cache_info  # type: ignore[attr-defined]
 
 
 def read_catalog_manifest(path: Path | str = DEFAULT_CATALOG_PATH) -> dict[str, Any]:

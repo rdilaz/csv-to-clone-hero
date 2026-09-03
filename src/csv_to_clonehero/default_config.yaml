@@ -248,11 +248,14 @@ server:
   # Reuse one global bounded Enchor catalog check across all users.
   enchor_preflight_ttl_seconds: 3600
   max_scope_playlists: 200
-  max_scope_tracks: 10000
+  max_scope_tracks: 50000
+  # Hard bound on the final cross-provider deduplicated library. This admits
+  # observed 17k-song libraries while bounding matching and SQLite work.
+  max_library_tracks: 50000
   max_content_length: 52428800
   trusted_hops: 1
-  # Public discovery is exact imported-library matching only.
-  enable_expansion: false
+  # Optional, explicit catalog-backed artist expansion after exact matching.
+  enable_expansion: true
   # Session signing key. ALWAYS from the environment (SECRET_KEY), never here.
   secret_key_env: SECRET_KEY
   # When true, the multi-user server refuses to start without SECRET_KEY set.

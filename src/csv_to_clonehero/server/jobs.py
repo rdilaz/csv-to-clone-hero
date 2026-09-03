@@ -196,12 +196,14 @@ class JobManager:
         *,
         workspace_key: str = "",
         notify_email: str = "",
+        initial_progress: Mapping[str, Any] | None = None,
     ) -> JobResult:
         result, _created = self.enqueue_unique(
             user_id,
             kind,
             workspace_key=workspace_key,
             notify_email=notify_email,
+            initial_progress=initial_progress,
         )
         return result
 
@@ -212,16 +214,19 @@ class JobManager:
         *,
         workspace_key: str = "",
         notify_email: str = "",
+        initial_progress: Mapping[str, Any] | None = None,
     ) -> tuple[JobResult, bool]:
-        db = Database(self.config.database_path)
-        try:
-            row, created = db.create_or_get_active_job(
-                user_id, kind, workspace_key=workspace_key, notify_email=notify_email
-            )
-            result = _from_row(row)
-        finally:
-            db.close()
         with self._cv:
+            db = Database(self.config.database_path)
+            try:
+                row, created = db.create_or_get_active_job(
+                    user_id, kind, workspace_key=workspace_key, notify_email=notify_email
+                )
+                if created and initial_progress is not None:
+                    row = db.update_job(int(row["id"]), progress=dict(initial_progress))
+                result = _from_row(row)
+            finally:
+                db.close()
             self._handles[result.id] = result
             self._cv.notify_all()
         return result, created
@@ -259,17 +264,18 @@ class JobManager:
             self._run_job(next_job)
 
     def _dequeue_next(self) -> JobResult | None:
-        db = Database(self.config.database_path)
-        try:
-            for row in db.get_running_jobs():
-                job = _from_row(row)
-                if job.status in ("queued", "running"):
-                    claimed = db.claim_job(job.id)
-                    if claimed is not None:
-                        return _from_row(claimed)
-            return None
-        finally:
-            db.close()
+        with self._cv:
+            db = Database(self.config.database_path)
+            try:
+                for row in db.get_running_jobs():
+                    job = _from_row(row)
+                    if job.status in ("queued", "running"):
+                        claimed = db.claim_job(job.id)
+                        if claimed is not None:
+                            return _from_row(claimed)
+                return None
+            finally:
+                db.close()
 
     def _run_job(self, job: JobResult) -> None:
         self._cancel_events.setdefault(job.id, threading.Event())
@@ -279,13 +285,13 @@ class JobManager:
                 return
             if job.kind == "discovery":
                 from csv_to_clonehero.server.safeguards import (
-                    get_enchor_preflight,
+                    get_discovery_availability,
                     refresh_enchor_preflight,
                 )
 
                 db = Database(self.config.database_path)
                 try:
-                    if not get_enchor_preflight(db).get("fresh"):
+                    if not get_discovery_availability(self.config, db).get("fresh"):
                         refresh_enchor_preflight(self.config, db, self.source_factory)
                 finally:
                     db.close()
@@ -324,10 +330,118 @@ class JobManager:
     def _execute(self, job: JobResult) -> None:
         if job.kind == "discovery":
             self._run_discovery(job)
+        elif job.kind == "expansion":
+            self._run_expansion(job)
         else:
             raise ValueError(f"unknown job kind: {job.kind}")
 
+    def _run_expansion(self, job: JobResult) -> None:
+        """Build a confirmed expansion solely from the validated local catalog."""
+        from csv_to_clonehero.catalog import load_enchor_catalog
+        from csv_to_clonehero.combined_pipeline import expand_combined
+
+        if not self.config.server.enable_expansion:
+            raise RuntimeError("Artist expansion is disabled.")
+        artists = [str(value) for value in job.progress.get("artists", ())]
+        expected_generation = int(job.progress.get("exact_generation_id") or 0)
+        if not artists:
+            raise RuntimeError("Choose at least one artist to expand.")
+
+        self._mark(
+            job.id,
+            status="running",
+            phase="catalog_expansion",
+            message="Preparing artist recommendations",
+            progress={**job.progress, "completed_artists": 0, "total_artists": len(artists)},
+        )
+        db = Database(self.config.database_path)
+        try:
+            workspace = db.get_workspace(job.workspace_key)
+            if workspace is None:
+                raise RuntimeError("discovery workspace no longer exists")
+            if int(workspace["id"]) <= 0:
+                raise RuntimeError("discovery workspace is invalid")
+            user = db.get_user(job.user_id)
+            if user is None or str(workspace["workspace_key"]) != Database.workspace_key_for_user(
+                str(user["spotify_user_id"])
+            ):
+                raise RuntimeError("artist expansion workspace is not owned by this user")
+            metadata = _json_object(workspace["metadata_json"])
+            generation = db.get_current_exact_generation(workspace["id"])
+            if (
+                generation is None
+                or int(generation["id"]) != expected_generation
+                or metadata.get("workflow") != "public_catalog"
+            ):
+                raise RuntimeError(
+                    "Artist expansion requires the current completed catalog-backed exact match."
+                )
+            catalog = load_enchor_catalog(
+                self.config.catalog_path,
+                excluded_identities=db.get_blocked_chart_identities(),
+                validation_fingerprint=db.chart_validation_fingerprint(),
+            )
+            if not catalog.available:
+                raise RuntimeError(catalog.diagnostic or "The local chart catalog is unavailable.")
+
+            def on_progress(payload: Mapping[str, Any]) -> None:
+                if self._cancelled(job.id):
+                    raise RuntimeError("Artist expansion was cancelled.")
+                self._mark(
+                    job.id,
+                    status="running",
+                    phase="catalog_expansion",
+                    message=str(payload.get("message") or "Preparing artist recommendations"),
+                    progress={**job.progress, **dict(payload)},
+                    heartbeat_at=time.time(),
+                )
+
+            result = expand_combined(
+                self.config,
+                db,
+                int(workspace["id"]),
+                artists,
+                catalog=catalog,
+                exact_generation_id=expected_generation,
+                on_progress=on_progress,
+            )
+            current = db.get_current_exact_generation(workspace["id"])
+            if current is None or int(current["id"]) != expected_generation:
+                db.clear_workspace_expansion_candidates(workspace["id"])
+                raise RuntimeError("Exact matching changed while expansion was running; choose artists again.")
+            selected = set(artists)
+            for row in db.get_workspace_expansion_artists(workspace["id"]):
+                db.set_expansion_artist_selected(
+                    workspace["id"], str(row["artist_norm"]), str(row["artist_norm"]) in selected
+                )
+            cancelled = self._cancelled(job.id)
+            payload = {
+                "artists": artists,
+                "exact_generation_id": expected_generation,
+                "total_artists": len(artists),
+                "completed_artists": len(artists),
+                "recommendations": int(result.candidates),
+                "catalog_snapshot_id": result.catalog_snapshot_id,
+                "network_requests": 0,
+            }
+            self._mark(
+                job.id,
+                status="cancelled" if cancelled else "complete",
+                phase="cancelled" if cancelled else "complete",
+                message="Job cancelled" if cancelled else "Artist recommendations are ready.",
+                progress=payload,
+                result=payload,
+            )
+        finally:
+            db.close()
+
     def _run_discovery(self, job: JobResult) -> None:
+        from csv_to_clonehero.catalog import load_enchor_catalog
+        from csv_to_clonehero.combined_pipeline import (
+            discover_combined,
+            enforce_library_limit,
+            workspace_snapshots,
+        )
         from csv_to_clonehero.spotify_pipeline import run_spotify_discovery
         from csv_to_clonehero.server.safeguards import validate_discovery_start
 
@@ -352,6 +466,11 @@ class JobManager:
             workspace = db.get_workspace(job.workspace_key)
             workspace_id = int(workspace["id"]) if workspace is not None else None
             metadata = _json_object(workspace["metadata_json"] if workspace is not None else "{}")
+            catalog = load_enchor_catalog(
+                self.config.catalog_path,
+                excluded_identities=db.get_blocked_chart_identities(),
+                validation_fingerprint=db.chart_validation_fingerprint(),
+            )
             spotify_scope = (
                 db.get_workspace_scope_data(workspace_id)
                 if workspace_id is not None
@@ -374,8 +493,8 @@ class JobManager:
             combined_provider_discovery = (
                 has_persisted_soundcloud or _scope_selected(soundcloud_scope)
             )
-
-            if combined_provider_discovery and _scope_selected(spotify_scope):
+            pending_snapshots: list[tuple[Any, Mapping[str, Any] | None]] = []
+            if (catalog.available or combined_provider_discovery) and _scope_selected(spotify_scope):
                 from csv_to_clonehero.providers.spotify import SpotifyLibraryProvider
 
                 self._mark(job.id, status="running", phase="provider_import", message="Loading current Spotify selection")
@@ -384,7 +503,7 @@ class JobManager:
                 spotify_snapshot = SpotifyLibraryProvider(client).import_library(scope=spotify_scope)
                 if workspace_id is None:
                     raise RuntimeError("discovery workspace no longer exists")
-                db.upsert_library_snapshot(workspace_id, spotify_snapshot, scope=spotify_scope)
+                pending_snapshots.append((spotify_snapshot, spotify_scope))
 
             if _scope_selected(soundcloud_scope) and not has_uploaded_soundcloud:
                 from csv_to_clonehero.providers.soundcloud_api import SoundCloudAPIProvider, SoundCloudClient
@@ -398,13 +517,28 @@ class JobManager:
                 soundcloud_snapshot = SoundCloudAPIProvider(soundcloud_client).import_library(scope=soundcloud_scope)
                 if workspace_id is None:
                     raise RuntimeError("discovery workspace no longer exists")
-                db.upsert_library_snapshot(workspace_id, soundcloud_snapshot, scope=soundcloud_scope)
+                pending_snapshots.append((soundcloud_snapshot, soundcloud_scope))
 
-            prefetched_library = None
-            if combined_provider_discovery and workspace_id is not None:
-                current_provider_tracks = _provider_tracks_from_provenance(db, workspace_id)
-                if current_provider_tracks:
-                    prefetched_library = _provider_library_result(current_provider_tracks)
+            if workspace_id is None:
+                raise RuntimeError("discovery workspace no longer exists")
+            if pending_snapshots:
+                replaced = {str(snapshot.provider).casefold() for snapshot, _ in pending_snapshots}
+                prospective = [
+                    snapshot for snapshot in workspace_snapshots(db, workspace_id)
+                    if str(snapshot.provider).casefold() not in replaced
+                ] + [snapshot for snapshot, _ in pending_snapshots]
+                enforce_library_limit(prospective, self.config.server.max_library_tracks)
+                for snapshot, scope_value in pending_snapshots:
+                    db.upsert_library_snapshot(workspace_id, snapshot, scope=scope_value)
+            snapshots = workspace_snapshots(db, workspace_id)
+            if snapshots and (catalog.available or combined_provider_discovery):
+                enforce_library_limit(snapshots, self.config.server.max_library_tracks)
+            current_provider_tracks = _provider_tracks_from_provenance(db, workspace_id)
+            prefetched_library = (
+                _provider_library_result(current_provider_tracks)
+                if current_provider_tracks and (catalog.available or combined_provider_discovery)
+                else None
+            )
 
             self._mark(
                 job.id,
@@ -412,10 +546,9 @@ class JobManager:
                 phase="starting",
                 message=f"Preparing discovery for {user['display_name'] or user['spotify_user_id']}",
             )
-            if prefetched_library is None:
+            if not catalog.available and prefetched_library is None:
                 oauth = build_oauth(self.config, job.user_id, self.cipher)
                 client = build_spotify_client(self.config, oauth)
-            sources = self.source_factory(self.config)
 
             def on_progress(payload: Mapping[str, Any]) -> None:
                 data = dict(payload)
@@ -428,33 +561,91 @@ class JobManager:
                     progress=data,
                     heartbeat_at=time.time(),
                 )
+                db.update_workspace_progress(
+                    workspace_id,
+                    status="running",
+                    phase=str(data.get("phase") or "running"),
+                    total_tracks=int(data.get("total_tracks") or 0),
+                    completed_tracks=int(data.get("processed_tracks") or data.get("completed_tracks") or 0),
+                    message=message,
+                    metadata={
+                        key: data[key]
+                        for key in (
+                            "elapsed_seconds",
+                            "estimated_remaining_seconds",
+                            "estimated_lower_seconds",
+                            "estimated_upper_seconds",
+                        )
+                        if key in data
+                    },
+                )
 
             def on_log(message: Any) -> None:
                 if message:
                     self._mark(job.id, message=str(message)[:1000])
 
-            result = run_spotify_discovery(
-                self.config,
-                db,
-                sources,
-                client,
-                prefetched_library=prefetched_library,
-                workspace_key=job.workspace_key or None,
-                workspace_name=user["spotify_user_id"],
-                on_progress=on_progress,
-                on_log=on_log,
-                cancellation_event=self._cancel_events[job.id],
-            )
+            if catalog.available:
+                result = discover_combined(
+                    self.config,
+                    db,
+                    snapshots,
+                    workspace_key=job.workspace_key,
+                    workspace_name=str(user["spotify_user_id"]),
+                    catalog=catalog,
+                    on_progress=on_progress,
+                    operation_id=str(job.id),
+                    cancellation_event=self._cancel_events[job.id],
+                )
+            else:
+                sources = self.source_factory(self.config)
+                result = run_spotify_discovery(
+                    self.config,
+                    db,
+                    sources,
+                    client,
+                    prefetched_library=prefetched_library,
+                    workspace_id=workspace_id,
+                    workspace_name=user["spotify_user_id"],
+                    on_progress=on_progress,
+                    on_log=on_log,
+                    cancellation_event=self._cancel_events[job.id],
+                )
             stats = getattr(result, "stats", None)
             cancelled = self._cancelled(job.id)
+            final_payload = _stats_payload(stats)
+            final_payload["discovery_mode"] = "catalog" if catalog.available else "live_fallback"
+            final_payload["catalog_diagnostic"] = catalog.diagnostic
+            if not catalog.available:
+                final_payload.update(_live_yield_audit(self.config, db, workspace_id, stats))
+            elif isinstance(final_payload.get("yield_histogram"), Mapping):
+                final_payload["yield_total"] = sum(
+                    int(value or 0) for value in final_payload["yield_histogram"].values()
+                )
+            previous_progress = self.get(job.id).progress if self.get(job.id) is not None else {}
+            terminal_progress = {**previous_progress, **final_payload}
+            workspace_row = db.get_workspace(workspace_id)
+            workspace_metadata = _json_object(workspace_row["metadata_json"] if workspace_row is not None else "{}")
+            workspace_metadata.update({
+                "workflow": "public_catalog" if catalog.available else "public_live_fallback",
+                "partial": str(result.status or "complete") != "complete",
+                "stats": final_payload,
+            })
+            db.update_workspace(
+                workspace_id,
+                status="cancelled" if cancelled else str(result.status or "complete"),
+                phase="cancelled" if cancelled else str(result.phase or result.status or "complete"),
+                total_tracks=int(final_payload.get("tracks") or final_payload.get("library_tracks") or 0),
+                completed_tracks=int(final_payload.get("tracks") or final_payload.get("library_tracks") or 0),
+                metadata=workspace_metadata,
+            )
             self._mark(
                 job.id,
                 status="cancelled" if cancelled else str(result.status or "complete"),
                 phase="cancelled" if cancelled else str(result.phase or result.status or "complete"),
                 error=str(result.error or "") or None,
                 message="Job cancelled" if cancelled else _completion_message(result),
-                progress=_stats_payload(stats),
-                result=_stats_payload(stats),
+                progress=terminal_progress,
+                result=final_payload,
             )
         finally:
             if client is not None:
@@ -688,6 +879,93 @@ def _stats_payload(stats: Any) -> dict[str, Any]:
         return {field.name: getattr(stats, field.name) for field in fields(stats)}
     values = getattr(stats, "__dict__", {})
     return dict(values) if isinstance(values, dict) else {}
+
+
+def _live_yield_audit(
+    config: AppConfig,
+    db: Database,
+    workspace_id: int,
+    stats: Any,
+) -> dict[str, Any]:
+    """Partition fallback results without converting source failures into absence."""
+    from csv_to_clonehero.combined_pipeline import TERMINAL_YIELD_CLASSES, _primary_rejection_reason
+    from csv_to_clonehero.matching import score_candidate
+
+    histogram = {name: 0 for name in TERMINAL_YIELD_CLASSES}
+    persisted = db.get_discovery_song_yield_summary(workspace_id)
+    workspace_track_ids = db.get_workspace_library_track_ids(workspace_id)
+    mapping = {
+        "strong": "recommended_strong",
+        "review": "recommended_review",
+        "no_catalog_candidate": "no_plausible_catalog_candidate",
+        "not_playable": "hard_rejected",
+        "no_suitable": "soft_rejected",
+        "incomplete_evidence": "incomplete_evidence",
+    }
+    if persisted["total"] == len(workspace_track_ids) and all(
+        classification in mapping
+        for classification in persisted["classifications"]
+    ):
+        for classification, count in persisted["classifications"].items():
+            histogram[mapping[classification]] += int(count)
+        return {
+            "yield_histogram": histogram,
+            "rejection_song_reasons": dict(persisted["reasons"]),
+            "yield_total": sum(histogram.values()),
+        }
+    reasons: dict[str, int] = {}
+    generation = db.get_current_exact_generation(workspace_id)
+    generation_id = int(generation["id"]) if generation is not None else -1
+    rows = db.get_workspace_candidates(
+        workspace_id,
+        kind="exact",
+        include_rejected=True,
+        generation_id=generation_id,
+    )
+    by_track: dict[int, list[Any]] = {}
+    for row in rows:
+        if row["track_id"]:
+            by_track.setdefault(int(row["track_id"]), []).append(row)
+    tracks = {
+        int(track.db_id): track
+        for track in db.get_spotify_tracks(True)
+        if track.db_id is not None
+        and int(track.db_id) in workspace_track_ids
+    }
+    incomplete = any(
+        bool(getattr(stats, name, 0))
+        for name in ("partial", "query_errors", "partial_queries", "cap_reached_queries", "catalog_unavailable_tracks")
+    )
+    for track_id, track in tracks.items():
+        scored = []
+        for row in by_track.get(track_id, ()):
+            candidate = db.get_candidate(int(row["candidate_id"]))
+            if candidate is not None:
+                scored.append((candidate, score_candidate(track, candidate, config)))
+        if any(str(value.eligibility).upper() == "RECOMMENDED" for _, value in scored):
+            histogram["recommended_strong"] += 1
+            continue
+        if any(str(value.eligibility).upper() == "ELIGIBLE_REVIEW" for _, value in scored):
+            histogram["recommended_review"] += 1
+            continue
+        if scored:
+            hard = all(bool(value.gate_factors.get("hard_gate")) for _, value in scored)
+            bucket = "hard_rejected" if hard else "soft_rejected"
+            classification = "not_playable" if hard else "no_suitable"
+            reason = _primary_rejection_reason(classification, scored)
+        elif incomplete:
+            bucket = "incomplete_evidence"
+            reason = "live provider failure or truncated evidence"
+        else:
+            bucket = "no_plausible_catalog_candidate"
+            reason = "no plausible catalog candidate"
+        histogram[bucket] += 1
+        reasons[reason] = reasons.get(reason, 0) + 1
+    return {
+        "yield_histogram": histogram,
+        "rejection_song_reasons": reasons,
+        "yield_total": sum(histogram.values()),
+    }
 
 
 def _completion_message(result: Any) -> str:

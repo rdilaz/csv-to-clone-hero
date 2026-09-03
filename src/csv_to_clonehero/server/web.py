@@ -30,11 +30,12 @@ from flask import Flask, abort, g, jsonify, redirect, render_template, request, 
 
 from csv_to_clonehero.config import AppConfig
 from csv_to_clonehero.database import Database
+from csv_to_clonehero.normalization import normalize_artist, normalize_title
 from csv_to_clonehero.server.auth import build_oauth, build_soundcloud_oauth, user_workspace_key
 from csv_to_clonehero.server.downloads import BrowserDownloads, DownloadError, build_archive
 from csv_to_clonehero.server.jobs import JobManager
 from csv_to_clonehero.server.safeguards import (
-    get_enchor_preflight,
+    get_discovery_availability,
     refresh_enchor_preflight,
     validate_discovery_start,
 )
@@ -530,7 +531,7 @@ def create_app(
         _require_user()
         db = _user_db()
         try:
-            return jsonify({"preflight": get_enchor_preflight(db)})
+            return jsonify({"preflight": get_discovery_availability(config, db)})
         finally:
             db.close()
 
@@ -563,6 +564,15 @@ def create_app(
         db = _user_db()
         try:
             key = user_workspace_key(user["spotify_user_id"])
+            active_expansion = db.get_active_job(
+                int(user["id"]), workspace_key=key, kind="expansion"
+            )
+            if active_expansion is not None:
+                existing = jobs.get(int(active_expansion["id"]))
+                return jsonify({
+                    "error": "Wait for the active artist expansion to finish before searching again.",
+                    "job": _job_public(existing) if existing is not None else None,
+                }), 409
             validation = validate_discovery_start(
                 db,
                 config,
@@ -592,6 +602,165 @@ def create_app(
                 "job": _job_public(job),
             }), 409
         return jsonify({"job": _job_public(job)}), 202
+
+    # ---- optional catalog-only artist expansion -----------------------------
+    @app.get("/api/expansion/artists")
+    def expansion_artists():
+        user = _require_user()
+        if not config.server.enable_expansion:
+            abort(404)
+        db = _user_db()
+        try:
+            workspace = _ensure_workspace(db, user)
+            context = _public_expansion_context(config, db, workspace)
+            prior_selected = {
+                str(row["artist_norm"]): (
+                    bool(row["selected"])
+                    and int(_json_object(row["metadata_json"]).get("exact_generation_id") or 0)
+                    == int(context.get("exact_generation_id") or 0)
+                )
+                for row in db.get_workspace_expansion_artists(workspace)
+            }
+            if context["available"]:
+                db.replace_workspace_expansion_artists(workspace, [
+                    {
+                        "artist_name": item["artist"],
+                        "artist_norm": item["artist_norm"],
+                        "track_count": item["imported_songs"],
+                        "cap": item["cap"],
+                        "metadata": {
+                            "catalog_songs": item["catalog_songs"],
+                            "catalog_charts": item["catalog_charts"],
+                            "eligible_songs": item["eligible_songs"],
+                            "eligible_charts": item["eligible_charts"],
+                            "exact_generation_id": context["exact_generation_id"],
+                        },
+                    }
+                    for item in context["artists"]
+                ])
+                for row in db.get_workspace_expansion_artists(workspace):
+                    db.set_expansion_artist_selected(
+                        workspace,
+                        str(row["artist_norm"]),
+                        prior_selected.get(str(row["artist_norm"]), False),
+                    )
+            selected = {
+                str(row["artist_norm"]): bool(row["selected"])
+                for row in db.get_workspace_expansion_artists(workspace)
+            }
+            artists = [
+                {**item, "selected": selected.get(item["artist_norm"], False)}
+                for item in context["artists"]
+            ]
+            expansion_job = next(
+                (
+                    item for item in jobs.list_for_user(int(user["id"]), limit=20)
+                    if item.get("kind") == "expansion"
+                    and item.get("workspace_key") == user_workspace_key(user["spotify_user_id"])
+                    and int((item.get("progress") or {}).get("exact_generation_id") or 0)
+                    == int(context.get("exact_generation_id") or 0)
+                ),
+                None,
+            )
+            return jsonify({
+                **context,
+                "artists": artists,
+                "max_artists": min(25, int(config.expansion.max_artists_per_batch)),
+                "job": _job_mapping_public(expansion_job) if expansion_job else None,
+            })
+        finally:
+            db.close()
+
+    @app.post("/api/expansion")
+    @app.post("/api/expansion/artists/select")
+    def start_expansion():
+        user = _require_user()
+        if not config.server.enable_expansion:
+            abort(404)
+        payload = request.get_json(silent=True) or {}
+        values = payload.get("artists")
+        if not isinstance(values, list):
+            return jsonify({"error": "artists must be a list"}), 400
+        artists = []
+        for value in values:
+            norm = normalize_artist(str(value or ""))
+            if norm and norm not in artists:
+                artists.append(norm)
+        maximum = min(25, int(config.expansion.max_artists_per_batch))
+        if not artists:
+            return jsonify({"error": "Choose at least one artist."}), 400
+        if len(artists) > maximum:
+            return jsonify({"error": f"Choose no more than {maximum} artists at a time."}), 400
+
+        db = _user_db()
+        try:
+            workspace = _ensure_workspace(db, user)
+            context = _public_expansion_context(config, db, workspace)
+            if not context["available"]:
+                return jsonify({"error": context["reason"]}), 409
+            allowed = {item["artist_norm"] for item in context["artists"]}
+            unknown = [artist for artist in artists if artist not in allowed]
+            if unknown:
+                return jsonify({"error": "Choose artists from the current eligible list."}), 400
+            key = user_workspace_key(user["spotify_user_id"])
+            active_discovery = db.get_active_job(
+                int(user["id"]), workspace_key=key, kind="discovery"
+            )
+            if active_discovery is not None:
+                return jsonify({"error": "Wait for exact matching to finish first."}), 409
+            job, created = jobs.enqueue_unique(
+                int(user["id"]),
+                "expansion",
+                workspace_key=key,
+                initial_progress={
+                    "artists": artists,
+                    "exact_generation_id": context["exact_generation_id"],
+                    "total_artists": len(artists),
+                    "completed_artists": 0,
+                    "network_requests": 0,
+                },
+            )
+            if not created:
+                return jsonify({
+                    "error": "An artist expansion job is already active for this workspace.",
+                    "job": _job_public(job),
+                }), 409
+            for row in db.get_workspace_expansion_artists(workspace):
+                db.set_expansion_artist_selected(
+                    workspace, str(row["artist_norm"]), str(row["artist_norm"]) in artists
+                )
+            return jsonify({"job": _job_public(job)}), 202
+        finally:
+            db.close()
+
+    @app.get("/api/expansion/results")
+    def expansion_results():
+        user = _require_user()
+        if not config.server.enable_expansion:
+            abort(404)
+        db = _user_db()
+        try:
+            workspace = _ensure_workspace(db, user)
+            cards = _expansion_review_cards(config, db, workspace)
+            result_cap = max(1, min(1250, 25 * max(
+                int(config.expansion.cap_many_songs),
+                int(config.expansion.cap_some_songs),
+                int(config.expansion.cap_one_song),
+            )))
+            limit = min(result_cap, max(1, int(request.args.get("limit", result_cap))))
+            offset = max(0, int(request.args.get("offset", 0)))
+            selected = sum(bool(card["selected"]) for card in cards)
+            return jsonify({
+                "songs": cards[offset:offset + limit],
+                "total": len(cards),
+                "offset": offset,
+                "limit": limit,
+                "summary": {"total": len(cards), "selected": selected},
+            })
+        except (TypeError, ValueError):
+            return jsonify({"error": "invalid expansion paging parameters"}), 400
+        finally:
+            db.close()
 
     @app.get("/api/jobs/<int:job_id>")
     def job_status(job_id):
@@ -759,19 +928,39 @@ def create_app(
                     track_id=track_value,
                     kind=candidate_kind,
                     include_rejected=True,
-                    generation_id=generation_id,
+                    generation_id=generation_id if candidate_kind == "exact" else None,
                 )
                 candidate_row = next(
-                    (row for row in matching_rows if int(row["candidate_id"]) == candidate_id),
+                    (
+                        row for row in matching_rows
+                        if int(row["candidate_id"]) == candidate_id
+                        and (
+                            candidate_kind == "exact"
+                            or not artist_norm
+                            or str(row["artist_norm"]) == normalize_artist(artist_norm)
+                        )
+                    ),
                     None,
                 )
                 if candidate_row is None:
                     raise ValueError("candidate does not belong to this workspace track")
                 candidate = db.get_candidate(candidate_id)
-                track = _track_by_id(db, candidate_row["track_id"])
-                current_eligibility, current_hard_gate, current_score, _current_quality, _current_breakdown = (
-                    _current_match(config, track, candidate)
-                )
+                if candidate_kind == "exact":
+                    track = _track_by_id(db, candidate_row["track_id"])
+                    current = _current_match(config, track, candidate)
+                else:
+                    row_metadata = _json_object(candidate_row["metadata_json"])
+                    if int(row_metadata.get("exact_generation_id") or 0) != int(generation_id or 0):
+                        raise ValueError("artist recommendation is stale; run expansion again")
+                    artist_norm = str(candidate_row["artist_norm"] or "")
+                    identity = (
+                        normalize_artist(str(candidate.artist or "")),
+                        normalize_title(str(candidate.name or "")),
+                    )
+                    if identity in _workspace_imported_identities(db, workspace):
+                        raise ValueError("song is already represented by the imported library")
+                    current = _current_expansion_match(config, artist_norm, candidate)
+                current_eligibility, current_hard_gate, current_score, _current_quality, _current_breakdown = current
                 if current_hard_gate or current_eligibility == "INCOMPATIBLE":
                     raise ValueError("candidate is blocked by a hard compatibility gate")
                 if candidate_kind == "exact":
@@ -803,6 +992,22 @@ def create_app(
                                 pass
                 if current_score < threshold:
                     raise ValueError(f"candidate score is below the workspace threshold ({threshold:g})")
+                if candidate_kind == "expansion":
+                    for other_row in matching_rows:
+                        other = db.get_candidate(int(other_row["candidate_id"] or 0))
+                        if other is None:
+                            continue
+                        other_identity = (
+                            normalize_artist(str(other.artist or "")),
+                            normalize_title(str(other.name or "")),
+                        )
+                        if other_identity == identity:
+                            db.clear_workspace_selection(
+                                workspace,
+                                candidate_id=int(other_row["candidate_id"]),
+                                kind="expansion",
+                                artist_norm=str(other_row["artist_norm"] or ""),
+                            )
                 db.select_workspace_candidate(
                     workspace,
                     track_value,
@@ -1008,10 +1213,11 @@ def create_app(
         db = _user_db()
         try:
             workspace = _ensure_workspace(db, user)
-            archive, summary = build_archive(
-                config, db, workspace, None, downloads.root
-            )
-            download = downloads.create(int(user["id"]), workspace, archive)
+            with downloads.building(workspace):
+                archive, summary = build_archive(
+                    config, db, workspace, None, downloads.root
+                )
+                download = downloads.create(int(user["id"]), workspace, archive)
             return jsonify({"download": download, "summary": summary})
         except DownloadError as exc:
             return jsonify({"error": str(exc)}), 400
@@ -1202,6 +1408,68 @@ def _public_generation_id(db: Database, workspace_id: int) -> int | None:
     return int(current["id"]) if current is not None else -1
 
 
+def _public_expansion_context(
+    config: AppConfig,
+    db: Database,
+    workspace_id: int,
+) -> dict[str, Any]:
+    if not config.server.enable_expansion:
+        return {"enabled": False, "available": False, "reason": "Artist expansion is disabled.", "artists": []}
+    workspace = db.get_workspace(workspace_id)
+    generation = db.get_current_exact_generation(workspace_id)
+    metadata = _json_object(workspace["metadata_json"] if workspace is not None else "{}")
+    if generation is None or metadata.get("workflow") != "public_catalog":
+        return {
+            "enabled": True,
+            "available": False,
+            "reason": "Complete catalog-backed exact matching before choosing artists.",
+            "artists": [],
+            "exact_generation_id": None,
+        }
+    from csv_to_clonehero.catalog import load_enchor_catalog
+    from csv_to_clonehero.combined_pipeline import workspace_expansion_choices
+
+    catalog = load_enchor_catalog(
+        config.catalog_path,
+        excluded_identities=db.get_blocked_chart_identities(),
+        validation_fingerprint=db.chart_validation_fingerprint(),
+    )
+    if not catalog.available:
+        return {
+            "enabled": True,
+            "available": False,
+            "reason": catalog.diagnostic or "The verified chart catalog is unavailable.",
+            "artists": [],
+            "exact_generation_id": int(generation["id"]),
+        }
+    return {
+        "enabled": True,
+        "available": True,
+        "reason": "",
+        "artists": workspace_expansion_choices(
+            config, db, workspace_id, catalog=catalog
+        ),
+        "exact_generation_id": int(generation["id"]),
+        "catalog_snapshot_id": str(catalog.snapshot_id or ""),
+    }
+
+
+def _workspace_imported_identities(
+    db: Database, workspace_id: int
+) -> set[tuple[str, str]]:
+    identities = {
+        (str(row["normalized_artist"]), str(row["normalized_title"]))
+        for row in db.get_neutral_library_tracks(workspace_id)
+    }
+    workspace_track_ids = db.get_workspace_library_track_ids(workspace_id)
+    identities.update({
+        (track.primary_artist_norm, track.title_norm)
+        for track in db.get_spotify_tracks(True)
+        if int(track.db_id or 0) in workspace_track_ids
+    })
+    return identities
+
+
 def _current_match(
     config: AppConfig,
     track: Any,
@@ -1235,6 +1503,40 @@ def _current_match(
         return "INCOMPATIBLE", True, 0.0, 0.0, {
             "eligibility": "INCOMPATIBLE",
             "reasons": ["current compatibility check could not be completed"],
+            "factors": {"gates": {"hard_gate": True}},
+        }
+
+
+def _current_expansion_match(
+    config: AppConfig,
+    artist_norm: str,
+    candidate: Any,
+) -> tuple[str, bool, float, float, dict[str, Any]]:
+    """Reapply expansion-specific gates without treating it as an exact song."""
+    if not artist_norm or candidate is None:
+        return "INCOMPATIBLE", True, 0.0, 0.0, {
+            "eligibility": "INCOMPATIBLE",
+            "reasons": ["artist or chart metadata is unavailable"],
+            "factors": {"gates": {"hard_gate": True}},
+        }
+    try:
+        from csv_to_clonehero.matching import score_expansion_candidate
+
+        scored = score_expansion_candidate(artist_norm, candidate, config)
+        breakdown = scored.as_dict()
+        eligibility = str(scored.eligibility or "EXCLUDED").upper()
+        return (
+            eligibility,
+            bool(scored.gate_factors.get("hard_gate")),
+            float(scored.final_score or 0),
+            float(scored.quality or 0),
+            breakdown,
+        )
+    except Exception:  # noqa: BLE001 - fail closed at the public trust boundary
+        log.warning("current public expansion evaluation failed", exc_info=True)
+        return "INCOMPATIBLE", True, 0.0, 0.0, {
+            "eligibility": "INCOMPATIBLE",
+            "reasons": ["current expansion compatibility check could not be completed"],
             "factors": {"gates": {"hard_gate": True}},
         }
 
@@ -1329,7 +1631,9 @@ def _review_cards(
         if not tid:
             continue
         candidate = db.get_candidate(int(data.get("candidate_id") or 0))
-        if candidate is None:
+        if candidate is None or not db.is_chart_artifact_eligible(
+            candidate.source, candidate.chart_id
+        ):
             continue
         current_eligibility, _hard_gate, current_score, current_quality, breakdown = _current_match(
             config,
@@ -1514,6 +1818,100 @@ def _review_cards(
                 "review_notice": review_notice,
             }
         )
+    cards.sort(key=lambda item: (item["artist"].casefold(), item["title"].casefold()))
+    return cards
+
+
+def _expansion_review_cards(
+    config: AppConfig,
+    db: Database,
+    workspace: int,
+) -> list[dict[str, Any]]:
+    """Build expansion-only cards and independently reapply current gates."""
+    generation_id = _public_generation_id(db, workspace)
+    if generation_id is None or generation_id < 0:
+        return []
+    minimum_score = db.get_workspace_minimum_score(workspace)
+    imported_identities = _workspace_imported_identities(db, workspace)
+    grouped: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for row in db.get_workspace_candidates(
+        workspace, kind="expansion", include_rejected=True
+    ):
+        data = dict(row)
+        metadata = _json_object(data.get("metadata_json"))
+        if int(metadata.get("exact_generation_id") or 0) != generation_id:
+            continue
+        candidate = db.get_candidate(int(data.get("candidate_id") or 0))
+        if candidate is None or not db.is_chart_artifact_eligible(
+            candidate.source, candidate.chart_id
+        ):
+            continue
+        artist_norm = str(data.get("artist_norm") or "")
+        eligibility, hard_gate, score, quality, breakdown = _current_expansion_match(
+            config, artist_norm, candidate
+        )
+        selectable = (
+            not hard_gate
+            and eligibility in {"RECOMMENDED", "ELIGIBLE_REVIEW"}
+            and score >= minimum_score
+        )
+        identity = (
+            normalize_artist(str(candidate.artist or "")),
+            normalize_title(str(candidate.name or "")),
+        )
+        if not all(identity) or identity in imported_identities:
+            continue
+        selected = bool(data.get("selected") and selectable)
+        concerns = list(breakdown.get("reasons") or ())
+        if eligibility == "ELIGIBLE_REVIEW" and not concerns:
+            concerns = ["This playable chart has lower quality evidence and merits a quick review."]
+        item = {
+            "candidate_id": int(data["candidate_id"]),
+            "kind": "expansion",
+            "artist_norm": artist_norm,
+            "source": candidate.source,
+            "chart_id": candidate.chart_id,
+            "artist": candidate.artist,
+            "title": candidate.name,
+            "charter": candidate.charter,
+            "album": candidate.album,
+            "pack_name": candidate.pack_name,
+            "instruments": list(candidate.instruments or ()),
+            "score": round(score, 1),
+            "quality": round(quality, 1),
+            "eligibility": eligibility,
+            "selected": selected,
+            "selectable": selectable,
+            "review": {
+                "state": "strong" if eligibility == "RECOMMENDED" else "needs_review" if selectable else "unavailable",
+                "label": "Recommended expansion" if eligibility == "RECOMMENDED" else "Playable expansion" if selectable else "Unavailable",
+                "summary": "A playable catalog chart from an artist already in your library.",
+                "concerns": concerns,
+                "selectable": selectable,
+                "action": "Select" if selectable else "Unavailable",
+            },
+        }
+        grouped.setdefault(identity, []).append(item)
+
+    cards = []
+    for identity, candidates in grouped.items():
+        candidates.sort(
+            key=lambda item: (
+                -item["score"], -item["quality"], item["source"], item["chart_id"]
+            )
+        )
+        selected = next((item for item in candidates if item["selected"]), None)
+        primary = selected or candidates[0]
+        primary["best"] = True
+        cards.append({
+            "song_key": "|".join(identity),
+            "artist": primary["artist"],
+            "title": primary["title"],
+            "artist_norm": primary["artist_norm"],
+            "selected": selected is not None,
+            "selected_candidate_id": selected["candidate_id"] if selected else None,
+            "candidates": candidates,
+        })
     cards.sort(key=lambda item: (item["artist"].casefold(), item["title"].casefold()))
     return cards
 

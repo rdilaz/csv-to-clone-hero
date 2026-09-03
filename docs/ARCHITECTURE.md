@@ -36,7 +36,8 @@ The important boundaries are deliberately narrow:
 - `models.py` contains source-neutral `Track`, `ChartCandidate`,
   `ScoreBreakdown`, and selection data models.
 - `database.py` owns SQLite connections, migrations, query-cache state,
-  workspaces, candidates, selections, jobs, and export metadata.
+  workspaces, candidates, selections, jobs, export metadata, and the global
+  chart artifact validation ledger.
 
 ## Local Workflows
 
@@ -81,19 +82,24 @@ The public app in `server/web.py` follows this sequence:
    revocable server-side session.
 2. The user chooses playlists or Liked Songs. Optional SoundCloud OAuth or an
    uploaded export can add source data.
-3. A bounded Enchor preflight is cached globally. Discovery cannot start until
-   the preflight is fresh, successful, and authoritative.
+3. A complete checksum-valid Enchor snapshot on persistent server state is the
+   preferred discovery authority. It satisfies availability without a live
+   Enchor search probe. A globally cached bounded preflight gates only the live
+   fail-safe path when that snapshot is absent or invalid.
 4. `server/jobs.py:JobManager` stores a durable job and runs jobs FIFO on one
    process-wide worker. `server/throttle.py:GlobalGate` prevents concurrent
    Enchor-bound work from multiplying requests from the shared server IP.
-5. `server/jobs.py` normalizes the selected Spotify and optional SoundCloud
-   records into one canonical prefetched library. `spotify_pipeline.py` then
-   resolves bounded live chart queries, persists progress, and records
-   candidates and explainable scores in the user workspace. The public path
-   does not depend on the local catalog snapshot.
+5. `server/jobs.py` normalizes selected Spotify and optional SoundCloud records
+   into one canonical provider-neutral library and enforces a 50,000-song hard
+   bound after deduplication. With a valid snapshot it reuses
+   `combined_pipeline.py` for resumable local matching and sends zero Enchor
+   search requests. `spotify_pipeline.py` remains the bounded live fallback.
 6. Review endpoints change workspace selections only after checking ownership,
    candidate membership, score thresholds, and hard-gate eligibility.
-7. `server/downloads.py` asks `exporter.py:ExportService` to assemble a ZIP in
+7. After exact matching, users may explicitly choose primary artists for a
+   bounded catalog-backed expansion pass. Exact and expansion recommendations
+   remain separate in review and share the final selection tray.
+8. `server/downloads.py` asks `exporter.py:ExportService` to assemble a ZIP in
    a transient staging area. `BrowserDownloads` signs a short-lived, single-use
    token, streams the archive, and removes it after delivery or expiry.
 

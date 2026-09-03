@@ -7,6 +7,7 @@ from dataclasses import asdict, dataclass
 from typing import Any, Callable
 
 from csv_to_clonehero.config import AppConfig
+from csv_to_clonehero.catalog import load_enchor_catalog
 from csv_to_clonehero.database import Database, _load_json
 from csv_to_clonehero.server.auth import user_workspace_key
 from csv_to_clonehero.server.throttle import global_gate
@@ -74,11 +75,43 @@ def get_enchor_preflight(db: Database, *, now: float | None = None) -> dict[str,
     return preflight_public(db.get_source_preflight("enchor"), now=now)
 
 
+def get_discovery_availability(config: AppConfig, db: Database) -> dict[str, Any]:
+    """Prefer a verified persistent catalog; report live fallback otherwise."""
+    catalog = load_enchor_catalog(
+        config.catalog_path,
+        excluded_identities=db.get_blocked_chart_identities(),
+        validation_fingerprint=db.chart_validation_fingerprint(),
+    )
+    if catalog.available:
+        return {
+            "available": True,
+            "fresh": True,
+            "usable": True,
+            "mode": "catalog",
+            "source": "enchor",
+            "authoritative": True,
+            "success": True,
+            "supported": True,
+            "out_of": catalog.known_chart_count,
+            "eligible_charts": catalog.chart_count,
+            "snapshot_id": catalog.snapshot_id,
+            "catalog_sha256": catalog.sha256,
+            "message": f"Local catalog ready with {catalog.chart_count:,} eligible charts.",
+        }
+    live = get_enchor_preflight(db)
+    live["mode"] = "live_fallback"
+    live["catalog_diagnostic"] = catalog.diagnostic
+    return live
+
+
 def refresh_enchor_preflight(
     config: AppConfig,
     db: Database,
     source_factory: Callable[[AppConfig], list[ChartSource]],
 ) -> dict[str, Any]:
+    catalog = get_discovery_availability(config, db)
+    if catalog.get("mode") == "catalog":
+        return catalog
     cached = get_enchor_preflight(db)
     if cached.get("fresh"):
         return cached
@@ -153,7 +186,8 @@ def validate_discovery_start(
     errors: list[str] = []
     user = db.get_user(int(user_id))
     workspace_row = db.get_workspace(workspace_key) if workspace_key else None
-    has_neutral_library = bool(workspace_row and db.get_neutral_library_tracks(int(workspace_row["id"])))
+    neutral_tracks = db.get_neutral_library_tracks(int(workspace_row["id"])) if workspace_row else []
+    has_neutral_library = bool(neutral_tracks)
     expected_key = ""
     if user is None:
         errors.append("The signed-in user no longer exists.")
@@ -180,8 +214,7 @@ def validate_discovery_start(
         errors.append("The selected playlist scope is too large.")
     elif scope is not None and len(scope.get("track_ids") or []) > config.server.max_scope_tracks:
         errors.append("The selected track scope is too large.")
-
-    preflight = get_enchor_preflight(db)
+    preflight = get_discovery_availability(config, db)
     if not preflight.get("usable"):
         errors.append(str(preflight.get("message") or "Check Enchor before starting discovery."))
 
