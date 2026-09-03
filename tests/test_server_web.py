@@ -209,6 +209,13 @@ def test_oauth_callback_signs_in(client, config):
     assert me.get_json()["display_name"] == "Alice"
 
 
+def test_oauth_callback_denial_returns_safe_error_page(client):
+    response = client.get("/api/auth/spotify/callback?error=access_denied")
+
+    assert response.status_code == 400
+    assert b"Spotify sign-in failed" in response.data
+
+
 def test_oauth_callback_rejects_empty_spotify_profile(client, config, monkeypatch):
     import csv_to_clonehero.server.web as web
     from csv_to_clonehero.database import Database

@@ -278,7 +278,7 @@ def create_app(
         anonymous_workspace_key = str(session.get("anonymous_workspace_key") or "")
         error = request.args.get("error")
         if error:
-            return render_template("error.html", message=f"Spotify sign-in failed: {error}"), 400
+            return render_template("error.html", message=f"Spotify sign-in failed: {error}", config=config), 400
         state = request.args.get("state", "")
         code = request.args.get("code", "")
         expected_state = session.get("oauth_state")
@@ -296,7 +296,7 @@ def create_app(
             )
         except Exception:  # noqa: BLE001 - safe message to the browser
             log.warning("oauth callback failed")
-            return render_template("error.html", message="Spotify sign-in was not completed; please try again."), 400
+            return render_template("error.html", message="Spotify sign-in was not completed; please try again.", config=config), 400
         try:
             profile = _fetch_profile(config, token)
             spotify_user_id = str(profile.get("id") or "").strip()
@@ -391,7 +391,7 @@ def create_app(
     @app.get("/api/auth/soundcloud/callback")
     def soundcloud_auth_callback():
         if request.args.get("error"):
-            return render_template("error.html", message="SoundCloud sign-in was cancelled."), 400
+            return render_template("error.html", message="SoundCloud sign-in was cancelled.", config=config), 400
         if g.get("user") is None:
             return redirect(url_for("index"))
         oauth = None
@@ -406,7 +406,7 @@ def create_app(
             )
             return redirect(url_for("index"))
         except Exception:  # noqa: BLE001 - do not expose provider secrets
-            return render_template("error.html", message="SoundCloud sign-in was not completed; please try again."), 400
+            return render_template("error.html", message="SoundCloud sign-in was not completed; please try again.", config=config), 400
         finally:
             if oauth is not None:
                 oauth.close()

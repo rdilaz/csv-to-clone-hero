@@ -17,6 +17,7 @@
     reviewFilter: "recommended",
     reviewSearch: "",
     selected: 0,
+    selectionMode: "none",
   };
 
   async function api(path, options = {}) {
@@ -204,9 +205,15 @@
     if (!host) return;
     const saved = payload.workspace?.scope || {};
     const selectedIds = new Set(saved.playlist_ids || []);
+    const playlistRows = (payload.playlists || []).map(item => {
+      const count = item.track_count === null || item.track_count === undefined ? null : Number(item.track_count);
+      const displayCount = Number.isFinite(count) ? count.toLocaleString() : "Count unavailable";
+      const tallyCount = Number.isFinite(count) ? String(count) : "";
+      return `<label><input class="spotify-playlist" type="checkbox" value="${escapeHtml(item.id)}" data-track-count="${tallyCount}" ${selectedIds.has(item.id) ? "checked" : ""}><span>${escapeHtml(item.name || "Untitled playlist")}</span><small>${displayCount}</small></label>`;
+    });
     const rows = [
       `<label><input id="includeLiked" type="checkbox" ${saved.include_liked ? "checked" : ""}><span>Liked Songs</span><small>${Number(payload.liked_count || 0).toLocaleString()}</small></label>`,
-      ...(payload.playlists || []).map(item => `<label><input class="spotify-playlist" type="checkbox" value="${escapeHtml(item.id)}" ${selectedIds.has(item.id) ? "checked" : ""}><span>${escapeHtml(item.name || "Untitled playlist")}</span><small>${Number(item.track_count || 0).toLocaleString()}</small></label>`),
+      ...playlistRows,
     ];
     host.innerHTML = rows.join("") || "<p>No Spotify playlists were returned.</p>";
     host.setAttribute("aria-busy", "false");
@@ -273,21 +280,36 @@
     };
   }
 
+  function setAllSpotifyPlaylists(checked) {
+    const playlists = $$(".spotify-playlist");
+    playlists.forEach(input => { input.checked = checked; });
+    updateMusicTally();
+    announce(`${checked ? "Selected" : "Cleared"} ${playlists.length.toLocaleString()} Spotify playlists.`);
+  }
+
   function updateMusicTally() {
     const tally = $("#musicTally");
     if (!tally) return;
     const liked = $("#includeLiked")?.checked ? Number(state.scope?.liked_count || 0) : 0;
+    let hasUnknownPlaylistCount = false;
     const playlistCount = $$(".spotify-playlist:checked").reduce((sum, input) => {
-      const count = Number(input.closest("label")?.querySelector("small")?.textContent?.replace(/,/g, "") || 0);
-      return sum + count;
+      if (!input.dataset.trackCount) {
+        hasUnknownPlaylistCount = true;
+        return sum;
+      }
+      return sum + Number(input.dataset.trackCount);
     }, 0);
     const imported = Number(state.journey?.combined?.tracks || 0);
     const estimated = liked + playlistCount;
     const strong = tally.querySelector("strong");
     const small = tally.querySelector("small");
-    if (estimated || imported) {
-      strong.textContent = `${(estimated || imported).toLocaleString()} ${estimated ? "Spotify tracks chosen" : "imported songs"}`;
-      small.textContent = imported && estimated ? `${imported.toLocaleString()} imported SoundCloud songs will also be included; duplicates are merged.` : "Duplicates are merged before matching.";
+    if (estimated || imported || hasUnknownPlaylistCount) {
+      strong.textContent = hasUnknownPlaylistCount
+        ? estimated ? `At least ${estimated.toLocaleString()} Spotify tracks chosen` : "Spotify playlists chosen"
+        : `${(estimated || imported).toLocaleString()} ${estimated ? "Spotify tracks chosen" : "imported songs"}`;
+      small.textContent = hasUnknownPlaylistCount
+        ? "Some playlist counts are unavailable; the exact total will be known after import. Duplicates are merged."
+        : imported && estimated ? `${imported.toLocaleString()} imported SoundCloud songs will also be included; duplicates are merged.` : "Duplicates are merged before matching.";
     } else {
       strong.textContent = "Choose music above";
       small.textContent = "Liked Songs, playlists, or an optional SoundCloud export.";
@@ -352,9 +374,23 @@
 
   function progressNumbers(job) {
     const progress = job.progress || {};
-    const total = Number(progress.total_tracks || progress.total_work || progress.scoring_tasks_total || 0);
-    const done = Math.min(total || Infinity, Number(progress.processed_tracks || progress.completed_work || progress.scoring_tasks_completed || 0));
-    return {progress, total, done: Number.isFinite(done) ? done : 0, percent: total ? Math.min(100, Math.round(done / total * 100)) : 0};
+    const pairs = [
+      [progress.completed_work, progress.total_work, "checks"],
+      [progress.processed_tracks, progress.total_tracks, "songs"],
+      [progress.scoring_tasks_completed, progress.scoring_tasks_total, "checks"],
+      [progress.completed_tracks, progress.total_tracks, "songs"],
+      [progress.completed_tasks, progress.total_tasks, "queries"],
+    ];
+    for (const [rawDone, rawTotal, unit] of pairs) {
+      const total = Number(rawTotal || 0);
+      if (!Number.isFinite(total) || total <= 0) continue;
+      const value = Number(rawDone || 0);
+      const done = Math.min(total, Number.isFinite(value) ? value : 0);
+      const calculated = Math.min(100, Math.round(done / total * 100));
+      const percent = !isTerminal(job) && calculated === 100 ? 99 : calculated;
+      return {progress, total, done, percent, unit};
+    }
+    return {progress, total: 0, done: 0, percent: 0, unit: "checks"};
   }
 
   async function pollJob() {
@@ -378,14 +414,14 @@
   }
 
   function renderProgress(job) {
-    const {progress, total, done, percent} = progressNumbers(job);
+    const {progress, total, done, percent, unit} = progressNumbers(job);
     const disc = $("#progressDisc");
     disc.style.setProperty("--progress", `${percent}%`);
     if (total) disc.setAttribute("aria-valuenow", String(percent)); else disc.removeAttribute("aria-valuenow");
-    disc.setAttribute("aria-valuetext", total ? `${done} of ${total} songs checked` : "Preparing music");
+    disc.setAttribute("aria-valuetext", total ? `${done} of ${total} ${unit} complete` : "Preparing music");
     $("#progressPercent").textContent = total ? `${percent}%` : "...";
     $("#progressBar").style.width = `${percent}%`;
-    $("#progressCount").textContent = total ? `${done.toLocaleString()} of ${total.toLocaleString()} songs checked` : "Preparing your music";
+    $("#progressCount").textContent = total ? `${done.toLocaleString()} of ${total.toLocaleString()} ${unit} complete` : "Preparing your music";
     const phases = {
       queued: "Your search is waiting its turn. Riff searches carefully to protect the community service.",
       starting: "Preparing your selected music...",
@@ -445,20 +481,21 @@
       state.selected = Number(data.summary?.selection_count || 0);
       const strong = Number(data.summary?.strong || 0);
       const review = Number(data.summary?.review || 0);
-      const selectedStrong = Number(data.summary?.selected_strong || 0);
-      const selectedReview = Number(data.summary?.selected_review || 0);
       $("#chartsFoundCount").textContent = (strong + review).toLocaleString();
       $("#chartsFoundLabel").textContent = strong + review === 1 ? "song has a recommendation." : "songs have recommendations.";
       $("#bestMatchCount").textContent = `${strong.toLocaleString()} ${strong === 1 ? "chart" : "charts"}`;
       $("#allMatchCount").textContent = `${(strong + review).toLocaleString()} ${strong + review === 1 ? "chart" : "charts"}`;
       $("#selectedCount").textContent = state.selected.toLocaleString();
       $("#continueDownloadButton").disabled = state.selected < 1;
-      $("#selectBestButton").setAttribute("aria-pressed", String(
-        state.selected > 0 && state.selected === strong && selectedReview === 0
-      ));
-      $("#selectAllButton").setAttribute("aria-pressed", String(
-        review > 0 && state.selected === strong + review && selectedReview === review
-      ));
+      if (state.selected < 1) state.selectionMode = "none";
+      else if (state.selectionMode === "none") state.selectionMode = "custom";
+      $("#selectBestButton").setAttribute("aria-pressed", String(state.selectionMode === "strong"));
+      $("#selectAllButton").setAttribute("aria-pressed", String(state.selectionMode === "eligible"));
+      const modeLabels = {strong: "Best Matches preset", eligible: "All recommendations preset", custom: "Custom choices", none: "No selection preset"};
+      $("#selectionMode").textContent = modeLabels[state.selectionMode];
+      $("#continueDownloadButton").textContent = state.selected
+        ? `Continue with ${state.selected.toLocaleString()} selected ${state.selected === 1 ? "chart" : "charts"}`
+        : "Continue with selected charts";
       $("#reviewSummary").textContent = `${state.reviewTotal.toLocaleString()} in this view; ${Number(data.summary?.unavailable || 0).toLocaleString()} songs have no safe recommendation.`;
       $("#reviewCards").innerHTML = (data.tracks || []).map(reviewCard).join("") || `<div class="empty-state">No recommendations match this view.</div>`;
       bindReviewActions();
@@ -474,12 +511,13 @@
   function reviewCard(track) {
     const candidates = track.candidates || [];
     const best = candidates.find(candidate => candidate.best) || candidates[0];
-    if (!best) return "";
-    const alternatives = candidates.filter(candidate => candidate !== best && ["strong", "needs_review"].includes(candidate.review?.state));
+    const primary = candidates.find(candidate => candidate.selected) || best;
+    if (!primary) return "";
+    const alternatives = candidates.filter(candidate => candidate !== primary && ["strong", "needs_review"].includes(candidate.review?.state));
     return `<article class="review-card">
       <div class="review-card__song"><span class="eyebrow">YOUR MUSIC</span><h3>${escapeHtml(track.artist)} - ${escapeHtml(track.title)}</h3><p>${escapeHtml(track.album || "")}</p></div>
-      ${candidateSummary(best, true)}
-      <div class="review-card__action">${candidateAction(track, best)}</div>
+      ${candidateSummary(primary, primary === best)}
+      <div class="review-card__action">${candidateAction(track, primary)}</div>
       ${alternatives.length ? `<details class="alternatives"><summary>Other chart versions (${alternatives.length})</summary>${alternatives.map(candidate => `<div class="alternative">${candidateSummary(candidate, false)}<div class="review-card__action">${candidateAction(track, candidate)}</div></div>`).join("")}</details>` : ""}
     </article>`;
   }
@@ -489,7 +527,7 @@
     const concerns = review.concerns || [];
     const version = candidate.pack_name || candidate.source || "Community chart";
     return `<div class="review-card__chart">
-      <span class="match-badge ${review.state === "needs_review" ? "match-badge--review" : ""}">${best && review.state === "strong" ? "Best match" : review.state === "needs_review" ? "Best available" : escapeHtml(review.label || "Chart")}</span>
+      <span class="match-badge ${review.state === "needs_review" ? "match-badge--review" : ""}">${candidate.selected ? "Selected chart" : best && review.state === "strong" ? "Best match" : review.state === "needs_review" ? "Best available" : escapeHtml(review.label || "Chart")}</span>
       <h4>${escapeHtml(candidate.artist)} - ${escapeHtml(candidate.title)}</h4>
       <p>${escapeHtml(version)}${candidate.charter ? ` · ${escapeHtml(candidate.charter)}` : ""}</p>
       ${concerns.length ? `<details class="concern-details"><summary>${concerns.length} chart ${concerns.length === 1 ? "concern" : "concerns"}</summary><div>${concerns.map(item => `<p>${escapeHtml(item)}</p>`).join("")}</div></details>` : ""}
@@ -510,6 +548,7 @@
     setButtonBusy(button, true, "Saving...");
     try {
       await api("/api/selection", {method: "POST", body: JSON.stringify({track_key: button.dataset.track, candidate_id: Number(button.dataset.candidate), action: button.dataset.selection})});
+      state.selectionMode = "custom";
       announce(button.dataset.selection === "clear" ? "Chart choice cleared." : "Chart choice saved.");
       await loadReview();
     } catch (error) {
@@ -524,6 +563,7 @@
     try {
       const payload = scope === "clear" ? {action: "clear"} : {action: "select", scope};
       await api("/api/selection/bulk", {method: "POST", body: JSON.stringify(payload)});
+      state.selectionMode = scope === "clear" ? "none" : scope;
       $("#selectBestButton").setAttribute("aria-pressed", String(scope === "strong"));
       $("#selectAllButton").setAttribute("aria-pressed", String(scope === "eligible"));
       announce(scope === "clear" ? "Chart choices cleared." : "Chart choices saved.");
@@ -587,6 +627,8 @@
 
   function bindAuthenticated() {
     $("#soundcloudForm")?.addEventListener("submit", importAuthenticatedSoundCloud);
+    $("#selectAllPlaylistsButton")?.addEventListener("click", () => setAllSpotifyPlaylists(true));
+    $("#clearPlaylistsButton")?.addEventListener("click", () => setAllSpotifyPlaylists(false));
     $("#findChartsButton")?.addEventListener("click", startDiscovery);
     $("#cancelJobButton")?.addEventListener("click", cancelDiscovery);
     $("#activityDetails")?.addEventListener("toggle", event => { if (event.currentTarget.open) loadActivity(); });

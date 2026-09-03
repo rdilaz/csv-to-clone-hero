@@ -1229,7 +1229,9 @@ def _item_track(item: Any) -> tuple[Mapping[str, Any] | None, LibraryItemStatus 
         return None, LibraryItemStatus.SKIPPED_NULL, "item is null"
     if not isinstance(item, Mapping):
         return None, LibraryItemStatus.SKIPPED_UNAVAILABLE, "item is not an object"
-    if "track" in item:
+    if "item" in item:
+        track = item.get("item")
+    elif "track" in item:
         track = item.get("track")
     else:
         # Accept raw track dictionaries in addition to Web API item wrappers;

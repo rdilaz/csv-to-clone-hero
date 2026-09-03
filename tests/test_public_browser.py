@@ -175,7 +175,10 @@ def test_public_authenticated_journey_to_download_ready(
             if method == "GET":
                 payload = {
                     "liked_count": 1,
-                    "playlists": [{"id": "playlist-1", "name": "Road trip", "track_count": 12, "owner_name": "Browser Player"}],
+                    "playlists": [
+                        {"id": "playlist-1", "name": "Road trip", "track_count": 12, "owner_name": "Browser Player"},
+                        {"id": "playlist-unknown", "name": "Current API playlist", "track_count": None, "owner_name": "Browser Player"},
+                    ],
                     "workspace": {"id": 1, "exists": True, "scope": {"include_liked": True, "playlist_ids": []} if scope_saved["value"] else None, "soundcloud_scope": {}},
                 }
             else:
@@ -190,7 +193,11 @@ def test_public_authenticated_journey_to_download_ready(
             payload, status = {"job": {"id": 9, "status": "queued", "phase": "queued"}}, 202
         elif path == "/api/jobs/9":
             job_polls["count"] += 1
-            payload, status = {"job": {"id": 9, "status": "complete", "phase": "complete", "message": "Matching complete", "progress": {"total_tracks": 1, "processed_tracks": 1}}}, 200
+            if job_polls["count"] == 1:
+                payload = {"job": {"id": 9, "status": "running", "phase": "finding_charts", "message": "Matching", "progress": {"total_tracks": 133, "completed_tracks": 133, "total_work": 180, "completed_work": 140}}}
+            else:
+                payload = {"job": {"id": 9, "status": "complete", "phase": "complete", "message": "Matching complete", "progress": {"total_tracks": 1, "processed_tracks": 1}}}
+            status = 200
         elif path.startswith("/api/workspace?"):
             payload, status = workspace_payload(), 200
         elif path == "/api/selection/bulk":
@@ -213,9 +220,21 @@ def test_public_authenticated_journey_to_download_ready(
         page.route("**/api/**", route_api)
         page.goto(base_url + "/", wait_until="networkidle")
 
+        playwright.expect(page.get_by_text("Count unavailable", exact=True)).to_be_visible()
+        page.get_by_role("button", name="Select all playlists").click()
+        assert page.locator(".spotify-playlist:checked").count() == 2
+        assert not page.get_by_label("Liked Songs").is_checked()
+        page.get_by_role("button", name="Clear all playlists").click()
+        assert page.locator(".spotify-playlist:checked").count() == 0
+        assert not page.get_by_label("Liked Songs").is_checked()
+        page.locator('input[value="playlist-unknown"]').check()
         page.get_by_label("Liked Songs").check()
         page.get_by_role("button", name="Find Clone Hero charts").click()
+        playwright.expect(page.get_by_text("140 of 180 checks complete", exact=True)).to_be_visible()
+        assert page.locator("#progressPercent").inner_text() == "78%"
         page.get_by_role("heading", name="1 song has a recommendation.").wait_for()
+        scope_posts = [json.loads(body or "{}") for method, path, body in api_calls if method == "POST" and path == "/api/spotify/scope"]
+        assert scope_posts and scope_posts[-1]["playlist_ids"] == ["playlist-unknown"]
         assert page.locator("[data-step=confirm]").get_attribute("aria-current") == "step"
         _assert_no_overflow(page)
         _capture(page, f"confirm-{viewport['width']}x{viewport['height']}.png")
@@ -241,7 +260,11 @@ def test_public_authenticated_journey_to_download_ready(
             playwright.expect(page.locator("#continueDownloadButton")).to_be_enabled()
         except AssertionError:
             pytest.fail(f"selection did not settle: calls={api_calls!r}, error={page.locator('#appError').inner_text()!r}")
-        page.get_by_role("button", name="Continue to download").click()
+        assert page.locator("#selectBestButton").get_attribute("aria-pressed") == "true"
+        assert page.get_by_text("Best Matches preset", exact=True).is_visible()
+        assert page.get_by_text("Selected chart", exact=True).is_visible()
+        assert page.locator("#continueDownloadButton").inner_text() == "Continue with 1 selected chart"
+        page.get_by_role("button", name="Continue with 1 selected chart").click()
         assert page.get_by_role("heading", name="Prepare your Riff library.").is_visible()
         assert "Songs folder" not in page.locator("#stageDownload").inner_text()
         page.get_by_role("button", name="Prepare my Riff library").click()

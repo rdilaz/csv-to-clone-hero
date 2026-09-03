@@ -109,6 +109,26 @@ def test_library_parser_retains_terminal_item_statuses():
     assert result.status_counts[LibraryItemStatus.SKIPPED_LOCAL.value] == 1
 
 
+def test_library_parser_accepts_current_playlist_item_wrapper():
+    current = {
+        "added_at": "2026-09-02T00:00:00Z",
+        "item": {
+            "id": "track-current",
+            "name": "Current Song",
+            "type": "track",
+            "artists": [{"name": "Current Artist"}],
+            "album": {"name": "Current Album"},
+        },
+    }
+
+    result = parse_library({"playlist": [current]})
+
+    assert len(result.records) == 1
+    assert result.records[0].spotify_id == "track-current"
+    assert result.records[0].title == "Current Song"
+    assert result.records[0].artists == ["Current Artist"]
+
+
 def test_playlist_parser_retains_creator_metadata():
     playlist = SpotifyPlaylist.from_payload({
         "id": "playlist-1",

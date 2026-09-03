@@ -79,6 +79,10 @@
           <div><h2>Spotify</h2><p>Connected as {{ user.display_name }}</p></div>
           <span class="status-pill">Connected</span>
         </div>
+        <div class="playlist-actions" role="group" aria-label="Spotify playlist selection">
+          <button class="button button--secondary" id="selectAllPlaylistsButton" type="button">Select all playlists</button>
+          <button class="button button--secondary" id="clearPlaylistsButton" type="button">Clear all playlists</button>
+        </div>
         <div id="spotifyChoices" class="choice-list" aria-busy="true"><p>Loading your Spotify music...</p></div>
       </article>
 
@@ -155,7 +159,7 @@
     </div>
 
     <div class="selection-bar">
-      <p><strong id="selectedCount">0</strong> charts selected</p>
+      <p><span><strong id="selectedCount">0</strong> charts selected</span><small id="selectionMode">No selection preset</small></p>
       <button class="text-button" id="clearSelectionButton" type="button">Clear choices</button>
     </div>
 
@@ -174,7 +178,7 @@
       <div class="pager" id="reviewPager"><button class="button button--secondary" id="reviewPrev" type="button">Previous</button><span id="reviewPage"></span><button class="button button--secondary" id="reviewNext" type="button">Next</button></div>
     </section>
     <div class="primary-action">
-      <button class="button button--large" id="continueDownloadButton" type="button" disabled>Continue to download</button>
+      <button class="button button--large" id="continueDownloadButton" type="button" disabled>Continue with selected charts</button>
       <button class="text-button" id="searchAgainButton" type="button">Search again</button>
     </div>
   </section>
