@@ -69,8 +69,10 @@ refresh date, and distribution method in operator records.
 
 Artifact validation is deliberately bounded and restart-safe. The global ledger
 keeps `VERIFIED`, `UNVERIFIED`, `REJECTED`, and `UNAVAILABLE` identities and
-their reasons. Rejected identities are retained for audit but excluded from the
-eligible catalog index. The command hard-caps one invocation at 1,000 charts.
+their reasons. Its current projection is synchronized once per catalog snapshot;
+replaced observations remain in append-only history. Rejected identities are
+retained for audit but excluded from the eligible catalog index. The command
+hard-caps one invocation at 1,000 charts.
 
 ## Production Secrets
 

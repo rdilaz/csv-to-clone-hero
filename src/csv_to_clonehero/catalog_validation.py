@@ -17,11 +17,12 @@ from csv_to_clonehero.sources.base import ChartSource, SourceError
 VALIDATOR_VERSION = str(SngValidation.__dataclass_fields__["validation_version"].default)
 
 
-def validation_summary(db: Database) -> dict[str, int]:
-    counts = {state: 0 for state in ("VERIFIED", "UNVERIFIED", "REJECTED", "UNAVAILABLE")}
-    for row in db.list_chart_artifact_validations():
-        counts[str(row["state"])] = counts.get(str(row["state"]), 0) + 1
-    return counts
+def validation_summary(
+    db: Database, *, catalog_snapshot_id: str = ""
+) -> dict[str, int]:
+    return db.get_chart_artifact_validation_counts(
+        catalog_snapshot_id=catalog_snapshot_id
+    )
 
 
 def validate_catalog_artifacts(
@@ -37,24 +38,24 @@ def validate_catalog_artifacts(
     catalog = load_enchor_catalog(config.catalog_path)
     if not catalog.available:
         raise ValueError(catalog.diagnostic)
-    charts = catalog.charts()
-    by_identity = {(str(chart.source).casefold(), int(chart.chart_id)): chart for chart in charts}
-    for chart in charts:
-        db.observe_chart_artifact(chart.source, chart.chart_id, chart.md5 or "")
     source_map = {str(source.name).casefold(): source for source in sources}
+    catalog_snapshot_id = f"{catalog.snapshot_id}:{catalog.sha256}"
+    synchronization = db.sync_catalog_artifacts(
+        catalog_snapshot_id, catalog.iter_charts()
+    )
     requested = {str(state).upper() for state in states}
-    rows = [
-        row
-        for row in db.list_chart_artifact_validations(states=requested)
-        if (str(row["source"]), int(row["chart_id"])) in by_identity
-        and str(row["source"]) in source_map
-    ][:limit]
+    rows = db.list_chart_artifact_validations(
+        states=requested,
+        sources=source_map,
+        catalog_snapshot_id=catalog_snapshot_id,
+        limit=limit,
+    )
     attempted = 0
     with tempfile.TemporaryDirectory(prefix="riff-catalog-validation-") as temporary:
         root = Path(temporary)
         for row in rows:
             identity = (str(row["source"]), int(row["chart_id"]))
-            chart = by_identity.get(identity)
+            chart = catalog.get_chart(*identity)
             source = source_map.get(identity[0])
             if chart is None or source is None:
                 continue
@@ -111,4 +112,10 @@ def validate_catalog_artifacts(
                 )
             finally:
                 destination.unlink(missing_ok=True)
-    return {"attempted": attempted, "limit": limit, "states": validation_summary(db)}
+    return {
+        "attempted": attempted,
+        "limit": limit,
+        "states": validation_summary(db, catalog_snapshot_id=catalog_snapshot_id),
+        "catalog_snapshot_id": catalog_snapshot_id,
+        "synchronization": synchronization,
+    }

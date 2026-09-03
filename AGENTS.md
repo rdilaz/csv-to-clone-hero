@@ -121,9 +121,11 @@
 - Public artist expansion is an explicit second-stage catalog job. It uses no
   Enchor search requests, preserves exact/expansion review separation, and
   applies the normal expansion gates and caps.
-- `chart_artifact_validations` is the global durable validation ledger.
-  `REJECTED`/`UNAVAILABLE` identities remain auditable but are excluded from
-  catalog eligibility; `catalog-validate` is bounded and restart-safe.
+- `chart_artifact_validations` is the efficient current projection and
+  `chart_artifact_validation_history` preserves replaced observations
+  append-only. `REJECTED`/`UNAVAILABLE` identities remain auditable but are
+  excluded from catalog eligibility; `catalog-validate` seeds once per catalog
+  snapshot and processes bounded, restart-safe SQL batches.
 - Public chart downloads are browser-only: `server/downloads.build_archive`
   assembles a ZIP from workspace selections into transient staging, and
   `server/downloads.BrowserDownloads` hands it over via a short-lived, signed,
