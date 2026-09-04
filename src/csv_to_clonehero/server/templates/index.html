@@ -146,7 +146,7 @@
     <header class="stage-heading stage-heading--wide">
       <p class="kicker">CONFIRM CHARTS</p>
       <h1 id="confirmTitle"><span id="chartsFoundCount">0</span> <span id="chartsFoundLabel">songs have recommendations.</span></h1>
-      <p>Start with the cleanest matches, or include playable versions that need a quick look.</p>
+      <p>Start with the cleanest matches, then disclose chart variants and alternate recordings only when wanted.</p>
     </header>
 
     <div class="cohort-grid" role="group" aria-label="Quick chart selection">
@@ -155,8 +155,12 @@
         <small>Only confident song and artist matches</small><strong id="bestMatchCount">0 charts</strong>
       </button>
       <button class="cohort-card" id="selectAllButton" type="button" aria-pressed="false">
-        <span class="cohort-card__option">OPTION B</span><b>All recommendations</b>
-        <small>Includes playable “Best available” versions to review</small><strong id="allMatchCount">0 charts</strong>
+        <span class="cohort-card__option">OPTION B</span><b>All Safe Charts</b>
+        <small>Recommended charts and variants of the same recording</small><strong id="allMatchCount">0 charts</strong>
+      </button>
+      <button class="cohort-card" id="selectMaximumButton" type="button" aria-pressed="false">
+        <span class="cohort-card__option">OPTION C</span><b>Maximum Playable</b>
+        <small>Adds alternate live, remix, acoustic, cover, and instrumental recordings</small><strong id="maximumMatchCount">0 charts</strong>
       </button>
     </div>
 
@@ -171,9 +175,9 @@
         <label class="search-field"><span class="sr-only">Search recommendations</span><input id="reviewSearch" type="search" placeholder="Search artist or song" autocomplete="off"></label>
       </div>
       <div class="filter-row" role="group" aria-label="Filter chart recommendations">
-        <button type="button" data-review-filter="recommended" aria-pressed="true">Recommended</button>
-        <button type="button" data-review-filter="strong" aria-pressed="false">Best matches</button>
-        <button type="button" data-review-filter="review" aria-pressed="false">Best available</button>
+        <button type="button" data-review-filter="recommended" aria-pressed="true">All playable</button>
+        <button type="button" data-review-filter="strong" aria-pressed="false">Recommended</button>
+        <button type="button" data-review-filter="review" aria-pressed="false">Possible matches</button>
         <button type="button" data-review-filter="selected" aria-pressed="false">Selected</button>
       </div>
       <div id="reviewCards" aria-live="polite"></div>
@@ -192,7 +196,8 @@
       </div>
       <div class="expansion-results" id="expansionResults" hidden>
         <div class="review-toolbar"><div><h2>Expansion recommendations</h2><p><span id="expansionResultCount">0</span> additional songs available</p></div></div>
-        <div id="expansionCards"></div>
+      <div id="expansionCards"></div>
+      <button class="button button--secondary" id="loadMoreExpansion" type="button" hidden>Load more songs</button>
       </div>
     </section>
     {% endif %}

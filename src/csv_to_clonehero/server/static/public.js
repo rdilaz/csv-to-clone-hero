@@ -21,6 +21,8 @@
     expansionSelected: 0,
     expansionJobId: null,
     expansionPollTimer: null,
+    expansionOffset: 0,
+    expansionCards: [],
     selectionMode: "none",
   };
 
@@ -612,10 +614,10 @@
   function reviewParams() {
     const params = new URLSearchParams({limit: "25", offset: String(state.reviewOffset)});
     if (state.reviewSearch) params.set("search", state.reviewSearch);
-    if (state.reviewFilter === "strong") params.set("state", "strong");
-    if (state.reviewFilter === "review") params.set("state", "review");
+    if (state.reviewFilter === "strong") params.set("tier", "RECOMMENDED_EXACT");
+    if (state.reviewFilter === "review") params.set("tier", "POSSIBLE_MATCH");
     if (state.reviewFilter === "selected") params.set("selected", "true");
-    if (state.reviewFilter === "recommended") params.set("state", "strong,review");
+    // The default view includes progressively disclosed tier groups per song.
     return params;
   }
 
@@ -624,20 +626,24 @@
       const data = await api(`/api/workspace?${reviewParams()}`);
       state.reviewTotal = Number(data.total || 0);
       state.exactSelected = Number(data.summary?.selection_count || 0);
-      const strong = Number(data.summary?.strong || 0);
-      const review = Number(data.summary?.review || 0);
-      $("#chartsFoundCount").textContent = (strong + review).toLocaleString();
-      $("#chartsFoundLabel").textContent = strong + review === 1 ? "song has a recommendation." : "songs have recommendations.";
-      $("#bestMatchCount").textContent = `${strong.toLocaleString()} ${strong === 1 ? "chart" : "charts"}`;
-      $("#allMatchCount").textContent = `${(strong + review).toLocaleString()} ${strong + review === 1 ? "chart" : "charts"}`;
+      const legacyRecommended = Number(data.summary?.strong || 0) + Number(data.summary?.review || 0);
+      const recommended = Number(data.summary?.recommended_songs ?? legacyRecommended);
+      const additional = Number(data.summary?.additional_playable_charts || 0);
+      const selectable = Number(data.summary?.selectable_charts ?? legacyRecommended);
+      $("#chartsFoundCount").textContent = recommended.toLocaleString();
+      $("#chartsFoundLabel").textContent = recommended === 1 ? "song has a recommended chart." : "songs have recommended charts.";
+      $("#bestMatchCount").textContent = `${recommended.toLocaleString()} ${recommended === 1 ? "chart" : "charts"}`;
+      $("#allMatchCount").textContent = `${Number(data.summary?.all_safe_charts ?? recommended).toLocaleString()} safe charts`;
+      $("#maximumMatchCount").textContent = `${Number(data.summary?.maximum_playable_charts ?? selectable).toLocaleString()} playable charts`;
       if (state.exactSelected < 1 && state.expansionSelected < 1) state.selectionMode = "none";
       else if (state.selectionMode === "none") state.selectionMode = "custom";
-      $("#selectBestButton").setAttribute("aria-pressed", String(state.selectionMode === "strong"));
-      $("#selectAllButton").setAttribute("aria-pressed", String(state.selectionMode === "eligible"));
-      const modeLabels = {strong: "Best Matches preset", eligible: "All recommendations preset", custom: "Custom choices", none: "No selection preset"};
+      $("#selectBestButton").setAttribute("aria-pressed", String(state.selectionMode === "best_matches"));
+      $("#selectAllButton").setAttribute("aria-pressed", String(state.selectionMode === "all_safe_charts"));
+      $("#selectMaximumButton").setAttribute("aria-pressed", String(state.selectionMode === "maximum_playable"));
+      const modeLabels = {best_matches: "Best Matches preset", all_safe_charts: "All Safe Charts preset", maximum_playable: "Maximum Playable preset", custom: "Custom choices", none: "No selection preset"};
       $("#selectionMode").textContent = modeLabels[state.selectionMode];
       refreshSelectionUi();
-      $("#reviewSummary").textContent = `${state.reviewTotal.toLocaleString()} in this view; ${Number(data.summary?.unavailable || 0).toLocaleString()} songs have no safe recommendation.`;
+      $("#reviewSummary").textContent = `${recommended.toLocaleString()} songs have recommendations; ${additional.toLocaleString()} additional playable charts are available.`;
       $("#reviewCards").innerHTML = (data.tracks || []).map(reviewCard).join("") || `<div class="empty-state">No recommendations match this view.</div>`;
       bindReviewActions();
       const page = Math.floor(state.reviewOffset / 25) + 1;
@@ -661,14 +667,21 @@
   function reviewCard(track) {
     const candidates = track.candidates || [];
     const best = candidates.find(candidate => candidate.best) || candidates[0];
-    const primary = candidates.find(candidate => candidate.selected) || best;
+    const primary = best;
     if (!primary) return "";
-    const alternatives = candidates.filter(candidate => candidate !== primary && ["strong", "needs_review"].includes(candidate.review?.state));
+    const groups = [
+      ["SAME_RECORDING_CHART_VARIANT", "Other charts for this recording"],
+      ["ALTERNATE_RECORDING", "Alternate versions"],
+      ["POSSIBLE_MATCH", "Possible matches - review required"],
+    ];
     return `<article class="review-card">
       <div class="review-card__song"><span class="eyebrow">YOUR MUSIC</span><h3>${escapeHtml(track.artist)} - ${escapeHtml(track.title)}</h3><p>${escapeHtml(track.album || "")}</p></div>
       ${candidateSummary(primary, primary === best)}
       <div class="review-card__action">${candidateAction(track, primary)}</div>
-      ${alternatives.length ? `<details class="alternatives"><summary>Other chart versions (${alternatives.length})</summary>${alternatives.map(candidate => `<div class="alternative">${candidateSummary(candidate, false)}<div class="review-card__action">${candidateAction(track, candidate)}</div></div>`).join("")}</details>` : ""}
+      ${groups.map(([tier, label]) => {
+        const values = candidates.filter(candidate => candidate !== primary && candidate.result_tier === tier);
+        return values.length ? `<details class="alternatives"><summary>${label} (${values.length})</summary>${values.map(candidate => `<div class="alternative">${candidateSummary(candidate, false)}<div class="review-card__action">${candidateAction(track, candidate)}</div></div>`).join("")}</details>` : "";
+      }).join("")}
     </article>`;
   }
 
@@ -676,18 +689,22 @@
     const review = candidate.review || {};
     const concerns = review.concerns || [];
     const version = candidate.pack_name || candidate.source || "Community chart";
+    const tierLabels = {RECOMMENDED_EXACT: "Best match", SAME_RECORDING_CHART_VARIANT: "Chart variant", ALTERNATE_RECORDING: "Alternate recording", POSSIBLE_MATCH: "Possible match"};
+    const coverage = (candidate.instruments || []).join(", ") || "Instrument coverage unknown";
     return `<div class="review-card__chart">
-      <span class="match-badge ${review.state === "needs_review" ? "match-badge--review" : ""}">${candidate.selected ? "Selected chart" : best && review.state === "strong" ? "Best match" : review.state === "needs_review" ? "Best available" : escapeHtml(review.label || "Chart")}</span>
+      <span class="match-badge ${candidate.result_tier === "POSSIBLE_MATCH" ? "match-badge--review" : ""}">${candidate.selected ? "Selected chart" : escapeHtml(tierLabels[candidate.result_tier] || review.label || "Chart")}</span>
       <h4>${escapeHtml(candidate.artist)} - ${escapeHtml(candidate.title)}</h4>
       <p>${escapeHtml(version)}${candidate.charter ? ` · ${escapeHtml(candidate.charter)}` : ""}</p>
+      <p>${escapeHtml(coverage)}${candidate.diff_guitar !== null && candidate.diff_guitar !== undefined ? ` · guitar difficulty ${escapeHtml(candidate.diff_guitar)}` : " · difficulty evidence missing"}</p>
       ${concerns.length ? `<details class="concern-details"><summary>${concerns.length} chart ${concerns.length === 1 ? "concern" : "concerns"}</summary><div>${concerns.map(item => `<p>${escapeHtml(item)}</p>`).join("")}</div></details>` : ""}
     </div>`;
   }
 
   function candidateAction(track, candidate) {
     if (candidate.selected) return `<button class="button button--secondary" type="button" data-selection="clear" data-track="${escapeHtml(track.track_key)}" data-candidate="${candidate.candidate_id}" aria-label="Clear selected chart for ${escapeHtml(track.title)}">Clear choice</button>`;
-    if (!candidate.review?.selectable) return `<button class="button button--secondary" type="button" disabled>Unavailable</button>`;
-    return `<button class="button button--secondary" type="button" data-selection="select" data-track="${escapeHtml(track.track_key)}" data-candidate="${candidate.candidate_id}">Select</button>`;
+    if (!(candidate.selectable ?? candidate.review?.selectable)) return `<button class="button button--secondary" type="button" disabled>Unavailable</button>`;
+    const possible = candidate.result_tier === "POSSIBLE_MATCH";
+    return `<button class="button button--secondary" type="button" data-selection="select" data-track="${escapeHtml(track.track_key)}" data-candidate="${candidate.candidate_id}" data-possible="${possible}">${possible ? "Review and select" : "Select"}</button>`;
   }
 
   function bindReviewActions() {
@@ -697,7 +714,9 @@
   async function updateSelection(button) {
     setButtonBusy(button, true, "Saving...");
     try {
-      await api("/api/selection", {method: "POST", body: JSON.stringify({track_key: button.dataset.track, candidate_id: Number(button.dataset.candidate), action: button.dataset.selection})});
+      const possible = button.dataset.possible === "true";
+      if (possible && !window.confirm("This possible match has uncertain song identity. Select it anyway?")) { setButtonBusy(button, false); return; }
+      await api("/api/selection", {method: "POST", body: JSON.stringify({track_key: button.dataset.track, candidate_id: Number(button.dataset.candidate), action: button.dataset.selection, confirm_possible: possible})});
       state.selectionMode = "custom";
       announce(button.dataset.selection === "clear" ? "Chart choice cleared." : "Chart choice saved.");
       await loadReview();
@@ -708,14 +727,15 @@
   }
 
   async function bulkSelect(scope) {
-    const button = scope === "strong" ? $("#selectBestButton") : scope === "eligible" ? $("#selectAllButton") : $("#clearSelectionButton");
+    const button = scope === "best_matches" ? $("#selectBestButton") : scope === "all_safe_charts" ? $("#selectAllButton") : scope === "maximum_playable" ? $("#selectMaximumButton") : $("#clearSelectionButton");
     setButtonBusy(button, true, "Saving choices...");
     try {
-      const payload = scope === "clear" ? {action: "clear"} : {action: "select", scope};
+      const payload = scope === "clear" ? {action: "clear"} : {action: "select", preset: scope};
       await api("/api/selection/bulk", {method: "POST", body: JSON.stringify(payload)});
       state.selectionMode = scope === "clear" ? "none" : scope;
-      $("#selectBestButton").setAttribute("aria-pressed", String(scope === "strong"));
-      $("#selectAllButton").setAttribute("aria-pressed", String(scope === "eligible"));
+      $("#selectBestButton").setAttribute("aria-pressed", String(scope === "best_matches"));
+      $("#selectAllButton").setAttribute("aria-pressed", String(scope === "all_safe_charts"));
+      $("#selectMaximumButton").setAttribute("aria-pressed", String(scope === "maximum_playable"));
       announce(scope === "clear" ? "Chart choices cleared." : "Chart choices saved.");
       state.reviewOffset = 0;
       await loadReview();
@@ -726,22 +746,23 @@
     }
   }
 
-  async function loadExpansion() {
+  async function loadExpansion(append = false) {
     const panel = $("#expansionPanel");
     if (!panel) return;
     const choices = $("#expansionChoices");
     const status = $("#expansionStatus");
     const start = $("#startExpansionButton");
     try {
+      if (!append) state.expansionOffset = 0;
       const [artistData, resultData] = await Promise.all([
-        api("/api/expansion/artists"),
-        api("/api/expansion/results"),
+        append ? Promise.resolve(null) : api("/api/expansion/artists"),
+        api(`/api/expansion/results?limit=25&offset=${state.expansionOffset}`),
       ]);
-      const artists = artistData.artists || [];
-      if (!artistData.available) {
+      const artists = artistData?.artists || [];
+      if (artistData && !artistData.available) {
         choices.innerHTML = `<p class="empty-state">${escapeHtml(artistData.reason || "Artist expansion is not available yet.")}</p>`;
         start.disabled = true;
-      } else {
+      } else if (artistData) {
         choices.innerHTML = artists.map(artist => `<label>
           <input type="checkbox" value="${escapeHtml(artist.artist_norm)}" ${artist.selected ? "checked" : ""}>
           <span><strong>${escapeHtml(artist.artist)}</strong><small>${Number(artist.eligible_songs || 0).toLocaleString()} eligible songs · up to ${Number(artist.cap || 0).toLocaleString()} recommended</small></span>
@@ -755,14 +776,22 @@
             : `${count.toLocaleString()} ${count === 1 ? "artist" : "artists"} selected.`;
         };
       }
-      const cards = resultData.songs || [];
+      const pageCards = resultData.songs || [];
+      state.expansionCards = append
+        ? [...state.expansionCards, ...pageCards].filter((item, index, values) => values.findIndex(other => other.song_key === item.song_key) === index)
+        : pageCards;
+      const cards = state.expansionCards;
+      state.expansionOffset = cards.length;
       state.expansionSelected = Number(resultData.summary?.selected || 0);
       refreshSelectionUi();
       $("#expansionResults").hidden = cards.length === 0;
       $("#expansionResultCount").textContent = Number(resultData.total || 0).toLocaleString();
       $("#expansionCards").innerHTML = cards.map(expansionCard).join("");
+      const more = $("#loadMoreExpansion");
+      more.hidden = !resultData.has_more;
+      more.onclick = () => loadExpansion(true);
       bindExpansionActions();
-      const job = artistData.job;
+      const job = artistData?.job;
       if (job && ["queued", "running"].includes(job.status)) {
         status.textContent = job.message || "Preparing expansion recommendations...";
         start.disabled = true;
@@ -792,18 +821,22 @@
   function expansionCandidateAction(song, candidate) {
     if (candidate.selected) return `<button class="button button--secondary" type="button" data-expansion-selection="clear" data-artist="${escapeHtml(candidate.artist_norm)}" data-candidate="${candidate.candidate_id}">Clear choice</button>`;
     if (!candidate.selectable) return `<button class="button button--secondary" type="button" disabled>Unavailable</button>`;
-    return `<button class="button button--secondary" type="button" data-expansion-selection="select" data-artist="${escapeHtml(candidate.artist_norm)}" data-candidate="${candidate.candidate_id}">Select</button>`;
+    const possible = candidate.result_tier === "POSSIBLE_MATCH";
+    return `<button class="button button--secondary" type="button" data-expansion-selection="select" data-artist="${escapeHtml(candidate.artist_norm)}" data-candidate="${candidate.candidate_id}" data-possible="${possible}">${possible ? "Review and select" : "Select"}</button>`;
   }
 
   function bindExpansionActions() {
     $$('[data-expansion-selection]').forEach(button => button.addEventListener("click", async () => {
       setButtonBusy(button, true, "Saving...");
       try {
+        const possible = button.dataset.possible === "true";
+        if (possible && !window.confirm("This possible expansion match needs explicit confirmation. Select it?")) { setButtonBusy(button, false); return; }
         await api("/api/selection", {method: "POST", body: JSON.stringify({
           kind: "expansion",
           artist_norm: button.dataset.artist,
           candidate_id: Number(button.dataset.candidate),
           action: button.dataset.expansionSelection,
+          confirm_possible: possible,
         })});
         state.selectionMode = "custom";
         await loadExpansion();
@@ -922,8 +955,9 @@
     $("#activitySearch")?.addEventListener("input", debounce(() => { state.activityOffset = 0; loadActivity(); }));
     $("#activityPrev")?.addEventListener("click", () => { state.activityOffset = Math.max(0, state.activityOffset - 50); loadActivity(); });
     $("#activityNext")?.addEventListener("click", () => { state.activityOffset += 50; loadActivity(); });
-    $("#selectBestButton")?.addEventListener("click", () => bulkSelect("strong"));
-    $("#selectAllButton")?.addEventListener("click", () => bulkSelect("eligible"));
+    $("#selectBestButton")?.addEventListener("click", () => bulkSelect("best_matches"));
+    $("#selectAllButton")?.addEventListener("click", () => bulkSelect("all_safe_charts"));
+    $("#selectMaximumButton")?.addEventListener("click", () => bulkSelect("maximum_playable"));
     $("#clearSelectionButton")?.addEventListener("click", () => bulkSelect("clear"));
     $("#reviewSearch")?.addEventListener("input", debounce(event => { state.reviewSearch = event.target.value.trim(); state.reviewOffset = 0; loadReview(); }));
     $$('[data-review-filter]').forEach(button => button.addEventListener("click", () => {

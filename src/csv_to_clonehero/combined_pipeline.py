@@ -19,7 +19,18 @@ from csv_to_clonehero.catalog import (
 )
 from csv_to_clonehero.config import AppConfig
 from csv_to_clonehero.database import Database
-from csv_to_clonehero.matching import ELIGIBLE_REVIEW, RECOMMENDED, score_candidate, score_expansion_candidate
+from csv_to_clonehero.matching import (
+    ALTERNATE_RECORDING,
+    BLOCKED,
+    ELIGIBLE_REVIEW,
+    POSSIBLE_MATCH,
+    RECOMMENDED,
+    RECOMMENDED_EXACT,
+    SAME_RECORDING_CHART_VARIANT,
+    SELECTABLE_RESULT_TIERS,
+    score_candidate,
+    score_expansion_candidate,
+)
 from csv_to_clonehero.models import ChartCandidate
 from csv_to_clonehero.normalization import normalize_artist, normalize_title
 from csv_to_clonehero.providers.base import (
@@ -62,6 +73,9 @@ class CombinedDiscoveryResult:
     candidates: int = 0
     expansion_artists: list[dict[str, Any]] = field(default_factory=list)
     source_summaries: dict[str, dict[str, int]] = field(default_factory=dict)
+    songs_with_selectable_charts: int = 0
+    selectable_chart_artifacts: int = 0
+    result_tier_histogram: dict[str, int] = field(default_factory=dict)
     catalog_available: bool = False
     catalog_diagnostic: str = ""
     rejected_candidates: int = 0
@@ -144,7 +158,7 @@ class CombinedDiscoveryResult:
         }
 
 
-MATCH_CACHE_VERSION = "combined-match-v8"
+MATCH_CACHE_VERSION = "combined-match-v9"
 
 
 def matching_cache_fingerprint(track: Any, catalog: Any, config: AppConfig, *, config_fingerprint: str = "") -> str:
@@ -322,8 +336,24 @@ def materialize_completed_scan_cache(config: AppConfig, db: Database, workspace_
     if not catalog.available:
         raise ValueError(catalog.diagnostic)
     manifest = _catalog_manifest(catalog, config.catalog_path)
+    candidate_rows = db.get_workspace_candidates(
+        workspace_id, kind="exact", include_rejected=True, current_only=True
+    )
+    tiers: dict[str, int] = {}
+    selectable_tracks: set[int] = set()
+    selectable_candidates = 0
+    for row in candidate_rows:
+        breakdown = json.loads(str(row["breakdown_json"] or "{}"))
+        tier = str(breakdown.get("result_tier") or "")
+        if not tier:
+            raise ValueError("persisted candidates predate result tiers; rerun discovery")
+        tiers[tier] = tiers.get(tier, 0) + 1
+        if tier in SELECTABLE_RESULT_TIERS:
+            selectable_candidates += 1
+            if row["track_id"] is not None:
+                selectable_tracks.add(int(row["track_id"]))
     candidate_count, candidate_digest, _ = db.workspace_current_candidate_digest(workspace_id)
-    result = CombinedDiscoveryResult(status="complete", phase="complete", tracks=progress["total"], catalog_available=True, catalog_snapshot_id=str(manifest["snapshot_id"]), catalog_chart_count=int(manifest["chart_count"]), candidate_charts_evaluated=candidate_count, unique_charts_evaluated=candidate_count, tracks_with_candidates=progress["total"] - progress["no_catalog_candidate"], strong_match_tracks=progress["strong"], review_match_tracks=progress["review"], soft_rejected_only_tracks=progress["no_suitable"], hard_rejected_only_tracks=progress["not_playable"], no_plausible_tracks=progress["no_catalog_candidate"], persisted_candidates=candidate_count, candidate_relationship_digest=candidate_digest)
+    result = CombinedDiscoveryResult(status="complete", phase="complete", tracks=progress["total"], catalog_available=True, catalog_snapshot_id=str(manifest["snapshot_id"]), catalog_chart_count=int(manifest["chart_count"]), candidate_charts_evaluated=candidate_count, unique_charts_evaluated=candidate_count, tracks_with_candidates=progress["total"] - progress["no_catalog_candidate"], strong_match_tracks=progress["strong"], review_match_tracks=progress["review"], soft_rejected_only_tracks=progress["no_suitable"], hard_rejected_only_tracks=progress["not_playable"], no_plausible_tracks=progress["no_catalog_candidate"], persisted_candidates=candidate_count, candidate_relationship_digest=candidate_digest, songs_with_selectable_charts=len(selectable_tracks), selectable_chart_artifacts=selectable_candidates, result_tier_histogram=tiers)
     scan_fingerprint = matching_scan_fingerprint((), manifest, config, library_fingerprint=library_fingerprint)
     db.save_matching_scan_cache(workspace_id, scan_fingerprint, result.tracks, asdict(result))
     return result, {"library_fingerprint": library_fingerprint, "catalog_manifest": manifest, "scan_fingerprint": scan_fingerprint, "candidate_count": candidate_count, "candidate_digest": candidate_digest}
@@ -554,17 +584,17 @@ def discover_combined(
                         if isinstance(value, (list, tuple)) and len(value) == 2
                     } or expected_ids
                     evaluated_chart_ids.update(evaluated_ids)
-                    _, _, existing_ids = db.workspace_current_candidate_digest(workspace_id, track.track_key)
+                    _, _, existing_ids = db.workspace_current_candidate_digest(
+                        workspace_id, track.track_key
+                    )
                     if existing_ids != expected_ids:
                         db.clear_workspace_track_candidates(workspace_id, track.track_key)
-                        for entry in entries:
-                            chart = ChartCandidate(**dict(entry["candidate"]))
-                            db.upsert_candidate(chart)
-                            metadata = dict(entry.get("metadata") or {})
-                            metadata["provenance"] = track.origin_metadata.get("provenance", [])
-                            db.upsert_workspace_candidate(workspace_id, track.track_key, chart, score=float(entry["score"]), quality=float(entry["quality"]), decision=str(entry["decision"]), eligibility=str(entry["eligibility"]), breakdown_json=str(entry["breakdown_json"]), kind="exact", task_id=task_ids[track.track_key], metadata=metadata)
-                    else:
-                        db.assign_workspace_track_candidates_to_task(workspace_id, track.track_key, task_ids[track.track_key])
+                    for entry in entries:
+                        chart = ChartCandidate(**dict(entry["candidate"]))
+                        db.upsert_candidate(chart)
+                        metadata = dict(entry.get("metadata") or {})
+                        metadata["provenance"] = track.origin_metadata.get("provenance", [])
+                        db.upsert_workspace_candidate(workspace_id, track.track_key, chart, score=float(entry["score"]), quality=float(entry["quality"]), decision=str(entry["decision"]), eligibility=str(entry["eligibility"]), breakdown_json=str(entry["breakdown_json"]), kind="exact", task_id=task_ids[track.track_key], metadata=metadata)
                     result.cached_tracks += 1
                     result.candidates += candidate_count
                     result.eligible_candidates += int(cached_result.get("eligible_count", 0))
@@ -574,6 +604,15 @@ def discover_combined(
                             max(0, candidate_count - int(cached_result.get("eligible_count", 0))),
                         )
                     )
+                    selectable_count = int(cached_result.get("selectable_count", 0))
+                    result.selectable_chart_artifacts += selectable_count
+                    result.songs_with_selectable_charts += int(selectable_count > 0)
+                    for tier, count in dict(
+                        cached_result.get("result_tier_histogram") or {}
+                    ).items():
+                        result.result_tier_histogram[str(tier)] = (
+                            result.result_tier_histogram.get(str(tier), 0) + int(count)
+                        )
                     result.candidate_charts_evaluated += candidate_count
                     if bool(cached_result.get("strict_exact")):
                         result.exact_hits += 1
@@ -748,6 +787,19 @@ def discover_combined(
                     fallback_recovered = bool(eligible)
                 if fallback_recovered and not initial_broader_retrieval:
                     result.broader_retrieval_tracks += 1
+            recommended_exact = sorted(
+                [item for item in scored if item[1].result_tier == RECOMMENDED_EXACT],
+                key=_scored_rank,
+            )
+            for _chart, breakdown in recommended_exact[1:]:
+                breakdown.result_tier = SAME_RECORDING_CHART_VARIANT
+                breakdown.result_tier_reasons = [
+                    "additional safe chart artifact for the same recording"
+                ]
+                breakdown.factors["result_tier"] = {
+                    "state": breakdown.result_tier,
+                    "reasons": list(breakdown.result_tier_reasons),
+                }
             strong = any(
                 str(getattr(breakdown, "eligibility", "")).upper() == "RECOMMENDED"
                 for _, breakdown in scored
@@ -756,7 +808,35 @@ def discover_combined(
                 str(getattr(breakdown, "eligibility", "")).upper() == "ELIGIBLE_REVIEW"
                 for _, breakdown in scored
             )
-            to_persist = list(eligible)
+            tier_limits = {
+                RECOMMENDED_EXACT: 1,
+                SAME_RECORDING_CHART_VARIANT: 12,
+                ALTERNATE_RECORDING: 12,
+                POSSIBLE_MATCH: 8,
+            }
+            tier_groups: dict[str, list[tuple[Any, Any]]] = {}
+            for item in scored:
+                tier = str(getattr(item[1], "result_tier", BLOCKED) or BLOCKED)
+                result.result_tier_histogram[tier] = (
+                    result.result_tier_histogram.get(tier, 0) + 1
+                )
+                if tier in SELECTABLE_RESULT_TIERS:
+                    tier_groups.setdefault(tier, []).append(item)
+            to_persist = []
+            for tier in (
+                RECOMMENDED_EXACT,
+                SAME_RECORDING_CHART_VARIANT,
+                ALTERNATE_RECORDING,
+                POSSIBLE_MATCH,
+            ):
+                to_persist.extend(
+                    sorted(tier_groups.get(tier, ()), key=_scored_rank)[
+                        :tier_limits[tier]
+                    ]
+                )
+            if to_persist:
+                result.songs_with_selectable_charts += 1
+                result.selectable_chart_artifacts += len(to_persist)
             rejection_exemplar = None
             if not to_persist and scored:
                 # Keep the exact exemplar that supplies the terminal reason.
@@ -782,6 +862,8 @@ def discover_combined(
                     task_id=task_ids[track.track_key],
                     metadata={
                         "provenance": track.origin_metadata.get("provenance", []),
+                        "result_tier": breakdown.result_tier,
+                        "result_tier_reasons": list(breakdown.result_tier_reasons),
                         "catalog_retrieval": {
                             "strict_exact": lookup.strict_exact,
                             "methods": list(lookup.methods),
@@ -833,6 +915,23 @@ def discover_combined(
                     "candidate_count": len(matches),
                     "eligible_count": len(eligible),
                     "rejected_count": max(0, len(matches) - len(eligible)),
+                    "selectable_count": len([
+                        item for item in to_persist
+                        if item[1].result_tier in SELECTABLE_RESULT_TIERS
+                    ]),
+                    "result_tier_histogram": {
+                        tier: sum(
+                            1 for _chart, breakdown in scored
+                            if breakdown.result_tier == tier
+                        )
+                        for tier in (
+                            RECOMMENDED_EXACT,
+                            SAME_RECORDING_CHART_VARIANT,
+                            ALTERNATE_RECORDING,
+                            POSSIBLE_MATCH,
+                            BLOCKED,
+                        )
+                    },
                     "primary_reason": primary_reason,
                     "provenance": list(lookup.methods),
                     "strict_exact": bool(lookup.strict_exact),
@@ -851,7 +950,7 @@ def discover_combined(
                         [str(chart.source), int(chart.chart_id)] for chart in matches
                     ],
                     "candidates": [
-                        {"candidate": asdict(chart), "score": breakdown.final_score, "quality": breakdown.quality, "decision": breakdown.decision, "eligibility": breakdown.eligibility, "breakdown_json": json.dumps(breakdown.to_dict(), sort_keys=True), "metadata": {"catalog_retrieval": {"strict_exact": lookup.strict_exact, "methods": list(lookup.methods), "retrieved_song_keys": lookup.retrieved_song_keys, "candidate_methods": list(lookup.candidate_methods.get((str(chart.source), int(chart.chart_id)), lookup.methods))}}}
+                        {"candidate": asdict(chart), "score": breakdown.final_score, "quality": breakdown.quality, "decision": breakdown.decision, "eligibility": breakdown.eligibility, "breakdown_json": json.dumps(breakdown.to_dict(), sort_keys=True), "metadata": {"result_tier": breakdown.result_tier, "result_tier_reasons": list(breakdown.result_tier_reasons), "catalog_retrieval": {"strict_exact": lookup.strict_exact, "methods": list(lookup.methods), "retrieved_song_keys": lookup.retrieved_song_keys, "candidate_methods": list(lookup.candidate_methods.get((str(chart.source), int(chart.chart_id)), lookup.methods))}}}
                         for chart, breakdown in to_persist
                     ],
                 },
@@ -1178,6 +1277,7 @@ def workspace_snapshots(db: Database, workspace_id: int | str) -> list[LibrarySn
             playlist_ids=[str(value["playlist_provider_id"]) for value in memberships],
             playlist_names=[str(value["playlist_name"] or "") for value in memberships],
             liked=bool(row["liked"]),
+            duration_ms=(int(row["duration_ms"]) if row["duration_ms"] is not None else None),
             isrc=str(row["isrc"] or ""),
             url=str(row["url"] or ""),
             metadata=json.loads(row["metadata_json"] or "{}"),

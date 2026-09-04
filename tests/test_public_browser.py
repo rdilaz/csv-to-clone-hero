@@ -313,7 +313,7 @@ def test_public_authenticated_journey_to_download_ready(
         assert page.locator("#progressEta").inner_text() == "About 4-6 minutes"
         _assert_in_viewport(page, "#progressEta")
         _assert_no_overflow(page)
-        page.get_by_role("heading", name="1 song has a recommendation.").wait_for()
+        page.get_by_role("heading", name="1 song has a recommended chart.").wait_for()
         scope_posts = [json.loads(body or "{}") for method, path, body in api_calls if method == "POST" and path == "/api/spotify/scope"]
         assert scope_posts and scope_posts[-1]["playlist_ids"] == ["playlist-unknown"]
         assert page.locator("[data-step=confirm]").get_attribute("aria-current") == "step"
@@ -323,7 +323,7 @@ def test_public_authenticated_journey_to_download_ready(
         page.get_by_role("button", name="Search again").click()
         playwright.expect(page.get_by_label("Liked Songs")).to_be_visible()
         page.get_by_role("button", name="Find Clone Hero charts").click()
-        page.get_by_role("heading", name="1 song has a recommendation.").wait_for()
+        page.get_by_role("heading", name="1 song has a recommended chart.").wait_for()
 
         concern = page.get_by_text("1 chart concern", exact=True)
         if has_touch:
@@ -401,7 +401,7 @@ def test_public_expansion_confirm_and_reload_in_browser(public_server):
                 }],
                 "job": ({"id": 12, "kind": "expansion", "status": "complete"} if expansion_started["value"] else None),
             }, 200
-        elif path == "/api/expansion/results":
+        elif path.startswith("/api/expansion/results?"):
             candidate = {
                 "candidate_id": 51, "source": "enchor", "chart_id": 510,
                 "artist": "Paramore", "title": "Decode", "charter": "Community Charter",

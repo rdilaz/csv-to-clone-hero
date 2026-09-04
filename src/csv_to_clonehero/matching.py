@@ -74,6 +74,18 @@ EXCLUDED = "EXCLUDED"
 INCOMPATIBLE = "INCOMPATIBLE"
 ELIGIBILITY_STATES = frozenset({RECOMMENDED, ELIGIBLE_REVIEW, EXCLUDED, INCOMPATIBLE})
 
+RECOMMENDED_EXACT = "RECOMMENDED_EXACT"
+SAME_RECORDING_CHART_VARIANT = "SAME_RECORDING_CHART_VARIANT"
+ALTERNATE_RECORDING = "ALTERNATE_RECORDING"
+POSSIBLE_MATCH = "POSSIBLE_MATCH"
+BLOCKED = "BLOCKED"
+SELECTABLE_RESULT_TIERS = frozenset({
+    RECOMMENDED_EXACT,
+    SAME_RECORDING_CHART_VARIANT,
+    ALTERNATE_RECORDING,
+    POSSIBLE_MATCH,
+})
+
 _DIFF_FIELDS = (
     "diff_guitar", "diff_guitarghl", "diff_bass",
     "diff_drums", "diff_vocals", "diff_keys",
@@ -194,6 +206,8 @@ class SpotifyScoreBreakdown(ScoreBreakdown):
     gate_factors: dict[str, Any] = field(default_factory=dict)
     eligibility: str = ""
     eligibility_reasons: list[str] = field(default_factory=list)
+    result_tier: str = ""
+    result_tier_reasons: list[str] = field(default_factory=list)
 
     @property
     def eligibility_state(self) -> str:
@@ -222,6 +236,87 @@ class SpotifyScoreBreakdown(ScoreBreakdown):
 # A short alias is useful to integrations that do not want to couple their
 # import name to the Spotify workflow while retaining the concrete type above.
 ScoredBreakdown = SpotifyScoreBreakdown
+
+
+def classify_result_tier(
+    value: SpotifyScoreBreakdown | Mapping[str, Any],
+    *,
+    kind: str = "exact",
+    artifact_state: str = "",
+) -> tuple[str, list[str]]:
+    """Describe product meaning independently from numeric score thresholds."""
+    if isinstance(value, Mapping):
+        gates = value.get("gate_factors") or (value.get("factors") or {}).get("gates") or {}
+        match = value.get("match_factors") or (value.get("factors") or {}).get("match") or {}
+        eligibility = str(value.get("eligibility") or value.get("eligibility_state") or "")
+    else:
+        gates = value.gate_factors
+        match = value.match_factors
+        eligibility = value.eligibility
+    state = str(artifact_state or "").upper()
+    if state in {"REJECTED", "UNAVAILABLE"}:
+        return BLOCKED, [f"artifact validation is {state.casefold()}"]
+    if bool(gates.get("hard_gate")) or eligibility == INCOMPATIBLE:
+        reasons = list(gates.get("hard_gate_reasons") or ())
+        return BLOCKED, reasons or ["hard compatibility or identity gate"]
+    if kind == "expansion":
+        if eligibility == RECOMMENDED:
+            return RECOMMENDED_EXACT, ["recommended expansion song"]
+        return POSSIBLE_MATCH, ["artist expansion requires explicit song review"]
+
+    title_state = str(gates.get("title_identity") or "")
+    artist_state = str(gates.get("artist_identity") or "")
+    strong_pair = bool(
+        gates.get("external_identity_match")
+        or (gates.get("title_auto_identity") and gates.get("artist_auto_identity"))
+    )
+    plausible_pair = bool(
+        title_state != "conflict"
+        and artist_state != "conflict"
+        and (strong_pair or title_state in {"strong", "borderline"})
+        and artist_state in {"strong", "borderline"}
+    )
+    version = match.get("version_markers") if isinstance(match, Mapping) else {}
+    version = version if isinstance(version, Mapping) else {}
+    version_conflict = bool(
+        version.get("matched") is False
+        and (version.get("track") or version.get("candidate"))
+    )
+    duration = match.get("duration") if isinstance(match, Mapping) else {}
+    duration = duration if isinstance(duration, Mapping) else {}
+    duration_conflict = bool(
+        duration.get("available") and duration.get("within_tolerance") is False
+    )
+    if (
+        title_state == "borderline"
+        and artist_state == "borderline"
+        and duration_conflict
+    ):
+        return BLOCKED, [
+            "combined title/artist uncertainty plus material duration conflict"
+        ]
+    if plausible_pair and (version_conflict or duration_conflict):
+        reasons = []
+        if version_conflict:
+            reasons.append("meaningful recording/version markers differ")
+        if duration_conflict:
+            reasons.append("recording duration differs")
+        return ALTERNATE_RECORDING, reasons
+    if eligibility == RECOMMENDED and strong_pair:
+        return RECOMMENDED_EXACT, ["safe same-song recommendation"]
+    if strong_pair:
+        return SAME_RECORDING_CHART_VARIANT, ["same recording identity with another chart artifact"]
+    return POSSIBLE_MATCH, ["plausible identity requires explicit review"]
+
+
+def _apply_result_tier(
+    breakdown: SpotifyScoreBreakdown,
+    *,
+    kind: str = "exact",
+) -> None:
+    breakdown.result_tier, breakdown.result_tier_reasons = classify_result_tier(
+        breakdown, kind=kind
+    )
 
 
 def _new_breakdown() -> SpotifyScoreBreakdown:
@@ -1070,12 +1165,15 @@ def _hard_gate(
     breakdown.decision = decision
     breakdown.final_score = max(0.0, min(100.0, final_score))
     _set_eligibility(breakdown, state, unique_reasons)
+    _apply_result_tier(breakdown)
     _sync_factors(breakdown)
     return breakdown
 
 
 def _sync_factors(breakdown: SpotifyScoreBreakdown) -> None:
     """Refresh the JSON-ready factor envelope after each scoring phase."""
+    if not breakdown.result_tier:
+        _apply_result_tier(breakdown)
     breakdown.factors = {
         "match": dict(breakdown.match_factors),
         "quality": dict(breakdown.quality_factors),
@@ -1090,6 +1188,10 @@ def _sync_factors(breakdown: SpotifyScoreBreakdown) -> None:
         "eligibility": {
             "state": breakdown.eligibility,
             "reasons": list(breakdown.eligibility_reasons),
+        },
+        "result_tier": {
+            "state": breakdown.result_tier,
+            "reasons": list(breakdown.result_tier_reasons),
         },
     }
     # Keep common factors addressable without requiring callers to understand
@@ -1688,6 +1790,8 @@ def score_expansion_candidate(
     # Eligibility still uses the shared 90/70 export thresholds.  The legacy
     # expansion minimum remains in ``decision`` for old planner callers.
     _set_threshold_eligibility(breakdown, config, update_decision=False)
+    _apply_result_tier(breakdown, kind="expansion")
+    _sync_factors(breakdown)
     return breakdown
 
 

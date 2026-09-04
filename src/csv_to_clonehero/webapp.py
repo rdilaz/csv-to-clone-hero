@@ -2880,6 +2880,7 @@ def create_app(
                 "quality": float(data.get("quality") or 0),
                 "eligibility": data.get("eligibility", ""),
                 "decision": data.get("decision", ""),
+                "result_tier": str(breakdown.get("result_tier") or data.get("metadata", {}).get("result_tier") or ""),
                 "selected": bool(data.get("selected")),
             }
         source_artwork = str(
@@ -2929,6 +2930,8 @@ def create_app(
                 or []
             ),
             "decision": str(data.get("decision") or breakdown.get("decision") or ""),
+            "result_tier": str(breakdown.get("result_tier") or ""),
+            "result_tier_reasons": list(breakdown.get("result_tier_reasons") or []),
             "explanation": str(breakdown.get("explanation") or ""),
             "breakdown": dict(breakdown),
             "base_score": float(

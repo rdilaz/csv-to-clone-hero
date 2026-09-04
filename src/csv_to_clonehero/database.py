@@ -2071,7 +2071,7 @@ class Database:
         if db_id is None:
             return []
         return list(self._conn.execute(
-            """SELECT t.id AS library_track_id,t.normalized_artist,t.normalized_title,
+            """SELECT t.id AS library_track_id,t.normalized_artist,t.normalized_title,t.duration_ms,
                       p.source_id,s.source_key,p.provider_id,s.provider,p.title,p.artist,p.album,p.liked,
                       p.isrc,p.url,p.metadata_json
                FROM library_tracks t JOIN library_track_provenance p ON p.library_track_id=t.id
@@ -4288,22 +4288,36 @@ class Database:
                 explanation = check["breakdown_json"] or ""
         if score is None and candidate_row is not None:
             score = 0.0
+        if candidate_row is not None and str(candidate_row.md5 or ""):
+            duplicate = self._conn.execute(
+                """SELECT ws.id,ws.candidate_id FROM workspace_selections ws
+                     JOIN candidate_charts c ON c.id=ws.candidate_id
+                    WHERE ws.workspace_id=? AND ws.status='selected'
+                      AND c.source=? AND c.md5=? LIMIT 1""",
+                (db_id, str(candidate_row.source), str(candidate_row.md5)),
+            ).fetchone()
+            if duplicate is not None:
+                if int(duplicate["candidate_id"]) == candidate_id:
+                    with self._conn:
+                        self._conn.execute(
+                            """UPDATE workspace_selections SET score=?,explanation=?,
+                                      eligibility=?,metadata_json=?,updated_at=? WHERE id=?""",
+                            (
+                                score, explanation, eligibility,
+                                _json_text(metadata or {}, {}), time.time(),
+                                int(duplicate["id"]),
+                            ),
+                        )
+                return int(duplicate["id"])
         now = time.time()
         with self._conn:
-            if kind == "exact":
-                self._conn.execute(
-                    """DELETE FROM workspace_selections
-                       WHERE workspace_id = ? AND kind = 'exact' AND track_id = ?""",
-                    (db_id, resolved_track),
-                )
-            else:
-                self._conn.execute(
-                    """DELETE FROM workspace_selections
-                       WHERE workspace_id = ? AND kind = ? AND candidate_id = ?
-                         AND COALESCE(artist_norm, '') = COALESCE(?, '')
-                         AND COALESCE(track_id, 0) = COALESCE(?, 0)""",
-                    (db_id, kind, candidate_id, artist_norm, resolved_track),
-                )
+            self._conn.execute(
+                """DELETE FROM workspace_selections
+                   WHERE workspace_id = ? AND kind = ? AND candidate_id = ?
+                     AND COALESCE(artist_norm, '') = COALESCE(?, '')
+                     AND COALESCE(track_id, 0) = COALESCE(?, 0)""",
+                (db_id, kind, candidate_id, artist_norm, resolved_track),
+            )
             row_track = self._conn.execute(
                 "SELECT spotify_id FROM spotify_tracks WHERE id = ?", (resolved_track,)
             ).fetchone() if resolved_track is not None else None

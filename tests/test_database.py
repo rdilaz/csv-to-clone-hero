@@ -380,6 +380,49 @@ def test_select_workspace_candidate_force_allows_excluded_but_not_incompatible(t
     db.close()
 
 
+def test_exact_workspace_selection_is_additive_idempotent_and_candidate_scoped(tmp_path):
+    from csv_to_clonehero.models import ChartCandidate
+
+    db = Database(tmp_path / "state.db")
+    ws = db.create_workspace(workspace_key="multi", status="complete", phase="complete")
+    db.upsert_spotify_tracks([{
+        "track_key": "spotify:multi", "spotify_id": "multi", "title": "Song",
+        "title_norm": "song", "artist_full": "Artist", "artist_norm": "artist",
+        "primary_artist": "Artist", "primary_artist_norm": "artist",
+    }])
+    charts = [
+        ChartCandidate(source="test", chart_id=value, md5=str(value) * 32,
+                       name="Song", artist="Artist", name_norm="song",
+                       artist_norm="artist", instruments=["guitar"], diff_guitar=3)
+        for value in (1, 2)
+    ]
+    for chart in charts:
+        db.upsert_workspace_candidate(
+            ws, "spotify:multi", chart, score=95, eligibility="RECOMMENDED"
+        )
+        db.select_workspace_candidate(ws, "spotify:multi", chart)
+    assert len(db.list_workspace_selections(ws, kind="exact")) == 2
+    duplicate_content = ChartCandidate(
+        source="test", chart_id=3, md5=charts[0].md5,
+        name="Song", artist="Artist", name_norm="song", artist_norm="artist",
+        instruments=["guitar"], diff_guitar=3,
+    )
+    db.upsert_workspace_candidate(
+        ws, "spotify:multi", duplicate_content, score=94, eligibility="RECOMMENDED"
+    )
+    db.select_workspace_candidate(ws, "spotify:multi", duplicate_content)
+    assert len(db.list_workspace_selections(ws, kind="exact")) == 2
+    first = db.select_workspace_candidate(ws, "spotify:multi", charts[0])
+    assert len(db.list_workspace_selections(ws, kind="exact")) == 2
+    assert db.clear_workspace_selection(
+        ws, "spotify:multi", candidate_id=charts[0].db_id, kind="exact"
+    ) == 1
+    remaining = db.list_workspace_selections(ws, kind="exact")
+    assert len(remaining) == 1 and int(remaining[0]["candidate_id"]) == charts[1].db_id
+    assert first is not None
+    db.close()
+
+
 def test_record_export_item_tolerates_stale_selection_id(tmp_path):
     from csv_to_clonehero.models import ChartCandidate
 

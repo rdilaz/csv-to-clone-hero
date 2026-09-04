@@ -38,7 +38,7 @@ from pathlib import Path
 from typing import Any, BinaryIO, Protocol, runtime_checkable
 
 from csv_to_clonehero.config import AppConfig
-from csv_to_clonehero.filesystem import MAX_COMPONENT_LENGTH, destination_path, is_within
+from csv_to_clonehero.filesystem import MAX_COMPONENT_LENGTH, MAX_RELPATH_CHARS, destination_path, is_within
 from csv_to_clonehero.models import ChartCandidate, Track
 from csv_to_clonehero.sources.base import ChartSource
 
@@ -1760,11 +1760,16 @@ class ExportService:
                 )
             )
         eligibility = _field(selection, "eligibility", None)
+        result_tier = str(_field(selection, "result_tier", "") or "").upper()
+        tier_selectable = result_tier in {
+            "RECOMMENDED_EXACT", "SAME_RECORDING_CHART_VARIANT",
+            "ALTERNATE_RECORDING", "POSSIBLE_MATCH",
+        }
         if eligibility is None:
             eligibility = _field(selection, "eligibility_state", None)
         if eligibility is None:
             eligibility = _field(selection, "export_status", None)
-        if eligibility is not None and str(eligibility).casefold() in {
+        if not tier_selectable and eligibility is not None and str(eligibility).casefold() in {
             "excluded",
             "incompatible",
             "ineligible",
@@ -1789,7 +1794,7 @@ class ExportService:
         if decision in {"reject", "rejected", "incompatible"}:
             issues.append(PreflightIssue("selection_ineligible", f"persisted decision is {decision!r}", selection_index=index))
         score = _field(selection, "score", None)
-        if score is not None and export_floor is not None:
+        if not tier_selectable and score is not None and export_floor is not None:
             try:
                 if float(score) < export_floor:
                     issues.append(PreflightIssue("below_export_floor", f"score {float(score):.1f} is below export floor {export_floor:.1f}", selection_index=index))
@@ -1991,10 +1996,29 @@ class ExportService:
                 continue
             prior_target = by_target.get(target_key)
             if prior_target is not None:
-                issue = PreflightIssue("duplicate_target_path", f"target path duplicates selection {prior_target.index}: {item.target_relpath}", selection_index=item.index)
-                item.issues.append(issue)
-                prior_target.issues.append(PreflightIssue("duplicate_target_path", f"target path duplicates selection {item.index}: {prior_target.target_relpath}", selection_index=prior_target.index))
-                continue
+                relative = Path(item.target_relpath)
+                source_label = re.sub(r"[^A-Za-z0-9_-]+", "-", item.source_name).strip("-") or "chart"
+                suffix = relative.suffix or ".sng"
+                variant = f" [{source_label}-{item.chart_id}]"
+                stem_budget = max(1, MAX_COMPONENT_LENGTH - len(suffix) - len(variant))
+                item.target_relpath = relative.with_name(
+                    f"{relative.stem[:stem_budget]}{variant}{suffix}"
+                ).as_posix()
+                overflow = len(item.target_relpath) - MAX_RELPATH_CHARS
+                if overflow > 0:
+                    shorter = max(1, stem_budget - overflow)
+                    item.target_relpath = relative.with_name(
+                        f"{relative.stem[:shorter]}{variant}{suffix}"
+                    ).as_posix()
+                item.target_path = _safe_path(root, item.target_relpath)
+                target_key = _path_key(item.target_relpath)
+                if target_key in by_target:
+                    item.issues.append(PreflightIssue(
+                        "duplicate_target_path",
+                        f"target path still duplicates another distinct artifact: {item.target_relpath}",
+                        selection_index=item.index,
+                    ))
+                    continue
             by_identity[identity] = item
             by_target[target_key] = item
 

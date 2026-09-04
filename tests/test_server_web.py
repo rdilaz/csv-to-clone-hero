@@ -105,7 +105,8 @@ def test_authenticated_review_shell_prioritizes_human_decisions(client):
 
     assert "CONFIRM CHARTS" in html
     assert "Best Matches" in html
-    assert "All recommendations" in html
+    assert "All Safe Charts" in html
+    assert "Maximum Playable" in html
     assert "Quick confirmation" in html
     assert "Advanced review settings" not in html
     assert "Selection cutoff" not in html
@@ -543,8 +544,14 @@ def test_score_threshold_controls_selection_but_never_overrides_hard_gate(client
         db.close()
 
     assert client.post("/api/workspace/settings", json={"minimum_score": 50}).status_code == 200
+    unconfirmed = client.post("/api/selection", json={
+        "track_key": track.track_key, "candidate_id": chart_id, "action": "select",
+    })
+    assert unconfirmed.status_code == 400
+    assert "explicit confirmation" in unconfirmed.get_json()["error"]
     selected = client.post("/api/selection", json={
         "track_key": track.track_key, "candidate_id": chart_id, "action": "select",
+        "confirm_possible": True,
     })
     assert selected.status_code == 200
     assert client.post("/api/workspace/settings", json={"minimum_score": 100}).status_code == 200
@@ -587,7 +594,7 @@ def test_bulk_selection_defaults_to_strong_and_can_explicitly_include_review(cli
 
     default = client.post("/api/selection/bulk", json={})
     assert default.status_code == 200
-    assert default.get_json()["scope"] == "strong"
+    assert default.get_json()["scope"] == "best_matches"
     db = Database(config.database_path)
     try:
         selected = db.list_workspace_selections(workspace["id"])
@@ -598,16 +605,28 @@ def test_bulk_selection_defaults_to_strong_and_can_explicitly_include_review(cli
 
     explicit = client.post(
         "/api/selection/bulk",
-        json={"scope": "eligible", "track_ids": [track.track_key]},
+        json={"preset": "maximum_playable", "track_ids": [track.track_key]},
     )
     assert explicit.status_code == 200
-    assert explicit.get_json()["scope"] == "eligible"
+    assert explicit.get_json()["scope"] == "maximum_playable"
+    db = Database(config.database_path)
+    try:
+        selected = db.list_workspace_selections(workspace["id"])
+        assert len(selected) == 2
+        assert {row["candidate_id"] for row in selected} == {strong_id, review_id}
+    finally:
+        db.close()
+    cleared = client.post("/api/selection", json={
+        "track_key": track.track_key,
+        "candidate_id": review_id,
+        "action": "clear",
+    })
+    assert cleared.status_code == 200
     db = Database(config.database_path)
     try:
         selected = db.list_workspace_selections(workspace["id"])
         assert len(selected) == 1
         assert selected[0]["candidate_id"] == strong_id
-        assert selected[0]["candidate_id"] != review_id
     finally:
         db.close()
 
@@ -627,7 +646,7 @@ def test_bulk_cohorts_replace_instead_of_accumulate(client, config):
         ])
         db.replace_workspace_library_tracks(workspace["id"], tracks)
         strong = make_chart("Exact Song", "Exact Artist", chart_id=821)
-        review = make_chart("Ain't Nice", "Viagra Boys", chart_id=822)
+        review = make_chart("Ain't No Thief (Live)", "Viagra Boys", chart_id=822)
         db.upsert_workspace_candidate(
             workspace["id"], tracks[0].track_key, strong, score=95,
             eligibility="RECOMMENDED", decision="AUTO_ACCEPT", kind="exact",
@@ -639,7 +658,7 @@ def test_bulk_cohorts_replace_instead_of_accumulate(client, config):
     finally:
         db.close()
 
-    assert client.post("/api/selection/bulk", json={"scope": "eligible"}).get_json()["changed"] == 2
+    assert client.post("/api/selection/bulk", json={"preset": "maximum_playable"}).get_json()["changed"] == 2
     assert client.get("/api/workspace").get_json()["summary"]["selected"] == 2
     assert client.post("/api/selection/bulk", json={"scope": "strong"}).get_json()["changed"] == 1
     summary = client.get("/api/workspace").get_json()["summary"]
@@ -826,7 +845,10 @@ def test_public_journey_restores_owned_workspace_state(client, app, config):
     } == expected_source_counts
     assert payload["job"]["status"] == "complete"
     assert "workspace_key" not in payload["job"]
-    assert payload["review"] == {
+    assert {key: payload["review"][key] for key in {
+        "strong", "review", "unavailable", "selected",
+        "selected_strong", "selected_review", "total",
+    }} == {
         "strong": 1, "review": 0, "unavailable": 0, "selected": 1,
         "selected_strong": 1, "selected_review": 0, "total": 1,
     }
@@ -871,7 +893,10 @@ def test_workspace_paging_search_filters_and_summary_are_bounded(client, config)
     assert first["offset"] == 1
     assert first["total"] == 3
     assert len(first["tracks"]) == 1
-    assert first["summary"] == {
+    assert {key: first["summary"][key] for key in {
+        "strong", "review", "unavailable", "selected",
+        "selected_strong", "selected_review", "selection_count", "total",
+    }} == {
         "strong": 1, "review": 1, "unavailable": 1, "selected": 1,
         "selected_strong": 1, "selected_review": 0,
         "selection_count": 1, "total": 3,
@@ -1031,6 +1056,7 @@ def test_public_expansion_choices_job_review_and_selection_are_separate(
         "artist_norm": "artist",
         "candidate_id": candidate["candidate_id"],
         "action": "select",
+        "confirm_possible": True,
     })
     assert selected.status_code == 200
     assert client.get("/api/expansion/results").get_json()["summary"]["selected"] == 1

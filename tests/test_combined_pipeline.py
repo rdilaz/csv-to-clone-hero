@@ -438,7 +438,7 @@ def test_matching_cache_fingerprint_changes_with_track_catalog_and_config(config
     assert matching_cache_fingerprint(track, catalog, config) != baseline
 
 
-def test_matching_semantic_v7_cache_keys_cannot_satisfy_v8(config, monkeypatch):
+def test_matching_semantic_v8_cache_keys_cannot_satisfy_v9(config, monkeypatch):
     from tests.conftest import make_chart, make_track
     import csv_to_clonehero.combined_pipeline as pipeline
 
@@ -446,11 +446,11 @@ def test_matching_semantic_v7_cache_keys_cannot_satisfy_v8(config, monkeypatch):
     catalog = FakeCatalog(make_chart("The Only Exception", "Paramore", chart_id=26))
     manifest = {"snapshot_id": "fixture", "sha256": "fixture-sha", "chart_count": 1}
 
-    assert pipeline.MATCH_CACHE_VERSION == "combined-match-v8"
-    monkeypatch.setattr(pipeline, "MATCH_CACHE_VERSION", "combined-match-v7")
+    assert pipeline.MATCH_CACHE_VERSION == "combined-match-v9"
+    monkeypatch.setattr(pipeline, "MATCH_CACHE_VERSION", "combined-match-v8")
     stale_song = pipeline.matching_cache_fingerprint(track, catalog, config)
     stale_scan = pipeline.matching_scan_fingerprint([track], manifest, config)
-    monkeypatch.setattr(pipeline, "MATCH_CACHE_VERSION", "combined-match-v8")
+    monkeypatch.setattr(pipeline, "MATCH_CACHE_VERSION", "combined-match-v9")
 
     assert pipeline.matching_cache_fingerprint(track, catalog, config) != stale_song
     assert pipeline.matching_scan_fingerprint([track], manifest, config) != stale_scan
@@ -780,8 +780,51 @@ def test_workspace_snapshots_restore_playlist_scope_without_duplicate_songs(conf
         assert len(snapshots[0].tracks) == 1
         assert {item.provider_id for item in snapshots[0].playlists} == {"one", "two", "empty"}
         assert snapshots[0].tracks[0].playlist_ids == ["one", "two"]
+        assert snapshots[0].tracks[0].duration_ms == 123000
         assert snapshots[0].metadata["include_liked"] is True
         assert snapshots[0].import_report.total_rows == 4
+    finally:
+        db.close()
+
+
+def test_workspace_snapshot_duration_keeps_match_evidence_identical(config):
+    from csv_to_clonehero.matching import score_candidate
+    from csv_to_clonehero.providers.base import provider_track_to_track
+    from tests.conftest import make_chart
+
+    provider_track = ProviderTrack(
+        "spotify", "sp-duration", "Song", "Artist", duration_ms=180000
+    )
+    chart = make_chart("Song", "Artist", chart_id=219)
+    chart.song_length_ms = 181250
+    expected = score_candidate(provider_track_to_track(provider_track), chart, config)
+    db = Database(config.database_path)
+    try:
+        workspace = db.create_workspace(workspace_key="combined:duration-roundtrip")
+        db.upsert_library_snapshot(
+            workspace,
+            LibrarySnapshot("spotify", [provider_track], metadata={"import": "api"}),
+        )
+        restored = workspace_snapshots(db, workspace)[0].tracks[0]
+        actual = score_candidate(provider_track_to_track(restored), chart, config)
+        assert restored.duration_ms == 180000
+        assert actual.match_factors["duration"] == expected.match_factors["duration"]
+        assert actual.result_tier == expected.result_tier
+    finally:
+        db.close()
+
+
+def test_workspace_snapshot_without_duration_remains_valid(config):
+    db = Database(config.database_path)
+    try:
+        workspace = db.create_workspace(workspace_key="combined:no-duration")
+        db.upsert_library_snapshot(
+            workspace,
+            LibrarySnapshot("soundcloud", [ProviderTrack(
+                "soundcloud", "sc-none", "Song", "Artist"
+            )], metadata={"import": "export"}),
+        )
+        assert workspace_snapshots(db, workspace)[0].tracks[0].duration_ms is None
     finally:
         db.close()
 
