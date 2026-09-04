@@ -11,8 +11,8 @@
      and the community. That creator is currently fighting cancer, and the game
      lives on because of people who give back. If you love what we all play,
      please consider chipping in.</p>
-  {% if config.monetization.effective_gofundme_url %}
-  <p><a class="btn" href="{{ config.monetization.effective_gofundme_url }}" target="_blank" rel="noopener">GoFundMe — help the Clone Hero creator</a></p>
+  {% if config.monetization.gofundme_enabled and config.monetization.effective_gofundme_url %}
+  <p><a class="btn" href="{{ config.monetization.effective_gofundme_url }}" target="_blank" rel="noopener noreferrer">GoFundMe — help the Clone Hero creator</a></p>
   {% endif %}
   <h2>How we respect you and this community</h2>
   <ul>

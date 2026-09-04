@@ -186,49 +186,124 @@
         }
         return;
       }
-      await openAddMusic(false);
+      await openAddMusic(false, journey);
     } catch (error) {
       showStage("add");
       showError(error.message || "Riff could not restore your library.");
     }
   }
 
-  async function openAddMusic(focus = true) {
+  function spotifyLibraryFromJourney(journey) {
+    if (journey?.spotify_library) return journey.spotify_library;
+    const spotify = (journey?.sources || []).find(source => source.provider === "spotify");
+    return {
+      playlists: [],
+      liked_count: spotify ? Number(spotify.liked || 0) : null,
+      workspace: {scope: journey?.spotify_scope || null, soundcloud_scope: {}},
+      cache_available: Boolean(spotify),
+      cached: true,
+      cache_source: spotify ? "latest_import" : "none",
+      last_refreshed_at: spotify?.updated_at || null,
+      known_unique_songs: spotify ? Number(spotify.unique_tracks || spotify.tracks || 0) : null,
+      imported_scope: {known: false, playlist_ids: [], include_liked: false},
+    };
+  }
+
+  async function openAddMusic(focus = true, journey = state.journey) {
     showStage("add", focus);
     try {
-      const [journey, scope, soundcloud] = await Promise.all([
-        api("/api/journey"),
-        api("/api/spotify/scope"),
-        api("/api/auth/soundcloud/status").catch(() => ({configured: false})),
-      ]);
+      if (!journey) journey = await api("/api/journey");
       state.journey = journey;
+      const scope = spotifyLibraryFromJourney(journey);
       state.scope = scope;
       renderSources(journey);
       renderScope(scope);
-      await renderSoundCloudAuth(soundcloud);
+      void loadSoundCloudAuth();
+      if (!scope.cache_available) {
+        window.setTimeout(() => { void refreshSpotify(true); }, 0);
+      }
     } catch (error) {
       showError(error.message || "Your music could not be loaded. Reload to try again.");
     }
   }
 
-  function renderScope(payload) {
+  async function loadSoundCloudAuth() {
+    const soundcloud = await api("/api/auth/soundcloud/status").catch(() => ({configured: false}));
+    await renderSoundCloudAuth(soundcloud);
+  }
+
+  function renderSpotifyFreshness(payload) {
+    const node = $("#spotifyFreshness");
+    if (!node) return;
+    if (!payload.cache_available) {
+      node.textContent = "No saved playlist details yet. Refresh Spotify to load them.";
+      return;
+    }
+    if (!payload.cached) {
+      node.textContent = "Updated from Spotify just now.";
+      return;
+    }
+    const updated = Number(payload.last_refreshed_at || 0);
+    const prefix = payload.cache_source === "latest_import"
+      ? "Showing Spotify data saved by your latest import."
+      : "Showing saved Spotify data.";
+    node.textContent = updated
+      ? `${prefix} Last refreshed ${new Date(updated * 1000).toLocaleString()}.`
+      : prefix;
+  }
+
+  async function refreshSpotify(automatic = false) {
+    const button = $("#refreshSpotifyButton");
+    const freshness = $("#spotifyFreshness");
+    setButtonBusy(button, true, "Refreshing...");
+    if (freshness) freshness.textContent = "Refreshing Spotify; saved choices remain available.";
+    try {
+      const payload = await api("/api/spotify/scope");
+      const selected = $("#spotifyChoices")?.getAttribute("aria-busy") === "false"
+        ? currentScope()
+        : null;
+      state.scope = payload;
+      if (state.journey) state.journey.spotify_library = payload;
+      renderScope(payload, selected);
+      clearError();
+      if (!automatic) announce("Spotify playlists refreshed.");
+    } catch (error) {
+      if (freshness) freshness.textContent = state.scope?.cache_available
+        ? "Spotify could not be refreshed. Saved choices are still shown."
+        : "Spotify could not be loaded. Use Refresh Spotify to try again.";
+      if (!automatic) showError(error.message || "Spotify could not be refreshed.");
+    } finally {
+      setButtonBusy(button, false);
+    }
+  }
+
+  function renderScope(payload, selectedScope = null) {
     const host = $("#spotifyChoices");
     if (!host) return;
-    const saved = payload.workspace?.scope || {};
+    const saved = selectedScope || payload.workspace?.scope || {};
     const selectedIds = new Set(saved.playlist_ids || []);
-    const playlistRows = (payload.playlists || []).map(item => {
+    const playlists = [...(payload.playlists || [])];
+    const knownIds = new Set(playlists.map(item => item.id));
+    for (const id of selectedIds) {
+      if (!knownIds.has(id)) playlists.push({id, name: "Saved playlist", track_count: null});
+    }
+    const playlistRows = playlists.map(item => {
       const count = item.track_count === null || item.track_count === undefined ? null : Number(item.track_count);
       const displayCount = Number.isFinite(count) ? count.toLocaleString() : "Count unavailable";
       const tallyCount = Number.isFinite(count) ? String(count) : "";
       return `<label><input class="spotify-playlist" type="checkbox" value="${escapeHtml(item.id)}" data-track-count="${tallyCount}" ${selectedIds.has(item.id) ? "checked" : ""}><span>${escapeHtml(item.name || "Untitled playlist")}</span><small>${displayCount}</small></label>`;
     });
+    const likedCount = payload.liked_count === null || payload.liked_count === undefined
+      ? null
+      : Number(payload.liked_count);
     const rows = [
-      `<label><input id="includeLiked" type="checkbox" ${saved.include_liked ? "checked" : ""}><span>Liked Songs</span><small>${Number(payload.liked_count || 0).toLocaleString()}</small></label>`,
+      `<label><input id="includeLiked" type="checkbox" ${saved.include_liked ? "checked" : ""}><span>Liked Songs</span><small>${Number.isFinite(likedCount) ? likedCount.toLocaleString() : "Count unavailable"}</small></label>`,
       ...playlistRows,
     ];
     host.innerHTML = rows.join("") || "<p>No Spotify playlists were returned.</p>";
     host.setAttribute("aria-busy", "false");
-    host.addEventListener("change", updateMusicTally);
+    host.onchange = updateMusicTally;
+    renderSpotifyFreshness(payload);
     updateMusicTally();
   }
 
@@ -243,20 +318,31 @@
       const raw = Number(spotify?.raw_items || 0);
       const liked = Number(spotify?.liked || 0);
       const playlistOnly = Number(spotify?.playlist_only || 0);
-      const likedLabel = journey.spotify_scope?.include_liked ? " + Liked Songs" : "";
-      const playlistLabel = `${playlists.toLocaleString()} ${playlists === 1 ? "playlist" : "playlists"}`;
-      const sourceItemLabel = `${spotify?.raw_items_lower_bound ? "at least " : ""}${raw.toLocaleString()} source items`;
-      spotifySummary.textContent = unique || playlists
-        ? `${playlistLabel}${likedLabel}; ${sourceItemLabel} became ${unique.toLocaleString()} unique ${unique === 1 ? "song" : "songs"} (${liked.toLocaleString()} liked, ${playlistOnly.toLocaleString()} playlist-only).`
+      const importedScope = journey.spotify_library?.imported_scope;
+      const likedLabel = importedScope?.known && importedScope.include_liked
+        ? " + Liked Songs"
         : "";
+      const playlistLabel = `${playlists.toLocaleString()} ${playlists === 1 ? "playlist" : "playlists"}`;
+      const sourceItemLabel = `${spotify?.raw_items_lower_bound ? "at least " : ""}${raw.toLocaleString()} selected source entries`;
+      if (spotify?.status === "partial") {
+        spotifySummary.textContent = unique || playlists
+          ? `Partial import: ${playlistLabel}; ${sourceItemLabel} processed, with ${unique.toLocaleString()} unique ${unique === 1 ? "song" : "songs"} saved so far.`
+          : "Partial Spotify import; refresh or import again for final counts.";
+      } else {
+        spotifySummary.textContent = unique || playlists
+          ? `${playlistLabel}${likedLabel}; ${sourceItemLabel} became ${unique.toLocaleString()} unique ${unique === 1 ? "song" : "songs"} (${liked.toLocaleString()} liked, ${playlistOnly.toLocaleString()} playlist-only).`
+          : "";
+      }
     }
     const count = Number(imported?.unique_tracks || imported?.tracks || 0);
     const playlistCount = Number(imported?.playlists || 0);
     const badge = $("#soundcloudCount");
     if (badge) {
-      badge.textContent = count || playlistCount
-        ? `${count.toLocaleString()} unique ${count === 1 ? "song" : "songs"}${playlistCount ? `, ${playlistCount.toLocaleString()} ${playlistCount === 1 ? "playlist" : "playlists"}` : ""}`
-        : "Not added";
+      badge.textContent = imported?.status === "partial"
+        ? `Partial: ${count.toLocaleString()} unique ${count === 1 ? "song" : "songs"} saved`
+        : count || playlistCount
+          ? `${count.toLocaleString()} unique ${count === 1 ? "song" : "songs"}${playlistCount ? `, ${playlistCount.toLocaleString()} ${playlistCount === 1 ? "playlist" : "playlists"}` : ""}`
+          : "Not added";
       badge.classList.toggle("status-pill--quiet", !(count || playlistCount));
     }
     updateMusicTally();
@@ -289,10 +375,15 @@
     const message = $("#soundcloudScopeMessage");
     setButtonBusy(button, true, "Saving...");
     try {
-      await api("/api/soundcloud/scope", {method: "POST", body: JSON.stringify({
+      const result = await api("/api/soundcloud/scope", {method: "POST", body: JSON.stringify({
         include_liked: Boolean($("#soundcloudLiked")?.checked),
         playlist_ids: $$(".soundcloud-playlist:checked").map(input => input.value),
       })});
+      if (state.scope?.workspace) state.scope.workspace.soundcloud_scope = result.scope;
+      if (state.journey?.soundcloud_library) {
+        state.journey.soundcloud_library.current_scope = result.scope;
+      }
+      updateMusicTally();
       message.textContent = "SoundCloud selection saved.";
       announce(message.textContent);
     } catch (error) {
@@ -317,11 +408,27 @@
     announce(`${checked ? "Selected" : "Cleared"} ${playlists.length.toLocaleString()} Spotify playlists.`);
   }
 
+  function scopesMatch(left, right) {
+    if (!right?.known) return false;
+    const leftIds = [...new Set(left?.playlist_ids || [])].sort();
+    const rightIds = [...new Set(right.playlist_ids || [])].sort();
+    return Boolean(left?.include_liked) === Boolean(right.include_liked)
+      && leftIds.length === rightIds.length
+      && leftIds.every((value, index) => value === rightIds[index]);
+  }
+
   function updateMusicTally() {
     const tally = $("#musicTally");
     if (!tally) return;
-    const liked = $("#includeLiked")?.checked ? Number(state.scope?.liked_count || 0) : 0;
+    const selectedScope = currentScope();
+    const likedValue = state.scope?.liked_count;
+    const liked = selectedScope.include_liked && likedValue !== null && likedValue !== undefined
+      ? Number(likedValue)
+      : 0;
     let hasUnknownPlaylistCount = false;
+    if (selectedScope.include_liked && (likedValue === null || likedValue === undefined)) {
+      hasUnknownPlaylistCount = true;
+    }
     const playlistCount = $$(".spotify-playlist:checked").reduce((sum, input) => {
       if (!input.dataset.trackCount) {
         hasUnknownPlaylistCount = true;
@@ -329,17 +436,54 @@
       }
       return sum + Number(input.dataset.trackCount);
     }, 0);
-    const imported = Number(state.journey?.combined?.tracks || 0);
+    const sources = state.journey?.sources || [];
+    const spotify = sources.find(source => source.provider === "spotify");
+    const soundcloud = sources.find(source => source.provider === "soundcloud");
+    const spotifyUnique = Number(spotify?.unique_tracks || spotify?.tracks || state.scope?.known_unique_songs || 0);
+    const soundcloudUnique = Number(soundcloud?.unique_tracks || soundcloud?.tracks || 0);
+    const combinedUnique = Number(state.journey?.combined?.tracks || 0);
     const estimated = liked + playlistCount;
+    const spotifyChosen = selectedScope.include_liked || selectedScope.playlist_ids.length > 0;
+    const importedScopeMatches = scopesMatch(selectedScope, state.scope?.imported_scope);
+    const soundcloudLibrary = state.journey?.soundcloud_library;
+    const currentSoundcloudScope = soundcloudLibrary?.current_scope || {};
+    const soundcloudScopeSelected = Boolean(
+      currentSoundcloudScope.include_liked || currentSoundcloudScope.playlist_ids?.length
+    );
+    const soundcloudScopeRelevant = Boolean(soundcloudUnique || soundcloudScopeSelected);
+    const soundcloudScopeMatches = !soundcloudScopeRelevant || Boolean(
+      soundcloudLibrary?.status !== "partial"
+      && scopesMatch(currentSoundcloudScope, soundcloudLibrary?.imported_scope)
+    );
     const strong = tally.querySelector("strong");
     const small = tally.querySelector("small");
-    if (estimated || imported || hasUnknownPlaylistCount) {
+    if (importedScopeMatches && soundcloudScopeMatches && (spotifyUnique || soundcloudUnique || combinedUnique)) {
+      const latestTotal = combinedUnique || spotifyUnique || soundcloudUnique;
+      strong.textContent = `${latestTotal.toLocaleString()} combined unique ${latestTotal === 1 ? "song" : "songs"} in the latest import`;
+      const sourceCounts = [];
+      if (spotifyUnique) sourceCounts.push(`${spotifyUnique.toLocaleString()} unique Spotify ${spotifyUnique === 1 ? "song" : "songs"}`);
+      if (soundcloudUnique) sourceCounts.push(`${soundcloudUnique.toLocaleString()} unique SoundCloud ${soundcloudUnique === 1 ? "song" : "songs"}`);
+      small.textContent = `${sourceCounts.join(" and ")}${sourceCounts.length ? "; " : ""}${latestTotal.toLocaleString()} combined after cross-provider deduplication.`;
+    } else if (spotifyChosen || hasUnknownPlaylistCount) {
       strong.textContent = hasUnknownPlaylistCount
-        ? estimated ? `At least ${estimated.toLocaleString()} Spotify tracks chosen` : "Spotify playlists chosen"
-        : `${(estimated || imported).toLocaleString()} ${estimated ? "Spotify tracks chosen" : "imported songs"}`;
-      small.textContent = hasUnknownPlaylistCount
-        ? "Some playlist counts are unavailable; the exact total will be known after import. Duplicates are merged."
-        : imported && estimated ? `${imported.toLocaleString()} imported SoundCloud songs will also be included; duplicates are merged.` : "Duplicates are merged before matching.";
+        ? estimated ? `At least ${estimated.toLocaleString()} selected Spotify ${estimated === 1 ? "entry" : "entries"}` : "Spotify sources selected"
+        : `${estimated.toLocaleString()} selected Spotify ${estimated === 1 ? "entry" : "entries"}`;
+      small.textContent = "Playlist memberships and Liked Songs can overlap. The exact unique total will be determined after import and cross-provider deduplication."
+        + (soundcloudUnique
+          ? soundcloud?.status === "partial"
+            ? ` ${soundcloudUnique.toLocaleString()} unique SoundCloud ${soundcloudUnique === 1 ? "song is" : "songs are"} saved from a partial import.`
+            : ` ${soundcloudUnique.toLocaleString()} unique SoundCloud ${soundcloudUnique === 1 ? "song is" : "songs are"} already imported.`
+          : "");
+    } else if (soundcloudUnique) {
+      const soundcloudPartial = soundcloud?.status === "partial";
+      strong.textContent = soundcloudPartial
+        ? `${soundcloudUnique.toLocaleString()} unique SoundCloud ${soundcloudUnique === 1 ? "song" : "songs"} saved so far`
+        : `${soundcloudUnique.toLocaleString()} unique SoundCloud ${soundcloudUnique === 1 ? "song" : "songs"} imported`;
+      small.textContent = soundcloudPartial
+        ? "The SoundCloud import is partial; its final unique and combined totals are not known yet."
+        : combinedUnique && combinedUnique !== soundcloudUnique
+          ? `${combinedUnique.toLocaleString()} combined unique songs remain in the latest imported library.`
+          : "Choose Spotify music to add it before cross-provider deduplication.";
     } else {
       strong.textContent = "Choose music above";
       small.textContent = "Liked Songs, playlists, or an optional SoundCloud export.";
@@ -353,6 +497,11 @@
     if (!result) return;
     state.journey.sources = result.sources || [];
     state.journey.combined = result.combined || {};
+    state.journey.soundcloud_library = result.soundcloud_library || {
+      status: "partial",
+      current_scope: state.scope?.workspace?.soundcloud_scope || {},
+      imported_scope: {known: false, playlist_ids: [], include_liked: false},
+    };
     renderSources(state.journey);
   }
 
@@ -977,6 +1126,7 @@
     $("#soundcloudForm")?.addEventListener("submit", importAuthenticatedSoundCloud);
     $("#selectAllPlaylistsButton")?.addEventListener("click", () => setAllSpotifyPlaylists(true));
     $("#clearPlaylistsButton")?.addEventListener("click", () => setAllSpotifyPlaylists(false));
+    $("#refreshSpotifyButton")?.addEventListener("click", () => refreshSpotify(false));
     $("#findChartsButton")?.addEventListener("click", startDiscovery);
     $("#cancelJobButton")?.addEventListener("click", cancelDiscovery);
     $("#activityDetails")?.addEventListener("toggle", event => { if (event.currentTarget.open) loadActivity(); });

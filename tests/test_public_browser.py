@@ -32,6 +32,7 @@ def public_server(tmp_path, monkeypatch):
     config.paths.state_dir = "state"
     config.server.enforce_secret_key = False
     monkeypatch.setenv("SPOTIFY_CLIENT_ID", "browser-test")
+    monkeypatch.delenv("GOFUNDME_URL", raising=False)
     app = create_app(config, source_factory=lambda _config: [])
 
     db = Database(config.database_path)
@@ -96,6 +97,18 @@ def test_public_landing_mobile_and_desktop(public_server):
                 login = page.get_by_role("link", name="Continue with Spotify")
                 assert login.is_visible()
                 assert login.bounding_box()["height"] >= 44
+                support = page.get_by_role(
+                    "link", name="Support the creator of Clone Hero on GoFundMe"
+                )
+                assert support.is_visible()
+                assert support.get_attribute("href") == (
+                    "https://www.gofundme.com/f/"
+                    "cancer-deudas-y-a-punto-de-perder-nuestro-hogar-apoyanos"
+                )
+                assert support.get_attribute("target") == "_blank"
+                assert support.get_attribute("rel") == "noopener noreferrer"
+                support.focus()
+                assert support.evaluate("element => document.activeElement === element")
                 assert page.get_by_text("Your music", exact=True).is_visible()
                 assert page.get_by_text("Community charts", exact=True).is_visible()
                 _assert_no_overflow(page)
@@ -184,19 +197,52 @@ def test_public_authenticated_journey_to_download_ready(
     scope_saved = {"value": False}
     job_polls = {"count": 0}
     api_calls = []
+    pending_refresh = []
 
     def journey_payload():
         complete = job_polls["count"] > 0
+        saved_scope = (
+            {"include_liked": True, "playlist_ids": ["playlist-unknown"]}
+            if scope_saved["value"]
+            else {"include_liked": False, "playlist_ids": []}
+        )
+        imported_scope = (
+            {"known": True, "include_liked": True, "playlist_ids": ["playlist-unknown"]}
+            if complete
+            else {"known": True, "include_liked": False, "playlist_ids": ["playlist-1"]}
+        )
         return {
             "workspace_id": 1,
             "workspace_status": "complete" if complete else "created",
             "workspace": {"id": 1, "status": "complete" if complete else "created", "phase": "complete" if complete else "source_setup", "updated_at": time.time()},
-            "spotify_scope": None,
+            "spotify_scope": saved_scope,
+            "spotify_library": {
+                "playlists": [
+                    {"id": "playlist-1", "name": "Road trip", "track_count": 12, "owner_name": "Browser Player"},
+                    {"id": "playlist-unknown", "name": "Current API playlist", "track_count": None, "owner_name": "Browser Player"},
+                ],
+                "liked_count": 1,
+                "workspace": {"id": 1, "exists": True, "scope": saved_scope, "soundcloud_scope": {}},
+                "cache_available": True,
+                "cached": True,
+                "cache_source": "spotify",
+                "last_refreshed_at": 1788552000,
+                "last_imported_at": 1788551000,
+                "known_unique_songs": 2,
+                "imported_scope": imported_scope,
+            },
+            "soundcloud_library": {
+                "status": "active",
+                "known_unique_songs": 1,
+                "last_imported_at": 1788551000,
+                "current_scope": {"include_liked": False, "playlist_ids": []},
+                "imported_scope": {"known": True, "include_liked": False, "playlist_ids": []},
+            },
             "sources": [
                 {"provider": "spotify", "tracks": 2, "unique_tracks": 2, "playlists": 1, "raw_items": 3, "liked": 1, "playlist_only": 1},
                 {"provider": "soundcloud", "tracks": 1, "unique_tracks": 1, "playlists": 1, "raw_items": 1, "liked": 0, "playlist_only": 1},
             ],
-            "combined": {"tracks": 0, "artists": 0},
+            "combined": {"tracks": 2, "artists": 2},
             "job": {"id": 9, "status": "complete", "phase": "complete", "message": "Complete", "progress": {"total_tracks": 1, "processed_tracks": 1}} if complete else None,
             "review": {"strong": 1 if complete else 0, "review": 0, "unavailable": 0, "selected": int(selected["value"]), "total": 1 if complete else 0},
             "download": None,
@@ -283,7 +329,16 @@ def test_public_authenticated_journey_to_download_ready(
                         {"id": "playlist-unknown", "name": "Current API playlist", "track_count": None, "owner_name": "Browser Player"},
                     ],
                     "workspace": {"id": 1, "exists": True, "scope": {"include_liked": True, "playlist_ids": []} if scope_saved["value"] else None, "soundcloud_scope": {}},
+                    "cache_available": True,
+                    "cached": False,
+                    "cache_source": "spotify",
+                    "last_refreshed_at": time.time(),
+                    "last_imported_at": 1788551000,
+                    "known_unique_songs": 2,
+                    "imported_scope": {"known": True, "include_liked": False, "playlist_ids": ["playlist-1"]},
                 }
+                pending_refresh.append((route, payload))
+                return
             else:
                 scope_saved["value"] = True
                 payload = {"ok": True, "workspace": {"scope": {"include_liked": True}}}
@@ -323,8 +378,76 @@ def test_public_authenticated_journey_to_download_ready(
         page.route("**/api/**", route_api)
         page.goto(base_url + "/", wait_until="networkidle")
 
+        assert sum(
+            method == "GET" and path == "/api/journey"
+            for method, path, _body in api_calls
+        ) == 1
+        assert not [
+            call for call in api_calls
+            if call[0] == "GET" and call[1] == "/api/spotify/scope"
+        ]
+        playwright.expect(page.get_by_text("Road trip", exact=True)).to_be_visible()
+        playwright.expect(
+            page.get_by_text("Showing saved Spotify data.", exact=False)
+        ).to_be_visible()
+        source_cards = page.locator(".source-card")
+        spotify_card = source_cards.nth(0).bounding_box()
+        soundcloud_card = source_cards.nth(1).bounding_box()
+        assert spotify_card is not None and soundcloud_card is not None
+        soundcloud_title = page.locator(".source-card--soundcloud h2")
+        assert soundcloud_title.is_visible()
+        assert page.locator(".source-card--soundcloud .source-icon").is_visible()
+        assert page.get_by_text("Optional export import", exact=True).is_visible()
+        assert page.locator("#soundcloudCount").is_visible()
+        page.locator("#soundcloudCount").evaluate(
+            "element => { element.textContent = '2,354 unique songs, 53 playlists'; }"
+        )
+        assert soundcloud_title.evaluate(
+            "element => element.scrollWidth <= element.clientWidth "
+            "&& element.getBoundingClientRect().height < 30"
+        )
+        title_box = soundcloud_title.bounding_box()
+        badge_box = page.locator("#soundcloudCount").bounding_box()
+        assert title_box is not None and badge_box is not None
+        assert title_box["y"] + title_box["height"] <= badge_box["y"]
+        if viewport["width"] > 820:
+            assert abs(spotify_card["y"] - soundcloud_card["y"]) < 2
+            assert spotify_card["width"] > soundcloud_card["width"]
+            assert soundcloud_card["width"] / spotify_card["width"] > 0.65
+        else:
+            assert soundcloud_card["y"] >= spotify_card["y"] + spotify_card["height"]
+        _capture(page, f"add-music-{viewport['width']}x{viewport['height']}.png")
+        page.locator("#soundcloudCount").evaluate(
+            "element => { element.textContent = '1 unique song, 1 playlist'; }"
+        )
+
+        page.get_by_role("button", name="Refresh Spotify").click()
+        playwright.expect(
+            page.get_by_role("button", name="Refreshing...")
+        ).to_be_disabled()
+        page.wait_for_timeout(50)
+        assert pending_refresh
+        page.locator('input[value="playlist-1"]').check()
+        refresh_route, refresh_payload = pending_refresh.pop()
+        refresh_route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps(refresh_payload),
+        )
+        playwright.expect(
+            page.get_by_text("Updated from Spotify just now.", exact=True)
+        ).to_be_visible()
+        assert page.locator('input[value="playlist-1"]').is_checked()
+        assert sum(
+            method == "GET" and path == "/api/spotify/scope"
+            for method, path, _body in api_calls
+        ) == 1
         playwright.expect(page.get_by_text("Count unavailable", exact=True)).to_be_visible()
-        playwright.expect(page.get_by_text("1 playlist; 3 source items became 2 unique songs (1 liked, 1 playlist-only).", exact=True)).to_be_visible()
+        playwright.expect(page.get_by_text(
+            "1 playlist; 3 selected source entries became 2 unique songs "
+            "(1 liked, 1 playlist-only).",
+            exact=True,
+        )).to_be_visible()
         assert page.locator("#soundcloudCount").inner_text() == "1 unique song, 1 playlist"
         page.get_by_role("button", name="Select all playlists").click()
         assert page.locator(".spotify-playlist:checked").count() == 2
@@ -334,6 +457,18 @@ def test_public_authenticated_journey_to_download_ready(
         assert not page.get_by_label("Liked Songs").is_checked()
         page.locator('input[value="playlist-unknown"]').check()
         page.get_by_label("Liked Songs").check()
+        playwright.expect(
+            page.get_by_text("At least 1 selected Spotify entry", exact=True)
+        ).to_be_visible()
+        playwright.expect(page.get_by_text(
+            "Playlist memberships and Liked Songs can overlap. The exact unique "
+            "total will be determined after import and cross-provider deduplication. "
+            "1 unique SoundCloud song is already imported.",
+            exact=True,
+        )).to_be_visible()
+        add_music_text = page.locator("#stageAdd").inner_text()
+        assert "unique Spotify tracks" not in add_music_text
+        assert "imported SoundCloud songs" not in add_music_text
         page.get_by_role("button", name="Find Clone Hero charts").click()
         playwright.expect(page.get_by_text("50 of 200 songs complete", exact=True)).to_be_visible()
         assert page.locator("#progressPercent").inner_text() == "25%"
@@ -362,6 +497,17 @@ def test_public_authenticated_journey_to_download_ready(
 
         page.get_by_role("button", name="Search again").click()
         playwright.expect(page.get_by_label("Liked Songs")).to_be_visible()
+        assert sum(
+            method == "GET" and path == "/api/journey"
+            for method, path, _body in api_calls
+        ) == 2
+        assert sum(
+            method == "GET" and path == "/api/spotify/scope"
+            for method, path, _body in api_calls
+        ) == 1
+        playwright.expect(
+            page.get_by_text("2 combined unique songs in the latest import", exact=True)
+        ).to_be_visible()
         page.get_by_role("button", name="Find Clone Hero charts").click()
         page.get_by_role("heading", name="1 song has a recommended chart.").wait_for()
 
@@ -396,6 +542,131 @@ def test_public_authenticated_journey_to_download_ready(
         assert page.get_by_text("Scan Songs.", exact=True).is_visible()
         _assert_no_overflow(page)
         _capture(page, f"done-{viewport['width']}x{viewport['height']}.png")
+        browser.close()
+
+
+def test_partial_source_counts_never_claim_exact_combined_total(public_server):
+    _app, base_url, cookie_name, cookie = public_server
+
+    def route_api(route):
+        path = route.request.url.split(base_url, 1)[-1]
+        if path == "/api/journey":
+            payload, status = {
+                "workspace_id": 1,
+                "workspace_status": "partial",
+                "workspace": {"id": 1, "status": "partial", "phase": "source_setup"},
+                "spotify_scope": {"include_liked": True, "playlist_ids": []},
+                "spotify_library": {
+                    "playlists": [],
+                    "liked_count": None,
+                    "workspace": {"id": 1, "exists": True, "scope": {"include_liked": True, "playlist_ids": []}, "soundcloud_scope": {}},
+                    "cache_available": True,
+                    "cached": True,
+                    "cache_source": "latest_import",
+                    "known_unique_songs": 1,
+                    "import_status": "partial",
+                    "imported_scope": {"known": False, "include_liked": True, "playlist_ids": []},
+                },
+                "soundcloud_library": {
+                    "status": "partial",
+                    "known_unique_songs": 2,
+                    "current_scope": {"include_liked": False, "playlist_ids": []},
+                    "imported_scope": {"known": False, "include_liked": False, "playlist_ids": []},
+                },
+                "sources": [
+                    {"provider": "spotify", "status": "partial", "tracks": 1, "unique_tracks": 1, "playlists": 0, "raw_items": 2, "liked": 1, "playlist_only": 0},
+                    {"provider": "soundcloud", "status": "partial", "tracks": 2, "unique_tracks": 2, "playlists": 1, "raw_items": 3, "liked": 0, "playlist_only": 2},
+                ],
+                "combined": {"tracks": 3, "artists": 3},
+                "job": None,
+                "review": {"strong": 0, "review": 0, "unavailable": 0, "selected": 0, "total": 0},
+                "download": None,
+            }, 200
+        elif path == "/api/auth/soundcloud/status":
+            payload, status = {"configured": False, "authenticated": False}, 200
+        else:
+            payload, status = {"error": f"unexpected mocked request: {path}"}, 500
+        route.fulfill(status=status, content_type="application/json", body=json.dumps(payload))
+
+    with playwright.sync_playwright() as runtime:
+        try:
+            browser = runtime.chromium.launch(headless=True)
+        except Exception as exc:
+            pytest.skip(f"Chromium is not installed: {exc}")
+        context = browser.new_context(viewport={"width": 390, "height": 844})
+        context.add_cookies([{"name": cookie_name, "value": cookie, "url": base_url}])
+        page = context.new_page()
+        page.route("**/api/**", route_api)
+        page.goto(base_url + "/", wait_until="networkidle")
+
+        assert "Partial import:" in page.locator("#spotifyImportedSummary").inner_text()
+        assert page.locator("#soundcloudCount").inner_text().startswith("Partial:")
+        playwright.expect(
+            page.get_by_text("Spotify sources selected", exact=True)
+        ).to_be_visible()
+        assert "combined unique songs in the latest import" not in page.locator("#musicTally").inner_text()
+        assert "exact unique total will be determined after import" in page.locator("#musicTally").inner_text()
+        _assert_no_overflow(page)
+        browser.close()
+
+
+def test_unimported_soundcloud_scope_invalidates_combined_count(public_server):
+    _app, base_url, cookie_name, cookie = public_server
+
+    def route_api(route):
+        path = route.request.url.split(base_url, 1)[-1]
+        if path == "/api/journey":
+            payload, status = {
+                "workspace_id": 1,
+                "workspace_status": "complete",
+                "workspace": {"id": 1, "status": "complete", "phase": "source_setup"},
+                "spotify_scope": {"include_liked": True, "playlist_ids": []},
+                "spotify_library": {
+                    "playlists": [],
+                    "liked_count": 10,
+                    "workspace": {"id": 1, "exists": True, "scope": {"include_liked": True, "playlist_ids": []}, "soundcloud_scope": {"playlist_ids": ["new-set"], "include_liked": False}},
+                    "cache_available": True,
+                    "cached": True,
+                    "cache_source": "spotify",
+                    "known_unique_songs": 3,
+                    "import_status": "active",
+                    "imported_scope": {"known": True, "include_liked": True, "playlist_ids": []},
+                },
+                "soundcloud_library": {
+                    "status": "",
+                    "known_unique_songs": None,
+                    "current_scope": {"include_liked": False, "playlist_ids": ["new-set"]},
+                    "imported_scope": {"known": False, "include_liked": False, "playlist_ids": []},
+                },
+                "sources": [{"provider": "spotify", "status": "active", "tracks": 3, "unique_tracks": 3, "playlists": 0, "raw_items": 3, "liked": 3, "playlist_only": 0}],
+                "combined": {"tracks": 3, "artists": 3},
+                "job": None,
+                "review": {"strong": 0, "review": 0, "unavailable": 0, "selected": 0, "total": 0},
+                "download": None,
+            }, 200
+        elif path == "/api/auth/soundcloud/status":
+            payload, status = {"configured": False, "authenticated": False}, 200
+        else:
+            payload, status = {"error": f"unexpected mocked request: {path}"}, 500
+        route.fulfill(status=status, content_type="application/json", body=json.dumps(payload))
+
+    with playwright.sync_playwright() as runtime:
+        try:
+            browser = runtime.chromium.launch(headless=True)
+        except Exception as exc:
+            pytest.skip(f"Chromium is not installed: {exc}")
+        context = browser.new_context(viewport={"width": 1440, "height": 900})
+        context.add_cookies([{"name": cookie_name, "value": cookie, "url": base_url}])
+        page = context.new_page()
+        page.route("**/api/**", route_api)
+        page.goto(base_url + "/", wait_until="networkidle")
+
+        playwright.expect(
+            page.get_by_text("10 selected Spotify entries", exact=True)
+        ).to_be_visible()
+        tally = page.locator("#musicTally").inner_text()
+        assert "3 combined unique songs in the latest import" not in tally
+        assert "exact unique total will be determined after import" in tally
         browser.close()
 
 

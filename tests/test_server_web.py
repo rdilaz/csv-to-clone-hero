@@ -17,6 +17,7 @@ from csv_to_clonehero.server.web import create_app
 @pytest.fixture(autouse=True)
 def spotify_client_id(monkeypatch):
     monkeypatch.setenv("SPOTIFY_CLIENT_ID", "test-client")
+    monkeypatch.delenv("GOFUNDME_URL", raising=False)
 
 
 @pytest.fixture
@@ -99,6 +100,26 @@ def test_landing_is_public(client):
     assert b"Songs folder" not in r.data
 
 
+def test_enabled_gofundme_banner_uses_canonical_fallback(client):
+    from csv_to_clonehero.config import DEFAULT_GOFUNDME_URL
+
+    html = client.get("/").get_data(as_text=True)
+    assert f'href="{DEFAULT_GOFUNDME_URL}"' in html
+    assert 'target="_blank"' in html
+    assert 'rel="noopener noreferrer"' in html
+    assert "Support the creator of Clone Hero" in html
+
+
+def test_gofundme_environment_url_overrides_fallback(client, monkeypatch):
+    override = "https://example.test/community-support"
+    monkeypatch.setenv("GOFUNDME_URL", override)
+
+    html = client.get("/").get_data(as_text=True)
+
+    assert f'href="{override}"' in html
+    assert "cancer-deudas-y-a-punto-de-perder-nuestro-hogar-apoyanos" not in html
+
+
 def test_authenticated_review_shell_prioritizes_human_decisions(client):
     _sign_in(client)
     html = client.get("/").get_data(as_text=True)
@@ -168,6 +189,28 @@ def test_authenticated_soundcloud_import_uses_owned_workspace(client, config):
         content_type="multipart/form-data",
     )
     assert response.status_code == 200
+    assert response.get_json()["soundcloud_library"]["imported_scope"]["known"] is True
+    assert response.get_json()["sources"] == [{
+        "accepted_items": 1,
+        "duplicate_items": 0,
+        "include_liked": False,
+        "liked": 0,
+        "liked_in_playlists": 0,
+        "liked_only": 0,
+        "playlist_memberships": 0,
+        "playlist_only": 0,
+        "playlist_unique_tracks": 0,
+        "playlists": 0,
+        "provider": "soundcloud",
+        "provenance": 1,
+        "raw_items": 1,
+        "raw_items_lower_bound": False,
+        "skipped_items": 0,
+        "status": "active",
+        "tracks": 1,
+        "unique_tracks": 1,
+        "updated_at": response.get_json()["sources"][0]["updated_at"],
+    }]
     from csv_to_clonehero.database import Database
     from csv_to_clonehero.server.auth import user_workspace_key
 
@@ -178,6 +221,172 @@ def test_authenticated_soundcloud_import_uses_owned_workspace(client, config):
         assert db.get_combined_summary(workspace["id"])["tracks"] == 1
     finally:
         db.close()
+
+
+def test_journey_restores_cached_spotify_library_and_live_refresh_persists(
+    client, config, monkeypatch
+):
+    from types import SimpleNamespace
+
+    import csv_to_clonehero.server.web as web
+    from csv_to_clonehero.database import Database
+    from csv_to_clonehero.providers.base import (
+        LibrarySnapshot,
+        ProviderPlaylist,
+        ProviderTrack,
+        SourceImportReport,
+    )
+    _sign_in(client)
+    workspace_id = client.get("/api/journey").get_json()["workspace_id"]
+    db = Database(config.database_path)
+    try:
+        db.upsert_library_snapshot(
+            workspace_id,
+            LibrarySnapshot(
+                "spotify",
+                [
+                    ProviderTrack(
+                        "spotify",
+                        "track-1",
+                        "Song",
+                        "Artist",
+                        playlist_ids=["saved-list"],
+                        playlist_names=["Saved mix"],
+                        liked=True,
+                    )
+                ],
+                [
+                    ProviderPlaylist(
+                        "spotify",
+                        "saved-list",
+                        "Saved mix",
+                        metadata={"total_tracks": 17, "owner_name": "Alice"},
+                    )
+                ],
+                import_report=SourceImportReport(
+                    total_rows=18,
+                    accepted_rows=18,
+                    unique_tracks=1,
+                    duplicate_rows=17,
+                    liked_count=1,
+                ),
+            ),
+            scope={"playlist_ids": ["saved-list"], "include_liked": True},
+        )
+        db.set_workspace_scope(workspace_id, ["saved-list"], True)
+    finally:
+        db.close()
+
+    provider_calls = []
+
+    class SpotifyClient:
+        def list_playlists(self):
+            provider_calls.append("playlists")
+            return [
+                SimpleNamespace(
+                    id="fresh-list",
+                    name="Fresh mix",
+                    total_tracks=23,
+                    owner_name="Alice",
+                )
+            ]
+
+        def get_saved_tracks_count(self):
+            provider_calls.append("liked")
+            return 11
+
+        def get_liked_tracks(self):
+            raise AssertionError("the count endpoint should be used")
+
+        def close(self):
+            provider_calls.append("close")
+
+    monkeypatch.setattr(web, "build_oauth", lambda *_args: object())
+    monkeypatch.setattr(web, "_client_for", lambda *_args: SpotifyClient())
+
+    cached = client.get("/api/journey").get_json()["spotify_library"]
+    assert provider_calls == []
+    assert cached["cached"] is True
+    assert cached["cache_source"] == "latest_import"
+    assert cached["playlists"] == [{
+        "id": "saved-list",
+        "name": "Saved mix",
+        "owner_name": "Alice",
+        "track_count": 17,
+    }]
+    assert cached["liked_count"] is None
+    assert cached["known_unique_songs"] == 1
+    assert cached["imported_scope"] == {
+        "known": True,
+        "playlist_ids": ["saved-list"],
+        "include_liked": True,
+    }
+
+    refreshed = client.get("/api/spotify/scope").get_json()
+    assert provider_calls == ["playlists", "liked", "close"]
+    assert refreshed["cached"] is False
+    assert refreshed["playlists"][0]["id"] == "fresh-list"
+    assert refreshed["liked_count"] == 11
+    assert refreshed["last_refreshed_at"] is not None
+
+    persisted = client.get("/api/journey").get_json()["spotify_library"]
+    assert persisted["cached"] is True
+    assert persisted["cache_source"] == "spotify"
+    assert persisted["playlists"][0]["id"] == "fresh-list"
+    assert persisted["workspace"]["scope"]["playlist_ids"] == ["saved-list"]
+
+    class BrokenSpotifyClient:
+        def list_playlists(self):
+            raise RuntimeError("provider unavailable")
+
+        def close(self):
+            provider_calls.append("broken-close")
+
+    monkeypatch.setattr(web, "_client_for", lambda *_args: BrokenSpotifyClient())
+    failed = client.get("/api/spotify/scope")
+    assert failed.status_code == 502
+    assert "saved choices were not changed" in failed.get_json()["error"]
+    after_failure = client.get("/api/journey").get_json()["spotify_library"]
+    assert after_failure["playlists"][0]["id"] == "fresh-list"
+    assert after_failure["liked_count"] == 11
+
+
+def test_partial_spotify_import_does_not_claim_exact_imported_scope(client, config):
+    from csv_to_clonehero.database import Database
+    from csv_to_clonehero.providers.base import (
+        LibrarySnapshot,
+        ProviderTrack,
+        SourceImportReport,
+    )
+
+    _sign_in(client)
+    workspace_id = client.get("/api/journey").get_json()["workspace_id"]
+    db = Database(config.database_path)
+    try:
+        db.upsert_library_snapshot(
+            workspace_id,
+            LibrarySnapshot(
+                "spotify",
+                [ProviderTrack("spotify", "partial", "Song", "Artist", liked=True)],
+                metadata={"partial": True},
+                import_report=SourceImportReport(
+                    total_rows=2,
+                    accepted_rows=1,
+                    skipped_rows=1,
+                    unique_tracks=1,
+                    error_count=1,
+                ),
+            ),
+            scope={"playlist_ids": [], "include_liked": True},
+        )
+        db.set_workspace_scope(workspace_id, [], True)
+    finally:
+        db.close()
+
+    spotify = client.get("/api/journey").get_json()["spotify_library"]
+    assert spotify["cache_available"] is True
+    assert spotify["liked_count"] is None
+    assert spotify["imported_scope"]["known"] is False
 
 
 def test_api_requires_auth(client):
