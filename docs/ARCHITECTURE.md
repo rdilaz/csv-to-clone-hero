@@ -147,6 +147,24 @@ separate planner tie-break so two saturated scores do not become arbitrary.
 Legacy `decision` values and public-workflow `eligibility` values are kept
 separate for compatibility.
 
+## Bounded Continuation Follow-up
+
+The result-tier and candidate-level selection foundation deliberately does not
+turn the current 10/25/50 artist-expansion presentation windows into permanent
+discovery limits. The follow-up implementation must:
+
+- materialize deterministic pages from the finite checksum-valid local catalog;
+- bind every page to both the exact generation and catalog snapshot;
+- preserve existing candidate-level selections while appending new rows;
+- retain cross-artist song ownership and artifact/content deduplication;
+- use bounded page sizes and an explicit hard safety ceiling;
+- issue zero Enchor search requests.
+
+Large delivery is a separate packaging concern. Before archive creation the
+server must estimate selected artifact count and bytes, then split oversized
+deliveries into bounded numbered ZIP packages instead of reducing discovery
+yield or silently dropping selected charts.
+
 ## Source Policy
 
 All source-specific behavior belongs behind `ChartSource`. Enchor uses:
