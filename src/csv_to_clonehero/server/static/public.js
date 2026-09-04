@@ -614,10 +614,10 @@
   function reviewParams() {
     const params = new URLSearchParams({limit: "25", offset: String(state.reviewOffset)});
     if (state.reviewSearch) params.set("search", state.reviewSearch);
+    if (state.reviewFilter === "recommended") params.set("tier", "RECOMMENDED_EXACT,SAME_RECORDING_CHART_VARIANT,ALTERNATE_RECORDING,POSSIBLE_MATCH");
     if (state.reviewFilter === "strong") params.set("tier", "RECOMMENDED_EXACT");
     if (state.reviewFilter === "review") params.set("tier", "POSSIBLE_MATCH");
     if (state.reviewFilter === "selected") params.set("selected", "true");
-    // The default view includes progressively disclosed tier groups per song.
     return params;
   }
 
@@ -687,17 +687,45 @@
 
   function candidateSummary(candidate, best) {
     const review = candidate.review || {};
-    const concerns = review.concerns || [];
     const version = candidate.pack_name || candidate.source || "Community chart";
     const tierLabels = {RECOMMENDED_EXACT: "Best match", SAME_RECORDING_CHART_VARIANT: "Chart variant", ALTERNATE_RECORDING: "Alternate recording", POSSIBLE_MATCH: "Possible match"};
     const coverage = (candidate.instruments || []).join(", ") || "Instrument coverage unknown";
+    const tierReason = humanizedTierReason(candidate);
+    const concerns = (review.concerns || []).filter(
+      concern => !duplicatesTierReason(tierReason, concern)
+    );
     return `<div class="review-card__chart">
       <span class="match-badge ${candidate.result_tier === "POSSIBLE_MATCH" ? "match-badge--review" : ""}">${candidate.selected ? "Selected chart" : escapeHtml(tierLabels[candidate.result_tier] || review.label || "Chart")}</span>
       <h4>${escapeHtml(candidate.artist)} - ${escapeHtml(candidate.title)}</h4>
       <p>${escapeHtml(version)}${candidate.charter ? ` · ${escapeHtml(candidate.charter)}` : ""}</p>
       <p>${escapeHtml(coverage)}${candidate.diff_guitar !== null && candidate.diff_guitar !== undefined ? ` · guitar difficulty ${escapeHtml(candidate.diff_guitar)}` : " · difficulty evidence missing"}</p>
+      ${tierReason ? `<p>${escapeHtml(tierReason)}</p>` : ""}
       ${concerns.length ? `<details class="concern-details"><summary>${concerns.length} chart ${concerns.length === 1 ? "concern" : "concerns"}</summary><div>${concerns.map(item => `<p>${escapeHtml(item)}</p>`).join("")}</div></details>` : ""}
     </div>`;
+  }
+
+  function humanizedTierReason(candidate) {
+    if (!candidate || candidate.result_tier === "RECOMMENDED_EXACT") return "";
+    const raw = String((candidate.result_tier_reasons || [])[0] || "").toLowerCase();
+    if (raw.includes("duration")) {
+      return "Recording duration differs.";
+    } else if (raw.includes("version") || raw.includes("marker")) {
+      return "Meaningful version markers differ.";
+    } else if (raw.includes("identity") || raw.includes("review")) {
+      return "Song identity requires explicit review.";
+    } else if (candidate.result_tier === "SAME_RECORDING_CHART_VARIANT") {
+      return "Another chart artifact for this recording.";
+    }
+    return "";
+  }
+
+  function duplicatesTierReason(reason, concern) {
+    const value = String(concern || "").toLowerCase();
+    if (reason === "Recording duration differs.") return ["duration", "recording length", "length differs"].some(term => value.includes(term));
+    if (reason === "Meaningful version markers differ.") return ["version", "live", "remix", "cover"].some(term => value.includes(term));
+    if (reason === "Song identity requires explicit review.") return value.includes("identity");
+    if (reason === "Another chart artifact for this recording.") return value.includes("chart artifact") || value.includes("chart variant");
+    return false;
   }
 
   function candidateAction(track, candidate) {

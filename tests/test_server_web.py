@@ -912,6 +912,43 @@ def test_workspace_paging_search_filters_and_summary_are_bounded(client, config)
     assert searched["total"] == 1 and searched["tracks"][0]["title"] == "Beta"
 
 
+def test_workspace_selectable_tier_filter_excludes_blocked_and_no_result(
+    client, monkeypatch
+):
+    import csv_to_clonehero.server.web as web
+
+    _sign_in(client)
+
+    def card(title, tier=None):
+        candidates = [] if tier is None else [{
+            "candidate_id": len(title), "result_tier": tier, "selected": False,
+            "score": 80, "review": {"state": "needs_review"},
+        }]
+        return {
+            "track_key": title.casefold(), "artist": "Artist", "title": title,
+            "review_state": "unavailable" if not candidates else "review",
+            "selected": False, "selected_count": 0, "candidates": candidates,
+        }
+
+    monkeypatch.setattr(web, "_review_cards", lambda *_args, **_kwargs: [
+        card("Recommended", "RECOMMENDED_EXACT"),
+        card("Variant", "SAME_RECORDING_CHART_VARIANT"),
+        card("Alternate", "ALTERNATE_RECORDING"),
+        card("Possible", "POSSIBLE_MATCH"),
+        card("Blocked", "BLOCKED"),
+        card("No result"),
+    ])
+    tiers = (
+        "RECOMMENDED_EXACT,SAME_RECORDING_CHART_VARIANT,"
+        "ALTERNATE_RECORDING,POSSIBLE_MATCH"
+    )
+    payload = client.get(f"/api/workspace?tier={tiers}").get_json()
+    assert payload["total"] == 4
+    assert {item["title"] for item in payload["tracks"]} == {
+        "Recommended", "Variant", "Alternate", "Possible",
+    }
+
+
 def test_workspace_projection_never_leaks_another_owner(client, config):
     from csv_to_clonehero.database import Database
     from tests.conftest import make_chart, make_track

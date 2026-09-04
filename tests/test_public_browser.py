@@ -213,11 +213,38 @@ def test_public_authenticated_journey_to_download_ready(
             "pack_name": "Full band",
             "selected": selected["value"],
             "best": True,
+            "result_tier": "RECOMMENDED_EXACT",
+            "result_tier_reasons": ["safe same-song recommendation"],
+            "selectable": True,
             "review": {
                 "state": "strong",
                 "label": "Strong match",
                 "summary": "The song and artist identities agree.",
                 "concerns": ["This chart is an alternate album version."],
+                "selectable": True,
+                "action": "Select chart",
+            },
+        }
+        alternate = {
+            "candidate_id": 42,
+            "source": "enchor",
+            "chart_id": 420,
+            "artist": "Paramore",
+            "title": "Misery Business (Live)",
+            "charter": "Live Charter",
+            "pack_name": "Live set",
+            "instruments": ["guitar", "drums"],
+            "diff_guitar": 4,
+            "selected": False,
+            "best": False,
+            "result_tier": "ALTERNATE_RECORDING",
+            "result_tier_reasons": ["recording duration differs"],
+            "selectable": True,
+            "review": {
+                "state": "needs_review",
+                "label": "Alternate recording",
+                "summary": "The recording evidence differs.",
+                "concerns": ["Recording duration differs from the imported track."],
                 "selectable": True,
                 "action": "Select chart",
             },
@@ -232,12 +259,12 @@ def test_public_authenticated_journey_to_download_ready(
                 "album": "Riot!",
                 "review_state": "strong",
                 "selected": selected["value"],
-                "candidates": [candidate],
+                "candidates": [candidate, alternate],
             }],
             "total": 1,
             "offset": 0,
             "limit": 25,
-            "summary": {"strong": 1, "review": 0, "unavailable": 0, "selected": int(selected["value"]), "selected_strong": int(selected["value"]), "selected_review": 0, "selection_count": int(selected["value"]), "total": 1},
+            "summary": {"strong": 1, "review": 0, "unavailable": 0, "selected": int(selected["value"]), "selected_strong": int(selected["value"]), "selected_review": 0, "selection_count": int(selected["value"]), "recommended_songs": 1, "additional_playable_charts": 1, "selectable_charts": 2, "all_safe_charts": 1, "maximum_playable_charts": 2, "total": 1},
         }
 
     def route_api(route):
@@ -314,6 +341,19 @@ def test_public_authenticated_journey_to_download_ready(
         _assert_in_viewport(page, "#progressEta")
         _assert_no_overflow(page)
         page.get_by_role("heading", name="1 song has a recommended chart.").wait_for()
+        workspace_requests = [
+            path for method, path, _body in api_calls
+            if method == "GET" and path.startswith("/api/workspace?")
+        ]
+        assert workspace_requests
+        assert "tier=RECOMMENDED_EXACT%2CSAME_RECORDING_CHART_VARIANT%2CALTERNATE_RECORDING%2CPOSSIBLE_MATCH" in workspace_requests[-1]
+        page.get_by_text("Alternate versions (1)", exact=True).click()
+        playwright.expect(
+            page.get_by_text("Recording duration differs.", exact=True)
+        ).to_be_visible()
+        assert page.get_by_text(
+            "Recording duration differs from the imported track.", exact=True
+        ).count() == 0
         scope_posts = [json.loads(body or "{}") for method, path, body in api_calls if method == "POST" and path == "/api/spotify/scope"]
         assert scope_posts and scope_posts[-1]["playlist_ids"] == ["playlist-unknown"]
         assert page.locator("[data-step=confirm]").get_attribute("aria-current") == "step"
