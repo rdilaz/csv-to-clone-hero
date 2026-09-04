@@ -1966,8 +1966,8 @@ def _real_database_summary(
             "SELECT t.track_key,wc.candidate_id,wc.score,wc.quality,wc.decision,"
             "wc.eligibility,wc.breakdown_json,wc.metadata_json "
             "FROM workspace_candidates wc JOIN spotify_tracks t ON t.id=wc.track_id "
-            "JOIN discovery_song_progress dsp ON dsp.workspace_id=wc.workspace_id "
-            "AND dsp.track_key=t.track_key WHERE wc.workspace_id=? AND wc.kind='exact' "
+            "JOIN workspace_library_tracks wlt ON wlt.workspace_id=wc.workspace_id "
+            "AND wlt.track_id=wc.track_id WHERE wc.workspace_id=? AND wc.kind='exact' "
             "ORDER BY t.track_key,wc.candidate_id,wc.score,wc.quality,wc.decision,"
             "wc.eligibility,wc.breakdown_json,wc.metadata_json",
             (workspace_id,),

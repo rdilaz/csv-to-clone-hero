@@ -1,9 +1,11 @@
 import json
 
+import pytest
+
 from csv_to_clonehero.combined_pipeline import _primary_rejection_reason, _rejection_exemplar, completed_scan_fast_path, discover_combined, enforce_library_limit, estimate_remaining_range, expand_combined, matching_cache_fingerprint, matching_scan_fingerprint, rank_expansion_artists, workspace_snapshots
 from csv_to_clonehero.catalog import CatalogLookup
 from csv_to_clonehero.database import Database
-from csv_to_clonehero.providers.base import LibrarySnapshot, ProviderPlaylist, ProviderTrack
+from csv_to_clonehero.providers.base import LibrarySnapshot, ProviderPlaylist, ProviderTrack, provider_track_to_track
 
 
 class FakeCatalog:
@@ -44,7 +46,10 @@ def test_combined_discovery_deduplicates_provenance_and_scores(config):
             "combined:test", track_id=track.db_id, kind="exact", current_only=True
         )
         assert [row["chart_id"] for row in current] == [12]
+        assert current[0]["track_id"] == track.db_id
+        assert current[0]["track_id"] is not None
         assert current[0]["task_id"] is not None
+        assert track.track_key == "artist|song"
         providers = track.origin_metadata["provenance"]
         assert {entry["provider"] for entry in providers} == {"spotify", "soundcloud"}
     finally:
@@ -309,6 +314,71 @@ def test_completed_fast_path_ignores_stale_candidate_rows(config, monkeypatch):
         db.close()
 
 
+def test_completed_fast_path_rebuilds_unbound_current_generation(config):
+    from tests.conftest import make_chart
+
+    chart = make_chart("Song", "Artist", chart_id=201)
+    snapshot = LibrarySnapshot(
+        "spotify", [ProviderTrack("spotify", "legacy-fast", "Song", "Artist")]
+    )
+    catalog = FakeCatalog(chart)
+    db = Database(config.database_path)
+    try:
+        workspace = db.create_workspace(
+            workspace_key="combined:fast-unbound", name="Fast unbound", kind="exact"
+        )
+        db.upsert_library_snapshot(workspace, snapshot)
+        snapshots = workspace_snapshots(db, workspace)
+        discover_combined(
+            config,
+            db,
+            snapshots,
+            workspace_key="combined:fast-unbound",
+            catalog=catalog,
+        )
+        first_generation = int(db.get_current_combined_generation(workspace)["id"])
+        candidate = db.get_workspace_candidates(
+            workspace, kind="exact", current_only=True
+        )[0]
+        db.select_workspace_candidate(
+            workspace,
+            candidate["track_id"],
+            candidate["candidate_id"],
+            require_workspace_candidate=True,
+        )
+        cached_revision = int(
+            db._conn.execute(
+                "SELECT candidate_revision FROM matching_scan_cache WHERE workspace_id=?",
+                (workspace,),
+            ).fetchone()[0]
+        )
+        db._conn.execute(
+            "UPDATE workspace_candidates SET track_id=NULL WHERE id=?",
+            (candidate["id"],),
+        )
+        db._conn.commit()
+        assert db.get_workspace_candidate_revision(workspace) == cached_revision
+
+        result = discover_combined(
+            config,
+            db,
+            snapshots,
+            workspace_key="combined:fast-unbound",
+            catalog=catalog,
+        )
+
+        assert result.cached_tracks == 1
+        assert int(db.get_current_combined_generation(workspace)["id"]) > first_generation
+        current = db.get_workspace_candidates(
+            workspace, kind="exact", current_only=True
+        )
+        assert len(current) == 1
+        assert current[0]["track_id"] is not None
+        assert db.list_workspace_selections(workspace, kind="exact") == []
+    finally:
+        db.close()
+
+
 def test_completed_fast_path_materializes_legacy_combined_generation(config, monkeypatch):
     from tests.conftest import make_chart
     import csv_to_clonehero.combined_pipeline as pipeline
@@ -415,7 +485,146 @@ def test_partial_library_change_reuses_unchanged_song_only(config, monkeypatch):
         assert second.candidate_charts_evaluated == 2
         assert second.unique_charts_evaluated == 2
         assert second.exact_hits == 2
-        assert len(db.list_workspace_selections(workspace["id"], kind="exact")) == 1
+        assert db.list_workspace_selections(workspace["id"], kind="exact") == []
+    finally:
+        db.close()
+
+
+def test_combined_discovery_binds_legacy_spotify_key_by_database_id(config):
+    from csv_to_clonehero.server.web import _review_cards, _review_summary
+    from tests.conftest import make_chart, make_track
+
+    spotify_id = "legacy-track-id"
+    legacy_key = f"spotify:{spotify_id}"
+    neutral_key = "artist|song"
+    old_chart = make_chart("Song", "Artist", chart_id=170)
+    primary = make_chart("Song", "Artist", chart_id=171)
+    variant = make_chart("Song", "Artist", chart_id=172)
+
+    class Catalog(FakeCatalog):
+        chart_count = 2
+
+        def candidates(self, artist, title):
+            return (primary, variant) if (artist, title) == ("Artist", "Song") else ()
+
+    db = Database(config.database_path)
+    try:
+        legacy = db.upsert_spotify_track(make_track("Song", "Artist", spotify_id))
+        assert legacy.track_key == legacy_key
+        workspace = db.create_workspace(
+            workspace_key="combined:legacy-binding", name="Legacy binding", kind="exact"
+        )
+        db.replace_workspace_library_tracks(workspace, [legacy])
+        db.upsert_workspace_candidate(
+            workspace, legacy.db_id, old_chart, score=95,
+            eligibility="RECOMMENDED", decision="AUTO_ACCEPT", kind="exact",
+        )
+        db.select_workspace_candidate(workspace, legacy.db_id, old_chart, kind="exact")
+        db._conn.execute(
+            "UPDATE workspace_candidates SET track_id=NULL "
+            "WHERE workspace_id=? AND candidate_id=?",
+            (workspace, old_chart.db_id),
+        )
+        db._conn.commit()
+
+        normalized = provider_track_to_track(
+            ProviderTrack("spotify", spotify_id, "Song", "Artist")
+        )
+        assert normalized.track_key == neutral_key
+        resolved = db.upsert_spotify_track(normalized)
+        assert resolved.db_id == normalized.db_id == legacy.db_id
+
+        result = discover_combined(
+            config,
+            db,
+            [LibrarySnapshot("spotify", [
+                ProviderTrack("spotify", spotify_id, "Song", "Artist")
+            ])],
+            workspace_key="combined:legacy-binding",
+            catalog=Catalog(primary),
+        )
+
+        stored = db.get_spotify_tracks(True)
+        assert len(stored) == 1
+        assert stored[0].db_id == legacy.db_id
+        assert stored[0].track_key == legacy_key
+        current = db.get_workspace_candidates(
+            workspace, kind="exact", include_rejected=True, current_only=True
+        )
+        assert {row["chart_id"] for row in current} == {171, 172}
+        assert {row["track_id"] for row in current} == {legacy.db_id}
+        assert db._conn.execute(
+            "SELECT COUNT(*) FROM workspace_candidates "
+            "WHERE workspace_id=? AND kind='exact' AND track_id IS NULL",
+            (workspace,),
+        ).fetchone()[0] == 0
+        assert db.list_workspace_selections(workspace, kind="exact") == []
+        progress = db.get_discovery_song_progress(workspace)
+        assert [row["track_key"] for row in progress] == [neutral_key]
+
+        first_candidate = current[0]
+        db.select_workspace_candidate(
+            workspace,
+            legacy.db_id,
+            first_candidate["candidate_id"],
+            kind="exact",
+            require_workspace_candidate=True,
+        )
+        cached = discover_combined(
+            config,
+            db,
+            [LibrarySnapshot("spotify", [
+                ProviderTrack("spotify", spotify_id, "Song", "Artist")
+            ])],
+            workspace_key="combined:legacy-binding",
+            catalog=Catalog(primary),
+        )
+        assert cached.cached_tracks == 1
+        assert cached.recomputed_tracks == 0
+        assert db.list_workspace_selections(workspace, kind="exact") == []
+        current = db.get_workspace_candidates(
+            workspace, kind="exact", include_rejected=True, current_only=True
+        )
+        assert {row["track_id"] for row in current} == {legacy.db_id}
+
+        cards = _review_cards(config, db, workspace)
+        summary = _review_summary(cards)
+        assert len(cards) == 1
+        assert cards[0]["track_key"] == legacy_key
+        assert {item["chart_id"] for item in cards[0]["candidates"]} == {171, 172}
+        assert summary["recommended_songs"] == result.result_tier_histogram["RECOMMENDED_EXACT"] == 1
+        assert summary["selectable_charts"] == result.selectable_chart_artifacts == 2
+        assert result.songs_with_selectable_charts == 1
+
+        for row in current:
+            db.select_workspace_candidate(
+                workspace,
+                legacy.db_id,
+                row["candidate_id"],
+                kind="exact",
+                require_workspace_candidate=True,
+            )
+        assert len(db.list_workspace_selections(workspace, kind="exact")) == 2
+    finally:
+        db.close()
+
+
+def test_combined_discovery_fails_when_upsert_does_not_resolve_track_id(
+    config, monkeypatch
+):
+    db = Database(config.database_path)
+    try:
+        monkeypatch.setattr(db, "upsert_spotify_tracks", lambda tracks: list(tracks))
+        with pytest.raises(RuntimeError, match="could not resolve 1 database track IDs"):
+            discover_combined(
+                config,
+                db,
+                [LibrarySnapshot("soundcloud", [
+                    ProviderTrack("soundcloud", "missing", "Song", "Artist")
+                ])],
+                workspace_key="combined:unresolved",
+                catalog=FakeCatalog(None),
+            )
     finally:
         db.close()
 

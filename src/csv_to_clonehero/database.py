@@ -3900,6 +3900,8 @@ class Database:
             candidate = _load_json(candidate, {})
         candidate_id = self._candidate_db_id(candidate)
         resolved_track_id = self._resolve_track_value(track_id)
+        if kind == "exact" and resolved_track_id is None:
+            raise ValueError("exact workspace candidate requires a resolved track ID")
         candidate_data = _as_mapping(candidate)
         if score is None:
             raw_score = _first_value(candidate_data, "score", "final_score", default=0)
@@ -4647,27 +4649,33 @@ class Database:
             )
         return int(cur.rowcount)
 
-    def clear_workspace_track_candidates(self, workspace_id: int | str, track_key: str) -> int:
+    def clear_workspace_track_candidates(self, workspace_id: int | str, track_id: Any) -> int:
         """Remove stale exact results for one changed track before recomputing it."""
         db_id = self._workspace_db_id(workspace_id)
+        resolved_track_id = self._resolve_track_value(track_id)
+        if resolved_track_id is None:
+            raise ValueError("exact candidate cleanup requires a resolved track ID")
         with self._conn:
             self._conn.execute(
-                "DELETE FROM workspace_selections WHERE workspace_id=? AND kind='exact' AND track_id=(SELECT id FROM spotify_tracks WHERE track_key=?)",
-                (db_id, str(track_key)),
+                "DELETE FROM workspace_selections WHERE workspace_id=? AND kind='exact' AND track_id=?",
+                (db_id, resolved_track_id),
             )
             cur = self._conn.execute(
-                "DELETE FROM workspace_candidates WHERE workspace_id=? AND kind='exact' AND track_id=(SELECT id FROM spotify_tracks WHERE track_key=?)",
-                (db_id, str(track_key)),
+                "DELETE FROM workspace_candidates WHERE workspace_id=? AND kind='exact' AND track_id=?",
+                (db_id, resolved_track_id),
             )
             if cur.rowcount:
                 self._conn.execute("UPDATE discovery_workspaces SET candidate_revision=candidate_revision+1, updated_at=? WHERE id=?", (time.time(), db_id))
         return int(cur.rowcount)
 
-    def workspace_has_track_candidates(self, workspace_id: int | str, track_key: str) -> bool:
+    def workspace_has_track_candidates(self, workspace_id: int | str, track_id: Any) -> bool:
         db_id = self._workspace_db_id(workspace_id)
+        resolved_track_id = self._resolve_track_value(track_id)
+        if resolved_track_id is None:
+            raise ValueError("exact candidate lookup requires a resolved track ID")
         return self._conn.execute(
-            "SELECT 1 FROM workspace_candidates WHERE workspace_id=? AND kind='exact' AND track_id=(SELECT id FROM spotify_tracks WHERE track_key=?) LIMIT 1",
-            (db_id, str(track_key)),
+            "SELECT 1 FROM workspace_candidates WHERE workspace_id=? AND kind='exact' AND track_id=? LIMIT 1",
+            (db_id, resolved_track_id),
         ).fetchone() is not None
 
     def workspace_exact_candidate_count(self, workspace_id: int | str) -> int:
@@ -4675,20 +4683,24 @@ class Database:
         row = self._conn.execute("SELECT COUNT(*) AS count FROM workspace_candidates WHERE workspace_id=? AND kind='exact'", (db_id,)).fetchone()
         return int(row["count"] or 0)
 
-    def workspace_current_candidate_digest(self, workspace_id: int | str, track_key: str | None = None) -> tuple[int, str, set[tuple[str, int]]]:
-        """Digest exact relationships limited to the current progress tracks."""
+    def workspace_current_candidate_digest(self, workspace_id: int | str, track_id: Any | None = None) -> tuple[int, str, set[tuple[str, int]]]:
+        """Digest exact relationships for the current relational library tracks."""
         db_id = self._workspace_db_id(workspace_id)
         params: list[Any] = [db_id]
         clause = ""
-        if track_key is not None:
-            clause = " AND t.track_key=?"
-            params.append(str(track_key))
+        join = " JOIN workspace_library_tracks wlt ON wlt.workspace_id=wc.workspace_id AND wlt.track_id=wc.track_id"
+        if track_id is not None:
+            resolved_track_id = self._resolve_track_value(track_id)
+            if resolved_track_id is None:
+                raise ValueError("exact candidate digest requires a resolved track ID")
+            clause = " AND wc.track_id=?"
+            params.append(resolved_track_id)
+            join = ""
         rows = self._conn.execute(
             """SELECT t.track_key,wc.candidate_id,c.source,c.chart_id,wc.score,wc.quality,wc.decision,wc.eligibility,wc.breakdown_json,wc.metadata_json
                FROM workspace_candidates wc JOIN spotify_tracks t ON t.id=wc.track_id
                JOIN candidate_charts c ON c.id=wc.candidate_id
-               JOIN discovery_song_progress dsp ON dsp.workspace_id=wc.workspace_id AND dsp.track_key=t.track_key
-               WHERE wc.workspace_id=? AND wc.kind='exact'""" + clause + " ORDER BY t.track_key,wc.candidate_id,wc.score,wc.quality,wc.decision,wc.eligibility,wc.breakdown_json,wc.metadata_json", params)
+               """ + join + " WHERE wc.workspace_id=? AND wc.kind='exact'" + clause + " ORDER BY t.track_key,wc.candidate_id,wc.score,wc.quality,wc.decision,wc.eligibility,wc.breakdown_json,wc.metadata_json", params)
         digest = hashlib.sha256()
         ids: set[tuple[str, int]] = set()
         count = 0
@@ -4700,21 +4712,77 @@ class Database:
         return count, digest.hexdigest(), ids
 
     def assign_current_progress_candidates_to_task(self, workspace_id: int | str, task_id: int) -> int:
-        """Attach only exact relationships covered by current song progress."""
+        """Attach only exact relationships for the current relational library."""
         db_id = self._workspace_db_id(workspace_id)
         with self._conn:
             cur = self._conn.execute(
                 """UPDATE workspace_candidates SET task_id = ?
                    WHERE id IN (
-                     SELECT wc.id FROM workspace_candidates wc
-                     JOIN spotify_tracks t ON t.id = wc.track_id
-                     JOIN discovery_song_progress dsp
-                       ON dsp.workspace_id = wc.workspace_id AND dsp.track_key = t.track_key
-                     WHERE wc.workspace_id = ? AND wc.kind = 'exact'
+                      SELECT wc.id FROM workspace_candidates wc
+                      JOIN workspace_library_tracks wlt
+                        ON wlt.workspace_id = wc.workspace_id AND wlt.track_id = wc.track_id
+                      WHERE wc.workspace_id = ? AND wc.kind = 'exact'
                    )""",
                 (int(task_id), db_id),
             )
         return int(cur.rowcount)
+
+    def clear_workspace_exact_selections(self, workspace_id: int | str) -> int:
+        """Start a new exact generation without carrying prior user choices."""
+        db_id = self._workspace_db_id(workspace_id)
+        with self._conn:
+            cur = self._conn.execute(
+                "DELETE FROM workspace_selections WHERE workspace_id=? AND kind='exact'",
+                (db_id,),
+            )
+        return int(cur.rowcount)
+
+    def clear_workspace_unbound_exact_candidates(self, workspace_id: int | str) -> int:
+        """Remove legacy exact rows whose song relationship was never bound."""
+        db_id = self._workspace_db_id(workspace_id)
+        with self._conn:
+            cur = self._conn.execute(
+                "DELETE FROM workspace_candidates "
+                "WHERE workspace_id=? AND kind='exact' AND track_id IS NULL",
+                (db_id,),
+            )
+            if cur.rowcount:
+                self._conn.execute(
+                    "UPDATE discovery_workspaces "
+                    "SET candidate_revision=candidate_revision+1, updated_at=? WHERE id=?",
+                    (time.time(), db_id),
+                )
+        return int(cur.rowcount)
+
+    def assert_workspace_exact_track_bindings(
+        self, workspace_id: int | str, *, generation_id: int | None = None
+    ) -> None:
+        """Fail if exact candidates or selections have lost their song relation."""
+        db_id = self._workspace_db_id(workspace_id)
+        candidate_params: list[Any] = [db_id]
+        generation_clause = ""
+        if generation_id is not None:
+            generation_clause = (
+                " AND EXISTS (SELECT 1 FROM discovery_tasks dt "
+                "WHERE dt.id=workspace_candidates.task_id AND dt.scan_id=?)"
+            )
+            candidate_params.append(int(generation_id))
+        candidate_count = int(self._conn.execute(
+            "SELECT COUNT(*) FROM workspace_candidates "
+            "WHERE workspace_id=? AND kind='exact' AND track_id IS NULL"
+            + generation_clause,
+            candidate_params,
+        ).fetchone()[0])
+        selection_count = int(self._conn.execute(
+            "SELECT COUNT(*) FROM workspace_selections "
+            "WHERE workspace_id=? AND kind='exact' AND track_id IS NULL",
+            (db_id,),
+        ).fetchone()[0])
+        if candidate_count or selection_count:
+            raise RuntimeError(
+                "exact workspace relationships require resolved track IDs "
+                f"(candidates={candidate_count}, selections={selection_count})"
+            )
 
     def get_matching_song_cache(self, fingerprint: str) -> sqlite3.Row | None:
         return self._conn.execute(

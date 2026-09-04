@@ -254,6 +254,18 @@ def completed_scan_fast_path(config: AppConfig, db: Database, workspace_id: int 
             miss("progress incomplete")
             return None
         result_data = json.loads(row["result_json"])
+        latest_generation = db.get_latest_combined_generation(workspace_id)
+        if latest_generation is not None:
+            if str(latest_generation["status"] or "").lower() not in {"complete", "completed"}:
+                miss("latest combined generation is not complete")
+                return None
+            try:
+                db.assert_workspace_exact_track_bindings(
+                    workspace_id, generation_id=int(latest_generation["id"])
+                )
+            except RuntimeError:
+                miss("current exact generation contains unbound track relationships")
+                return None
         current_revision = db.get_workspace_candidate_revision(workspace_id)
         cached_revision = int(row["candidate_revision"] or 0)
         if int(result_data.get("tracks", -1)) != int(row["track_count"]):
@@ -266,10 +278,6 @@ def completed_scan_fast_path(config: AppConfig, db: Database, workspace_id: int 
                 miss("current candidate relationship mismatch")
                 return None
             db.update_matching_scan_cache_revision(workspace_id, current_revision)
-        latest_generation = db.get_latest_combined_generation(workspace_id)
-        if latest_generation is not None and str(latest_generation["status"] or "").lower() not in {"complete", "completed"}:
-            miss("latest combined generation is not complete")
-            return None
         if latest_generation is None:
             expected_digest = str(result_data.get("candidate_relationship_digest") or "")
             current_count, current_digest, _ = db.workspace_current_candidate_digest(workspace_id)
@@ -397,11 +405,18 @@ def discover_combined(
     tracks = merge_provider_tracks(track for snapshot in snapshots for track in snapshot.tracks)
     normalized = [track for provider_track in tracks for track in [provider_track_to_track(provider_track)]]
     db.upsert_spotify_tracks(normalized)
+    unresolved = [track.track_key for track in normalized if track.db_id is None]
+    if unresolved:
+        preview = ", ".join(unresolved[:3])
+        raise RuntimeError(
+            f"catalog discovery could not resolve {len(unresolved)} database track IDs: {preview}"
+        )
     workspace = db.get_workspace(workspace_key)
     workspace_id = int(workspace["id"]) if workspace else db.create_workspace(
         workspace_key=workspace_key, name=workspace_name, kind="exact", status="complete", phase="catalog_match",
         metadata={"workflow": "combined_catalog"},
     )
+    db.replace_workspace_library_tracks(workspace_id, normalized)
     catalog_manifest = None
     scan_fingerprint = ""
     config_fingerprint = matching_config_fingerprint(config)
@@ -481,6 +496,8 @@ def discover_combined(
         query_text="combined candidate generation", scan_id=scan_id,
         status="running", total=len(normalized), metadata={"run_id": operation_id},
     )
+    db.clear_workspace_exact_selections(workspace_id)
+    db.clear_workspace_unbound_exact_candidates(workspace_id)
     task_ids = {track.track_key: generation_task_id for track in normalized}
     db.initialize_discovery_song_progress(workspace_id, normalized)
 
@@ -585,16 +602,16 @@ def discover_combined(
                     } or expected_ids
                     evaluated_chart_ids.update(evaluated_ids)
                     _, _, existing_ids = db.workspace_current_candidate_digest(
-                        workspace_id, track.track_key
+                        workspace_id, track.db_id
                     )
                     if existing_ids != expected_ids:
-                        db.clear_workspace_track_candidates(workspace_id, track.track_key)
+                        db.clear_workspace_track_candidates(workspace_id, track.db_id)
                     for entry in entries:
                         chart = ChartCandidate(**dict(entry["candidate"]))
                         db.upsert_candidate(chart)
                         metadata = dict(entry.get("metadata") or {})
                         metadata["provenance"] = track.origin_metadata.get("provenance", [])
-                        db.upsert_workspace_candidate(workspace_id, track.track_key, chart, score=float(entry["score"]), quality=float(entry["quality"]), decision=str(entry["decision"]), eligibility=str(entry["eligibility"]), breakdown_json=str(entry["breakdown_json"]), kind="exact", task_id=task_ids[track.track_key], metadata=metadata)
+                        db.upsert_workspace_candidate(workspace_id, track.db_id, chart, score=float(entry["score"]), quality=float(entry["quality"]), decision=str(entry["decision"]), eligibility=str(entry["eligibility"]), breakdown_json=str(entry["breakdown_json"]), kind="exact", task_id=task_ids[track.track_key], metadata=metadata)
                     result.cached_tracks += 1
                     result.candidates += candidate_count
                     result.eligible_candidates += int(cached_result.get("eligible_count", 0))
@@ -646,7 +663,7 @@ def discover_combined(
             set_stage("database_persistence")
             result.recomputed_tracks += 1
             db.update_discovery_song_progress(workspace_id, track.track_key, status="checking")
-            db.clear_workspace_track_candidates(workspace_id, track.track_key)
+            db.clear_workspace_track_candidates(workspace_id, track.db_id)
             set_stage("retrieval")
             retrieval_started = time.perf_counter()
             lookup_method = getattr(catalog, "high_recall_candidates", None)
@@ -851,7 +868,7 @@ def discover_combined(
                 db.upsert_candidate(chart)
                 db.upsert_workspace_candidate(
                     workspace_id,
-                    track.track_key,
+                    track.db_id,
                     chart,
                     score=breakdown.final_score,
                     quality=breakdown.quality,
@@ -996,6 +1013,43 @@ def discover_combined(
     if not result.discovery_seconds:
         result.discovery_seconds = time.perf_counter() - discovery_started
     set_stage("generation_finalization")
+    db.assert_workspace_exact_track_bindings(workspace_id)
+    generation_rows = db.get_workspace_candidates(
+        workspace_id,
+        kind="exact",
+        include_rejected=True,
+        generation_id=scan_id,
+    )
+    persisted_selectable = []
+    persisted_recommended_tracks: set[int] = set()
+    for row in generation_rows:
+        breakdown = json.loads(str(row["breakdown_json"] or "{}"))
+        tier = str(breakdown.get("result_tier") or "")
+        if tier in SELECTABLE_RESULT_TIERS:
+            persisted_selectable.append(row)
+        if tier == RECOMMENDED_EXACT:
+            persisted_recommended_tracks.add(int(row["track_id"]))
+    persisted_selectable_tracks = {
+        int(row["track_id"]) for row in persisted_selectable
+    }
+    expected_recommended = int(result.result_tier_histogram.get(RECOMMENDED_EXACT, 0))
+    reconciliation = (
+        len(generation_rows),
+        len(persisted_recommended_tracks),
+        len(persisted_selectable_tracks),
+        len(persisted_selectable),
+    )
+    expected = (
+        result.persisted_candidates,
+        expected_recommended,
+        result.songs_with_selectable_charts,
+        result.selectable_chart_artifacts,
+    )
+    if reconciliation != expected:
+        raise RuntimeError(
+            "catalog discovery persistence did not reconcile "
+            f"(persisted={reconciliation}, pipeline={expected})"
+        )
     result.expansion_artists = rank_expansion_artists(catalog, normalized)
     if scan_fingerprint:
         _, result.candidate_relationship_digest, _ = db.workspace_current_candidate_digest(workspace_id)
