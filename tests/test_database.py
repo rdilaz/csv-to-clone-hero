@@ -515,6 +515,28 @@ def test_clear_workspace_candidates_scoped_and_global(tmp_path):
     db.close()
 
 
+def test_exact_relationships_fail_closed_without_resolved_track(tmp_path):
+    from csv_to_clonehero.models import ChartCandidate
+
+    db = Database(tmp_path / "state.db")
+    ws = db.create_workspace(workspace_key="null-exact", name="Null exact")
+    chart = ChartCandidate(
+        source="test", chart_id=999, md5="f" * 32, name="Song", artist="Artist",
+        name_norm="song", artist_norm="artist", instruments=["guitar"], diff_guitar=3,
+    )
+    with pytest.raises(ValueError, match="resolved track ID"):
+        db.upsert_workspace_candidate(ws, "missing|track", chart, kind="exact")
+    with pytest.raises(ValueError, match="requires a Spotify track"):
+        db.select_workspace_candidate(ws, None, chart, kind="exact")
+    assert db._conn.execute(
+        "SELECT COUNT(*) FROM workspace_candidates WHERE kind='exact' AND track_id IS NULL"
+    ).fetchone()[0] == 0
+    assert db._conn.execute(
+        "SELECT COUNT(*) FROM workspace_selections WHERE kind='exact' AND track_id IS NULL"
+    ).fetchone()[0] == 0
+    db.close()
+
+
 def test_select_workspace_candidate_blocks_nested_production_hard_gate(tmp_path):
     import json
 
