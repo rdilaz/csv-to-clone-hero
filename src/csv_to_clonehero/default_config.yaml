@@ -305,6 +305,7 @@ monetization:
   ad_banner_slot: ""
   ad_sidebar_slot: ""
   # Core platform mission: the Clone Hero creator's GoFundMe (he has cancer).
+  # A canonical campaign fallback is built in; GOFUNDME_URL overrides it.
   gofundme_enabled: true
   gofundme_banner: true
   gofundme_url_env: GOFUNDME_URL

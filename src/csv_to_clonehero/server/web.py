@@ -229,7 +229,16 @@ def create_app(
                 workspace = _request_workspace(db)
                 from csv_to_clonehero.library_pipeline import run_library_import
                 imported = run_library_import(config, db, workspace, {"soundcloud": provider})
-                return jsonify({"ok": True, "workspace_id": workspace, "source": imported.sources["soundcloud"].__dict__, "sources": [dict(row) for row in db.get_source_summary(workspace)], "combined": imported.combined_summary})
+                return jsonify({
+                    "ok": True,
+                    "workspace_id": workspace,
+                    "source": imported.sources["soundcloud"].__dict__,
+                    "sources": _public_source_rows(db, workspace),
+                    "combined": imported.combined_summary,
+                    "soundcloud_library": _provider_library_payload(
+                        db, workspace, "soundcloud"
+                    ),
+                })
             finally:
                 db.close()
         except (UnicodeDecodeError, ValueError, json.JSONDecodeError) as exc:
@@ -484,11 +493,29 @@ def create_app(
         db = _user_db()
         client = None
         try:
+            workspace_id = _ensure_workspace(db, user)
             oauth = build_oauth(config, int(user["id"]), cipher)
             client = _client_for(config, oauth)
             playlists = _list_playlists(client)
             liked = _count_liked(client) if hasattr(client, "get_liked_tracks") else 0
-            return jsonify({"playlists": playlists, "liked_count": liked, "workspace": _scope_workspace(db, user)})
+            refreshed_at = time.time()
+            cache = {
+                "playlists": playlists,
+                "liked_count": liked,
+                "refreshed_at": refreshed_at,
+            }
+            _set_spotify_library_cache(db, workspace_id, cache)
+            return jsonify(_spotify_library_payload(
+                db,
+                workspace_id,
+                live_cache=cache,
+                cached=False,
+            ))
+        except Exception:  # noqa: BLE001 - preserve the last known cache
+            log.warning("Spotify library refresh failed", exc_info=True)
+            return jsonify({
+                "error": "Spotify could not be refreshed. Your saved choices were not changed."
+            }), 502
         finally:
             if client is not None:
                 client.close()
@@ -823,29 +850,7 @@ def create_app(
             minimum_score = db.get_workspace_minimum_score(workspace_id)
             cards = _review_cards(config, db, workspace_id, minimum_score)
             scope = db.get_workspace_scope_data(workspace_id)
-            source_rows = [
-                {
-                    "provider": source["provider"],
-                    "status": source["status"],
-                    "tracks": int(source["tracks"] or 0),
-                    "unique_tracks": int(source["unique_tracks"] or 0),
-                    "provenance": int(source["provenance"] or 0),
-                    "playlists": int(source["playlist_count"] or 0),
-                    "playlist_memberships": int(source["membership_count"] or 0),
-                    "playlist_unique_tracks": int(source["playlist_unique_tracks"] or 0),
-                    "liked": int(source["liked_count"] or 0),
-                    "liked_in_playlists": int(source["liked_in_playlists"] or 0),
-                    "playlist_only": int(source["playlist_only_tracks"] or 0),
-                    "liked_only": int(source["liked_only_tracks"] or 0),
-                    "raw_items": int(source["source_item_count"] or 0),
-                    "raw_items_lower_bound": bool(source["source_item_count_is_lower_bound"]),
-                    "accepted_items": int(source["accepted_rows"] or 0),
-                    "skipped_items": int(source["skipped_rows"] or 0),
-                    "duplicate_items": int(source["duplicate_rows"] or 0),
-                    "updated_at": source["updated_at"],
-                }
-                for source in db.get_provider_summaries(workspace_id)
-            ]
+            source_rows = _public_source_rows(db, workspace_id)
             newest_jobs = jobs.list_for_user(int(user["id"]), limit=1)
             download = downloads.latest_for_user_workspace(int(user["id"]), workspace_id)
             if download is not None:
@@ -860,6 +865,10 @@ def create_app(
                     "updated_at": row["updated_at"] if row is not None else None,
                 },
                 "spotify_scope": _public_scope(scope),
+                "spotify_library": _spotify_library_payload(db, workspace_id),
+                "soundcloud_library": _provider_library_payload(
+                    db, workspace_id, "soundcloud"
+                ),
                 "sources": source_rows,
                 "combined": db.get_combined_summary(workspace_id),
                 "job": _job_mapping_public(newest_jobs[0]) if newest_jobs else None,
@@ -1325,35 +1334,26 @@ def _list_playlists(client: Any) -> list[dict[str, Any]]:
     if not callable(method):
         return []
     items = []
-    try:
-        for playlist in method():
-            items.append(
-                {
-                    "id": str(getattr(playlist, "id", "") or ""),
-                    "name": str(getattr(playlist, "name", "") or ""),
-                    "track_count": getattr(playlist, "total_tracks", None),
-                    "owner_name": str(getattr(playlist, "owner_name", "") or ""),
-                }
-            )
-    except Exception:  # noqa: BLE001
-        log.warning("could not list playlists", exc_info=True)
+    for playlist in method():
+        items.append(
+            {
+                "id": str(getattr(playlist, "id", "") or ""),
+                "name": str(getattr(playlist, "name", "") or ""),
+                "track_count": getattr(playlist, "total_tracks", None),
+                "owner_name": str(getattr(playlist, "owner_name", "") or ""),
+            }
+        )
     return items
 
 
 def _count_liked(client: Any) -> int:
     count_method = getattr(client, "get_saved_tracks_count", None)
     if callable(count_method):
-        try:
-            return max(0, int(count_method()))
-        except Exception:  # noqa: BLE001
-            pass
+        return max(0, int(count_method()))
     method = getattr(client, "get_liked_tracks", None)
     if not callable(method):
         return 0
-    try:
-        return len(list(method()))
-    except Exception:  # noqa: BLE001
-        return 0
+    return len(list(method()))
 
 
 def _fetch_profile(config: AppConfig, token: Any) -> dict[str, Any]:
@@ -1383,6 +1383,205 @@ def _scope_workspace(db: Database, user: Any) -> dict[str, Any]:
     scope = db.get_workspace_scope_data(workspace) if workspace is not None else None
     metadata = _json_object(row["metadata_json"] if row is not None else "{}")
     return {"id": workspace, "exists": workspace is not None, "scope": scope, "soundcloud_scope": metadata.get("soundcloud_scope", {})}
+
+
+def _spotify_library_payload(
+    db: Database,
+    workspace_id: int,
+    *,
+    live_cache: dict[str, Any] | None = None,
+    cached: bool = True,
+) -> dict[str, Any]:
+    """Return saved Spotify choices and import truth without provider traffic."""
+    workspace = db.get_workspace(workspace_id)
+    metadata = _json_object(workspace["metadata_json"] if workspace is not None else "{}")
+    stored_cache = metadata.get("spotify_library_cache")
+    stored_cache = stored_cache if isinstance(stored_cache, dict) else {}
+    cache = live_cache if live_cache is not None else stored_cache
+    source_rows = [dict(row) for row in db.get_source_summary(workspace_id, "spotify")]
+    provider_rows = db.get_provider_summaries(workspace_id)
+    provider = next(
+        (row for row in provider_rows if str(row.get("provider") or "") == "spotify"),
+        None,
+    )
+
+    playlists: list[dict[str, Any]] = []
+    raw_playlists = cache.get("playlists") if isinstance(cache, dict) else None
+    if isinstance(raw_playlists, list):
+        for item in raw_playlists:
+            if not isinstance(item, dict):
+                continue
+            playlist_id = str(item.get("id") or "").strip()
+            if not playlist_id:
+                continue
+            playlists.append({
+                "id": playlist_id,
+                "name": str(item.get("name") or "Untitled playlist"),
+                "track_count": _optional_count(item.get("track_count")),
+                "owner_name": str(item.get("owner_name") or ""),
+            })
+
+    cache_source = "spotify" if live_cache is not None or stored_cache else "latest_import"
+    if not playlists and not stored_cache:
+        for row in db.get_library_playlists(workspace_id, "spotify"):
+            playlist_metadata = _json_object(row["metadata_json"])
+            track_count = playlist_metadata.get(
+                "total_tracks", playlist_metadata.get("item_count", row["track_count"])
+            )
+            playlists.append({
+                "id": str(row["provider_id"]),
+                "name": str(row["name"] or "Untitled playlist"),
+                "track_count": _optional_count(track_count),
+                "owner_name": str(playlist_metadata.get("owner_name") or ""),
+            })
+
+    scope = db.get_workspace_scope_data(workspace_id)
+    selected_ids = {
+        str(value) for value in (scope.get("playlist_ids") or ()) if str(value)
+    } if scope else set()
+    known_ids = {item["id"] for item in playlists}
+    for playlist_id in sorted(str(value) for value in selected_ids - known_ids):
+        playlists.append({
+            "id": playlist_id,
+            "name": "Saved playlist",
+            "track_count": None,
+            "owner_name": "",
+        })
+
+    imported_scope, last_imported_at = _imported_scope(source_rows)
+
+    import_cache_available = any(row.get("import_id") is not None for row in source_rows)
+    cache_available = bool(stored_cache) or import_cache_available
+    refreshed_at = float(cache.get("refreshed_at") or 0) if isinstance(cache, dict) else 0.0
+    if not refreshed_at and source_rows:
+        refreshed_at = max(float(row.get("updated_at") or 0) for row in source_rows)
+    liked_count = cache.get("liked_count") if stored_cache or live_cache is not None else None
+    known_unique_songs = int(provider.get("unique_tracks") or 0) if provider else None
+
+    return {
+        "playlists": sorted(playlists, key=lambda item: (item["name"].casefold(), item["id"])),
+        "liked_count": _optional_count(liked_count),
+        "workspace": {
+            "id": workspace_id,
+            "exists": workspace is not None,
+            "scope": _public_scope(scope),
+            "soundcloud_scope": metadata.get("soundcloud_scope", {}),
+        },
+        "cache_available": cache_available,
+        "cached": bool(cached),
+        "cache_source": cache_source if cache_available else "none",
+        "last_refreshed_at": refreshed_at or None,
+        "last_imported_at": last_imported_at or None,
+        "known_unique_songs": known_unique_songs,
+        "import_status": str(provider.get("status") or "") if provider else "",
+        "imported_scope": imported_scope,
+    }
+
+
+def _public_source_rows(db: Database, workspace_id: int) -> list[dict[str, Any]]:
+    return [
+        {
+            "provider": source["provider"],
+            "status": source["status"],
+            "tracks": int(source["tracks"] or 0),
+            "unique_tracks": int(source["unique_tracks"] or 0),
+            "provenance": int(source["provenance"] or 0),
+            "playlists": int(source["playlist_count"] or 0),
+            "playlist_memberships": int(source["membership_count"] or 0),
+            "playlist_unique_tracks": int(source["playlist_unique_tracks"] or 0),
+            "liked": int(source["liked_count"] or 0),
+            "liked_in_playlists": int(source["liked_in_playlists"] or 0),
+            "playlist_only": int(source["playlist_only_tracks"] or 0),
+            "liked_only": int(source["liked_only_tracks"] or 0),
+            "raw_items": int(source["source_item_count"] or 0),
+            "raw_items_lower_bound": bool(source["source_item_count_is_lower_bound"]),
+            "accepted_items": int(source["accepted_rows"] or 0),
+            "skipped_items": int(source["skipped_rows"] or 0),
+            "duplicate_items": int(source["duplicate_rows"] or 0),
+            "include_liked": bool(source["include_liked"]),
+            "updated_at": source["updated_at"],
+        }
+        for source in db.get_provider_summaries(workspace_id)
+    ]
+
+
+def _provider_library_payload(
+    db: Database, workspace_id: int, provider_name: str
+) -> dict[str, Any]:
+    source_rows = [
+        dict(row) for row in db.get_source_summary(workspace_id, provider_name)
+    ]
+    provider = next(
+        (
+            row for row in db.get_provider_summaries(workspace_id)
+            if str(row.get("provider") or "") == provider_name
+        ),
+        None,
+    )
+    imported_scope, last_imported_at = _imported_scope(source_rows)
+    workspace = db.get_workspace(workspace_id)
+    metadata = _json_object(workspace["metadata_json"] if workspace is not None else "{}")
+    current_scope = metadata.get(f"{provider_name}_scope")
+    current_scope = current_scope if isinstance(current_scope, dict) else {}
+    return {
+        "status": str(provider.get("status") or "") if provider else "",
+        "known_unique_songs": int(provider.get("unique_tracks") or 0) if provider else None,
+        "last_imported_at": last_imported_at or None,
+        "current_scope": {
+            "playlist_ids": sorted(
+                str(value) for value in current_scope.get("playlist_ids", ()) if str(value)
+            ),
+            "include_liked": bool(current_scope.get("include_liked")),
+        },
+        "imported_scope": imported_scope,
+    }
+
+
+def _imported_scope(
+    source_rows: list[dict[str, Any]],
+) -> tuple[dict[str, Any], float]:
+    imported_rows = [row for row in source_rows if row.get("import_id") is not None]
+    playlist_ids: set[str] = set()
+    include_liked = False
+    last_imported_at = 0.0
+    for row in imported_rows:
+        source_scope = _json_object(row.get("scope_json"))
+        playlist_ids.update(
+            str(value) for value in source_scope.get("playlist_ids", ()) if str(value)
+        )
+        include_liked = include_liked or bool(source_scope.get("include_liked"))
+        last_imported_at = max(
+            last_imported_at,
+            float(row.get("completed_at") or row.get("updated_at") or 0),
+        )
+    complete = bool(imported_rows) and all(
+        str(row.get("import_status") or "").casefold()
+        in {"complete", "completed", "success"}
+        for row in imported_rows
+    )
+    return {
+        "known": complete,
+        "playlist_ids": sorted(playlist_ids),
+        "include_liked": include_liked,
+    }, last_imported_at
+
+
+def _set_spotify_library_cache(
+    db: Database, workspace_id: int, cache: dict[str, Any]
+) -> None:
+    workspace = db.get_workspace(workspace_id)
+    metadata = _json_object(workspace["metadata_json"] if workspace is not None else "{}")
+    metadata["spotify_library_cache"] = cache
+    db.update_workspace(workspace_id, metadata=metadata)
+
+
+def _optional_count(value: Any) -> int | None:
+    if value is None or value == "":
+        return None
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return None
 
 
 def _json_object(value: Any) -> dict[str, Any]:

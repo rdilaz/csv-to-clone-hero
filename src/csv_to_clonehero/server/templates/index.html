@@ -76,8 +76,12 @@
       <article class="source-card source-card--spotify">
         <div class="source-card__header">
           <span class="source-icon source-icon--spotify" aria-hidden="true">S</span>
-          <div><h2>Spotify</h2><p>Connected as {{ user.display_name }}</p></div>
+          <div class="source-card__identity"><h2>Spotify</h2><p>Connected as {{ user.display_name }}</p></div>
           <span class="status-pill">Connected</span>
+        </div>
+        <div class="source-refresh">
+          <p class="fine-print" id="spotifyFreshness" role="status">Restoring saved Spotify data...</p>
+          <button class="text-button" id="refreshSpotifyButton" type="button">Refresh Spotify</button>
         </div>
         <div class="playlist-actions" role="group" aria-label="Spotify playlist selection">
           <button class="button button--secondary" id="selectAllPlaylistsButton" type="button">Select all playlists</button>
@@ -87,10 +91,10 @@
         <p class="fine-print" id="spotifyImportedSummary"></p>
       </article>
 
-      <article class="source-card">
+      <article class="source-card source-card--soundcloud">
         <div class="source-card__header">
           <span class="source-icon" aria-hidden="true">SC</span>
-          <div><h2>SoundCloud</h2><p>Optional export import</p></div>
+          <div class="source-card__identity"><h2>SoundCloud</h2><p>Optional export import</p></div>
           <span class="status-pill status-pill--quiet" id="soundcloudCount">Not added</span>
         </div>
         <details class="source-details">

@@ -11,13 +11,10 @@
 <body data-authenticated="{{ 'true' if user else 'false' }}">
   <a class="skip-link" href="#main-content">Skip to content</a>
 
-  {% if config.monetization.gofundme_enabled %}
+  {% if config.monetization.gofundme_enabled and config.monetization.gofundme_banner and config.monetization.effective_gofundme_url %}
   <aside class="cause-bar" aria-label="Community support">
     <div class="shell cause-bar__inner">
-      <span><strong>Support the creator of Clone Hero.</strong> Help during his cancer fight.</span>
-      {% if config.monetization.effective_gofundme_url %}
-      <a href="{{ config.monetization.effective_gofundme_url }}" target="_blank" rel="noopener">Visit GoFundMe</a>
-      {% endif %}
+      <a class="cause-bar__link" href="{{ config.monetization.effective_gofundme_url }}" target="_blank" rel="noopener noreferrer" aria-label="Support the creator of Clone Hero on GoFundMe (opens in a new tab)"><strong>Support the creator of Clone Hero.</strong> Help during his cancer fight. <span>Visit GoFundMe</span></a>
     </div>
   </aside>
   {% endif %}
