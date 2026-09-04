@@ -7,7 +7,7 @@ provider name.
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
 
@@ -51,6 +51,10 @@ class ProviderTrack:
     def dedupe_key(self) -> tuple[str, str]:
         return self.artist_norm, self.title_norm
 
+    @property
+    def playlist_memberships(self) -> list[tuple[str, str]]:
+        return provider_track_playlist_memberships(self)
+
 
 @dataclass
 class LibrarySnapshot:
@@ -83,6 +87,8 @@ class SourceImportReport:
     liked_count: int = 0
     missing_artist_count: int = 0
     missing_provider_id_count: int = 0
+    inaccessible_count: int = 0
+    error_count: int = 0
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -96,6 +102,8 @@ class SourceImportReport:
             "liked_count": self.liked_count,
             "missing_artist_count": self.missing_artist_count,
             "missing_provider_id_count": self.missing_provider_id_count,
+            "inaccessible_count": self.inaccessible_count,
+            "error_count": self.error_count,
         }
 
 
@@ -156,6 +164,77 @@ def provider_track_to_track(value: ProviderTrack) -> Track:
     )
 
 
+def playlist_identity(provider_id: Any, name: Any) -> str:
+    """Return a stable source-local identity for an observed playlist."""
+    identity = str(provider_id or "").strip()
+    if identity:
+        return identity
+    label = str(name or "").strip()
+    return f"name:{label.casefold()}" if label else ""
+
+
+def playlist_membership_pairs(
+    playlist_ids: Iterable[Any] | None,
+    playlist_names: Iterable[Any] | None,
+) -> list[tuple[str, str]]:
+    """Pair parallel membership fields without dropping unmatched values."""
+    ids = [str(value or "").strip() for value in (playlist_ids or ())]
+    names = [str(value or "").strip() for value in (playlist_names or ())]
+    pairs: list[tuple[str, str]] = []
+    for index in range(max(len(ids), len(names))):
+        pair = (
+            ids[index] if index < len(ids) else "",
+            names[index] if index < len(names) else "",
+        )
+        if (pair[0] or pair[1]) and pair not in pairs:
+            pairs.append(pair)
+    return pairs
+
+
+def _coerce_membership_tuples(value: Any) -> list[tuple[str, str]]:
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
+        return []
+    pairs: list[tuple[str, str]] = []
+    for item in value:
+        if isinstance(item, Mapping):
+            pair = (
+                str(item.get("provider_id") or item.get("playlist_id") or item.get("id") or "").strip(),
+                str(item.get("name") or item.get("playlist_name") or "").strip(),
+            )
+        elif isinstance(item, Sequence) and not isinstance(item, (str, bytes)) and len(item) >= 2:
+            pair = (str(item[0] or "").strip(), str(item[1] or "").strip())
+        else:
+            continue
+        if (pair[0] or pair[1]) and pair not in pairs:
+            pairs.append(pair)
+    return pairs
+
+
+def provider_track_playlist_memberships(value: ProviderTrack) -> list[tuple[str, str]]:
+    """Read exact provenance memberships before pairing aggregate fields."""
+    provenance = value.metadata.get("provenance")
+    pairs: list[tuple[str, str]] = []
+    if isinstance(provenance, Sequence) and not isinstance(provenance, (str, bytes)):
+        for entry in provenance:
+            if not isinstance(entry, Mapping):
+                continue
+            entry_provider = str(entry.get("provider") or "").casefold()
+            if entry_provider and entry_provider != value.provider.casefold():
+                continue
+            exact = _coerce_membership_tuples(entry.get("playlist_memberships"))
+            if not exact:
+                exact = playlist_membership_pairs(
+                    entry.get("playlist_ids"), entry.get("playlist_names")
+                )
+            for pair in exact:
+                if pair not in pairs:
+                    pairs.append(pair)
+    if pairs:
+        return pairs
+    exact = _coerce_membership_tuples(value.metadata.get("playlist_memberships"))
+    return exact or playlist_membership_pairs(value.playlist_ids, value.playlist_names)
+
+
 def merge_provider_tracks(values: Iterable[ProviderTrack]) -> list[ProviderTrack]:
     """Union providers by normalized artist/title while preserving provenance."""
     merged: dict[tuple[str, str], ProviderTrack] = {}
@@ -168,6 +247,9 @@ def merge_provider_tracks(values: Iterable[ProviderTrack]) -> list[ProviderTrack
             "provider_id": incoming.provider_id,
             "playlist_ids": list(incoming.playlist_ids),
             "playlist_names": list(incoming.playlist_names),
+            "playlist_memberships": playlist_membership_pairs(
+                incoming.playlist_ids, incoming.playlist_names
+            ),
             "liked": bool(incoming.liked),
         }
         if current is None:

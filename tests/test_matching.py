@@ -1,6 +1,10 @@
 import pytest
 
 from csv_to_clonehero.matching import (
+    ALTERNATE_RECORDING,
+    BLOCKED,
+    POSSIBLE_MATCH,
+    RECOMMENDED_EXACT,
     instrument_compatible,
     pick_best,
     score_candidate,
@@ -80,9 +84,64 @@ def test_meaningful_version_mismatch_remains_version_evidence(config):
         config,
     )
 
-    assert result.gate_factors["title_identity"] == "strong"
+    assert result.match_factors["title"]["identity"]["safe_identity_projection"]["matched"] is False
     assert result.gate_factors["title_conflict"] is False
     assert any("version mismatch" in label for label, _ in result.penalties)
+
+
+@pytest.mark.parametrize(
+    "chart_title",
+    [
+        "Good Ass Intro (ft. Artist One, Artist Two & Artist Three)",
+        "Good Ass Intro [Overchart]",
+    ],
+)
+def test_safe_title_projection_establishes_same_song_identity(config, chart_title):
+    result = score_candidate(
+        make_track("Good Ass Intro", "Chance the Rapper"),
+        _high_quality_chart(chart_title, "Chance the Rapper"),
+        config,
+    )
+    projection = result.match_factors["title"]["identity"]["safe_identity_projection"]
+    assert projection["matched"] is True
+    assert projection["changed"] is True
+    assert result.gate_factors["title_auto_identity"] is True
+    assert result.eligibility == "RECOMMENDED"
+
+
+@pytest.mark.parametrize("marker", ["Live", "Remix", "Cover"])
+def test_safe_title_projection_never_erases_version_identity(config, marker):
+    result = score_candidate(
+        make_track("Song", "Artist"),
+        _high_quality_chart(f"Song ({marker})", "Artist"),
+        config,
+    )
+    projection = result.match_factors["title"]["identity"]["safe_identity_projection"]
+    assert projection["matched"] is False
+    assert projection["version_markers_agree"] is False
+    assert any("version mismatch" in label for label, _ in result.penalties)
+    assert result.eligibility != "RECOMMENDED"
+
+
+def test_result_tiers_separate_recommendation_alternate_possible_and_blocked(config):
+    exact_track = make_track("Song", "Artist")
+    exact_track.duration_ms = 180000
+    exact = make_chart("Song", "Artist", chart_id=300)
+    exact.song_length_ms = 181000
+    assert score_candidate(exact_track, exact, config).result_tier == RECOMMENDED_EXACT
+
+    alternate = make_chart("Song (Live)", "Artist", chart_id=301)
+    alternate.song_length_ms = 240000
+    alternate_result = score_candidate(exact_track, alternate, config)
+    assert alternate_result.result_tier == ALTERNATE_RECORDING
+    assert alternate_result.gate_factors["hard_gate"] is False
+
+    possible = make_chart("Song Long", "Artist", chart_id=302)
+    possible_result = score_candidate(exact_track, possible, config)
+    assert possible_result.result_tier == POSSIBLE_MATCH
+
+    blocked = make_chart("Wrong", "Unrelated", chart_id=303)
+    assert score_candidate(exact_track, blocked, config).result_tier == BLOCKED
 
 
 def test_pick_best_prefers_correct_song_over_higher_quality_wrong_song(config):

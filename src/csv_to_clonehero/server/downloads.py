@@ -363,10 +363,15 @@ def build_archive(
 
     def checker(selection: Any, _candidate: ChartCandidate | None) -> bool:
         value = dict(selection) if hasattr(selection, "get") else {}
-        eligibility = str(value.get("eligibility") or "").upper()
-        from csv_to_clonehero.matching import ELIGIBLE_REVIEW, RECOMMENDED
+        tier = str(value.get("result_tier") or "").upper()
+        metadata = json.loads(str(value.get("metadata_json") or "{}"))
+        from csv_to_clonehero.matching import POSSIBLE_MATCH, SELECTABLE_RESULT_TIERS
 
-        return eligibility in {RECOMMENDED, ELIGIBLE_REVIEW}
+        return tier in SELECTABLE_RESULT_TIERS and (
+            tier != POSSIBLE_MATCH
+            or bool(metadata.get("possible_confirmed"))
+            or not metadata.get("selection_origin")
+        )
 
     service: ExportService | None = None
     try:
@@ -512,6 +517,8 @@ def _validated_selections(
             continue
         current_eligibility = str(data.get("eligibility") or "RECOMMENDED")
         current_score = data.get("score")
+        selection_metadata = json.loads(str(data.get("metadata_json") or "{}"))
+        current_tier = ""
         if kind == "exact":
             track_id = int(data.get("track_id") or 0)
             if track_id not in workspace_track_ids:
@@ -530,14 +537,17 @@ def _validated_selections(
             ):
                 continue
             if config is not None:
-                from csv_to_clonehero.matching import ELIGIBLE_REVIEW, RECOMMENDED, score_candidate
+                from csv_to_clonehero.matching import BLOCKED, SELECTABLE_RESULT_TIERS, classify_result_tier, score_candidate
 
                 track = track_map.get(track_id)
                 if track is None:
                     continue
                 breakdown = score_candidate(track, candidate, config)
                 current_eligibility = str(getattr(breakdown, "eligibility", "") or "")
-                if current_eligibility not in {RECOMMENDED, ELIGIBLE_REVIEW}:
+                current_tier = classify_result_tier(breakdown)[0]
+                if current_tier == BLOCKED or current_tier not in SELECTABLE_RESULT_TIERS:
+                    continue
+                if current_tier == "POSSIBLE_MATCH" and not selection_metadata.get("possible_confirmed"):
                     continue
                 current_score = breakdown.final_score
         else:
@@ -560,7 +570,7 @@ def _validated_selections(
             metadata = json.loads(str(current["metadata_json"] or "{}"))
             if int(metadata.get("exact_generation_id") or 0) != generation_id:
                 continue
-            from csv_to_clonehero.matching import ELIGIBLE_REVIEW, RECOMMENDED, score_expansion_candidate
+            from csv_to_clonehero.matching import BLOCKED, SELECTABLE_RESULT_TIERS, classify_result_tier, score_expansion_candidate
             from csv_to_clonehero.normalization import normalize_artist, normalize_title
 
             if (
@@ -574,18 +584,16 @@ def _validated_selections(
             )
             breakdown = score_expansion_candidate(artist_norm, candidate, config)
             current_eligibility = str(getattr(breakdown, "eligibility", "") or "")
+            current_tier = classify_result_tier(breakdown, kind="expansion")[0]
             if (
                 bool(getattr(breakdown, "gate_factors", {}).get("hard_gate"))
-                or current_eligibility not in {RECOMMENDED, ELIGIBLE_REVIEW}
+                or current_tier == BLOCKED
+                or current_tier not in SELECTABLE_RESULT_TIERS
             ):
                 continue
             current_score = breakdown.final_score
-        if config is not None and float(current_score or 0) < minimum_score:
+        if config is not None and float(current_score or 0) < minimum_score and not current_tier:
             continue
-        if kind == "expansion":
-            if expansion_identity in seen_expansion_songs:
-                continue
-            seen_expansion_songs.add(expansion_identity)
         selection = dict(data)
         selection["candidate_json"] = json.dumps(
             {item.name: getattr(candidate, item.name) for item in fields(candidate)},
@@ -595,6 +603,7 @@ def _validated_selections(
         selection["candidate_id"] = data.get("candidate_id")
         selection["status"] = "selected"
         selection["eligibility"] = current_eligibility
+        selection["result_tier"] = current_tier
         selection["score"] = current_score
         selections.append(selection)
     if not selections:

@@ -20,6 +20,8 @@ from csv_to_clonehero.providers.base import (
     ProviderTrack,
     SourceImportReport,
     merge_provider_tracks,
+    playlist_identity,
+    provider_track_playlist_memberships,
 )
 
 
@@ -76,6 +78,17 @@ _ALIASES = {
     "artist": ("artist name", "artist", "user", "username", "creator"),
     "album": ("album",),
     "playlist": ("playlist name", "playlist", "playlist_name"),
+    "playlist_id": (
+        "playlist id",
+        "playlist_id",
+        "playlistid",
+        "soundcloud playlist id",
+        "soundcloud - playlist id",
+        "set id",
+        "set_id",
+        "playlist urn",
+        "playlist_urn",
+    ),
     "row_type": ("type",),
     "isrc": ("isrc",),
     "provider_id": ("soundcloud - id", "id", "track_id", "urn"),
@@ -126,6 +139,7 @@ def _snapshot_from_rows(rows: list[Any]) -> LibrarySnapshot:
             "artist": artist,
             "album": _value(normalized, "album"),
             "playlist_name": _value(normalized, "playlist"),
+            "playlist_id": _value(normalized, "playlist_id"),
             "id": provider_id,
             "isrc": _value(normalized, "isrc"),
             "row_type": _value(normalized, "row_type"),
@@ -147,13 +161,51 @@ def _snapshot_from_rows(rows: list[Any]) -> LibrarySnapshot:
             continue
         report.accepted_rows += 1
         report.playlists.extend(track.playlist_names)
-        report.liked_count += int(track.liked)
         parsed.append(track)
     merged = merge_provider_tracks(parsed)
+    playlists = _observed_playlists(parsed)
     report.unique_tracks = len(merged)
     report.duplicate_rows = max(0, len(parsed) - len(merged))
-    report.playlists = list(dict.fromkeys(report.playlists))
-    return LibrarySnapshot("soundcloud", merged, metadata={"import": "export", "report": report.as_dict()}, import_report=report)
+    report.playlists = [playlist.name for playlist in playlists if playlist.name]
+    report.liked_count = sum(track.liked for track in merged)
+    return LibrarySnapshot(
+        "soundcloud",
+        merged,
+        playlists,
+        metadata={"import": "export", "report": report.as_dict()},
+        import_report=report,
+    )
+
+
+def _observed_playlists(tracks: list[ProviderTrack]) -> list[ProviderPlaylist]:
+    observations = [
+        membership
+        for track in tracks
+        for membership in provider_track_playlist_memberships(track)
+    ]
+    ids_by_name: dict[str, set[str]] = {}
+    for provider_id, name in observations:
+        if provider_id and name:
+            ids_by_name.setdefault(name.casefold(), set()).add(provider_id)
+    playlists: dict[str, ProviderPlaylist] = {}
+    for provider_id, name in observations:
+        if not provider_id and name and len(ids_by_name.get(name.casefold(), ())) == 1:
+            provider_id = next(iter(ids_by_name[name.casefold()]))
+        identity = playlist_identity(provider_id, name)
+        if not identity:
+            continue
+        current = playlists.get(identity)
+        if current is None:
+            playlists[identity] = ProviderPlaylist(
+                provider="soundcloud",
+                provider_id=identity,
+                name=name,
+                liked=name.casefold() == "liked songs",
+                metadata={"inferred_from_membership": True},
+            )
+        elif not current.name and name:
+            current.name = name
+    return list(playlists.values())
 
 
 def _header(value: Any) -> str:
@@ -165,8 +217,18 @@ def _value(row: Mapping[str, Any], field: str) -> str:
         value = row.get(alias)
         if value not in (None, ""):
             if isinstance(value, Mapping):
-                value = value.get("username") or value.get("name") or ""
+                if field == "playlist_id":
+                    value = value.get("id") or value.get("urn") or ""
+                elif field == "playlist":
+                    value = value.get("title") or value.get("name") or ""
+                else:
+                    value = value.get("username") or value.get("name") or ""
             return str(value).strip()
+    if field == "playlist_id":
+        for alias in _ALIASES["playlist"]:
+            value = row.get(alias)
+            if isinstance(value, Mapping):
+                return str(value.get("id") or value.get("urn") or "").strip()
     return ""
 
 
@@ -205,21 +267,35 @@ def _track_from_mapping(row: Any) -> ProviderTrack | None:
     if not provider_id:
         provider_id = f"export:{artist}:{title}"
     playlist = row.get("playlist") or row.get("playlist_name") or ""
-    playlist_id = row.get("playlist_id") or ""
+    playlist_id = (
+        row.get("playlist_id")
+        or row.get("playlistId")
+        or row.get("playlist id")
+        or row.get("set_id")
+        or row.get("playlist_urn")
+        or ""
+    )
+    if isinstance(playlist, Mapping):
+        playlist_id = playlist_id or playlist.get("id") or playlist.get("urn") or ""
+        playlist = playlist.get("title") or playlist.get("name") or ""
+    playlist_name = str(playlist).strip()
+    playlist_provider_id = str(playlist_id).strip()
     metadata = row.get("metadata")
     metadata = dict(metadata) if isinstance(metadata, Mapping) else {}
     metadata.setdefault("export_row", True)
+    if playlist_provider_id or playlist_name:
+        metadata["playlist_memberships"] = [(playlist_provider_id, playlist_name)]
     return ProviderTrack(
         provider="soundcloud",
         provider_id=provider_id,
         title=title,
         artist=artist,
         album=str(row.get("album") or "").strip(),
-        playlist_ids=[str(playlist_id).strip()] if str(playlist_id).strip() else [],
-        playlist_names=[str(playlist).strip()] if str(playlist).strip() else [],
+        playlist_ids=[playlist_provider_id] if playlist_provider_id else [],
+        playlist_names=[playlist_name] if playlist_name else [],
         liked=(str(row.get("liked") or row.get("favorited") or "").casefold() in {"1", "true", "yes"}
                or str(row.get("row_type") or "").casefold() in {"favorite", "favourite"}
-               or str(playlist).casefold() == "liked songs"),
+               or playlist_name.casefold() == "liked songs"),
         duration_ms=_optional_int(row.get("duration_ms") or row.get("duration")),
         url=str(row.get("permalink_url") or row.get("url") or "").strip(),
         isrc=str(row.get("isrc") or "").strip(),

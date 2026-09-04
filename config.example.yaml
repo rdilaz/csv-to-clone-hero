@@ -173,6 +173,9 @@ search:
   catalog_title_fuzzy_limit: 50
   catalog_min_artist_similarity: 55.0
   catalog_min_title_similarity: 20.0
+  catalog_song_key_limit: 12
+  catalog_fuzzy_fallback_key_limit: 50
+  catalog_candidate_limit: 100
 
 sources:
   enabled: [enchor]

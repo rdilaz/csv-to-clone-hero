@@ -18,6 +18,7 @@ from csv_to_clonehero.providers.base import (
     LibrarySnapshot,
     ProviderPlaylist,
     ProviderTrack,
+    SourceImportReport,
     merge_provider_tracks,
 )
 from csv_to_clonehero.spotify import PKCEPair, code_challenge_for_verifier, generate_state
@@ -286,18 +287,37 @@ class SoundCloudAPIProvider:
         playlists = self.client.playlists()
         playlist_models = [ProviderPlaylist("soundcloud", str(row.get("id") or ""), str(row.get("title") or row.get("name") or "")) for row in playlists if str(row.get("id") or "") in selected_ids]
         tracks: list[ProviderTrack] = []
+        report = SourceImportReport(playlists=[value.name for value in playlist_models])
         for playlist in playlist_models:
             for row in self.client.playlist_tracks(playlist.provider_id):
+                report.total_rows += 1
                 track = _api_track(row, playlist)
                 if track:
                     tracks.append(track)
+                    report.accepted_rows += 1
+                else:
+                    report.skipped_rows += 1
         if scope.get("include_liked"):
             for row in self.client.liked_tracks():
+                report.total_rows += 1
                 track = _api_track(row, None)
                 if track:
                     track.liked = True
                     tracks.append(track)
-        return LibrarySnapshot("soundcloud", merge_provider_tracks(tracks), playlist_models, {"import": "api"})
+                    report.accepted_rows += 1
+                else:
+                    report.skipped_rows += 1
+        merged = merge_provider_tracks(tracks)
+        report.unique_tracks = len(merged)
+        report.duplicate_rows = max(0, report.accepted_rows - report.unique_tracks)
+        report.liked_count = sum(track.liked for track in merged)
+        return LibrarySnapshot(
+            "soundcloud",
+            merged,
+            playlist_models,
+            {"import": "api", "report": report.as_dict()},
+            import_report=report,
+        )
 
     def close(self) -> None:
         self.client.close()

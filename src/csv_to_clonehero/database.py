@@ -16,7 +16,7 @@ from typing import Any
 
 from csv_to_clonehero.models import ChartCandidate, Track
 
-SCHEMA_VERSION = 19
+SCHEMA_VERSION = 20
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);
@@ -1275,6 +1275,8 @@ class Database:
                     "SET workspace_key = substr(workspace_key, 1, length(workspace_key) - 5) "
                     "WHERE workspace_key LIKE 'spotify:u:%[:64]'"
                 )
+            if current < 20:
+                self._backfill_library_playlist_projection()
             row = self._conn.execute("SELECT COUNT(*) AS c FROM schema_version").fetchone()
             if row["c"] == 0:
                 self._conn.execute(
@@ -1293,6 +1295,172 @@ class Database:
             self._conn.execute(
                 f"ALTER TABLE {table} ADD COLUMN {column} {definition}"
             )
+
+    def _backfill_library_playlist_projection(self) -> None:
+        """Recover v19 playlist scope from durable provenance where possible."""
+        from csv_to_clonehero.providers.base import (
+            ProviderTrack,
+            playlist_identity,
+            provider_track_playlist_memberships,
+        )
+
+        sources = self._conn.execute(
+            "SELECT id,provider,scope_json FROM library_sources ORDER BY id"
+        ).fetchall()
+        now = time.time()
+        for source in sources:
+            source_id = int(source["id"])
+            if self._conn.execute(
+                "SELECT 1 FROM library_playlists WHERE source_id=? LIMIT 1",
+                (source_id,),
+            ).fetchone():
+                continue
+            latest = self._conn.execute(
+                "SELECT MAX(id) AS id FROM source_imports WHERE source_id=?",
+                (source_id,),
+            ).fetchone()
+            import_id = int(latest["id"] or 0) if latest else 0
+            if not import_id:
+                continue
+
+            playlist_rows: dict[str, dict[str, Any]] = {}
+            memberships: list[tuple[int, str]] = []
+            provenance = self._conn.execute(
+                """SELECT library_track_id,provider_id,title,artist,metadata_json
+                     FROM library_track_provenance
+                    WHERE source_id=? AND source_import_id=?
+                    ORDER BY id""",
+                (source_id, import_id),
+            ).fetchall()
+            for row in provenance:
+                try:
+                    metadata = json.loads(row["metadata_json"] or "{}")
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    metadata = {}
+                track = ProviderTrack(
+                    provider=str(source["provider"]),
+                    provider_id=str(row["provider_id"]),
+                    title=str(row["title"] or ""),
+                    artist=str(row["artist"] or ""),
+                    metadata=metadata if isinstance(metadata, dict) else {},
+                )
+                for raw_id, raw_name in provider_track_playlist_memberships(track):
+                    provider_id = playlist_identity(raw_id, raw_name)
+                    if not provider_id:
+                        continue
+                    playlist_rows.setdefault(provider_id, {
+                        "provider_id": provider_id,
+                        "name": str(raw_name or "").strip(),
+                        "metadata": {"recovered_from_v19": True},
+                    })
+                    memberships.append((int(row["library_track_id"]), provider_id))
+
+            try:
+                scope = json.loads(source["scope_json"] or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                scope = {}
+            scope_ids: list[str] = []
+            if isinstance(scope, Mapping):
+                scope_ids = [
+                    playlist_identity(raw_id, "")
+                    for raw_id in scope.get("playlist_ids", ()) or ()
+                    if playlist_identity(raw_id, "")
+                ]
+                for provider_id in scope_ids:
+                    playlist_rows.setdefault(provider_id, {
+                        "provider_id": provider_id,
+                        "name": "",
+                        "metadata": {"recovered_from_v19_scope": True},
+                    })
+
+            import_row = self._conn.execute(
+                "SELECT report_json FROM source_imports WHERE id=?", (import_id,)
+            ).fetchone()
+            try:
+                report = json.loads(import_row["report_json"] or "{}") if import_row else {}
+            except (TypeError, ValueError, json.JSONDecodeError):
+                report = {}
+            report_names = [
+                str(value or "").strip()
+                for value in (
+                    report.get("playlists", ()) if isinstance(report, Mapping) else ()
+                ) or ()
+                if str(value or "").strip()
+            ]
+            if scope_ids and len(scope_ids) == len(report_names):
+                for provider_id, name in zip(scope_ids, report_names):
+                    playlist_rows[provider_id]["name"] = (
+                        playlist_rows[provider_id]["name"] or name
+                    )
+            known_names = {
+                str(value["name"]).casefold(): value["provider_id"]
+                for value in playlist_rows.values()
+                if value["name"]
+            }
+            if isinstance(report, Mapping):
+                for name in report_names:
+                    provider_id = known_names.get(name.casefold()) or playlist_identity("", name)
+                    if provider_id:
+                        playlist_rows.setdefault(provider_id, {
+                            "provider_id": provider_id,
+                            "name": name,
+                            "metadata": {"recovered_from_v19_report": True},
+                        })
+
+            playlist_ids: dict[str, int] = {}
+            for value in sorted(playlist_rows.values(), key=lambda item: item["provider_id"]):
+                cur = self._conn.execute(
+                    """INSERT INTO library_playlists(
+                           source_id,provider_id,name,liked,metadata_json,updated_at
+                       ) VALUES(?,?,?,?,?,?)""",
+                    (
+                        source_id,
+                        value["provider_id"],
+                        value["name"],
+                        0,
+                        _json_text(value["metadata"], {}),
+                        now,
+                    ),
+                )
+                playlist_ids[value["provider_id"]] = int(cur.lastrowid)
+            positions: dict[str, int] = {}
+            for library_track_id, provider_id in memberships:
+                playlist_id = playlist_ids.get(provider_id)
+                if playlist_id is None:
+                    continue
+                positions[provider_id] = positions.get(provider_id, 0) + 1
+                self._conn.execute(
+                    """INSERT OR IGNORE INTO library_track_playlists(
+                           library_track_id,playlist_id,position
+                       ) VALUES(?,?,?)""",
+                    (library_track_id, playlist_id, positions[provider_id]),
+                )
+            if (
+                str(source["provider"]).casefold() == "spotify"
+                and isinstance(report, dict)
+                and "total_rows" not in report
+                and "source_item_count" not in report
+            ):
+                membership_count = self._conn.execute(
+                    """SELECT COUNT(*) FROM library_track_playlists ltp
+                         JOIN library_playlists lp ON lp.id=ltp.playlist_id
+                        WHERE lp.source_id=?""",
+                    (source_id,),
+                ).fetchone()[0]
+                liked_count = self._conn.execute(
+                    """SELECT COUNT(DISTINCT library_track_id)
+                         FROM library_track_provenance
+                        WHERE source_id=? AND source_import_id=? AND liked=1""",
+                    (source_id, import_id),
+                ).fetchone()[0]
+                report.update({
+                    "source_item_count": int(membership_count) + int(liked_count),
+                    "source_item_count_is_lower_bound": True,
+                })
+                self._conn.execute(
+                    "UPDATE source_imports SET report_json=? WHERE id=?",
+                    (_json_text(report, {}), import_id),
+                )
 
     def refresh_library_matching_fingerprint(self, workspace_id: int | str) -> str:
         """Persist the canonical fields consumed by matching as one identity."""
@@ -1358,7 +1526,11 @@ class Database:
         """Persist one provider snapshot without replacing other providers."""
         import time as _time
 
-        from csv_to_clonehero.providers.base import provider_track_to_track
+        from csv_to_clonehero.providers.base import (
+            playlist_identity,
+            provider_track_playlist_memberships,
+            provider_track_to_track,
+        )
 
         db_id = self._workspace_db_id(workspace_id)
         if db_id is None:
@@ -1366,7 +1538,103 @@ class Database:
         now = _time.time()
         provider = str(snapshot.provider).strip().casefold()
         source_key = str((snapshot.metadata or {}).get("import", "api")).strip() or "api"
-        report = snapshot.import_report.as_dict() if getattr(snapshot, "import_report", None) else {}
+        snapshot_tracks = list(snapshot.tracks)
+        current_provider_ids = {
+            str(value.provider_id or f"{value.artist_norm}|{value.title_norm}")
+            for value in snapshot_tracks
+        }
+        snapshot_playlists = list(getattr(snapshot, "playlists", ()) or ())
+        supplied_report = getattr(snapshot, "import_report", None)
+        if supplied_report is not None:
+            report = supplied_report.as_dict()
+        else:
+            metadata_report = (snapshot.metadata or {}).get("report", {})
+            report = dict(metadata_report) if isinstance(metadata_report, Mapping) else {}
+        unique_tracks = len({(value.artist_norm, value.title_norm) for value in snapshot_tracks})
+
+        def report_count(name: str, default: int) -> int:
+            try:
+                return max(0, int(report.get(name, default)))
+            except (TypeError, ValueError):
+                return default
+
+        accepted_rows = report_count("accepted_rows", len(snapshot_tracks))
+        skipped_rows = report_count("skipped_rows", 0)
+        report.update({
+            "total_rows": report_count("total_rows", accepted_rows + skipped_rows),
+            "accepted_rows": accepted_rows,
+            "skipped_rows": skipped_rows,
+            "duplicate_rows": report_count("duplicate_rows", max(0, accepted_rows - unique_tracks)),
+            "unique_tracks": unique_tracks,
+            "liked_count": len({
+                (value.artist_norm, value.title_norm)
+                for value in snapshot_tracks
+                if value.liked
+            }),
+        })
+        import_status = "partial" if (
+            bool((snapshot.metadata or {}).get("partial"))
+            or report_count("error_count", 0) > 0
+            or report_count("inaccessible_count", 0) > 0
+        ) else "complete"
+
+        playlist_rows: dict[str, dict[str, Any]] = {}
+        for value in snapshot_playlists:
+            data = _as_mapping(value)
+            name = str(_first_value(data, "name", "title", default="") or "").strip()
+            provider_id = playlist_identity(
+                _first_value(data, "provider_id", "playlist_id", "id", default=""),
+                name,
+            )
+            if not provider_id:
+                continue
+            metadata = data.get("metadata")
+            metadata = dict(metadata) if isinstance(metadata, Mapping) else {}
+            current = playlist_rows.get(provider_id)
+            if current is None:
+                playlist_rows[provider_id] = {
+                    "provider_id": provider_id,
+                    "name": name,
+                    "liked": bool(data.get("liked")),
+                    "metadata": metadata,
+                }
+            else:
+                if not current["name"] and name:
+                    current["name"] = name
+                current["liked"] = current["liked"] or bool(data.get("liked"))
+                current["metadata"].update(metadata)
+
+        ids_by_name: dict[str, set[str]] = {}
+        for playlist in playlist_rows.values():
+            if playlist["name"]:
+                ids_by_name.setdefault(playlist["name"].casefold(), set()).add(playlist["provider_id"])
+        track_playlist_ids: list[list[str]] = []
+        for value in snapshot_tracks:
+            memberships: list[str] = []
+            for raw_id, raw_name in provider_track_playlist_memberships(value):
+                provider_id = str(raw_id or "").strip()
+                name = str(raw_name or "").strip()
+                if not provider_id and name and len(ids_by_name.get(name.casefold(), ())) == 1:
+                    provider_id = next(iter(ids_by_name[name.casefold()]))
+                provider_id = playlist_identity(provider_id, name)
+                if not provider_id:
+                    continue
+                current = playlist_rows.get(provider_id)
+                if current is None:
+                    playlist_rows[provider_id] = {
+                        "provider_id": provider_id,
+                        "name": name,
+                        "liked": name.casefold() == "liked songs",
+                        "metadata": {"inferred_from_membership": True},
+                    }
+                    if name:
+                        ids_by_name.setdefault(name.casefold(), set()).add(provider_id)
+                elif not current["name"] and name:
+                    current["name"] = name
+                if provider_id not in memberships:
+                    memberships.append(provider_id)
+            track_playlist_ids.append(memberships)
+        report["playlists"] = [row["name"] for row in playlist_rows.values() if row["name"]]
         with self._conn:
             source = self._conn.execute(
                 "SELECT id FROM library_sources WHERE workspace_id=? AND provider=? AND source_key=?",
@@ -1384,21 +1652,76 @@ class Database:
                     (db_id, provider, source_key, "active", _json_text(scope or {}, {}), _json_text(snapshot.metadata or {}, {}), now, now),
                 )
                 source_id = int(cur.lastrowid)
+            previous_import = self._conn.execute(
+                "SELECT MAX(id) AS id FROM source_imports WHERE source_id=?",
+                (source_id,),
+            ).fetchone()
+            previous_import_id = int(previous_import["id"] or 0) if previous_import else 0
             cur = self._conn.execute(
                 "INSERT INTO source_imports(workspace_id,source_id,status,started_at,completed_at,total_rows,accepted_rows,skipped_rows,duplicate_rows,report_json) VALUES(?,?,?,?,?,?,?,?,?,?)",
-                (db_id, source_id, "complete", now, now, report.get("total_rows", len(snapshot.tracks)), report.get("accepted_rows", len(snapshot.tracks)), report.get("skipped_rows", 0), report.get("duplicate_rows", 0), _json_text(report, {})),
+                (db_id, source_id, import_status, now, now, report["total_rows"], report["accepted_rows"], report["skipped_rows"], report["duplicate_rows"], _json_text(report, {})),
             )
             import_id = int(cur.lastrowid)
+            protected_playlist_ids = {
+                provider_id
+                for provider_id, value in playlist_rows.items()
+                if str(value["metadata"].get("access_status") or "").casefold()
+                in {"error", "inaccessible"}
+            }
+            protected_memberships: list[tuple[int, str, int | None, int, str]] = []
+            if protected_playlist_ids and previous_import_id:
+                placeholders = ",".join("?" for _ in protected_playlist_ids)
+                protected_memberships = [
+                    (
+                        int(row["library_track_id"]),
+                        str(row["provider_id"]),
+                        int(row["position"]) if row["position"] is not None else None,
+                        int(row["provenance_id"]),
+                        str(row["provenance_provider_id"]),
+                    )
+                    for row in self._conn.execute(
+                        f"""SELECT ltp.library_track_id,lp.provider_id,ltp.position,
+                                   p.id AS provenance_id,
+                                   p.provider_id AS provenance_provider_id
+                              FROM library_track_playlists ltp
+                              JOIN library_playlists lp ON lp.id=ltp.playlist_id
+                              JOIN library_track_provenance p
+                                ON p.library_track_id=ltp.library_track_id
+                               AND p.source_id=lp.source_id
+                               AND p.source_import_id=?
+                             WHERE lp.source_id=? AND lp.provider_id IN ({placeholders})""",
+                        (previous_import_id, source_id, *sorted(protected_playlist_ids)),
+                    )
+                ]
+            # A successful import is the complete current playlist view for
+            # this source. Cascades remove only this source's stale edges.
+            self._conn.execute("DELETE FROM library_playlists WHERE source_id=?", (source_id,))
+            playlist_db_ids: dict[str, int] = {}
+            for playlist in playlist_rows.values():
+                cur = self._conn.execute(
+                    """INSERT INTO library_playlists(source_id,provider_id,name,liked,metadata_json,updated_at)
+                       VALUES(?,?,?,?,?,?)""",
+                    (
+                        source_id,
+                        playlist["provider_id"],
+                        playlist["name"],
+                        int(playlist["liked"]),
+                        _json_text(playlist["metadata"], {}),
+                        now,
+                    ),
+                )
+                playlist_db_ids[playlist["provider_id"]] = int(cur.lastrowid)
             legacy_tracks = []
-            total_tracks = len(snapshot.tracks)
+            total_tracks = len(snapshot_tracks)
             if on_progress:
                 on_progress({
                     "phase": "persist",
-                    "message": f"Saving SoundCloud tracks (0 / {total_tracks})...",
+                    "message": f"Saving {provider.title()} tracks (0 / {total_tracks})...",
                     "total_tracks": total_tracks,
                     "persisted_tracks": 0,
                 })
-            for position, value in enumerate(snapshot.tracks, start=1):
+            playlist_positions: dict[str, int] = {}
+            for position, value in enumerate(snapshot_tracks, start=1):
                 track = provider_track_to_track(value)
                 legacy_tracks.append(track)
                 self._conn.execute(
@@ -1422,15 +1745,83 @@ class Database:
                            VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(source_id,provider_id) DO UPDATE SET
                            library_track_id=excluded.library_track_id, source_import_id=excluded.source_import_id, title=excluded.title, artist=excluded.artist,
                            album=excluded.album, isrc=excluded.isrc, url=excluded.url, liked=excluded.liked, metadata_json=excluded.metadata_json, imported_at=excluded.imported_at""",
-                         (int(row["id"]), source_id, import_id, provider_id, value.title, value.artist, value.album, value.isrc, value.url, int(value.liked), _json_text(value.metadata, {}), now),
+                          (int(row["id"]), source_id, import_id, provider_id, value.title, value.artist, value.album, value.isrc, value.url, int(value.liked), _json_text(value.metadata, {}), now),
                     )
+                    for playlist_provider_id in track_playlist_ids[position - 1]:
+                        playlist_positions[playlist_provider_id] = playlist_positions.get(playlist_provider_id, 0) + 1
+                        self._conn.execute(
+                            """INSERT INTO library_track_playlists(library_track_id,playlist_id,position)
+                               VALUES(?,?,?) ON CONFLICT(library_track_id,playlist_id) DO NOTHING""",
+                            (
+                                int(row["id"]),
+                                playlist_db_ids[playlist_provider_id],
+                                playlist_positions[playlist_provider_id],
+                            ),
+                        )
                 if on_progress and (position == total_tracks or position % 25 == 0):
                     on_progress({
                         "phase": "persist",
-                        "message": f"Saving SoundCloud tracks ({position} / {total_tracks})...",
+                        "message": f"Saving {provider.title()} tracks ({position} / {total_tracks})...",
                         "total_tracks": total_tracks,
                         "persisted_tracks": position,
                     })
+            protected_provenance_ids: set[int] = set()
+            stale_liked_provenance_ids: set[int] = set()
+            for library_track_id, playlist_provider_id, position, provenance_id, provenance_provider_id in protected_memberships:
+                playlist_id = playlist_db_ids.get(playlist_provider_id)
+                if playlist_id is None:
+                    continue
+                current_provenance = self._conn.execute(
+                    "SELECT library_track_id FROM library_track_provenance WHERE id=?",
+                    (provenance_id,),
+                ).fetchone()
+                if current_provenance is not None:
+                    library_track_id = int(current_provenance["library_track_id"])
+                protected_provenance_ids.add(provenance_id)
+                if provenance_provider_id not in current_provider_ids:
+                    stale_liked_provenance_ids.add(provenance_id)
+                self._conn.execute(
+                    """INSERT INTO library_track_playlists(library_track_id,playlist_id,position)
+                       VALUES(?,?,?) ON CONFLICT(library_track_id,playlist_id) DO NOTHING""",
+                    (library_track_id, playlist_id, position),
+                )
+            if protected_provenance_ids:
+                placeholders = ",".join("?" for _ in protected_provenance_ids)
+                self._conn.execute(
+                    f"""UPDATE library_track_provenance
+                           SET source_import_id=?, imported_at=?
+                         WHERE source_id=? AND id IN ({placeholders})""",
+                    (import_id, now, source_id, *sorted(protected_provenance_ids)),
+                )
+            if stale_liked_provenance_ids:
+                placeholders = ",".join("?" for _ in stale_liked_provenance_ids)
+                self._conn.execute(
+                    f"""UPDATE library_track_provenance SET liked=0
+                         WHERE source_id=? AND id IN ({placeholders})""",
+                    (source_id, *sorted(stale_liked_provenance_ids)),
+                )
+            if import_status == "partial":
+                membership_count = self._conn.execute(
+                    """SELECT COUNT(*) FROM library_track_playlists ltp
+                         JOIN library_playlists lp ON lp.id=ltp.playlist_id
+                        WHERE lp.source_id=?""",
+                    (source_id,),
+                ).fetchone()[0]
+                liked_count = self._conn.execute(
+                    """SELECT COUNT(DISTINCT library_track_id)
+                         FROM library_track_provenance
+                        WHERE source_id=? AND source_import_id=? AND liked=1""",
+                    (source_id, import_id),
+                ).fetchone()[0]
+                report["source_item_count"] = max(
+                    int(report.get("total_rows") or 0),
+                    int(membership_count) + int(liked_count),
+                )
+                report["source_item_count_is_lower_bound"] = True
+                self._conn.execute(
+                    "UPDATE source_imports SET report_json=? WHERE id=?",
+                    (_json_text(report, {}), import_id),
+                )
             # Keep the existing chart engine projection usable for all callers.
             self.upsert_spotify_tracks(legacy_tracks)
         library_fingerprint = self.refresh_library_matching_fingerprint(db_id)
@@ -1456,7 +1847,7 @@ class Database:
                 if (str(row["normalized_artist"]), str(row["normalized_title"])) in by_identity
             ],
         )
-        return {"provider": provider, "source_id": source_id, "import_id": import_id, "tracks": len(snapshot.tracks), "report": report, "library_matching_fingerprint": library_fingerprint}
+        return {"provider": provider, "source_id": source_id, "import_id": import_id, "tracks": unique_tracks, "report": report, "library_matching_fingerprint": library_fingerprint}
 
     def get_neutral_library_tracks(self, workspace_id: int | str, *, provider: str | None = None) -> list[sqlite3.Row]:
         db_id = self._workspace_db_id(workspace_id)
@@ -1471,6 +1862,51 @@ class Database:
             clause = " AND EXISTS (SELECT 1 FROM library_track_provenance p JOIN library_sources s ON s.id=p.source_id WHERE p.library_track_id=t.id AND p.source_import_id=(SELECT MAX(i2.id) FROM source_imports i2 WHERE i2.source_id=s.id))"
         return list(self._conn.execute("SELECT t.* FROM library_tracks t WHERE t.workspace_id=?" + clause + " ORDER BY t.artist,t.title", params))
 
+    def get_library_playlists(self, workspace_id: int | str, provider: str | None = None) -> list[sqlite3.Row]:
+        """Return each source's current playlists, including empty ones."""
+        db_id = self._workspace_db_id(workspace_id)
+        params: list[Any] = [db_id]
+        clause = ""
+        if provider:
+            clause = " AND s.provider=?"
+            params.append(str(provider).casefold())
+        return list(self._conn.execute(
+            """SELECT lp.id,lp.source_id,s.provider,s.source_key,lp.provider_id,lp.name,
+                      lp.liked,lp.metadata_json,lp.updated_at,
+                      COUNT(ltp.library_track_id) AS track_count
+                 FROM library_playlists lp
+                 JOIN library_sources s ON s.id=lp.source_id
+                 LEFT JOIN library_track_playlists ltp ON ltp.playlist_id=lp.id
+                WHERE s.workspace_id=?""" + clause +
+            " GROUP BY lp.id ORDER BY s.provider,s.source_key,lp.name,lp.provider_id",
+            params,
+        ))
+
+    def get_library_track_playlists(self, workspace_id: int | str, provider: str | None = None) -> list[sqlite3.Row]:
+        """Return current canonical track-to-playlist membership edges."""
+        db_id = self._workspace_db_id(workspace_id)
+        params: list[Any] = [db_id]
+        clause = ""
+        if provider:
+            clause = " AND s.provider=?"
+            params.append(str(provider).casefold())
+        return list(self._conn.execute(
+            """SELECT ltp.library_track_id,ltp.playlist_id,ltp.position,
+                      lp.source_id,s.provider,s.source_key,lp.provider_id,
+                      lp.provider_id AS playlist_provider_id,lp.name AS playlist_name,
+                      lp.liked AS playlist_liked,lp.metadata_json AS playlist_metadata_json,
+                      t.normalized_artist,t.normalized_title,t.title,t.artist
+                 FROM library_track_playlists ltp
+                 JOIN library_playlists lp ON lp.id=ltp.playlist_id
+                 JOIN library_sources s ON s.id=lp.source_id
+                 JOIN library_tracks t ON t.id=ltp.library_track_id
+                WHERE t.workspace_id=?""" + clause +
+            " ORDER BY s.provider,s.source_key,lp.name,ltp.position,t.artist,t.title",
+            params,
+        ))
+
+    get_library_playlist_memberships = get_library_track_playlists
+
     def get_source_summary(self, workspace_id: int | str, provider: str | None = None) -> list[sqlite3.Row]:
         db_id = self._workspace_db_id(workspace_id)
         if db_id is None:
@@ -1481,27 +1917,162 @@ class Database:
             clause = " AND s.provider=?"
             params.append(str(provider).casefold())
         return list(self._conn.execute(
-            """SELECT s.provider,s.source_key,s.status,s.updated_at,
-                       COUNT(DISTINCT p.library_track_id) AS tracks,
-                       COUNT(DISTINCT p.provider_id) AS provenance, i.skipped_rows AS skipped_rows,
-                       i.duplicate_rows AS duplicate_rows, i.report_json AS report_json,
+            """SELECT s.id AS source_id,s.provider,s.source_key,s.status,s.scope_json,s.updated_at,
+                       (SELECT COUNT(DISTINCT p.library_track_id)
+                          FROM library_track_provenance p
+                         WHERE p.source_id=s.id AND p.source_import_id=i.id) AS tracks,
+                       (SELECT COUNT(DISTINCT p.library_track_id)
+                          FROM library_track_provenance p
+                         WHERE p.source_id=s.id AND p.source_import_id=i.id) AS unique_tracks,
+                       (SELECT COUNT(DISTINCT p.provider_id)
+                          FROM library_track_provenance p
+                         WHERE p.source_id=s.id AND p.source_import_id=i.id) AS provenance,
+                       (SELECT COUNT(*) FROM library_playlists lp
+                         WHERE lp.source_id=s.id) AS playlist_count,
+                       (SELECT COUNT(*) FROM library_track_playlists ltp
+                          JOIN library_playlists lp ON lp.id=ltp.playlist_id
+                         WHERE lp.source_id=s.id) AS membership_count,
+                       (SELECT COUNT(DISTINCT ltp.library_track_id)
+                          FROM library_track_playlists ltp
+                          JOIN library_playlists lp ON lp.id=ltp.playlist_id
+                         WHERE lp.source_id=s.id) AS playlist_unique_tracks,
+                       (SELECT COUNT(DISTINCT p.library_track_id)
+                          FROM library_track_provenance p
+                         WHERE p.source_id=s.id AND p.source_import_id=i.id AND p.liked=1) AS liked_count,
+                       (SELECT COUNT(DISTINCT p.library_track_id)
+                          FROM library_track_provenance p
+                         WHERE p.source_id=s.id AND p.source_import_id=i.id AND p.liked=1
+                           AND EXISTS (
+                               SELECT 1 FROM library_track_playlists ltp
+                               JOIN library_playlists lp ON lp.id=ltp.playlist_id
+                               WHERE lp.source_id=s.id AND ltp.library_track_id=p.library_track_id
+                           )) AS liked_in_playlists,
+                       (SELECT COUNT(DISTINCT p.library_track_id)
+                          FROM library_track_provenance p
+                         WHERE p.source_id=s.id AND p.source_import_id=i.id AND p.liked=0
+                           AND EXISTS (
+                               SELECT 1 FROM library_track_playlists ltp
+                               JOIN library_playlists lp ON lp.id=ltp.playlist_id
+                               WHERE lp.source_id=s.id AND ltp.library_track_id=p.library_track_id
+                           )) AS playlist_only_tracks,
+                       (SELECT COUNT(DISTINCT p.library_track_id)
+                          FROM library_track_provenance p
+                         WHERE p.source_id=s.id AND p.source_import_id=i.id AND p.liked=1
+                           AND NOT EXISTS (
+                               SELECT 1 FROM library_track_playlists ltp
+                               JOIN library_playlists lp ON lp.id=ltp.playlist_id
+                               WHERE lp.source_id=s.id AND ltp.library_track_id=p.library_track_id
+                           )) AS liked_only_tracks,
+                       COALESCE(i.skipped_rows,0) AS skipped_rows,
+                       COALESCE(i.duplicate_rows,0) AS duplicate_rows,
+                       i.report_json AS report_json,
                        i.id AS import_id, i.status AS import_status, i.error AS import_error,
-                       i.completed_at AS completed_at, i.total_rows AS total_rows, i.accepted_rows AS accepted_rows
+                       i.completed_at AS completed_at, COALESCE(i.total_rows,0) AS total_rows,
+                       COALESCE(json_extract(i.report_json,'$.source_item_count'),i.total_rows,0) AS source_item_count,
+                       COALESCE(json_extract(i.report_json,'$.source_item_count_is_lower_bound'),0) AS source_item_count_is_lower_bound,
+                       COALESCE(i.accepted_rows,0) AS accepted_rows
                  FROM library_sources s
                  LEFT JOIN source_imports i ON i.id=(SELECT MAX(i2.id) FROM source_imports i2 WHERE i2.source_id=s.id)
-                 LEFT JOIN library_track_provenance p ON p.source_id=s.id AND p.source_import_id=i.id
-                 WHERE s.workspace_id=?""" + clause + " GROUP BY s.id ORDER BY s.provider,s.source_key", params))
+                 WHERE s.workspace_id=?""" + clause + " ORDER BY s.provider,s.source_key", params))
+
+    def get_provider_summaries(self, workspace_id: int | str) -> list[dict[str, Any]]:
+        """Aggregate current provider sources without duplicating canonical songs."""
+        def includes_liked(row: Mapping[str, Any]) -> bool:
+            try:
+                value = json.loads(str(row.get("scope_json") or "{}"))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                return False
+            return bool(value.get("include_liked")) if isinstance(value, Mapping) else False
+
+        source_rows = [dict(row) for row in self.get_source_summary(workspace_id)]
+        provenance = self.get_track_provenance(workspace_id)
+        memberships = self.get_library_playlist_memberships(workspace_id)
+        playlists = self.get_library_playlists(workspace_id)
+        providers = {str(row["provider"]) for row in source_rows}
+        results: list[dict[str, Any]] = []
+        for provider in sorted(providers):
+            rows = [row for row in source_rows if str(row["provider"]) == provider]
+            track_ids = {
+                int(row["library_track_id"])
+                for row in provenance
+                if str(row["provider"]) == provider
+            }
+            liked_ids = {
+                int(row["library_track_id"])
+                for row in provenance
+                if str(row["provider"]) == provider and bool(row["liked"])
+            }
+            playlist_track_ids = {
+                int(row["library_track_id"])
+                for row in memberships
+                if str(row["provider"]) == provider
+            }
+            provider_playlist_ids = {
+                str(row["provider_id"])
+                for row in playlists
+                if str(row["provider"]) == provider
+            }
+            provider_memberships = {
+                (int(row["library_track_id"]), str(row["playlist_provider_id"]))
+                for row in memberships
+                if str(row["provider"]) == provider
+            }
+            results.append({
+                "provider": provider,
+                "status": "partial" if any(
+                    str(row.get("import_status") or "").casefold() == "partial"
+                    for row in rows
+                ) else "active",
+                "updated_at": max(
+                    (float(row["updated_at"] or 0) for row in rows), default=0.0
+                ),
+                "tracks": len(track_ids),
+                "unique_tracks": len(track_ids),
+                "provenance": sum(int(row["provenance"] or 0) for row in rows),
+                "playlist_count": len(provider_playlist_ids),
+                "membership_count": len(provider_memberships),
+                "playlist_unique_tracks": len(playlist_track_ids),
+                "liked_count": len(liked_ids),
+                "liked_in_playlists": len(liked_ids & playlist_track_ids),
+                "playlist_only_tracks": len(playlist_track_ids - liked_ids),
+                "liked_only_tracks": len(liked_ids - playlist_track_ids),
+                "source_item_count": sum(
+                    int(row["source_item_count"] or 0) for row in rows
+                ),
+                "source_item_count_is_lower_bound": int(any(
+                    bool(row["source_item_count_is_lower_bound"]) for row in rows
+                )),
+                "include_liked": int(any(
+                    includes_liked(row) for row in rows
+                )),
+                "total_rows": sum(int(row["total_rows"] or 0) for row in rows),
+                "accepted_rows": sum(int(row["accepted_rows"] or 0) for row in rows),
+                "skipped_rows": sum(int(row["skipped_rows"] or 0) for row in rows),
+                "duplicate_rows": sum(int(row["duplicate_rows"] or 0) for row in rows),
+            })
+        return results
 
     def get_combined_summary(self, workspace_id: int | str) -> dict[str, int]:
         rows = self.get_neutral_library_tracks(workspace_id)
-        return {"tracks": len(rows), "artists": len({row["normalized_artist"] for row in rows}), "sources": len(self.get_source_summary(workspace_id))}
+        sources = self.get_provider_summaries(workspace_id)
+        return {
+            "tracks": len(rows),
+            "artists": len({row["normalized_artist"] for row in rows}),
+            "sources": len(sources),
+            "source_items": sum(int(row["source_item_count"] or 0) for row in sources),
+            "playlists": sum(int(row["playlist_count"] or 0) for row in sources),
+            "playlist_memberships": sum(
+                int(row["membership_count"] or 0) for row in sources
+            ),
+        }
 
     def get_track_provenance(self, workspace_id: int | str) -> list[sqlite3.Row]:
         db_id = self._workspace_db_id(workspace_id)
         if db_id is None:
             return []
         return list(self._conn.execute(
-            """SELECT t.normalized_artist,t.normalized_title,p.provider_id,s.provider,p.title,p.artist,p.album,p.liked,
+            """SELECT t.id AS library_track_id,t.normalized_artist,t.normalized_title,t.duration_ms,
+                      p.source_id,s.source_key,p.provider_id,s.provider,p.title,p.artist,p.album,p.liked,
                       p.isrc,p.url,p.metadata_json
                FROM library_tracks t JOIN library_track_provenance p ON p.library_track_id=t.id
                JOIN library_sources s ON s.id=p.source_id
@@ -3717,22 +4288,36 @@ class Database:
                 explanation = check["breakdown_json"] or ""
         if score is None and candidate_row is not None:
             score = 0.0
+        if candidate_row is not None and str(candidate_row.md5 or ""):
+            duplicate = self._conn.execute(
+                """SELECT ws.id,ws.candidate_id FROM workspace_selections ws
+                     JOIN candidate_charts c ON c.id=ws.candidate_id
+                    WHERE ws.workspace_id=? AND ws.status='selected'
+                      AND c.source=? AND c.md5=? LIMIT 1""",
+                (db_id, str(candidate_row.source), str(candidate_row.md5)),
+            ).fetchone()
+            if duplicate is not None:
+                if int(duplicate["candidate_id"]) == candidate_id:
+                    with self._conn:
+                        self._conn.execute(
+                            """UPDATE workspace_selections SET score=?,explanation=?,
+                                      eligibility=?,metadata_json=?,updated_at=? WHERE id=?""",
+                            (
+                                score, explanation, eligibility,
+                                _json_text(metadata or {}, {}), time.time(),
+                                int(duplicate["id"]),
+                            ),
+                        )
+                return int(duplicate["id"])
         now = time.time()
         with self._conn:
-            if kind == "exact":
-                self._conn.execute(
-                    """DELETE FROM workspace_selections
-                       WHERE workspace_id = ? AND kind = 'exact' AND track_id = ?""",
-                    (db_id, resolved_track),
-                )
-            else:
-                self._conn.execute(
-                    """DELETE FROM workspace_selections
-                       WHERE workspace_id = ? AND kind = ? AND candidate_id = ?
-                         AND COALESCE(artist_norm, '') = COALESCE(?, '')
-                         AND COALESCE(track_id, 0) = COALESCE(?, 0)""",
-                    (db_id, kind, candidate_id, artist_norm, resolved_track),
-                )
+            self._conn.execute(
+                """DELETE FROM workspace_selections
+                   WHERE workspace_id = ? AND kind = ? AND candidate_id = ?
+                     AND COALESCE(artist_norm, '') = COALESCE(?, '')
+                     AND COALESCE(track_id, 0) = COALESCE(?, 0)""",
+                (db_id, kind, candidate_id, artist_norm, resolved_track),
+            )
             row_track = self._conn.execute(
                 "SELECT spotify_id FROM spotify_tracks WHERE id = ?", (resolved_track,)
             ).fetchone() if resolved_track is not None else None

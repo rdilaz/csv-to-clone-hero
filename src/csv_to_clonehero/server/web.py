@@ -30,6 +30,15 @@ from flask import Flask, abort, g, jsonify, redirect, render_template, request, 
 
 from csv_to_clonehero.config import AppConfig
 from csv_to_clonehero.database import Database
+from csv_to_clonehero.matching import (
+    ALTERNATE_RECORDING,
+    BLOCKED,
+    POSSIBLE_MATCH,
+    RECOMMENDED_EXACT,
+    SAME_RECORDING_CHART_VARIANT,
+    SELECTABLE_RESULT_TIERS,
+    classify_result_tier,
+)
 from csv_to_clonehero.normalization import normalize_artist, normalize_title
 from csv_to_clonehero.server.auth import build_oauth, build_soundcloud_oauth, user_workspace_key
 from csv_to_clonehero.server.downloads import BrowserDownloads, DownloadError, build_archive
@@ -742,19 +751,15 @@ def create_app(
         try:
             workspace = _ensure_workspace(db, user)
             cards = _expansion_review_cards(config, db, workspace)
-            result_cap = max(1, min(1250, 25 * max(
-                int(config.expansion.cap_many_songs),
-                int(config.expansion.cap_some_songs),
-                int(config.expansion.cap_one_song),
-            )))
-            limit = min(result_cap, max(1, int(request.args.get("limit", result_cap))))
+            limit = min(100, max(1, int(request.args.get("limit", 25))))
             offset = max(0, int(request.args.get("offset", 0)))
-            selected = sum(bool(card["selected"]) for card in cards)
+            selected = sum(int(card.get("selected_count") or 0) for card in cards)
             return jsonify({
                 "songs": cards[offset:offset + limit],
                 "total": len(cards),
                 "offset": offset,
                 "limit": limit,
+                "has_more": offset + limit < len(cards),
                 "summary": {"total": len(cards), "selected": selected},
             })
         except (TypeError, ValueError):
@@ -823,10 +828,23 @@ def create_app(
                     "provider": source["provider"],
                     "status": source["status"],
                     "tracks": int(source["tracks"] or 0),
+                    "unique_tracks": int(source["unique_tracks"] or 0),
                     "provenance": int(source["provenance"] or 0),
+                    "playlists": int(source["playlist_count"] or 0),
+                    "playlist_memberships": int(source["membership_count"] or 0),
+                    "playlist_unique_tracks": int(source["playlist_unique_tracks"] or 0),
+                    "liked": int(source["liked_count"] or 0),
+                    "liked_in_playlists": int(source["liked_in_playlists"] or 0),
+                    "playlist_only": int(source["playlist_only_tracks"] or 0),
+                    "liked_only": int(source["liked_only_tracks"] or 0),
+                    "raw_items": int(source["source_item_count"] or 0),
+                    "raw_items_lower_bound": bool(source["source_item_count_is_lower_bound"]),
+                    "accepted_items": int(source["accepted_rows"] or 0),
+                    "skipped_items": int(source["skipped_rows"] or 0),
+                    "duplicate_items": int(source["duplicate_rows"] or 0),
                     "updated_at": source["updated_at"],
                 }
-                for source in db.get_source_summary(workspace_id)
+                for source in db.get_provider_summaries(workspace_id)
             ]
             newest_jobs = jobs.list_for_user(int(user["id"]), limit=1)
             download = downloads.latest_for_user_workspace(int(user["id"]), workspace_id)
@@ -860,10 +878,16 @@ def create_app(
             minimum_score = db.get_workspace_minimum_score(workspace) if workspace else 50.0
             cards = _review_cards(config, db, workspace, minimum_score)
             summary = _review_summary(cards)
-            summary["selection_count"] = summary["selected"]
+            summary["selection_count"] = summary["selected_charts"]
             states = {
                 value.strip().casefold()
                 for raw in [*request.args.getlist("state"), *request.args.getlist("review_state")]
+                for value in raw.split(",")
+                if value.strip()
+            }
+            tiers = {
+                value.strip().upper()
+                for raw in request.args.getlist("tier")
                 for value in raw.split(",")
                 if value.strip()
             }
@@ -886,6 +910,13 @@ def create_app(
                     or _card_review_bucket(card) in states
                 )
                 and (selected is None or bool(card.get("selected")) is selected)
+                and (
+                    not tiers
+                    or any(
+                        str(candidate.get("result_tier") or "").upper() in tiers
+                        for candidate in card.get("candidates") or ()
+                    )
+                )
                 and (not search or _card_matches_search(card, search))
             ]
             limit = min(100, max(1, int(request.args.get("limit", 50))))
@@ -960,9 +991,18 @@ def create_app(
                     if identity in _workspace_imported_identities(db, workspace):
                         raise ValueError("song is already represented by the imported library")
                     current = _current_expansion_match(config, artist_norm, candidate)
-                current_eligibility, current_hard_gate, current_score, _current_quality, _current_breakdown = current
+                current_eligibility, current_hard_gate, current_score, _current_quality, current_breakdown = current
                 if current_hard_gate or current_eligibility == "INCOMPATIBLE":
                     raise ValueError("candidate is blocked by a hard compatibility gate")
+                result_tier, tier_reasons = classify_result_tier(
+                    current_breakdown, kind=candidate_kind
+                )
+                if result_tier == BLOCKED:
+                    raise ValueError("candidate is blocked by a hard compatibility gate")
+                if result_tier == POSSIBLE_MATCH and not bool(
+                    payload.get("confirm_possible")
+                ):
+                    raise ValueError("possible matches require explicit confirmation")
                 if candidate_kind == "exact":
                     catalog_sources = list(jobs.source_factory(config))
                     try:
@@ -990,24 +1030,8 @@ def create_app(
                                 source.close()
                             except Exception:
                                 pass
-                if current_score < threshold:
+                if current_score < threshold and result_tier not in SELECTABLE_RESULT_TIERS:
                     raise ValueError(f"candidate score is below the workspace threshold ({threshold:g})")
-                if candidate_kind == "expansion":
-                    for other_row in matching_rows:
-                        other = db.get_candidate(int(other_row["candidate_id"] or 0))
-                        if other is None:
-                            continue
-                        other_identity = (
-                            normalize_artist(str(other.artist or "")),
-                            normalize_title(str(other.name or "")),
-                        )
-                        if other_identity == identity:
-                            db.clear_workspace_selection(
-                                workspace,
-                                candidate_id=int(other_row["candidate_id"]),
-                                kind="expansion",
-                                artist_norm=str(other_row["artist_norm"] or ""),
-                            )
                 db.select_workspace_candidate(
                     workspace,
                     track_value,
@@ -1016,6 +1040,12 @@ def create_app(
                     artist_norm=artist_norm,
                     force=True,
                     require_workspace_candidate=True,
+                    metadata={
+                        "result_tier": result_tier,
+                        "result_tier_reasons": tier_reasons,
+                        "possible_confirmed": bool(payload.get("confirm_possible")),
+                        "selection_origin": "explicit",
+                    },
                 )
             return jsonify({"ok": True})
         except (TypeError, ValueError) as exc:
@@ -1095,27 +1125,34 @@ def create_app(
             changed = 0
             if action == "select":
                 scope = str(
-                    payload.get("scope")
+                    payload.get("preset")
+                    or payload.get("scope")
                     or payload.get("selection_scope")
                     or payload.get("filter")
                     or "strong"
                 ).casefold()
-                if scope in {"recommended", "auto", "auto_accept", "strong"}:
-                    allowed = {"RECOMMENDED"}
-                    scope = "strong"
-                elif scope in {"eligible", "current", "filter", "all_eligible"}:
-                    allowed = {"RECOMMENDED", "ELIGIBLE_REVIEW"}
-                    scope = "eligible"
+                if scope in {"recommended", "auto", "auto_accept", "strong", "best_matches"}:
+                    allowed_tiers = {RECOMMENDED_EXACT}
+                    scope = "best_matches"
+                elif scope in {"all_safe_charts", "safe", "eligible"}:
+                    allowed_tiers = {RECOMMENDED_EXACT, SAME_RECORDING_CHART_VARIANT}
+                    scope = "all_safe_charts"
+                elif scope in {"maximum_playable", "maximum", "max"}:
+                    allowed_tiers = {
+                        RECOMMENDED_EXACT,
+                        SAME_RECORDING_CHART_VARIANT,
+                        ALTERNATE_RECORDING,
+                    }
+                    scope = "maximum_playable"
                 else:
-                    return jsonify({"error": "bulk selection scope must be strong or eligible"}), 400
+                    return jsonify({"error": "unknown selection preset"}), 400
                 db.clear_workspace_selection(workspace, kind="exact")
                 requested = payload.get("track_ids")
                 if isinstance(requested, (str, bytes)):
                     requested = [requested]
                 requested_ids = {str(value) for value in requested} if requested is not None else None
                 needle = str(payload.get("search") or payload.get("query") or "").strip().casefold()
-                grouped: dict[Any, Any] = {}
-                current_values: dict[tuple[int, int], tuple[str, float, float]] = {}
+                selected_rows: list[tuple[dict[str, Any], str]] = []
                 generation_id = _public_generation_id(db, workspace)
                 rows = db.get_workspace_candidates(
                     workspace,
@@ -1133,21 +1170,13 @@ def create_app(
                         continue
                     candidate = db.get_candidate(int(data.get("candidate_id") or 0))
                     track = _track_by_id(db, data.get("track_id"))
-                    eligibility, hard_gate, score, quality, _breakdown = _current_match(
+                    eligibility, hard_gate, score, quality, current_breakdown = _current_match(
                         config, track, candidate
                     )
                     if hard_gate:
                         continue
-                    if eligibility not in allowed:
-                        continue
-                    current_key = (
-                        int(data.get("track_id") or 0),
-                        int(data.get("candidate_id") or 0),
-                    )
-                    current_values[current_key] = (
-                        eligibility, score, quality
-                    )
-                    if score < threshold:
+                    tier = classify_result_tier(current_breakdown)[0]
+                    if tier not in allowed_tiers:
                         continue
                     if needle and needle not in " ".join(
                         str(data.get(key) or "")
@@ -1159,27 +1188,25 @@ def create_app(
                             for key in ("artist", "name", "charter", "url")
                         ).casefold():
                             continue
-                    key = data.get("track_id")
-                    prior = grouped.get(key)
-                    if prior is None or (
-                        score,
-                        quality,
-                        -int(data.get("candidate_id") or 0),
-                    ) > (
-                        current_values[(int(prior["track_id"]), int(prior["candidate_id"]))][1],
-                        current_values[(int(prior["track_id"]), int(prior["candidate_id"]))][2],
-                        -int(prior["candidate_id"] or 0),
-                    ):
-                        grouped[key] = data
-                for row in grouped.values():
+                    data["_rank"] = (score, quality, -int(data.get("candidate_id") or 0))
+                    selected_rows.append((data, tier))
+                if scope == "best_matches":
+                    best_by_track: dict[int, tuple[dict[str, Any], str]] = {}
+                    for data, tier in selected_rows:
+                        track_id = int(data.get("track_id") or 0)
+                        if track_id not in best_by_track or data["_rank"] > best_by_track[track_id][0]["_rank"]:
+                            best_by_track[track_id] = (data, tier)
+                    selected_rows = list(best_by_track.values())
+                for row, tier in selected_rows:
                     try:
                         db.select_workspace_candidate(
                             workspace,
                             row["track_id"],
                             int(row["candidate_id"]),
                             kind="exact",
-                            force=False,
+                            force=True,
                             require_workspace_candidate=True,
+                            metadata={"selection_origin": "preset", "preset": scope, "result_tier": tier},
                         )
                         changed += 1
                     except ValueError:
@@ -1563,11 +1590,44 @@ def _review_summary(cards: list[dict[str, Any]]) -> dict[str, int]:
         bool(card.get("selected")) and card.get("review_state") == "needs_review"
         for card in cards
     )
+    selected_charts = sum(int(card.get("selected_count") or 0) for card in cards)
+    recommended_songs = sum(
+        any(candidate.get("result_tier") == RECOMMENDED_EXACT for candidate in card.get("candidates") or ())
+        for card in cards
+    )
+    selectable_charts = sum(
+        candidate.get("result_tier") in SELECTABLE_RESULT_TIERS
+        for card in cards
+        for candidate in card.get("candidates") or ()
+    )
+    tier_counts = {
+        tier: sum(
+            candidate.get("result_tier") == tier
+            for card in cards
+            for candidate in card.get("candidates") or ()
+        )
+        for tier in (
+            RECOMMENDED_EXACT,
+            SAME_RECORDING_CHART_VARIANT,
+            ALTERNATE_RECORDING,
+            POSSIBLE_MATCH,
+            BLOCKED,
+        )
+    }
     return {
         "strong": strong,
         "review": review,
         "unavailable": len(cards) - strong - review,
         "selected": selected_strong + selected_review,
+        "selected_tracks": sum(bool(card.get("selected")) for card in cards),
+        "selected_charts": selected_charts,
+        "recommended_songs": recommended_songs,
+        "additional_playable_charts": max(0, selectable_charts - recommended_songs),
+        "selectable_charts": selectable_charts,
+        "all_safe_charts": tier_counts[RECOMMENDED_EXACT] + tier_counts[SAME_RECORDING_CHART_VARIANT],
+        "maximum_playable_charts": tier_counts[RECOMMENDED_EXACT] + tier_counts[SAME_RECORDING_CHART_VARIANT] + tier_counts[ALTERNATE_RECORDING],
+        "possible_match_charts": tier_counts[POSSIBLE_MATCH],
+        "tier_histogram": tier_counts,
         "selected_strong": selected_strong,
         "selected_review": selected_review,
         "total": len(cards),
@@ -1624,6 +1684,11 @@ def _review_cards(
         for track in db.get_spotify_tracks(True)
         if track.db_id is not None
     }
+    selection_metadata = {
+        (int(row["track_id"] or 0), int(row["candidate_id"] or 0)):
+            _json_object(row["metadata_json"])
+        for row in db.list_workspace_selections(workspace, kind="exact")
+    }
     by_track: dict[int, list[dict[str, Any]]] = {}
     for row in rows:
         data = dict(row) if hasattr(row, "keys") else {}
@@ -1640,6 +1705,17 @@ def _review_cards(
             tracks_by_id.get(int(tid)),
             candidate,
         )
+        result_tier, tier_reasons = classify_result_tier(breakdown)
+        selected = bool(data.get("selected"))
+        selected_metadata = selection_metadata.get(
+            (int(tid), int(data.get("candidate_id") or 0)), {}
+        )
+        if (
+            result_tier == POSSIBLE_MATCH
+            and selected_metadata.get("selection_origin")
+            and not selected_metadata.get("possible_confirmed")
+        ):
+            selected = False
         item = {
             "candidate_id": data.get("candidate_id"),
             "source": candidate.source,
@@ -1660,7 +1736,9 @@ def _review_cards(
             # ``review`` object is the only shape the human-facing UI needs.
             "eligibility": current_eligibility,
             "explanation": breakdown.get("explanation") or "",
-            "selected": bool(data.get("selected")),
+            "selected": selected,
+            "result_tier": result_tier,
+            "result_tier_reasons": tier_reasons,
         }
         item["review"] = build_review_presentation(
             {**item, "breakdown": breakdown},
@@ -1669,7 +1747,7 @@ def _review_cards(
         item["review_state"] = item["review"]["state"]
         item["review_label"] = item["review"]["label"]
         item["review_summary"] = item["review"]["summary"]
-        item["selectable"] = item["review"]["selectable"]
+        item["selectable"] = item["result_tier"] in SELECTABLE_RESULT_TIERS
         item["selected"] = bool(item["selected"] and item["selectable"])
         item["selection_action"] = item["review"]["action"]
         by_track.setdefault(int(tid), []).append(item)
@@ -1774,7 +1852,17 @@ def _review_cards(
     for track in tracks:
         candidates = by_track.get(int(track.db_id or 0))
         candidates = candidates or []
-        candidates.sort(key=lambda item: (-item["score"], item["source"], str(item["chart_id"])))
+        tier_order = {
+            RECOMMENDED_EXACT: 0,
+            SAME_RECORDING_CHART_VARIANT: 1,
+            ALTERNATE_RECORDING: 2,
+            POSSIBLE_MATCH: 3,
+            BLOCKED: 4,
+        }
+        candidates.sort(key=lambda item: (
+            tier_order.get(item["result_tier"], 5),
+            -item["score"], item["source"], str(item["chart_id"]),
+        ))
         if candidates:
             # A hard-gated high score is never presented as the best safe
             # recommendation when another usable version exists.
@@ -1788,6 +1876,14 @@ def _review_cards(
             )
             for item in candidates:
                 item["best"] = item is best
+                if (
+                    item is not best
+                    and item["result_tier"] == RECOMMENDED_EXACT
+                ):
+                    item["result_tier"] = SAME_RECORDING_CHART_VARIANT
+                    item["result_tier_reasons"] = [
+                        "additional chart artifact for this recording"
+                    ]
             selected = next((item for item in candidates if item["selected"]), None)
             review = best["review"]
             review_notice = (
@@ -1810,6 +1906,10 @@ def _review_cards(
                 "candidates": candidates,
                 "best_candidate_id": best["candidate_id"] if best else None,
                 "selected_candidate_id": selected["candidate_id"] if selected else None,
+                "selected_candidate_ids": [
+                    item["candidate_id"] for item in candidates if item["selected"]
+                ],
+                "selected_count": sum(item["selected"] for item in candidates),
                 "selected": bool(selected),
                 "review": review,
                 "review_state": review["state"],
@@ -1850,11 +1950,10 @@ def _expansion_review_cards(
         eligibility, hard_gate, score, quality, breakdown = _current_expansion_match(
             config, artist_norm, candidate
         )
-        selectable = (
-            not hard_gate
-            and eligibility in {"RECOMMENDED", "ELIGIBLE_REVIEW"}
-            and score >= minimum_score
+        result_tier, tier_reasons = classify_result_tier(
+            breakdown, kind="expansion"
         )
+        selectable = not hard_gate and result_tier in SELECTABLE_RESULT_TIERS
         identity = (
             normalize_artist(str(candidate.artist or "")),
             normalize_title(str(candidate.name or "")),
@@ -1877,11 +1976,14 @@ def _expansion_review_cards(
             "album": candidate.album,
             "pack_name": candidate.pack_name,
             "instruments": list(candidate.instruments or ()),
+            "diff_guitar": candidate.diff_guitar,
             "score": round(score, 1),
             "quality": round(quality, 1),
             "eligibility": eligibility,
             "selected": selected,
             "selectable": selectable,
+            "result_tier": result_tier,
+            "result_tier_reasons": tier_reasons,
             "review": {
                 "state": "strong" if eligibility == "RECOMMENDED" else "needs_review" if selectable else "unavailable",
                 "label": "Recommended expansion" if eligibility == "RECOMMENDED" else "Playable expansion" if selectable else "Unavailable",
@@ -1901,8 +2003,12 @@ def _expansion_review_cards(
             )
         )
         selected = next((item for item in candidates if item["selected"]), None)
-        primary = selected or candidates[0]
+        primary = candidates[0]
         primary["best"] = True
+        for item in candidates[1:]:
+            if item["result_tier"] == RECOMMENDED_EXACT:
+                item["result_tier"] = SAME_RECORDING_CHART_VARIANT
+                item["result_tier_reasons"] = ["additional expansion chart artifact"]
         cards.append({
             "song_key": "|".join(identity),
             "artist": primary["artist"],
@@ -1910,6 +2016,8 @@ def _expansion_review_cards(
             "artist_norm": primary["artist_norm"],
             "selected": selected is not None,
             "selected_candidate_id": selected["candidate_id"] if selected else None,
+            "selected_candidate_ids": [item["candidate_id"] for item in candidates if item["selected"]],
+            "selected_count": sum(item["selected"] for item in candidates),
             "candidates": candidates,
         })
     cards.sort(key=lambda item: (item["artist"].casefold(), item["title"].casefold()))

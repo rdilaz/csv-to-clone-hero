@@ -105,7 +105,8 @@ def test_authenticated_review_shell_prioritizes_human_decisions(client):
 
     assert "CONFIRM CHARTS" in html
     assert "Best Matches" in html
-    assert "All recommendations" in html
+    assert "All Safe Charts" in html
+    assert "Maximum Playable" in html
     assert "Quick confirmation" in html
     assert "Advanced review settings" not in html
     assert "Selection cutoff" not in html
@@ -543,8 +544,14 @@ def test_score_threshold_controls_selection_but_never_overrides_hard_gate(client
         db.close()
 
     assert client.post("/api/workspace/settings", json={"minimum_score": 50}).status_code == 200
+    unconfirmed = client.post("/api/selection", json={
+        "track_key": track.track_key, "candidate_id": chart_id, "action": "select",
+    })
+    assert unconfirmed.status_code == 400
+    assert "explicit confirmation" in unconfirmed.get_json()["error"]
     selected = client.post("/api/selection", json={
         "track_key": track.track_key, "candidate_id": chart_id, "action": "select",
+        "confirm_possible": True,
     })
     assert selected.status_code == 200
     assert client.post("/api/workspace/settings", json={"minimum_score": 100}).status_code == 200
@@ -587,7 +594,7 @@ def test_bulk_selection_defaults_to_strong_and_can_explicitly_include_review(cli
 
     default = client.post("/api/selection/bulk", json={})
     assert default.status_code == 200
-    assert default.get_json()["scope"] == "strong"
+    assert default.get_json()["scope"] == "best_matches"
     db = Database(config.database_path)
     try:
         selected = db.list_workspace_selections(workspace["id"])
@@ -598,16 +605,28 @@ def test_bulk_selection_defaults_to_strong_and_can_explicitly_include_review(cli
 
     explicit = client.post(
         "/api/selection/bulk",
-        json={"scope": "eligible", "track_ids": [track.track_key]},
+        json={"preset": "maximum_playable", "track_ids": [track.track_key]},
     )
     assert explicit.status_code == 200
-    assert explicit.get_json()["scope"] == "eligible"
+    assert explicit.get_json()["scope"] == "maximum_playable"
+    db = Database(config.database_path)
+    try:
+        selected = db.list_workspace_selections(workspace["id"])
+        assert len(selected) == 2
+        assert {row["candidate_id"] for row in selected} == {strong_id, review_id}
+    finally:
+        db.close()
+    cleared = client.post("/api/selection", json={
+        "track_key": track.track_key,
+        "candidate_id": review_id,
+        "action": "clear",
+    })
+    assert cleared.status_code == 200
     db = Database(config.database_path)
     try:
         selected = db.list_workspace_selections(workspace["id"])
         assert len(selected) == 1
         assert selected[0]["candidate_id"] == strong_id
-        assert selected[0]["candidate_id"] != review_id
     finally:
         db.close()
 
@@ -627,7 +646,7 @@ def test_bulk_cohorts_replace_instead_of_accumulate(client, config):
         ])
         db.replace_workspace_library_tracks(workspace["id"], tracks)
         strong = make_chart("Exact Song", "Exact Artist", chart_id=821)
-        review = make_chart("Ain't Nice", "Viagra Boys", chart_id=822)
+        review = make_chart("Ain't No Thief (Live)", "Viagra Boys", chart_id=822)
         db.upsert_workspace_candidate(
             workspace["id"], tracks[0].track_key, strong, score=95,
             eligibility="RECOMMENDED", decision="AUTO_ACCEPT", kind="exact",
@@ -639,7 +658,7 @@ def test_bulk_cohorts_replace_instead_of_accumulate(client, config):
     finally:
         db.close()
 
-    assert client.post("/api/selection/bulk", json={"scope": "eligible"}).get_json()["changed"] == 2
+    assert client.post("/api/selection/bulk", json={"preset": "maximum_playable"}).get_json()["changed"] == 2
     assert client.get("/api/workspace").get_json()["summary"]["selected"] == 2
     assert client.post("/api/selection/bulk", json={"scope": "strong"}).get_json()["changed"] == 1
     summary = client.get("/api/workspace").get_json()["summary"]
@@ -759,7 +778,7 @@ def test_fresh_authenticated_sources_creates_user_scoped_workspace(client, confi
 
 def test_public_journey_restores_owned_workspace_state(client, app, config):
     from csv_to_clonehero.database import Database
-    from csv_to_clonehero.providers.base import LibrarySnapshot, ProviderTrack
+    from csv_to_clonehero.providers.base import LibrarySnapshot, ProviderPlaylist, ProviderTrack, SourceImportReport
     from csv_to_clonehero.server.auth import user_workspace_key
     from tests.conftest import make_chart
 
@@ -770,8 +789,16 @@ def test_public_journey_restores_owned_workspace_state(client, app, config):
         workspace = db.get_workspace(user_workspace_key("user-1"))
         snapshot = LibrarySnapshot(
             "soundcloud",
-            [ProviderTrack("soundcloud", "sc-1", "Song", "Artist")],
+            [ProviderTrack(
+                "soundcloud", "sc-1", "Song", "Artist",
+                playlist_ids=["set-1"], playlist_names=["Set One"],
+            )],
+            [ProviderPlaylist("soundcloud", "set-1", "Set One")],
             metadata={"import": "upload"},
+            import_report=SourceImportReport(
+                total_rows=3, accepted_rows=2, skipped_rows=1,
+                duplicate_rows=1, unique_tracks=1,
+            ),
         )
         db.upsert_library_snapshot(workspace["id"], snapshot)
         track_id = next(iter(db.get_workspace_library_track_ids(workspace["id"])))
@@ -804,9 +831,24 @@ def test_public_journey_restores_owned_workspace_state(client, app, config):
     assert payload["spotify_scope"]["include_liked"] is True
     assert payload["combined"]["tracks"] == 1
     assert payload["sources"][0]["provider"] == "soundcloud"
+    expected_source_counts = {
+        "unique_tracks": 1,
+        "playlists": 1,
+        "playlist_memberships": 1,
+        "raw_items": 3,
+        "accepted_items": 2,
+        "skipped_items": 1,
+        "duplicate_items": 1,
+    }
+    assert {
+        key: payload["sources"][0][key] for key in expected_source_counts
+    } == expected_source_counts
     assert payload["job"]["status"] == "complete"
     assert "workspace_key" not in payload["job"]
-    assert payload["review"] == {
+    assert {key: payload["review"][key] for key in {
+        "strong", "review", "unavailable", "selected",
+        "selected_strong", "selected_review", "total",
+    }} == {
         "strong": 1, "review": 0, "unavailable": 0, "selected": 1,
         "selected_strong": 1, "selected_review": 0, "total": 1,
     }
@@ -851,7 +893,10 @@ def test_workspace_paging_search_filters_and_summary_are_bounded(client, config)
     assert first["offset"] == 1
     assert first["total"] == 3
     assert len(first["tracks"]) == 1
-    assert first["summary"] == {
+    assert {key: first["summary"][key] for key in {
+        "strong", "review", "unavailable", "selected",
+        "selected_strong", "selected_review", "selection_count", "total",
+    }} == {
         "strong": 1, "review": 1, "unavailable": 1, "selected": 1,
         "selected_strong": 1, "selected_review": 0,
         "selection_count": 1, "total": 3,
@@ -865,6 +910,43 @@ def test_workspace_paging_search_filters_and_summary_are_bounded(client, config)
     assert selected["total"] == 1 and selected["tracks"][0]["title"] == "Alpha"
     searched = client.get("/api/workspace?search=Review%20Charter").get_json()
     assert searched["total"] == 1 and searched["tracks"][0]["title"] == "Beta"
+
+
+def test_workspace_selectable_tier_filter_excludes_blocked_and_no_result(
+    client, monkeypatch
+):
+    import csv_to_clonehero.server.web as web
+
+    _sign_in(client)
+
+    def card(title, tier=None):
+        candidates = [] if tier is None else [{
+            "candidate_id": len(title), "result_tier": tier, "selected": False,
+            "score": 80, "review": {"state": "needs_review"},
+        }]
+        return {
+            "track_key": title.casefold(), "artist": "Artist", "title": title,
+            "review_state": "unavailable" if not candidates else "review",
+            "selected": False, "selected_count": 0, "candidates": candidates,
+        }
+
+    monkeypatch.setattr(web, "_review_cards", lambda *_args, **_kwargs: [
+        card("Recommended", "RECOMMENDED_EXACT"),
+        card("Variant", "SAME_RECORDING_CHART_VARIANT"),
+        card("Alternate", "ALTERNATE_RECORDING"),
+        card("Possible", "POSSIBLE_MATCH"),
+        card("Blocked", "BLOCKED"),
+        card("No result"),
+    ])
+    tiers = (
+        "RECOMMENDED_EXACT,SAME_RECORDING_CHART_VARIANT,"
+        "ALTERNATE_RECORDING,POSSIBLE_MATCH"
+    )
+    payload = client.get(f"/api/workspace?tier={tiers}").get_json()
+    assert payload["total"] == 4
+    assert {item["title"] for item in payload["tracks"]} == {
+        "Recommended", "Variant", "Alternate", "Possible",
+    }
 
 
 def test_workspace_projection_never_leaks_another_owner(client, config):
@@ -1011,6 +1093,7 @@ def test_public_expansion_choices_job_review_and_selection_are_separate(
         "artist_norm": "artist",
         "candidate_id": candidate["candidate_id"],
         "action": "select",
+        "confirm_possible": True,
     })
     assert selected.status_code == 200
     assert client.get("/api/expansion/results").get_json()["summary"]["selected"] == 1
