@@ -27,6 +27,7 @@ from csv_to_clonehero.models import ChartCandidate, ScoreBreakdown, Track
 from csv_to_clonehero.normalization import (
     normalize_artist,
     normalize_text,
+    normalize_title_for_identity,
     normalize_title_without_recognized_annotations,
     split_artists,
     version_markers,
@@ -212,6 +213,7 @@ class SpotifyScoreBreakdown(ScoreBreakdown):
         data["quality"] = self.quality
         data["eligibility_state"] = self.eligibility
         data["machine_factors"] = self.factors
+        data["explanation"] = self.explain()
         return data
 
     to_dict = as_dict
@@ -512,6 +514,20 @@ def _title_identity_evidence(
     plain_ratio = _plain_similarity(track_norm, chart_norm)
     exact = bool(track_norm and track_norm == chart_norm)
     number_equivalent = _number_word_equivalent(track_norm, chart_norm)
+    track_identity = normalize_title_for_identity(
+        str(getattr(track, "title", "") or "")
+    )
+    chart_identity = normalize_title_for_identity(
+        str(getattr(chart, "name", "") or "")
+    )
+    version_identity = version_markers(str(getattr(track, "title", "") or "")) == version_markers(
+        str(getattr(chart, "name", "") or "")
+    )
+    safe_projection_match = bool(
+        track_identity
+        and track_identity == chart_identity
+        and version_identity
+    )
     annotation_suffix = _recognized_title_suffix_relationship(
         str(getattr(track, "title", "") or ""),
         str(getattr(chart, "name", "") or ""),
@@ -524,6 +540,7 @@ def _title_identity_evidence(
         or number_equivalent
         or plain_ratio >= TITLE_IDENTITY_PLAIN_AUTO_THRESHOLD
         or annotation_suffix
+        or safe_projection_match
     )
     track_tokens = _tokens(track_norm)
     chart_tokens = _tokens(chart_norm)
@@ -537,6 +554,13 @@ def _title_identity_evidence(
         "exact_normalized": exact,
         "number_word_equivalent": number_equivalent,
         "recognized_annotation_suffix": annotation_suffix,
+        "safe_identity_projection": {
+            "track": track_identity,
+            "candidate": chart_identity,
+            "matched": safe_projection_match,
+            "changed": track_identity != track_norm or chart_identity != chart_norm,
+            "version_markers_agree": version_identity,
+        },
         "token_containment": containment,
         "plain_auto_threshold": TITLE_IDENTITY_PLAIN_AUTO_THRESHOLD,
         "conflict_threshold": TITLE_IDENTITY_CONFLICT_THRESHOLD,
@@ -1554,6 +1578,14 @@ def score_candidate(
         for label in ("title", "artist")
         if breakdown.gate_factors.get(f"{label}_identity") == "borderline"
     ]
+    version_evidence = breakdown.match_factors.get("version_markers", {})
+    version_review = bool(
+        isinstance(version_evidence, Mapping)
+        and version_evidence.get("matched") is False
+        and (version_evidence.get("track") or version_evidence.get("candidate"))
+    )
+    if version_review:
+        review_identities.append("version")
     if review_identities:
         auto_threshold = _thresholds(config)[0]
         breakdown.final_score = min(breakdown.final_score, max(0.0, auto_threshold - 1))

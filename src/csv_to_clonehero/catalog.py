@@ -49,6 +49,7 @@ class CatalogLookup:
     exact_artist: bool = False
     exact_title: bool = False
     candidate_methods: dict[tuple[str, int], tuple[str, ...]] = field(default_factory=dict)
+    fuzzy_fallback_attempted: bool = False
 
 
 class CatalogLoadError(ValueError):
@@ -187,6 +188,12 @@ class EnchorCatalog:
             return 0.0
         return max(fuzz.ratio(left, right), fuzz.token_set_ratio(left, right))
 
+    @staticmethod
+    def _plain_similarity(left: str, right: str) -> float:
+        if not left or not right:
+            return 0.0
+        return fuzz.ratio(left, right)
+
     def _artist_similarity(self, query_forms: tuple[str, ...], key: tuple[str, str]) -> float:
         chart_forms = self._artist_forms_by_key.get(key) or retrieval_artist_forms(key[0])
         return max(
@@ -207,6 +214,91 @@ class EnchorCatalog:
                 for chart in chart_forms
             ),
             default=0.0,
+        )
+
+    def _artist_plain_similarity(
+        self, query_forms: tuple[str, ...], key: tuple[str, str]
+    ) -> float:
+        chart_forms = self._artist_forms_by_key.get(key) or retrieval_artist_forms(key[0])
+        return max(
+            (
+                self._plain_similarity(query, chart)
+                for query in query_forms
+                for chart in chart_forms
+            ),
+            default=0.0,
+        )
+
+    def _title_plain_similarity(
+        self, query_forms: tuple[str, ...], key: tuple[str, str]
+    ) -> float:
+        chart_forms = self._title_forms_by_key.get(key) or retrieval_title_forms(key[1])
+        return max(
+            (
+                self._plain_similarity(query, chart)
+                for query in query_forms
+                for chart in chart_forms
+            ),
+            default=0.0,
+        )
+
+    @staticmethod
+    def _leading_artist_symbol(value: str) -> str:
+        text = str(value or "").strip()
+        return "$" if text.startswith("$") else ""
+
+    @classmethod
+    def _artist_symbol_conflict(
+        cls, query_values: tuple[str, ...], candidate_artist: str
+    ) -> bool:
+        """Protect normalized collisions such as the artists ``$NOT``/``Snot``."""
+        candidate_norm = normalize_artist(candidate_artist)
+        candidate_symbol = cls._leading_artist_symbol(candidate_artist)
+        query_symbols = [cls._leading_artist_symbol(value) for value in query_values]
+        if candidate_symbol:
+            return candidate_symbol not in query_symbols
+        if any(query_symbols):
+            # An explicit non-symbolic alternate still authorizes that spelling.
+            return not any(
+                not cls._leading_artist_symbol(value)
+                and normalize_artist(value) == candidate_norm
+                for value in query_values
+            )
+        comparable = [
+            cls._leading_artist_symbol(value)
+            for value in query_values
+            if normalize_artist(value) == candidate_norm
+        ]
+        return bool(
+            comparable
+            and candidate_symbol not in comparable
+            and (candidate_symbol or any(comparable))
+        )
+
+    @staticmethod
+    def _candidate_shortlist_priority(candidate: ChartCandidate) -> tuple[int, ...]:
+        instruments = {str(value).casefold() for value in candidate.instruments}
+        five_fret = bool(
+            candidate.has_five_fret_guitar
+            or instruments & {"guitar", "guitar5", "guitar5fret", "leadguitar"}
+        )
+        playable = bool(instruments or candidate.difficulty_fields or candidate.difficulties)
+        if not playable:
+            playable = any(
+                getattr(candidate, field_name, None) is not None
+                and int(getattr(candidate, field_name)) >= 0
+                for field_name in (
+                    "diff_guitar", "diff_guitarghl", "diff_bass", "diff_drums",
+                    "diff_vocals", "diff_keys", "diff_band",
+                )
+            )
+        return (
+            int(five_fret),
+            int(playable),
+            int(bool(candidate.supports_download)),
+            int(not candidate.modchart),
+            int(not candidate.has_issues),
+            int(candidate.instrument_count),
         )
 
     def _fuzzy_aliases(
@@ -246,21 +338,31 @@ class EnchorCatalog:
         title_fuzzy_limit: int = 20,
         min_artist_similarity: float = 55.0,
         min_title_similarity: float = 20.0,
+        song_key_limit: int = 12,
+        fuzzy_fallback_key_limit: int = 50,
+        candidate_limit: int = 100,
+        include_fuzzy_fallback: bool | None = None,
     ) -> CatalogLookup:
-        """Retrieve plausible charts without deciding whether they match.
+        """Return a staged, deterministic shortlist for one canonical song.
 
-        The exact two-dimensional index remains the fast path.  Secondary
-        indexes intentionally retrieve more than exact equality allows; the
-        caller must still pass every returned chart through ``score_candidate``.
-        Candidate filtering here is only a conservative shortlist bound: a
-        candidate must be capable of passing the scorer's hard artist conflict
-        gate and have a small amount of title evidence. Exact artist/title
-        aliases bypass that bound.
+        Exact pairs and conservative aliases lead the result. Shared-token and
+        fuzzy paths are bounded independently and run only after stronger
+        stages. Final match thresholds remain solely in
+        :func:`score_candidate`.
         """
         if not self.available:
             return CatalogLookup()
 
-        query_artist_values = (artist, *tuple(alternate_artists))
+        song_key_limit = max(1, int(song_key_limit))
+        fuzzy_fallback_key_limit = max(1, int(fuzzy_fallback_key_limit))
+        candidate_limit = max(1, int(candidate_limit))
+        query_artist_values = tuple(
+            dict.fromkeys(
+                str(value)
+                for value in (artist, *tuple(alternate_artists))
+                if str(value).strip()
+            )
+        )
         artist_forms: list[str] = []
         for value in query_artist_values:
             for form in retrieval_artist_forms(value):
@@ -271,8 +373,6 @@ class EnchorCatalog:
         strict_key = _row_key(artist, title)
         strict_keys = {strict_key} if strict_key in self._songs else set()
         key_methods: dict[tuple[str, str], set[str]] = defaultdict(set)
-        for key in strict_keys:
-            key_methods[key].add("exact")
 
         artist_keys: set[tuple[str, str]] = set()
         for form in query_artist_forms:
@@ -280,137 +380,198 @@ class EnchorCatalog:
         title_keys: set[tuple[str, str]] = set()
         for form in query_title_forms:
             title_keys.update(self._title_aliases.get(form, ()))
-
-        # Any shared annotation-light token is a recall path.  The final
-        # similarity checks below keep common words from turning into a full
-        # catalog scan while leaving exact aliases untouched.
         token_keys: set[tuple[str, str]] = set()
         for token in retrieval_title_tokens(title):
             token_keys.update(self._title_tokens.get(token, ()))
 
-        fuzzy_artist_keys: set[tuple[str, str]] = set()
-        fuzzy_artist_aliases: set[str] = set()
-        for form in query_artist_forms:
-            fuzzy_artist_aliases.update(
-                self._fuzzy_aliases(
-                    form,
-                    self._artist_choices,
-                    self._artist_fuzzy_cache,
-                    artist_fuzzy_limit,
-                )
+        selected_rank: dict[tuple[str, str], tuple[Any, ...]] = {}
+
+        def ranked(keys: set[tuple[str, str]], *, primary: str) -> list[tuple[str, str]]:
+            def scores(key: tuple[str, str]) -> tuple[float, float]:
+                artist_score = self._artist_plain_similarity(query_artist_forms, key)
+                title_score = self._title_similarity(query_title_forms, key)
+                return artist_score, title_score
+
+            return sorted(
+                keys,
+                key=lambda key: (
+                    -scores(key)[1 if primary == "title" else 0],
+                    -scores(key)[0 if primary == "title" else 1],
+                    key,
+                ),
             )
-        for alias in fuzzy_artist_aliases:
-            fuzzy_artist_keys.update(self._artist_aliases.get(alias, ()))
 
-        artist_token_keys: set[tuple[str, str]] = set()
-        for form in query_artist_forms:
-            for token in retrieval_artist_tokens(form):
-                artist_token_keys.update(self._artist_tokens.get(token, ()))
+        def add_stage(
+            keys: set[tuple[str, str]], method: str, stage: int, limit: int
+        ) -> None:
+            for key in ranked(keys - set(selected_rank), primary="artist" if method == "title" else "title")[:limit]:
+                artist_score = self._artist_plain_similarity(query_artist_forms, key)
+                title_score = self._title_similarity(query_title_forms, key)
+                selected_rank[key] = (stage, -title_score, -artist_score, key)
+                key_methods[key].add(method)
 
-        # Keep only token hits that have enough title evidence. This is still
-        # retrieval, not acceptance: every selected chart is scored later.
-        artist_allowed_keys = artist_keys | fuzzy_artist_keys | artist_token_keys
-        token_candidate_keys = {
+        # A. Strict normalized artist/title.
+        add_stage(strict_keys, "exact", 0, 1)
+
+        # B. Exact/alias artist plus exact or annotation-light title.
+        add_stage(artist_keys & title_keys, "artist", 1, song_key_limit)
+
+        # C. Exact/alias artist with shared title tokens or a bounded plausible
+        # title typo. A similarity around 20 is never enough by itself.
+        title_floor = max(45.0, float(min_title_similarity))
+        artist_pool = artist_keys - set(selected_rank)
+        same_artist_plausible = {
             key
-            for key in token_keys & artist_allowed_keys
-            if self._artist_similarity(query_artist_forms, key) >= min_artist_similarity
-            and self._title_similarity(query_title_forms, key) >= min_title_similarity
+            for key in artist_pool
+            if key in token_keys
+            or self._title_similarity(query_title_forms, key) >= title_floor
         }
+        stage_c = set(ranked(same_artist_plausible, primary="title")[:song_key_limit])
+        for key in stage_c:
+            method = "title_token" if key in token_keys else "title_fuzzy"
+            artist_score = self._artist_plain_similarity(query_artist_forms, key)
+            title_score = self._title_similarity(query_title_forms, key)
+            selected_rank[key] = (2, -title_score, -artist_score, key)
+            key_methods[key].add(method)
 
-        fuzzy_title_keys: set[tuple[str, str]] = set()
-        # Fuzzy title retrieval is needed when exact aliases and the indexed
-        # token path produced no usable shortlist. This covers spelling and
-        # formatting changes without running a fuzzy scan for every track.
-        if not title_keys and not token_candidate_keys:
+        # D. Exact/annotation-light title with the closest bounded artist
+        # aliases. Plain similarity prevents token-set inflation here.
+        if not any(rank[0] <= 1 for rank in selected_rank.values()):
+            exact_title_artist = {
+                key
+                for key in title_keys - set(selected_rank)
+                if self._artist_plain_similarity(query_artist_forms, key)
+                >= float(min_artist_similarity)
+            }
+            add_stage(exact_title_artist, "title", 3, song_key_limit)
+
+        # E. Fuzzy fallback runs last and is always bounded across both axes.
+        # It can recover an alternate credit even when a normalized collision
+        # produced a weaker strict-key candidate.
+        fuzzy_fallback_attempted = bool(
+            include_fuzzy_fallback is True
+            or (
+                include_fuzzy_fallback is None
+                and not any(rank[0] <= 1 for rank in selected_rank.values())
+            )
+        )
+        if fuzzy_fallback_attempted and (
+            artist_fuzzy_limit > 0 or title_fuzzy_limit > 0
+        ):
+            fuzzy_artist_aliases: set[str] = set()
+            for form in query_artist_forms:
+                fuzzy_artist_aliases.update(self._fuzzy_aliases(
+                    form, self._artist_choices, self._artist_fuzzy_cache,
+                    artist_fuzzy_limit,
+                ))
             fuzzy_title_aliases: set[str] = set()
             for form in query_title_forms:
-                fuzzy_title_aliases.update(
-                    self._fuzzy_aliases(
-                        form,
-                        self._title_choices,
-                        self._title_fuzzy_cache,
-                        title_fuzzy_limit,
-                    )
+                fuzzy_title_aliases.update(self._fuzzy_aliases(
+                    form, self._title_choices, self._title_fuzzy_cache,
+                    title_fuzzy_limit,
+                ))
+            fuzzy_artist_keys = {
+                key
+                for alias in fuzzy_artist_aliases
+                for key in self._artist_aliases.get(alias, ())
+            }
+            fuzzy_title_keys = {
+                key
+                for alias in fuzzy_title_aliases
+                for key in self._title_aliases.get(alias, ())
+            }
+            fuzzy_artist_fallback = {
+                key
+                for key in fuzzy_artist_keys
+                if self._title_similarity(query_title_forms, key) >= title_floor
+            }
+            fuzzy_title_fallback = {
+                key
+                for key in fuzzy_title_keys
+                if self._artist_plain_similarity(query_artist_forms, key)
+                >= float(min_artist_similarity)
+            }
+            def fallback_rank(key: tuple[str, str]) -> tuple[Any, ...]:
+                artist_score = self._artist_plain_similarity(query_artist_forms, key)
+                title_score = self._title_similarity(query_title_forms, key)
+                return (
+                    -(title_score * 0.55 + artist_score * 0.35),
+                    -title_score,
+                    -artist_score,
+                    key,
                 )
-            for alias in fuzzy_title_aliases:
-                fuzzy_title_keys.update(self._title_aliases.get(alias, ()))
 
-        selected: set[tuple[str, str]] = set(strict_keys)
-        methods: list[str] = []
-        if strict_keys:
-            methods.append("exact")
-
-        # An artist alias narrows the catalog, but an artist's unrelated songs
-        # are not plausible exact-song candidates. Keep exact title aliases
-        # unconditionally and require a small amount of title evidence for the
-        # remaining artist pool before invoking the final scorer.
-        exact_artist_keys = artist_keys - strict_keys
-        exact_artist_keys = {
-            key
-            for key in exact_artist_keys
-            if key in title_keys
-            or self._title_similarity(query_title_forms, key) >= min_title_similarity
-        }
-        if exact_artist_keys:
-            selected.update(exact_artist_keys)
-            for key in exact_artist_keys:
-                key_methods[key].add("artist")
-            methods.append("artist")
-
-        exact_title_keys = title_keys - selected
-        for key in exact_title_keys:
-            if self._artist_similarity(query_artist_forms, key) >= min_artist_similarity:
-                selected.add(key)
-                key_methods[key].add("title")
-        if exact_title_keys:
-            methods.append("title")
-
-        selected_before_broad = set(selected)
-        broad_keys = (
-            token_candidate_keys | fuzzy_artist_keys | fuzzy_title_keys
-        ) - selected
-        for key in broad_keys:
-            if (
-                key in token_candidate_keys
-                or (
-                    (key in artist_allowed_keys or key in fuzzy_title_keys)
-                and self._artist_similarity(query_artist_forms, key) >= min_artist_similarity
-                and self._title_similarity(query_title_forms, key) >= min_title_similarity
+            artist_fallback = set(sorted(
+                fuzzy_artist_fallback - set(selected_rank),
+                key=fallback_rank,
+            )[:fuzzy_fallback_key_limit])
+            title_fallback = set(sorted(
+                fuzzy_title_fallback - set(selected_rank),
+                key=lambda key: (
+                    -self._artist_plain_similarity(query_artist_forms, key),
+                    -self._title_similarity(query_title_forms, key),
+                    key,
+                ),
+            )[:min(12, fuzzy_fallback_key_limit)])
+            fallback = artist_fallback | title_fallback
+            for key in fallback:
+                artist_score = self._artist_plain_similarity(query_artist_forms, key)
+                title_score = self._title_similarity(query_title_forms, key)
+                selected_rank[key] = (
+                    4,
+                    -(title_score * 0.55 + artist_score * 0.35),
+                    -title_score,
+                    -artist_score,
+                    key,
                 )
-            ):
-                selected.add(key)
-                if key in token_candidate_keys:
-                    key_methods[key].add("title_token")
-                if key in fuzzy_artist_keys:
+                if key in fuzzy_artist_fallback:
                     key_methods[key].add("artist_fuzzy")
-                if key in fuzzy_title_keys:
+                if key in fuzzy_title_fallback:
                     key_methods[key].add("title_fuzzy")
-        if token_candidate_keys & (selected - selected_before_broad):
-            methods.append("title_token")
-        if fuzzy_artist_keys & (selected - selected_before_broad):
-            methods.append("artist_fuzzy")
-        if fuzzy_title_keys & (selected - selected_before_broad):
-            methods.append("title_fuzzy")
 
-        candidates: list[ChartCandidate] = []
-        seen: set[tuple[str, int]] = set()
-        candidate_methods: dict[tuple[str, int], tuple[str, ...]] = {}
-        for key in sorted(selected):
+        candidate_records: dict[
+            tuple[str, int], tuple[tuple[Any, ...], ChartCandidate]
+        ] = {}
+        candidate_method_sets: dict[tuple[str, int], set[str]] = defaultdict(set)
+        for key, key_rank in sorted(selected_rank.items(), key=lambda item: item[1]):
             for candidate in self._songs.get(key, ()):
-                identity = (str(candidate.source), int(candidate.chart_id))
-                if identity in seen:
+                if self._artist_symbol_conflict(query_artist_values, candidate.artist):
                     continue
-                seen.add(identity)
-                candidates.append(candidate)
-                candidate_methods[identity] = tuple(sorted(key_methods.get(key, ())))
+                identity = (str(candidate.source), int(candidate.chart_id))
+                priority = self._candidate_shortlist_priority(candidate)
+                rank = (
+                    *key_rank,
+                    *(-value for value in priority),
+                    str(candidate.source).casefold(),
+                    int(candidate.chart_id),
+                )
+                existing = candidate_records.get(identity)
+                if existing is None or rank < existing[0]:
+                    candidate_records[identity] = (rank, candidate)
+                candidate_method_sets[identity].update(key_methods.get(key, ()))
+
+        ordered_records = sorted(candidate_records.items(), key=lambda item: item[1][0])
+        ordered_records = ordered_records[:candidate_limit]
+        candidates = [record[1][1] for record in ordered_records]
+        candidate_methods = {
+            identity: tuple(sorted(candidate_method_sets[identity]))
+            for identity, _ in ordered_records
+        }
+        returned_methods = tuple(dict.fromkeys(
+            method
+            for identity, _ in ordered_records
+            for method in candidate_methods[identity]
+        ))
+        strict_exact = any("exact" in candidate_methods[identity] for identity, _ in ordered_records)
         return CatalogLookup(
             candidates=tuple(candidates),
-            strict_exact=bool(strict_keys),
-            methods=tuple(dict.fromkeys(methods)),
-            retrieved_song_keys=len(selected),
+            strict_exact=strict_exact,
+            methods=returned_methods,
+            retrieved_song_keys=len(selected_rank),
             exact_artist=bool(artist_keys),
             exact_title=bool(title_keys),
             candidate_methods=candidate_methods,
+            fuzzy_fallback_attempted=fuzzy_fallback_attempted,
         )
 
     def _load(self) -> None:

@@ -178,7 +178,63 @@ def test_high_recall_lookup_can_use_bounded_fuzzy_title_alias(tmp_path):
         min_title_similarity=60,
     )
     assert [item.chart_id for item in lookup.candidates] == [11]
-    assert "title_fuzzy" in lookup.methods
+    assert {"artist_fuzzy", "title_fuzzy"}.issubset(lookup.methods)
+
+
+def test_staged_lookup_excludes_unrelated_same_artist_songs(tmp_path):
+    path = tmp_path / "catalog.jsonl"
+    write_snapshot(
+        path,
+        [
+            candidate(20, "Chance the Rapper", "Good Ass Intro"),
+            candidate(21, "Chance the Rapper", "Cocoa Butter Kisses"),
+            candidate(22, "Chance the Rapper", "Chain Reaction"),
+        ],
+    )
+    lookup = EnchorCatalog(path).high_recall_candidates(
+        "Chance The Rapper", "Chain Smoker"
+    )
+    assert {item.name for item in lookup.candidates} == {"Chain Reaction"}
+
+
+def test_staged_lookup_protects_symbolic_artist_collisions(tmp_path):
+    path = tmp_path / "catalog.jsonl"
+    write_snapshot(
+        path,
+        [
+            candidate(30, "$NOT", "Revenge"),
+            candidate(31, "Snot", "Revenge"),
+        ],
+    )
+    catalog = EnchorCatalog(path)
+    assert [item.chart_id for item in catalog.high_recall_candidates("$NOT", "Revenge").candidates] == [30]
+    assert [item.chart_id for item in catalog.high_recall_candidates("Snot", "Revenge").candidates] == [31]
+
+
+def test_staged_lookup_bounds_generic_titles_and_short_artists(tmp_path):
+    path = tmp_path / "catalog.jsonl"
+    rows = [candidate(40, "X", "Love")]
+    rows.extend(candidate(41 + index, f"Other {index}", "Love") for index in range(30))
+    write_snapshot(path, rows)
+    lookup = EnchorCatalog(path).high_recall_candidates(
+        "X", "Love", song_key_limit=3, candidate_limit=4
+    )
+    assert [item.chart_id for item in lookup.candidates] == [40]
+
+
+def test_staged_lookup_uses_bounded_alternate_artist_credit(tmp_path):
+    path = tmp_path / "catalog.jsonl"
+    write_snapshot(
+        path,
+        [
+            candidate(80, "Featured Artist", "Shared Title"),
+            candidate(81, "Unrelated Artist", "Shared Title"),
+        ],
+    )
+    lookup = EnchorCatalog(path).high_recall_candidates(
+        "Uploader", "Shared Title", alternate_artists=("Featured Artist",)
+    )
+    assert [item.chart_id for item in lookup.candidates] == [80]
 
 
 def test_artist_songs_uses_indexed_artist_pool(tmp_path):

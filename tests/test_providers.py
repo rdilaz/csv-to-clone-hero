@@ -4,9 +4,15 @@ from __future__ import annotations
 
 from csv_to_clonehero.providers.base import ProviderTrack, merge_provider_tracks
 from csv_to_clonehero.providers.soundcloud import SoundCloudExportProvider
-from csv_to_clonehero.providers.soundcloud_api import SoundCloudClient, SoundCloudOAuth
+from csv_to_clonehero.providers.soundcloud_api import SoundCloudAPIProvider, SoundCloudClient, SoundCloudOAuth
 from csv_to_clonehero.providers.spotify import SpotifyLibraryProvider
-from csv_to_clonehero.spotify import LibraryImportResult, SpotifyLibraryRecord, SpotifyPlaylist
+from csv_to_clonehero.spotify import (
+    LibraryCounts,
+    LibraryImportResult,
+    SpotifyLibraryRecord,
+    SpotifyPlaylist,
+)
+from csv_to_clonehero.server.jobs import _provider_library_result
 
 
 def test_provider_union_preserves_ids_playlists_and_liked_status():
@@ -21,6 +27,21 @@ def test_provider_union_preserves_ids_playlists_and_liked_status():
     assert tracks[0].playlist_names == ["Favorites"]
     assert tracks[0].liked is True
     assert tracks[0].metadata["provenance"][0]["provider_id"] == "sc-9"
+
+
+def test_renamed_playlist_keeps_one_atomic_provider_membership():
+    result = _provider_library_result([
+        ProviderTrack(
+            "soundcloud", "sc-1", "Song", "Artist",
+            playlist_ids=["p"], playlist_names=["Old name"],
+        ),
+        ProviderTrack(
+            "soundcloud", "sc-1", "Song", "Artist",
+            playlist_ids=["p"], playlist_names=["New name"],
+        ),
+    ])
+    assert [playlist.id for playlist in result.playlists] == ["soundcloud:p"]
+    assert [playlist["id"] for playlist in result.records[0]["playlists"]] == ["soundcloud:p"]
 
 
 def test_spotify_provider_explicit_empty_playlists_imports_liked_only():
@@ -45,6 +66,98 @@ def test_spotify_provider_explicit_empty_playlists_imports_liked_only():
     assert [track.provider_id for track in snapshot.tracks] == ["liked-1"]
 
 
+def test_spotify_provider_preserves_empty_selected_playlist_metadata_and_raw_counts():
+    playlist = SpotifyPlaylist(
+        "playlist-1",
+        "Empty playlist",
+        url="https://open.spotify.com/playlist/playlist-1",
+        artwork_url="https://image.test/playlist.jpg",
+        total_tracks=0,
+        access_status="accessible",
+        owner_id="owner-1",
+        owner_name="Owner",
+        is_owned=True,
+    )
+
+    class EmptyClient:
+        def list_playlists(self):
+            return [playlist]
+
+        def fetch_library(self, *, include_liked, playlists, on_progress=None):
+            return LibraryImportResult([], counts=LibraryCounts())
+
+    empty = SpotifyLibraryProvider(EmptyClient()).import_library(
+        scope={"playlist_ids": ["playlist-1"]}
+    )
+    assert len(empty.playlists) == 1
+    assert empty.playlists[0].provider_id == "playlist-1"
+    assert empty.playlists[0].metadata == {
+        "url": "https://open.spotify.com/playlist/playlist-1",
+        "artwork_url": "https://image.test/playlist.jpg",
+        "total_tracks": 0,
+        "item_count": 0,
+        "access_status": "accessible",
+        "access_reason": "",
+        "owner_id": "owner-1",
+        "owner_name": "Owner",
+        "is_owned": True,
+    }
+
+    records = [
+        SpotifyLibraryRecord(
+            "one", "One", ["Artist"], playlists=[playlist.navigation]
+        ),
+        SpotifyLibraryRecord("two", "Two", ["Artist"], liked=True),
+    ]
+
+    class CountedClient:
+        def list_playlists(self):
+            return [playlist]
+
+        def fetch_library(self, *, include_liked, playlists, on_progress=None):
+            return LibraryImportResult(
+                records,
+                playlists=[playlist],
+                counts=LibraryCounts(
+                    playlist_count=1,
+                    playlist_item_count=3,
+                    liked_item_count=1,
+                    included_count=2,
+                    duplicate_count=1,
+                    skipped_null_count=1,
+                ),
+            )
+
+    counted = SpotifyLibraryProvider(CountedClient()).import_library()
+    assert counted.import_report.total_rows == 4
+    assert counted.import_report.accepted_rows == 3
+    assert counted.import_report.skipped_rows == 1
+    assert counted.import_report.duplicate_rows == 1
+    assert counted.import_report.unique_tracks == 2
+    assert counted.import_report.liked_count == 1
+
+    inaccessible = SpotifyPlaylist(
+        "playlist-1", "Empty playlist", access_status="inaccessible",
+        access_reason="permission denied",
+    )
+
+    class PartialClient:
+        def list_playlists(self):
+            return [playlist]
+
+        def fetch_library(self, *, include_liked, playlists, on_progress=None):
+            return LibraryImportResult(
+                [],
+                playlists=[inaccessible],
+                counts=LibraryCounts(playlist_count=1, inaccessible_count=1),
+            )
+
+    partial = SpotifyLibraryProvider(PartialClient()).import_library()
+    assert partial.metadata["partial"] is True
+    assert partial.import_report.inaccessible_count == 1
+    assert partial.playlists[0].metadata["access_status"] == "inaccessible"
+
+
 def test_soundcloud_json_export_is_strict_and_normalized():
     provider = SoundCloudExportProvider.from_json(
         '{"collection": [{"id": 10, "title": "Track", "user": {"username": "DJ"},'
@@ -56,7 +169,33 @@ def test_soundcloud_json_export_is_strict_and_normalized():
     assert snapshot.unique_track_count == 1
     assert snapshot.tracks[0].provider_id == "10"
     assert snapshot.tracks[0].playlist_names == ["Set"]
+    assert [(playlist.provider_id, playlist.name) for playlist in snapshot.playlists] == [
+        ("name:set", "Set")
+    ]
     assert snapshot.normalized_tracks()[0].origin == "soundcloud"
+
+
+def test_soundcloud_export_accepts_playlist_id_aliases_and_reports_unique_counts():
+    provider = SoundCloudExportProvider.from_csv(
+        "title,artist,id,playlist name,SoundCloud Playlist ID,liked\n"
+        "Song,DJ,1,First,p-1,yes\n"
+        "Song,DJ,1,Second,p-2,yes\n"
+        ",DJ,2,Skipped,p-3,no\n"
+    )
+    snapshot = provider.import_library()
+
+    assert {(playlist.provider_id, playlist.name) for playlist in snapshot.playlists} == {
+        ("p-1", "First"), ("p-2", "Second")
+    }
+    assert snapshot.tracks[0].playlist_memberships == [
+        ("p-2", "Second"), ("p-1", "First")
+    ]
+    assert snapshot.import_report.total_rows == 3
+    assert snapshot.import_report.accepted_rows == 2
+    assert snapshot.import_report.skipped_rows == 1
+    assert snapshot.import_report.duplicate_rows == 1
+    assert snapshot.import_report.unique_tracks == 1
+    assert snapshot.import_report.liked_count == 1
 
 
 def test_soundcloud_csv_export_skips_incomplete_rows():
@@ -171,6 +310,31 @@ def test_soundcloud_official_client_uses_linked_pagination_and_oauth_headers():
     assert client.get_liked_tracks()[0]["track"]["id"] == 8
     assert all(call[1]["linked_partitioning"] == "true" for call in http.calls)
     assert all(call[2]["Authorization"] == "OAuth access" for call in http.calls)
+
+
+def test_soundcloud_api_provider_reports_raw_items_and_duplicates():
+    class Client:
+        def playlists(self):
+            return [{"id": 4, "title": "Set"}]
+
+        def playlist_tracks(self, playlist_id):
+            assert playlist_id == "4"
+            return [{"id": 8, "title": "Song", "user": {"username": "Artist"}}]
+
+        def liked_tracks(self):
+            return [{"id": 8, "title": "Song", "user": {"username": "Artist"}}]
+
+        def close(self):
+            return None
+
+    snapshot = SoundCloudAPIProvider(Client()).import_library(
+        scope={"playlist_ids": ["4"], "include_liked": True}
+    )
+    assert snapshot.import_report.total_rows == 2
+    assert snapshot.import_report.accepted_rows == 2
+    assert snapshot.import_report.unique_tracks == 1
+    assert snapshot.import_report.duplicate_rows == 1
+    assert snapshot.import_report.liked_count == 1
 
 
 def test_soundcloud_oauth_validates_state_and_exchanges_pkce_code():

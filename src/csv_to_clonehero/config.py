@@ -192,6 +192,11 @@ class SearchConfig(BaseModel):
     catalog_title_fuzzy_limit: int = 50
     catalog_min_artist_similarity: float = 55.0
     catalog_min_title_similarity: float = 20.0
+    # Per-song catalog shortlist bounds. Exact and alias paths are ranked first;
+    # broad fuzzy retrieval can never turn one song into a catalog-wide scan.
+    catalog_song_key_limit: int = Field(default=12, ge=1, le=100)
+    catalog_fuzzy_fallback_key_limit: int = Field(default=50, ge=1, le=50)
+    catalog_candidate_limit: int = Field(default=100, ge=1, le=500)
 
     @property
     def search_result_cap(self) -> int:

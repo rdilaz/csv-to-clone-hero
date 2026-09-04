@@ -534,8 +534,16 @@ class JobManager:
             if snapshots and (catalog.available or combined_provider_discovery):
                 enforce_library_limit(snapshots, self.config.server.max_library_tracks)
             current_provider_tracks = _provider_tracks_from_provenance(db, workspace_id)
+            current_provider_playlists = [
+                playlist
+                for snapshot in snapshots
+                for playlist in snapshot.playlists
+            ]
             prefetched_library = (
-                _provider_library_result(current_provider_tracks)
+                _provider_library_result(
+                    current_provider_tracks,
+                    current_provider_playlists,
+                )
                 if current_provider_tracks and (catalog.available or combined_provider_discovery)
                 else None
             )
@@ -740,27 +748,23 @@ def _provider_tracks_from_provenance(
 ) -> list[Any]:
     if workspace_id is None:
         return []
-    from csv_to_clonehero.providers.base import ProviderTrack
+    from csv_to_clonehero.combined_pipeline import workspace_snapshots
 
-    tracks = []
-    for row in db.get_track_provenance(workspace_id):
-        tracks.append(ProviderTrack(
-            provider=str(row["provider"]),
-            provider_id=str(row["provider_id"]),
-            title=str(row["title"]),
-            artist=str(row["artist"]),
-            album=str(row["album"] or ""),
-            liked=bool(row["liked"]),
-            isrc=str(row["isrc"] or ""),
-            url=str(row["url"] or ""),
-            metadata=_json_object(row["metadata_json"]),
-        ))
-    return tracks
+    return [
+        track
+        for snapshot in workspace_snapshots(db, workspace_id)
+        for track in snapshot.tracks
+    ]
 
 
-def _provider_library_result(provider_tracks: list[Any]) -> Any:
+def _provider_library_result(
+    provider_tracks: list[Any], provider_playlists: list[Any] | tuple[Any, ...] = ()
+) -> Any:
     """Adapt approved provider records to the shared discovery import shape."""
-    from csv_to_clonehero.providers.base import merge_provider_tracks
+    from csv_to_clonehero.providers.base import (
+        merge_provider_tracks,
+        provider_track_playlist_memberships,
+    )
     from csv_to_clonehero.spotify import LibraryCounts, LibraryImportResult, SpotifyPlaylist
 
     ordered = sorted(
@@ -779,6 +783,7 @@ def _provider_library_result(provider_tracks: list[Any]) -> Any:
             "provider_id": track.provider_id,
             "playlist_ids": list(track.playlist_ids),
             "playlist_names": list(track.playlist_names),
+            "playlist_memberships": provider_track_playlist_memberships(track),
             "liked": bool(track.liked),
             "album": track.album,
             "isrc": track.isrc,
@@ -788,6 +793,12 @@ def _provider_library_result(provider_tracks: list[Any]) -> Any:
 
     records: list[dict[str, Any]] = []
     playlist_models: dict[str, str] = {}
+    for playlist in provider_playlists:
+        raw_id = str(getattr(playlist, "provider_id", "") or "")
+        provider = str(getattr(playlist, "provider", "") or "")
+        playlist_id = raw_id if provider == "spotify" else f"{provider}:{raw_id}"
+        if playlist_id:
+            playlist_models[playlist_id] = str(getattr(playlist, "name", "") or raw_id)
     playlist_item_count = 0
     liked_count = 0
     for track in merge_provider_tracks(ordered):
@@ -806,10 +817,8 @@ def _provider_library_result(provider_tracks: list[Any]) -> Any:
         playlists: list[dict[str, str]] = []
         seen_playlists: set[str] = set()
         for item in provenance:
-            ids = list(item["playlist_ids"])
-            names = list(item["playlist_names"])
-            for index in range(max(len(ids), len(names))):
-                raw_id = ids[index] if index < len(ids) else names[index]
+            for raw_id, raw_name in item["playlist_memberships"]:
+                raw_id = raw_id or raw_name
                 playlist_id = (
                     raw_id
                     if item["provider"] == "spotify"
@@ -820,7 +829,7 @@ def _provider_library_result(provider_tracks: list[Any]) -> Any:
                 seen_playlists.add(playlist_id)
                 playlist = {
                     "id": playlist_id,
-                    "name": names[index] if index < len(names) else raw_id,
+                    "name": raw_name or raw_id,
                 }
                 playlists.append(playlist)
                 playlist_models.setdefault(playlist_id, playlist["name"])

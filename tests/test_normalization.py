@@ -2,6 +2,7 @@ from csv_to_clonehero.normalization import (
     normalize_artist,
     normalize_text,
     normalize_title,
+    normalize_title_for_identity,
     normalize_title_without_recognized_annotations,
     retrieval_artist_forms,
     retrieval_title_forms,
@@ -122,3 +123,22 @@ def test_recognized_title_annotations_do_not_remove_arbitrary_suffixes():
     assert normalize_title_without_recognized_annotations(
         "Garden Shed (feat. Estelle)"
     ) != normalize_title("Garden")
+
+
+def test_safe_identity_projection_removes_only_credit_and_presentation_metadata():
+    expected = normalize_title("Good Ass Intro")
+    assert normalize_title_for_identity(
+        "Good Ass Intro (ft. Artist One, Artist Two & Artist Three)"
+    ) == expected
+    assert normalize_title_for_identity("Good Ass Intro [Overchart]") == expected
+    assert normalize_title_for_identity("Good Ass Intro - Official Video") == expected
+    assert normalize_title_for_identity("Good Ass Intro (prod. Producer)") == expected
+
+
+def test_safe_identity_projection_preserves_meaningful_versions():
+    for marker in ("Live", "Remix", "Acoustic", "Instrumental", "Cover", "Demo", "Reprise", "Medley"):
+        assert normalize_title_for_identity(f"Song ({marker})") != normalize_title_for_identity("Song")
+
+
+def test_safe_identity_projection_does_not_strip_lexical_suffixes():
+    assert normalize_title_for_identity("The Unofficial") != normalize_title_for_identity("The Un")

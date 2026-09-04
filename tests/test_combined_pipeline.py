@@ -1,9 +1,9 @@
 import json
 
-from csv_to_clonehero.combined_pipeline import completed_scan_fast_path, discover_combined, enforce_library_limit, estimate_remaining_range, expand_combined, matching_cache_fingerprint, matching_scan_fingerprint, rank_expansion_artists
+from csv_to_clonehero.combined_pipeline import _primary_rejection_reason, _rejection_exemplar, completed_scan_fast_path, discover_combined, enforce_library_limit, estimate_remaining_range, expand_combined, matching_cache_fingerprint, matching_scan_fingerprint, rank_expansion_artists, workspace_snapshots
 from csv_to_clonehero.catalog import CatalogLookup
 from csv_to_clonehero.database import Database
-from csv_to_clonehero.providers.base import LibrarySnapshot, ProviderTrack
+from csv_to_clonehero.providers.base import LibrarySnapshot, ProviderPlaylist, ProviderTrack
 
 
 class FakeCatalog:
@@ -173,6 +173,11 @@ def test_yield_histogram_partitions_unique_songs_with_specific_reasons(config):
             catalog=YieldCatalog(strong),
         )
         assert sum(result.yield_histogram.values()) == result.tracks == 3
+        assert (
+            result.strong_match_tracks
+            + result.review_match_tracks
+            + sum(result.rejection_song_reasons.values())
+        ) == result.tracks
         assert result.yield_histogram == {
             "recommended_strong": 1,
             "recommended_review": 0,
@@ -261,6 +266,9 @@ def test_completed_scan_fast_path_skips_per_song_iteration(config, monkeypatch):
         assert calls == 1
         assert second.cached_tracks == 1
         assert second.recomputed_tracks == 0
+        assert second.retrieval_seconds == 0
+        assert second.scoring_seconds == 0
+        assert second.persistence_seconds == 0
         final_scan_count = db._conn.execute(
             "SELECT COUNT(*) FROM discovery_scans WHERE workspace_id = "
             "(SELECT id FROM discovery_workspaces WHERE workspace_key = 'combined:fast')"
@@ -400,8 +408,13 @@ def test_partial_library_change_reuses_unchanged_song_only(config, monkeypatch):
             require_workspace_candidate=True,
         )
         catalog.chart = second_chart
-        discover_combined(config, db, [LibrarySnapshot("soundcloud", [ProviderTrack("soundcloud", "one", "Song", "Artist"), ProviderTrack("soundcloud", "two", "New", "Artist")])], workspace_key="combined:partial", catalog=catalog)
+        second = discover_combined(config, db, [LibrarySnapshot("soundcloud", [ProviderTrack("soundcloud", "one", "Song", "Artist"), ProviderTrack("soundcloud", "two", "New", "Artist")])], workspace_key="combined:partial", catalog=catalog)
         assert calls == 2
+        assert second.cached_tracks == 1
+        assert second.recomputed_tracks == 1
+        assert second.candidate_charts_evaluated == 2
+        assert second.unique_charts_evaluated == 2
+        assert second.exact_hits == 2
         assert len(db.list_workspace_selections(workspace["id"], kind="exact")) == 1
     finally:
         db.close()
@@ -425,7 +438,7 @@ def test_matching_cache_fingerprint_changes_with_track_catalog_and_config(config
     assert matching_cache_fingerprint(track, catalog, config) != baseline
 
 
-def test_matching_semantic_v4_cache_keys_cannot_satisfy_v5(config, monkeypatch):
+def test_matching_semantic_v7_cache_keys_cannot_satisfy_v8(config, monkeypatch):
     from tests.conftest import make_chart, make_track
     import csv_to_clonehero.combined_pipeline as pipeline
 
@@ -433,11 +446,11 @@ def test_matching_semantic_v4_cache_keys_cannot_satisfy_v5(config, monkeypatch):
     catalog = FakeCatalog(make_chart("The Only Exception", "Paramore", chart_id=26))
     manifest = {"snapshot_id": "fixture", "sha256": "fixture-sha", "chart_count": 1}
 
-    assert pipeline.MATCH_CACHE_VERSION == "combined-match-v7"
-    monkeypatch.setattr(pipeline, "MATCH_CACHE_VERSION", "combined-match-v6")
+    assert pipeline.MATCH_CACHE_VERSION == "combined-match-v8"
+    monkeypatch.setattr(pipeline, "MATCH_CACHE_VERSION", "combined-match-v7")
     stale_song = pipeline.matching_cache_fingerprint(track, catalog, config)
     stale_scan = pipeline.matching_scan_fingerprint([track], manifest, config)
-    monkeypatch.setattr(pipeline, "MATCH_CACHE_VERSION", "combined-match-v7")
+    monkeypatch.setattr(pipeline, "MATCH_CACHE_VERSION", "combined-match-v8")
 
     assert pipeline.matching_cache_fingerprint(track, catalog, config) != stale_song
     assert pipeline.matching_scan_fingerprint([track], manifest, config) != stale_scan
@@ -599,5 +612,224 @@ def test_combined_discovery_scores_non_exact_local_candidates_and_keeps_versions
         assert {row["chart_id"] for row in rows} == {20, 21}
         provenance = json.loads(rows[0]["metadata_json"])
         assert provenance["catalog_retrieval"]["candidate_methods"]
+    finally:
+        db.close()
+
+
+def test_rejection_reason_and_persisted_exemplar_use_same_candidate(config):
+    from tests.conftest import make_chart
+
+    same_artist_wrong_title = make_chart(
+        "Good Ass Intro", "Chance the Rapper", chart_id=201
+    )
+    unrelated_exact_title = make_chart(
+        "Chain Smoker", "Unrelated Artist", chart_id=202
+    )
+
+    class RejectionCatalog(FakeCatalog):
+        chart_count = 2
+
+        def candidates(self, artist, title):
+            return (same_artist_wrong_title, unrelated_exact_title)
+
+    db = Database(config.database_path)
+    try:
+        result = discover_combined(
+            config,
+            db,
+            [LibrarySnapshot("soundcloud", [ProviderTrack(
+                "soundcloud", "chain", "Chain Smoker", "Chance The Rapper"
+            )])],
+            workspace_key="combined:rejection-exemplar",
+            catalog=RejectionCatalog(same_artist_wrong_title),
+        )
+        rows = db.get_workspace_candidates(
+            "combined:rejection-exemplar",
+            kind="exact",
+            include_rejected=True,
+            current_only=True,
+        )
+        assert [row["chart_id"] for row in rows] == [201]
+        assert result.rejection_song_reasons == {"title identity/version conflict": 1}
+        explanation = json.loads(rows[0]["breakdown_json"])
+        assert "title conflict" in explanation["explanation"]
+        progress = db.get_discovery_song_progress_summary("combined:rejection-exemplar")
+        assert progress["not_playable"] == 1
+    finally:
+        db.close()
+
+
+def test_real_artist_conflict_reason_remains_artist_conflict(config):
+    from tests.conftest import make_chart
+
+    chart = make_chart("Chain Smoker", "Unrelated Artist", chart_id=203)
+
+    class ArtistConflictCatalog(FakeCatalog):
+        def candidates(self, artist, title):
+            return (chart,)
+
+    db = Database(config.database_path)
+    try:
+        result = discover_combined(
+            config,
+            db,
+            [LibrarySnapshot("soundcloud", [ProviderTrack(
+                "soundcloud", "chain", "Chain Smoker", "Chance The Rapper"
+            )])],
+            workspace_key="combined:artist-conflict",
+            catalog=ArtistConflictCatalog(chart),
+        )
+        assert result.rejection_song_reasons == {"artist identity conflict": 1}
+    finally:
+        db.close()
+
+
+def test_rejection_exemplar_reasons_cover_playability_version_and_threshold(config):
+    from csv_to_clonehero.matching import SpotifyScoreBreakdown, score_candidate
+    from tests.conftest import make_chart, make_track
+
+    no_five = make_chart("Song", "Artist", chart_id=210, instruments=["drums"])
+    no_five.diff_guitar = -1
+    no_five_score = score_candidate(make_track("Song", "Artist"), no_five, config)
+    assert _primary_rejection_reason(
+        "not_playable", (no_five, no_five_score)
+    ) == "no required 5-fret guitar"
+
+    version_chart = make_chart("Song (Live)", "Artist", chart_id=211)
+    version_score = SpotifyScoreBreakdown(
+        final_score=68,
+        penalties=[("version mismatch (chart is live)", 25)],
+        gate_factors={"hard_gate": False},
+        eligibility="EXCLUDED",
+        eligibility_reasons=["score below export eligibility threshold"],
+        match_factors={
+            "version_markers": {
+                "track": [], "candidate": ["live"], "matched": False
+            }
+        },
+    )
+    below_chart = make_chart("Song", "Artist Band", chart_id=212)
+    below_score = SpotifyScoreBreakdown(
+        final_score=67,
+        gate_factors={"hard_gate": False},
+        eligibility="EXCLUDED",
+        eligibility_reasons=["score below export eligibility threshold"],
+    )
+    exemplar = _rejection_exemplar([
+        (below_chart, below_score),
+        (version_chart, version_score),
+        (no_five, no_five_score),
+    ])
+    assert exemplar == (version_chart, version_score)
+    assert _primary_rejection_reason("no_suitable", exemplar) == "cover/live/remix/version conflict"
+    assert _primary_rejection_reason(
+        "no_suitable", (below_chart, below_score)
+    ) == "below safe score threshold"
+
+
+def test_rejection_exemplar_ties_are_stable_by_source_and_chart_id():
+    from csv_to_clonehero.matching import SpotifyScoreBreakdown
+    from tests.conftest import make_chart
+
+    first = make_chart("Song", "Artist", chart_id=5)
+    first.source = "alpha"
+    second = make_chart("Song", "Artist", chart_id=2)
+    second.source = "beta"
+    score = SpotifyScoreBreakdown(
+        final_score=0,
+        gate_factors={"hard_gate": True, "hard_gate_reasons": ["hard gate"]},
+    )
+    assert _rejection_exemplar([(second, score), (first, score)])[0] is first
+
+
+def test_workspace_snapshots_restore_playlist_scope_without_duplicate_songs(config):
+    from csv_to_clonehero.providers.base import SourceImportReport
+
+    db = Database(config.database_path)
+    try:
+        workspace = db.create_workspace(workspace_key="combined:scope-roundtrip")
+        db.upsert_library_snapshot(
+            workspace,
+            LibrarySnapshot(
+                "spotify",
+                [ProviderTrack(
+                    "spotify", "sp-1", "Song", "Artist",
+                    playlist_ids=["one", "two"],
+                    playlist_names=["One", "Two"],
+                    liked=True,
+                    duration_ms=123000,
+                )],
+                [
+                    ProviderPlaylist("spotify", "one", "One"),
+                    ProviderPlaylist("spotify", "two", "Two"),
+                    ProviderPlaylist("spotify", "empty", "Empty"),
+                ],
+                metadata={"import": "api"},
+                import_report=SourceImportReport(
+                    total_rows=4,
+                    accepted_rows=3,
+                    duplicate_rows=2,
+                    unique_tracks=1,
+                    liked_count=1,
+                ),
+            ),
+            scope={"playlist_ids": ["one", "two", "empty"], "include_liked": True},
+        )
+        snapshots = workspace_snapshots(db, workspace)
+        assert len(snapshots) == 1
+        assert len(snapshots[0].tracks) == 1
+        assert {item.provider_id for item in snapshots[0].playlists} == {"one", "two", "empty"}
+        assert snapshots[0].tracks[0].playlist_ids == ["one", "two"]
+        assert snapshots[0].metadata["include_liked"] is True
+        assert snapshots[0].import_report.total_rows == 4
+    finally:
+        db.close()
+
+
+def test_combined_discovery_runs_bounded_fuzzy_stage_only_after_strong_stages_reject(config):
+    from tests.conftest import make_chart
+
+    wrong = make_chart("Completely Else", "Artist", chart_id=220)
+    recovered = make_chart("Wanted Song", "Artist Alias", chart_id=221)
+    calls = []
+
+    class StagedCatalog(FakeCatalog):
+        chart_count = 2
+
+        def high_recall_candidates(self, artist, title, **kwargs):
+            include_fuzzy = kwargs.get("include_fuzzy_fallback")
+            calls.append(include_fuzzy)
+            candidates = (wrong, recovered) if include_fuzzy else (wrong,)
+            return CatalogLookup(
+                candidates=candidates,
+                strict_exact=False,
+                methods=("artist", "artist_fuzzy") if include_fuzzy else ("artist",),
+                retrieved_song_keys=len(candidates),
+                exact_artist=True,
+                exact_title=False,
+                candidate_methods={
+                    (chart.source, chart.chart_id): (
+                        "artist_fuzzy" if chart is recovered else "artist",
+                    )
+                    for chart in candidates
+                },
+                fuzzy_fallback_attempted=bool(include_fuzzy),
+            )
+
+    db = Database(config.database_path)
+    try:
+        result = discover_combined(
+            config,
+            db,
+            [LibrarySnapshot("soundcloud", [ProviderTrack(
+                "soundcloud", "wanted", "Wanted Song", "Artist Alias"
+            )])],
+            workspace_key="combined:staged-fuzzy",
+            catalog=StagedCatalog(wrong),
+        )
+        assert calls == [False, True]
+        assert result.strong_match_tracks == 1
+        assert result.candidate_charts_evaluated == 2
+        assert result.broader_retrieval_tracks == 1
     finally:
         db.close()

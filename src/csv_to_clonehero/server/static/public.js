@@ -231,12 +231,31 @@
   }
 
   function renderSources(journey) {
-    const imported = (journey.sources || []).find(source => source.provider === "soundcloud");
-    const count = Number(imported?.tracks || 0);
+    const sources = journey.sources || [];
+    const spotify = sources.find(source => source.provider === "spotify");
+    const imported = sources.find(source => source.provider === "soundcloud");
+    const spotifySummary = $("#spotifyImportedSummary");
+    if (spotifySummary) {
+      const unique = Number(spotify?.unique_tracks || spotify?.tracks || 0);
+      const playlists = Number(spotify?.playlists || 0);
+      const raw = Number(spotify?.raw_items || 0);
+      const liked = Number(spotify?.liked || 0);
+      const playlistOnly = Number(spotify?.playlist_only || 0);
+      const likedLabel = journey.spotify_scope?.include_liked ? " + Liked Songs" : "";
+      const playlistLabel = `${playlists.toLocaleString()} ${playlists === 1 ? "playlist" : "playlists"}`;
+      const sourceItemLabel = `${spotify?.raw_items_lower_bound ? "at least " : ""}${raw.toLocaleString()} source items`;
+      spotifySummary.textContent = unique || playlists
+        ? `${playlistLabel}${likedLabel}; ${sourceItemLabel} became ${unique.toLocaleString()} unique ${unique === 1 ? "song" : "songs"} (${liked.toLocaleString()} liked, ${playlistOnly.toLocaleString()} playlist-only).`
+        : "";
+    }
+    const count = Number(imported?.unique_tracks || imported?.tracks || 0);
+    const playlistCount = Number(imported?.playlists || 0);
     const badge = $("#soundcloudCount");
     if (badge) {
-      badge.textContent = count ? `${count.toLocaleString()} songs` : "Not added";
-      badge.classList.toggle("status-pill--quiet", !count);
+      badge.textContent = count || playlistCount
+        ? `${count.toLocaleString()} unique ${count === 1 ? "song" : "songs"}${playlistCount ? `, ${playlistCount.toLocaleString()} ${playlistCount === 1 ? "playlist" : "playlists"}` : ""}`
+        : "Not added";
+      badge.classList.toggle("status-pill--quiet", !(count || playlistCount));
     }
     updateMusicTally();
   }

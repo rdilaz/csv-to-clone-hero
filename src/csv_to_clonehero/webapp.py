@@ -105,7 +105,7 @@ log = logging.getLogger(__name__)
 
 _SPOTIFY_WORKSPACE_KEY = "spotify"
 JOURNEY_SCHEMA_VERSION = 1
-JOURNEY_ASSET_VERSION = "2.5.2"
+JOURNEY_ASSET_VERSION = "2.5.3"
 JOURNEY_MATCHING_FAILURE_CODE = "MATCHING_WORKER_FAILED"
 JOURNEY_MATCHING_START_CONFLICT_CODE = "MATCHING_START_CONFLICT"
 JOURNEY_MATCHING_START_REJECTED_CODE = "MATCHING_START_REJECTED"
@@ -4434,9 +4434,11 @@ def create_app(
             try:
                 spotify_job.wait_for_start_acknowledgement(run_id, timeout=30.0)
                 db = Database(config.database_path)
-                from csv_to_clonehero.combined_pipeline import discover_combined
-                from csv_to_clonehero.providers.base import LibrarySnapshot, ProviderTrack
-                from csv_to_clonehero.combined_pipeline import completed_scan_fast_path
+                from csv_to_clonehero.combined_pipeline import (
+                    completed_scan_fast_path,
+                    discover_combined,
+                    workspace_snapshots,
+                )
                 set_failure_phase("workspace_preparation")
                 library_fingerprint = db.get_library_matching_fingerprint(workspace)
                 if not library_fingerprint:
@@ -4470,15 +4472,7 @@ def create_app(
                         "saved matching state did not pass completed fast-path validation"
                     )
                 set_failure_phase("source_library_loading")
-                grouped: dict[str, list[ProviderTrack]] = {}
-                for row in db.get_track_provenance(workspace):
-                    provider = str(row["provider"])
-                    grouped.setdefault(provider, []).append(ProviderTrack(
-                        provider=provider, provider_id=str(row["provider_id"]), title=str(row["title"]),
-                        artist=str(row["artist"]), album=str(row["album"] or ""), liked=bool(row["liked"]),
-                        isrc=str(row["isrc"] or ""), url=str(row["url"] or ""),
-                        metadata=_json_object(row["metadata_json"], {}),
-                    ))
+                snapshots = workspace_snapshots(db, workspace)
                 last_persisted = 0.0
                 def on_progress(value: Mapping[str, Any]) -> None:
                     nonlocal last_persisted
@@ -4506,7 +4500,7 @@ def create_app(
                 result = discover_combined(
                     config,
                     db,
-                    [LibrarySnapshot(name, tracks) for name, tracks in grouped.items()],
+                    snapshots,
                     workspace_key=workspace_key,
                     workspace_name="Local combined library",
                     expansion_artists=(),
@@ -7981,7 +7975,7 @@ def create_app(
 
         selected = len(db.list_workspace_selections(workspace, kind="exact"))
         total = len(neutral_tracks)
-        source_rows = [dict(row) for row in db.get_source_summary(workspace)]
+        source_rows = db.get_provider_summaries(workspace)
         source_by_provider = {str(row["provider"]).casefold(): row for row in source_rows}
         provenance = db.get_track_provenance(workspace)
         source_sets: dict[tuple[str, str], set[str]] = {}
@@ -8095,8 +8089,8 @@ def create_app(
                 "selected_charts": selected,
             },
             "sources": {
-                "soundcloud": {"state": "imported" if "soundcloud" in source_by_provider else "not_imported", "count": combined_sources["soundcloud_count"], "raw_rows": int(source_by_provider.get("soundcloud", {}).get("total_rows", 0) or 0), "accepted_rows": int(source_by_provider.get("soundcloud", {}).get("accepted_rows", 0) or 0), "skipped": int(source_by_provider.get("soundcloud", {}).get("skipped_rows", 0) or 0), "duplicates": int(source_by_provider.get("soundcloud", {}).get("duplicate_rows", 0) or 0)},
-                "spotify": {"state": "connected" if _is_authenticated() else "not_connected", "imported": "spotify" in source_by_provider, "count": combined_sources["spotify_count"], "connection_copy": f"{combined_sources['spotify_count']:,} Spotify songs already imported · Account currently disconnected" if "spotify" in source_by_provider and not _is_authenticated() else "", "raw_rows": int(source_by_provider.get("spotify", {}).get("total_rows", 0) or 0), "accepted_rows": int(source_by_provider.get("spotify", {}).get("accepted_rows", 0) or 0), "skipped": int(source_by_provider.get("spotify", {}).get("skipped_rows", 0) or 0), "duplicates": int(source_by_provider.get("spotify", {}).get("duplicate_rows", 0) or 0)},
+                "soundcloud": {"state": "imported" if "soundcloud" in source_by_provider else "not_imported", "count": combined_sources["soundcloud_count"], "unique_count": int(source_by_provider.get("soundcloud", {}).get("unique_tracks", 0) or 0), "playlist_count": int(source_by_provider.get("soundcloud", {}).get("playlist_count", 0) or 0), "playlist_memberships": int(source_by_provider.get("soundcloud", {}).get("membership_count", 0) or 0), "liked_count": int(source_by_provider.get("soundcloud", {}).get("liked_count", 0) or 0), "playlist_only": int(source_by_provider.get("soundcloud", {}).get("playlist_only_tracks", 0) or 0), "raw_rows": int(source_by_provider.get("soundcloud", {}).get("source_item_count", 0) or 0), "accepted_rows": int(source_by_provider.get("soundcloud", {}).get("accepted_rows", 0) or 0), "skipped": int(source_by_provider.get("soundcloud", {}).get("skipped_rows", 0) or 0), "duplicates": int(source_by_provider.get("soundcloud", {}).get("duplicate_rows", 0) or 0)},
+                "spotify": {"state": "connected" if _is_authenticated() else "not_connected", "imported": "spotify" in source_by_provider, "count": combined_sources["spotify_count"], "unique_count": int(source_by_provider.get("spotify", {}).get("unique_tracks", 0) or 0), "playlist_count": int(source_by_provider.get("spotify", {}).get("playlist_count", 0) or 0), "playlist_memberships": int(source_by_provider.get("spotify", {}).get("membership_count", 0) or 0), "liked_count": int(source_by_provider.get("spotify", {}).get("liked_count", 0) or 0), "playlist_only": int(source_by_provider.get("spotify", {}).get("playlist_only_tracks", 0) or 0), "connection_copy": f"{combined_sources['spotify_count']:,} Spotify songs already imported · Account currently disconnected" if "spotify" in source_by_provider and not _is_authenticated() else "", "raw_rows": int(source_by_provider.get("spotify", {}).get("source_item_count", 0) or 0), "accepted_rows": int(source_by_provider.get("spotify", {}).get("accepted_rows", 0) or 0), "skipped": int(source_by_provider.get("spotify", {}).get("skipped_rows", 0) or 0), "duplicates": int(source_by_provider.get("spotify", {}).get("duplicate_rows", 0) or 0)},
             },
             "combined": combined_sources,
             "music": music[:250],
@@ -8244,8 +8238,8 @@ def create_app(
             else spotify_job.snapshot()
         )
         source_rows = {
-            str(row["provider"]).casefold(): dict(row)
-            for row in db.get_source_summary(workspace)
+            str(row["provider"]).casefold(): row
+            for row in db.get_provider_summaries(workspace)
         }
         records = _journey_records(db, workspace)
         spotify = source_rows.get("spotify", {})
@@ -8610,6 +8604,7 @@ def create_app(
             active: bool = False,
             reason: str = "",
         ) -> dict[str, Any]:
+            scope = _json_object(row.get("scope_json", "{}"), {})
             actions = {
                 "update_music": bool(imported and key == "spotify" and connected),
                 "reconnect": bool(key == "spotify" and not connected),
@@ -8625,6 +8620,20 @@ def create_app(
                 "availability": "available",
                 "state": state,
                 "song_count": count,
+                "unique_count": int(row.get("unique_tracks", count) or 0),
+                "playlist_count": int(row.get("playlist_count", 0) or 0),
+                "playlist_memberships": int(row.get("membership_count", 0) or 0),
+                "playlist_unique_count": int(row.get("playlist_unique_tracks", 0) or 0),
+                "liked_count": int(row.get("liked_count", 0) or 0),
+                "liked_in_playlists": int(row.get("liked_in_playlists", 0) or 0),
+                "playlist_only_count": int(row.get("playlist_only_tracks", 0) or 0),
+                "liked_only_count": int(row.get("liked_only_tracks", 0) or 0),
+                "raw_item_count": int(row.get("source_item_count", 0) or 0),
+                "raw_item_count_is_lower_bound": bool(row.get("source_item_count_is_lower_bound", 0)),
+                "accepted_item_count": int(row.get("accepted_rows", 0) or 0),
+                "skipped_item_count": int(row.get("skipped_rows", 0) or 0),
+                "duplicate_item_count": int(row.get("duplicate_rows", 0) or 0),
+                "include_liked": bool(row.get("include_liked") or scope.get("include_liked")),
                 "updated_at": updated_at(row),
                 "attention_reason": reason,
                 "connected": connected,

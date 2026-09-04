@@ -83,12 +83,20 @@ def test_journey_no_sources_and_stable_envelope(journey_client):
 
 def test_soundcloud_import_active_and_ready(journey_client):
     client, _ = journey_client
-    result = upload(client, "artist,title\nA,One\n")
+    result = upload(
+        client,
+        "artist,title,playlist name\nA,One,First Set\nA,One,Second Set\n",
+    )
     assert result["status"] == "complete"
     data = client.get("/api/journey").get_json()
     assert data["screen"] == "music_ready"
     assert data["sources"]["soundcloud"]["state"] == "added"
     assert data["sources"]["soundcloud"]["song_count"] == 1
+    assert data["sources"]["soundcloud"]["unique_count"] == 1
+    assert data["sources"]["soundcloud"]["playlist_count"] == 2
+    assert data["sources"]["soundcloud"]["playlist_memberships"] == 2
+    assert data["sources"]["soundcloud"]["raw_item_count"] == 2
+    assert data["sources"]["soundcloud"]["duplicate_item_count"] == 1
     assert data["music"]["canonical_count"] == 1
 
 
@@ -226,8 +234,8 @@ def test_journey_preserves_lan_access_token_model(config):
         response = client.get("/?access_token=private-token", environ_base={"REMOTE_ADDR": "192.168.1.2"})
         assert response.status_code == 200
         html = response.get_data(as_text=True)
-        assert "static/journey.css?v=2.5.2&amp;access_token=private-token" in html
-        assert "static/journey.js?v=2.5.2&amp;access_token=private-token" in html
+        assert "static/journey.css?v=2.5.3&amp;access_token=private-token" in html
+        assert "static/journey.js?v=2.5.3&amp;access_token=private-token" in html
         api = client.get("/api/journey?access_token=private-token", environ_base={"REMOTE_ADDR": "192.168.1.2"})
         assert api.status_code == 200
 

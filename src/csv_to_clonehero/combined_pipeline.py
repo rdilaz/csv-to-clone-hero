@@ -22,7 +22,15 @@ from csv_to_clonehero.database import Database
 from csv_to_clonehero.matching import ELIGIBLE_REVIEW, RECOMMENDED, score_candidate, score_expansion_candidate
 from csv_to_clonehero.models import ChartCandidate
 from csv_to_clonehero.normalization import normalize_artist, normalize_title
-from csv_to_clonehero.providers.base import LibrarySnapshot, ProviderTrack, merge_provider_tracks
+from csv_to_clonehero.providers.base import (
+    LibrarySnapshot,
+    ProviderPlaylist,
+    ProviderTrack,
+    SourceImportReport,
+    merge_provider_tracks,
+    playlist_identity,
+    provider_track_playlist_memberships,
+)
 
 
 TERMINAL_YIELD_CLASSES = (
@@ -136,7 +144,7 @@ class CombinedDiscoveryResult:
         }
 
 
-MATCH_CACHE_VERSION = "combined-match-v7"
+MATCH_CACHE_VERSION = "combined-match-v8"
 
 
 def matching_cache_fingerprint(track: Any, catalog: Any, config: AppConfig, *, config_fingerprint: str = "") -> str:
@@ -278,6 +286,9 @@ def completed_scan_fast_path(config: AppConfig, db: Database, workspace_id: int 
         result = CombinedDiscoveryResult(**result_data)
         result.cached_tracks = int(row["track_count"])
         result.recomputed_tracks = 0
+        result.retrieval_seconds = 0.0
+        result.scoring_seconds = 0.0
+        result.persistence_seconds = 0.0
         result.discovery_seconds = 0.0
         timings["total_seconds"] = time.perf_counter() - started
         result.fast_path_timings = timings
@@ -352,6 +363,7 @@ def discover_combined(
             str(snapshot.provider).casefold(),
         ),
     )
+    current_source_summaries = _source_summaries(snapshots)
     tracks = merge_provider_tracks(track for snapshot in snapshots for track in snapshot.tracks)
     normalized = [track for provider_track in tracks for track in [provider_track_to_track(provider_track)]]
     db.upsert_spotify_tracks(normalized)
@@ -390,6 +402,7 @@ def discover_combined(
             on_progress=on_progress,
         )
         if cached_result is not None:
+            cached_result.source_summaries = current_source_summaries
             return cached_result
     if catalog is None:
         set_stage("completed_scan_validation")
@@ -403,6 +416,7 @@ def discover_combined(
                 on_progress=on_progress,
             )
             if cached_result is not None:
+                cached_result.source_summaries = current_source_summaries
                 return cached_result
         set_stage("catalog_load")
         catalog = load_enchor_catalog(config.catalog_path)
@@ -473,13 +487,7 @@ def discover_combined(
             catalog_snapshot_id=result.catalog_snapshot_id,
             catalog_diagnostic=catalog.diagnostic,
         )
-    for snapshot in snapshots:
-        result.source_summaries[snapshot.provider] = {
-            "tracks": len(snapshot.tracks),
-            "artists": len({track.artist_norm for track in snapshot.tracks}),
-            "playlists": len(snapshot.playlists),
-            "liked": sum(1 for track in snapshot.tracks if track.liked),
-        }
+    result.source_summaries = current_source_summaries
     discovery_started = time.perf_counter()
     if catalog.available:
         search_config = getattr(config, "search", config)
@@ -496,6 +504,25 @@ def discover_combined(
         )
         min_title_similarity = float(
             getattr(search_config, "catalog_min_title_similarity", 20.0) or 20.0
+        )
+        song_key_limit = max(
+            1,
+            int(getattr(search_config, "catalog_song_key_limit", 12) or 12),
+        )
+        fuzzy_fallback_key_limit = max(
+            1,
+            int(
+                getattr(
+                    search_config,
+                    "catalog_fuzzy_fallback_key_limit",
+                    50,
+                )
+                or 50
+            ),
+        )
+        candidate_limit = max(
+            1,
+            int(getattr(search_config, "catalog_candidate_limit", 100) or 100),
         )
         evaluated_chart_ids: set[tuple[str, int]] = set()
         cached_progress: list[tuple[str, Mapping[str, Any]]] = []
@@ -521,12 +548,17 @@ def discover_combined(
                         )
                         for entry in entries
                     }
+                    evaluated_ids = {
+                        (str(value[0]), int(value[1]))
+                        for value in cached_result.get("evaluated_chart_ids", ())
+                        if isinstance(value, (list, tuple)) and len(value) == 2
+                    } or expected_ids
+                    evaluated_chart_ids.update(evaluated_ids)
                     _, _, existing_ids = db.workspace_current_candidate_digest(workspace_id, track.track_key)
                     if existing_ids != expected_ids:
                         db.clear_workspace_track_candidates(workspace_id, track.track_key)
                         for entry in entries:
                             chart = ChartCandidate(**dict(entry["candidate"]))
-                            evaluated_chart_ids.add((str(chart.source), int(chart.chart_id)))
                             db.upsert_candidate(chart)
                             metadata = dict(entry.get("metadata") or {})
                             metadata["provenance"] = track.origin_metadata.get("provenance", [])
@@ -536,7 +568,26 @@ def discover_combined(
                     result.cached_tracks += 1
                     result.candidates += candidate_count
                     result.eligible_candidates += int(cached_result.get("eligible_count", 0))
+                    result.rejected_candidates += int(
+                        cached_result.get(
+                            "rejected_count",
+                            max(0, candidate_count - int(cached_result.get("eligible_count", 0))),
+                        )
+                    )
                     result.candidate_charts_evaluated += candidate_count
+                    if bool(cached_result.get("strict_exact")):
+                        result.exact_hits += 1
+                    else:
+                        result.exact_misses += 1
+                    result.broader_retrieval_tracks += int(
+                        bool(cached_result.get("broader_retrieval"))
+                    )
+                    result.artist_found_title_different += int(
+                        bool(cached_result.get("artist_found_title_different"))
+                    )
+                    result.title_found_artist_different += int(
+                        bool(cached_result.get("title_found_artist_different"))
+                    )
                     if candidate_count > 0:
                         result.tracks_with_candidates += 1
                     else:
@@ -560,17 +611,25 @@ def discover_combined(
             set_stage("retrieval")
             retrieval_started = time.perf_counter()
             lookup_method = getattr(catalog, "high_recall_candidates", None)
+            lookup_kwargs: dict[str, Any] = {}
             if callable(lookup_method):
+                lookup_kwargs = {
+                    "alternate_artists": tuple(
+                        [track.primary_artist, *track.featured_artists]
+                    ),
+                    "artist_fuzzy_limit": artist_fuzzy_limit,
+                    "title_fuzzy_limit": title_fuzzy_limit,
+                    "min_artist_similarity": min_artist_similarity,
+                    "min_title_similarity": min_title_similarity,
+                    "song_key_limit": song_key_limit,
+                    "fuzzy_fallback_key_limit": fuzzy_fallback_key_limit,
+                    "candidate_limit": candidate_limit,
+                }
                 lookup = lookup_method(
                     track.artist_full,
                     track.title,
-                    alternate_artists=tuple(
-                        [track.primary_artist, *track.featured_artists]
-                    ),
-                    artist_fuzzy_limit=artist_fuzzy_limit,
-                    title_fuzzy_limit=title_fuzzy_limit,
-                    min_artist_similarity=min_artist_similarity,
-                    min_title_similarity=min_title_similarity,
+                    **lookup_kwargs,
+                    include_fuzzy_fallback=False,
                 )
             else:
                 matches = tuple(catalog.candidates(track.artist_full, track.title))
@@ -588,6 +647,7 @@ def discover_combined(
                 )
             result.retrieval_seconds += time.perf_counter() - retrieval_started
             matches = lookup.candidates
+            initial_broader_retrieval = bool(matches and not lookup.strict_exact)
             if lookup.strict_exact:
                 result.exact_hits += 1
             else:
@@ -635,6 +695,59 @@ def discover_combined(
                 if str(getattr(item[1], "eligibility", "")).upper()
                 in {"RECOMMENDED", "ELIGIBLE_REVIEW"}
             ]
+            fallback_recovered = False
+            if (
+                not eligible
+                and callable(lookup_method)
+                and not lookup.fuzzy_fallback_attempted
+            ):
+                fallback_started = time.perf_counter()
+                fallback_lookup = lookup_method(
+                    track.artist_full,
+                    track.title,
+                    **lookup_kwargs,
+                    include_fuzzy_fallback=True,
+                )
+                result.retrieval_seconds += time.perf_counter() - fallback_started
+                scored_by_identity = {
+                    (str(chart.source), int(chart.chart_id)): (chart, breakdown)
+                    for chart, breakdown in scored
+                }
+                new_charts = [
+                    chart
+                    for chart in fallback_lookup.candidates
+                    if (str(chart.source), int(chart.chart_id)) not in scored_by_identity
+                ]
+                if new_charts:
+                    fallback_scoring_started = time.perf_counter()
+                    for chart in new_charts:
+                        scored_by_identity[(str(chart.source), int(chart.chart_id))] = (
+                            chart,
+                            score_candidate(track, chart, config),
+                        )
+                    result.scoring_seconds += time.perf_counter() - fallback_scoring_started
+                    result.candidate_charts_evaluated += len(new_charts)
+                    evaluated_chart_ids.update(
+                        (str(chart.source), int(chart.chart_id)) for chart in new_charts
+                    )
+                    if not matches:
+                        result.zero_candidate_tracks -= 1
+                        result.tracks_with_candidates += 1
+                    matches = fallback_lookup.candidates
+                    lookup = fallback_lookup
+                    scored = [
+                        scored_by_identity[(str(chart.source), int(chart.chart_id))]
+                        for chart in matches
+                    ]
+                    eligible = [
+                        item
+                        for item in scored
+                        if str(getattr(item[1], "eligibility", "")).upper()
+                        in {"RECOMMENDED", "ELIGIBLE_REVIEW"}
+                    ]
+                    fallback_recovered = bool(eligible)
+                if fallback_recovered and not initial_broader_retrieval:
+                    result.broader_retrieval_tracks += 1
             strong = any(
                 str(getattr(breakdown, "eligibility", "")).upper() == "RECOMMENDED"
                 for _, breakdown in scored
@@ -644,20 +757,14 @@ def discover_combined(
                 for _, breakdown in scored
             )
             to_persist = list(eligible)
+            rejection_exemplar = None
             if not to_persist and scored:
-                # Keep one hard-gated explanation for songs with no usable
-                # alternative. Soft score rejects stay out of normal review.
-                hard = [
-                    item
-                    for item in scored
-                    if bool(
-                        getattr(item[1], "gate_factors", {}).get("hard_gate", False)
-                    )
-                ]
-                if hard:
-                    to_persist = [
-                        max(hard, key=lambda item: (item[1].final_score, item[1].quality))
-                    ]
+                # Keep the exact exemplar that supplies the terminal reason.
+                # It remains noneligible, but gives review/audit surfaces one
+                # deterministic explanation for either hard or soft rejection.
+                rejection_exemplar = _rejection_exemplar(scored)
+                if rejection_exemplar is not None:
+                    to_persist = [rejection_exemplar]
             set_stage("database_persistence")
             persistence_started = time.perf_counter()
             for chart, breakdown in to_persist:
@@ -712,7 +819,10 @@ def discover_combined(
                 classification = "no_suitable"
             else:
                 classification = "no_catalog_candidate"
-            primary_reason = _primary_rejection_reason(classification, scored)
+            primary_reason = _primary_rejection_reason(
+                classification,
+                rejection_exemplar if rejection_exemplar is not None else scored,
+            )
             _record_terminal_yield(result, classification, primary_reason)
             db.save_matching_song_cache(
                 fingerprint,
@@ -722,8 +832,24 @@ def discover_combined(
                     "classification": classification,
                     "candidate_count": len(matches),
                     "eligible_count": len(eligible),
+                    "rejected_count": max(0, len(matches) - len(eligible)),
                     "primary_reason": primary_reason,
                     "provenance": list(lookup.methods),
+                    "strict_exact": bool(lookup.strict_exact),
+                    "broader_retrieval": bool(
+                        lookup.candidates and not lookup.strict_exact
+                    ) or fallback_recovered,
+                    "artist_found_title_different": bool(
+                        lookup.exact_artist and not lookup.strict_exact
+                    ),
+                    "title_found_artist_different": bool(
+                        lookup.exact_title
+                        and not lookup.strict_exact
+                        and not lookup.exact_artist
+                    ),
+                    "evaluated_chart_ids": [
+                        [str(chart.source), int(chart.chart_id)] for chart in matches
+                    ],
                     "candidates": [
                         {"candidate": asdict(chart), "score": breakdown.final_score, "quality": breakdown.quality, "decision": breakdown.decision, "eligibility": breakdown.eligibility, "breakdown_json": json.dumps(breakdown.to_dict(), sort_keys=True), "metadata": {"catalog_retrieval": {"strict_exact": lookup.strict_exact, "methods": list(lookup.methods), "retrieved_song_keys": lookup.retrieved_song_keys, "candidate_methods": list(lookup.candidate_methods.get((str(chart.source), int(chart.chart_id)), lookup.methods))}}}
                         for chart, breakdown in to_persist
@@ -866,15 +992,52 @@ def estimate_remaining_range(
     }
 
 
-def _primary_rejection_reason(classification: str, scored: Iterable[tuple[Any, Any]]) -> str:
+def _scored_rank(item: tuple[Any, Any]) -> tuple[Any, ...]:
+    chart, breakdown = item
+    return (
+        -float(getattr(breakdown, "final_score", 0.0) or 0.0),
+        -float(getattr(breakdown, "quality", 0.0) or 0.0),
+        str(getattr(chart, "source", "") or "").casefold(),
+        int(getattr(chart, "chart_id", 0) or 0),
+    )
+
+
+def _rejection_exemplar(
+    scored: Iterable[tuple[Any, Any]],
+) -> tuple[Any, Any] | None:
+    """Choose the one rejected candidate that owns the song explanation."""
+    values = list(scored)
+    if not values:
+        return None
+    soft = [
+        item
+        for item in values
+        if not bool(getattr(item[1], "gate_factors", {}).get("hard_gate", False))
+    ]
+    return min(soft or values, key=_scored_rank)
+
+
+def _primary_rejection_reason(
+    classification: str,
+    scored: Iterable[tuple[Any, Any]] | tuple[Any, Any],
+) -> str:
     if classification == "no_catalog_candidate":
-        return "no plausible catalog candidate"
+        return "no plausible candidate in current catalog snapshot"
     if classification in {"strong", "review"}:
         return ""
-    values = list(scored)
+    if (
+        isinstance(scored, tuple)
+        and len(scored) == 2
+        and hasattr(scored[1], "final_score")
+    ):
+        exemplar = scored
+    else:
+        exemplar = _rejection_exemplar(scored)
+    if exemplar is None:
+        return "no plausible candidate in current catalog snapshot"
+    _, breakdown = exemplar
     reasons = [
         str(reason).casefold()
-        for _, breakdown in values
         for reason in (
             list(getattr(breakdown, "gate_factors", {}).get("hard_gate_reasons", ()))
             + list(getattr(breakdown, "eligibility_reasons", ()))
@@ -882,8 +1045,10 @@ def _primary_rejection_reason(classification: str, scored: Iterable[tuple[Any, A
         )
     ]
     joined = " | ".join(reasons)
-    gates = [getattr(breakdown, "gate_factors", {}) for _, breakdown in values]
-    version_factors = [getattr(breakdown, "match_factors", {}).get("version_markers", {}) for _, breakdown in values]
+    gates = getattr(breakdown, "gate_factors", {})
+    version_factors = getattr(breakdown, "match_factors", {}).get(
+        "version_markers", {}
+    )
     priorities = (
         ("no 5-fret", "no required 5-fret guitar"),
         ("no playable chart content", "no playable chart content"),
@@ -898,14 +1063,13 @@ def _primary_rejection_reason(classification: str, scored: Iterable[tuple[Any, A
     for needle, label in priorities:
         if needle in joined:
             return label
-    if any(
-        isinstance(value, Mapping)
-        and value.get("matched") is False
-        and (value.get("track") or value.get("candidate"))
-        for value in version_factors
+    if (
+        isinstance(version_factors, Mapping)
+        and version_factors.get("matched") is False
+        and (version_factors.get("track") or version_factors.get("candidate"))
     ) or any(marker in joined for marker in ("cover", "live", "remix", "version")):
         return "cover/live/remix/version conflict"
-    if any(isinstance(gate, Mapping) and gate.get("hard_gate") for gate in gates):
+    if isinstance(gates, Mapping) and gates.get("hard_gate"):
         return "hard compatibility gate"
     return "below safe score threshold"
 
@@ -928,27 +1092,160 @@ def _record_terminal_yield(result: CombinedDiscoveryResult, classification: str,
         result.rejection_reasons[reason] = result.rejection_reasons.get(reason, 0) + 1
 
 
+def _source_summaries(
+    snapshots: Iterable[LibrarySnapshot],
+) -> dict[str, dict[str, int]]:
+    summaries: dict[str, dict[str, int]] = {}
+    for snapshot in snapshots:
+        tracks = list(snapshot.tracks)
+        report = snapshot.import_report
+        memberships_by_track = {
+            id(track): provider_track_playlist_memberships(track)
+            for track in tracks
+        }
+        playlist_tracks = [
+            track for track in tracks if memberships_by_track[id(track)]
+        ]
+        playlist_track_ids = {id(track) for track in playlist_tracks}
+        provider = str(snapshot.provider)
+        summaries[provider] = {
+            "tracks": len(tracks),
+            "unique": len(tracks),
+            "artists": len({track.artist_norm for track in tracks}),
+            "playlists": len(snapshot.playlists),
+            "playlist_memberships": sum(
+                len({
+                    playlist_identity(provider_id, name)
+                    for provider_id, name in memberships_by_track[id(track)]
+                    if playlist_identity(provider_id, name)
+                })
+                for track in tracks
+            ),
+            "playlist_unique": len(playlist_tracks),
+            "liked": sum(1 for track in tracks if track.liked),
+            "liked_in_playlists": sum(
+                1
+                for track in playlist_tracks
+                if track.liked
+            ),
+            "playlist_only": sum(
+                1
+                for track in playlist_tracks
+                if not track.liked
+            ),
+            "liked_only": sum(
+                1
+                for track in tracks
+                if track.liked and id(track) not in playlist_track_ids
+            ),
+            "raw_items": int(
+                (snapshot.metadata or {}).get(
+                    "source_item_count",
+                    report.total_rows if report else len(tracks),
+                )
+            ),
+            "raw_items_lower_bound": int(bool(
+                (snapshot.metadata or {}).get("source_item_count_is_lower_bound")
+            )),
+            "accepted_items": int(report.accepted_rows) if report else len(tracks),
+            "skipped_items": int(report.skipped_rows) if report else 0,
+            "duplicate_items": int(report.duplicate_rows) if report else 0,
+            "include_liked": int(bool((snapshot.metadata or {}).get("include_liked"))),
+        }
+    return summaries
+
+
 def workspace_snapshots(db: Database, workspace_id: int | str) -> list[LibrarySnapshot]:
     """Reconstruct current provider-neutral snapshots from durable provenance."""
+    membership_by_track: dict[tuple[int, int], list[Mapping[str, Any]]] = {}
+    for row in db.get_library_playlist_memberships(workspace_id):
+        membership_by_track.setdefault(
+            (int(row["source_id"]), int(row["library_track_id"])), []
+        ).append(row)
+
     grouped: dict[str, list[ProviderTrack]] = {}
     for row in db.get_track_provenance(workspace_id):
         provider = str(row["provider"])
+        memberships = membership_by_track.get(
+            (int(row["source_id"]), int(row["library_track_id"])), []
+        )
         grouped.setdefault(provider, []).append(ProviderTrack(
             provider=provider,
             provider_id=str(row["provider_id"]),
             title=str(row["title"]),
             artist=str(row["artist"]),
             album=str(row["album"] or ""),
+            playlist_ids=[str(value["playlist_provider_id"]) for value in memberships],
+            playlist_names=[str(value["playlist_name"] or "") for value in memberships],
             liked=bool(row["liked"]),
             isrc=str(row["isrc"] or ""),
             url=str(row["url"] or ""),
             metadata=json.loads(row["metadata_json"] or "{}"),
         ))
-    return [
-        LibrarySnapshot(provider, tracks, metadata={"import": "persisted"})
-        for provider, tracks in sorted(
-            grouped.items(), key=lambda item: (item[0] != "spotify", item[0])
+
+    playlists_by_provider: dict[str, dict[str, ProviderPlaylist]] = {}
+    for row in db.get_library_playlists(workspace_id):
+        provider = str(row["provider"])
+        provider_id = str(row["provider_id"])
+        playlist = ProviderPlaylist(
+            provider=provider,
+            provider_id=provider_id,
+            name=str(row["name"] or ""),
+            liked=bool(row["liked"]),
+            metadata=json.loads(row["metadata_json"] or "{}"),
         )
+        current = playlists_by_provider.setdefault(provider, {}).get(provider_id)
+        if current is None:
+            playlists_by_provider[provider][provider_id] = playlist
+        else:
+            current.name = current.name or playlist.name
+            current.liked = current.liked or playlist.liked
+            current.metadata.update(playlist.metadata)
+
+    reports_by_provider: dict[str, SourceImportReport] = {}
+    include_liked_by_provider: dict[str, bool] = {}
+    source_items_by_provider: dict[str, int] = {}
+    source_items_lower_bound_by_provider: dict[str, bool] = {}
+    for row in db.get_source_summary(workspace_id):
+        provider = str(row["provider"])
+        report = reports_by_provider.setdefault(provider, SourceImportReport())
+        report.total_rows += int(row["total_rows"] or 0)
+        report.accepted_rows += int(row["accepted_rows"] or 0)
+        report.skipped_rows += int(row["skipped_rows"] or 0)
+        report.duplicate_rows += int(row["duplicate_rows"] or 0)
+        report.unique_tracks += int(row["unique_tracks"] or 0)
+        report.liked_count += int(row["liked_count"] or 0)
+        source_items_by_provider[provider] = (
+            source_items_by_provider.get(provider, 0)
+            + int(row["source_item_count"] or 0)
+        )
+        source_items_lower_bound_by_provider[provider] = bool(
+            source_items_lower_bound_by_provider.get(provider)
+            or row["source_item_count_is_lower_bound"]
+        )
+        try:
+            scope = json.loads(row["scope_json"] or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            scope = {}
+        include_liked_by_provider[provider] = bool(
+            include_liked_by_provider.get(provider) or scope.get("include_liked")
+        )
+
+    providers = set(grouped) | set(playlists_by_provider)
+    return [
+        LibrarySnapshot(
+            provider,
+            merge_provider_tracks(grouped.get(provider, [])),
+            list(playlists_by_provider.get(provider, {}).values()),
+            metadata={
+                "import": "persisted",
+                "include_liked": include_liked_by_provider.get(provider, False),
+                "source_item_count": source_items_by_provider.get(provider, 0),
+                "source_item_count_is_lower_bound": source_items_lower_bound_by_provider.get(provider, False),
+            },
+            import_report=reports_by_provider.get(provider),
+        )
+        for provider in sorted(providers, key=lambda value: (value != "spotify", value))
     ]
 
 

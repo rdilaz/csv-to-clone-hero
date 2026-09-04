@@ -192,7 +192,10 @@ def test_public_authenticated_journey_to_download_ready(
             "workspace_status": "complete" if complete else "created",
             "workspace": {"id": 1, "status": "complete" if complete else "created", "phase": "complete" if complete else "source_setup", "updated_at": time.time()},
             "spotify_scope": None,
-            "sources": [],
+            "sources": [
+                {"provider": "spotify", "tracks": 2, "unique_tracks": 2, "playlists": 1, "raw_items": 3, "liked": 1, "playlist_only": 1},
+                {"provider": "soundcloud", "tracks": 1, "unique_tracks": 1, "playlists": 1, "raw_items": 1, "liked": 0, "playlist_only": 1},
+            ],
             "combined": {"tracks": 0, "artists": 0},
             "job": {"id": 9, "status": "complete", "phase": "complete", "message": "Complete", "progress": {"total_tracks": 1, "processed_tracks": 1}} if complete else None,
             "review": {"strong": 1 if complete else 0, "review": 0, "unavailable": 0, "selected": int(selected["value"]), "total": 1 if complete else 0},
@@ -294,6 +297,8 @@ def test_public_authenticated_journey_to_download_ready(
         page.goto(base_url + "/", wait_until="networkidle")
 
         playwright.expect(page.get_by_text("Count unavailable", exact=True)).to_be_visible()
+        playwright.expect(page.get_by_text("1 playlist; 3 source items became 2 unique songs (1 liked, 1 playlist-only).", exact=True)).to_be_visible()
+        assert page.locator("#soundcloudCount").inner_text() == "1 unique song, 1 playlist"
         page.get_by_role("button", name="Select all playlists").click()
         assert page.locator(".spotify-playlist:checked").count() == 2
         assert not page.get_by_label("Liked Songs").is_checked()

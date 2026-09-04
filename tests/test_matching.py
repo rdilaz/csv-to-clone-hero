@@ -80,9 +80,43 @@ def test_meaningful_version_mismatch_remains_version_evidence(config):
         config,
     )
 
-    assert result.gate_factors["title_identity"] == "strong"
+    assert result.match_factors["title"]["identity"]["safe_identity_projection"]["matched"] is False
     assert result.gate_factors["title_conflict"] is False
     assert any("version mismatch" in label for label, _ in result.penalties)
+
+
+@pytest.mark.parametrize(
+    "chart_title",
+    [
+        "Good Ass Intro (ft. Artist One, Artist Two & Artist Three)",
+        "Good Ass Intro [Overchart]",
+    ],
+)
+def test_safe_title_projection_establishes_same_song_identity(config, chart_title):
+    result = score_candidate(
+        make_track("Good Ass Intro", "Chance the Rapper"),
+        _high_quality_chart(chart_title, "Chance the Rapper"),
+        config,
+    )
+    projection = result.match_factors["title"]["identity"]["safe_identity_projection"]
+    assert projection["matched"] is True
+    assert projection["changed"] is True
+    assert result.gate_factors["title_auto_identity"] is True
+    assert result.eligibility == "RECOMMENDED"
+
+
+@pytest.mark.parametrize("marker", ["Live", "Remix", "Cover"])
+def test_safe_title_projection_never_erases_version_identity(config, marker):
+    result = score_candidate(
+        make_track("Song", "Artist"),
+        _high_quality_chart(f"Song ({marker})", "Artist"),
+        config,
+    )
+    projection = result.match_factors["title"]["identity"]["safe_identity_projection"]
+    assert projection["matched"] is False
+    assert projection["version_markers_agree"] is False
+    assert any("version mismatch" in label for label, _ in result.penalties)
+    assert result.eligibility != "RECOMMENDED"
 
 
 def test_pick_best_prefers_correct_song_over_higher_quality_wrong_song(config):

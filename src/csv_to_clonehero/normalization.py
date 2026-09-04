@@ -264,6 +264,33 @@ _RETRIEVAL_DASH_ANNOTATION_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Matching-only title projection. Unlike the broader retrieval aliases above,
+# these clauses describe credits or presentation rather than a musical version.
+# Meaningful identity markers such as live/remix/acoustic/cover are deliberately
+# absent and therefore survive this projection.
+_IDENTITY_CREDIT_CLAUSE_RE = re.compile(
+    r"\s*[\(\[]\s*(?:feat\.?|ft\.?|featuring|prod\.?|produced(?:\s+by)?)\b[^\)\]]*[\)\]]",
+    re.IGNORECASE,
+)
+_IDENTITY_PRESENTATION_CLAUSE_RE = re.compile(
+    r"\s*[\(\[]\s*(?:official(?:\s+(?:audio|video|lyrics|visualizer))?|"
+    r"audio|video|lyrics|lyric\s+video|visualizer)\s*[\)\]]",
+    re.IGNORECASE,
+)
+_IDENTITY_CHART_LABEL_RE = re.compile(
+    r"\s*\[\s*overchart\s*\]",
+    re.IGNORECASE,
+)
+_IDENTITY_TRAILING_CREDIT_RE = re.compile(
+    r"\s+(?:feat\.?|ft\.?|featuring|prod\.?|produced(?:\s+by)?)\b.*$",
+    re.IGNORECASE,
+)
+_IDENTITY_TRAILING_PRESENTATION_RE = re.compile(
+    r"\s*(?:[-\u2013\u2014]\s*)?\b(?:official(?:\s+(?:audio|video|lyrics|visualizer))?|"
+    r"audio|video|lyrics|lyric\s+video|visualizer)\s*$",
+    re.IGNORECASE,
+)
+
 
 @lru_cache(maxsize=16384)
 def normalize_title_without_recognized_annotations(title: str) -> str:
@@ -280,6 +307,27 @@ def normalize_title_without_recognized_annotations(title: str) -> str:
         simplified = _RETRIEVAL_CLAUSE_RE.sub("", simplified)
         simplified = _RETRIEVAL_TRAILING_ANNOTATION_RE.sub("", simplified)
         simplified = _RETRIEVAL_DASH_ANNOTATION_RE.sub("", simplified)
+        simplified = _WS_RE.sub(" ", simplified).strip()
+    return normalize_title(simplified)
+
+
+@lru_cache(maxsize=16384)
+def normalize_title_for_identity(title: str) -> str:
+    """Project only non-song credits/presentation out of a title for matching.
+
+    This is positive evidence for final identity checks, never a stored key.
+    Version markers remain intact so ``Song (Live)`` cannot collapse to
+    ``Song`` while ``Song (ft. Guest)`` and ``Song [Overchart]`` can agree.
+    """
+    simplified = strip_version_noise(_fold_unicode(str(title or "")).strip())
+    previous = None
+    while simplified != previous:
+        previous = simplified
+        simplified = _IDENTITY_CREDIT_CLAUSE_RE.sub("", simplified)
+        simplified = _IDENTITY_PRESENTATION_CLAUSE_RE.sub("", simplified)
+        simplified = _IDENTITY_CHART_LABEL_RE.sub("", simplified)
+        simplified = _IDENTITY_TRAILING_CREDIT_RE.sub("", simplified)
+        simplified = _IDENTITY_TRAILING_PRESENTATION_RE.sub("", simplified)
         simplified = _WS_RE.sub(" ", simplified).strip()
     return normalize_title(simplified)
 

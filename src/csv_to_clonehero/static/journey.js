@@ -198,7 +198,8 @@
 
   function sourceTile(source, compact) {
     const info = sourceInfo[source.source_key] || {};
-    const detail = source.song_count ? number(source.song_count) + " songs imported" : info.description;
+    const playlistDetail = source.playlist_count ? ", " + number(source.playlist_count) + " " + (source.playlist_count === 1 ? "playlist" : "playlists") : "";
+    const detail = source.song_count || source.playlist_count ? number(source.song_count) + " unique " + (source.song_count === 1 ? "song" : "songs") + playlistDetail : info.description;
     const copy = sourceMark(source) + '<span class="source-tile-copy"><strong>' + escapeHtml(source.label) + '</strong><small>' + escapeHtml(detail) + '</small>' + statusCue(source) + '</span>';
     if (source.availability === "coming_soon") {
       return '<article class="source-tile source-coming' + (compact ? " compact" : "") + '" aria-label="' + escapeHtml(source.label) + ', coming soon">' + copy + '</article>';
@@ -218,7 +219,8 @@
 
   function sourceSummary(source, count) {
     const info = sourceInfo[source.source_key] || {};
-    return '<div class="source-summary-row"><span class="source-summary-name"><span class="mini-source ' + escapeHtml(info.art) + '" aria-hidden="true">' + escapeHtml(info.mark) + '</span>' + escapeHtml(source.label) + '</span><strong>' + number(count) + '</strong><span>songs</span></div>';
+    const scope = source.playlist_count ? "songs, " + number(source.playlist_count) + " " + (source.playlist_count === 1 ? "playlist" : "playlists") : "songs";
+    return '<div class="source-summary-row"><span class="source-summary-name"><span class="mini-source ' + escapeHtml(info.art) + '" aria-hidden="true">' + escapeHtml(info.mark) + '</span>' + escapeHtml(source.label) + '</span><strong>' + number(count) + '</strong><span>' + escapeHtml(scope) + '</span></div>';
   }
 
   function musicReady(snapshot) {
@@ -802,7 +804,8 @@
     const playlists = (scope.playlists || []).map(function (playlist) {
       const accessible = playlist.access_status === "accessible";
       const checked = playlist.selected ? " checked" : "";
-      return '<label class="scope-option"><input type="checkbox" data-spotify-playlist="' + escapeHtml(playlist.spotify_id) + '"' + checked + (accessible ? "" : " disabled") + '><span><strong>' + escapeHtml(playlist.name || "Untitled playlist") + '</strong><small>' + escapeHtml(accessible ? number(playlist.item_count || 0) + " songs" : (playlist.access_reason || "Unavailable")) + '</small></span></label>';
+      const itemCount = playlist.item_count === null || playlist.item_count === undefined ? "Count unavailable" : number(playlist.item_count) + " songs";
+      return '<label class="scope-option"><input type="checkbox" data-spotify-playlist="' + escapeHtml(playlist.spotify_id) + '"' + checked + (accessible ? "" : " disabled") + '><span><strong>' + escapeHtml(playlist.name || "Untitled playlist") + '</strong><small>' + escapeHtml(accessible ? itemCount : (playlist.access_reason || "Unavailable")) + '</small></span></label>';
     }).join("");
     return '<section class="spotify-scope" aria-labelledby="spotify-scope-heading"><p class="overline">Choose music</p><h3 id="spotify-scope-heading">Add from Spotify</h3><label class="scope-option"><input type="checkbox" data-spotify-liked' + (liked ? " checked" : "") + (scope.liked_available === false && !liked ? " disabled" : "") + '><span><strong>Liked Songs</strong><small>' + escapeHtml(scope.liked_available === false ? "Count unavailable" : (likedCount || "Saved songs")) + '</small></span></label>' + (playlists || '<p class="scope-empty">No accessible playlists are available yet.</p>') + '<button class="button primary" data-action="save-spotify-scope">Add selected Spotify music ' + icons.arrow + '</button></section>';
   }
@@ -816,7 +819,9 @@
     if (imported) {
       const date = source.updated_at ? new Date(source.updated_at).toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" }) : "recently";
       const spotifyActions = source.connected ? '<button class="button primary" data-action="update-spotify">Update music</button><button class="button secondary" data-action="reconnect-source">Reconnect</button>' : '<button class="button primary" data-action="reconnect-source">Reconnect to update</button>';
-      body = '<p class="sheet-lead">Your imported music is part of this library.</p><div class="sheet-stat"><strong>' + number(source.song_count) + '</strong><span>songs imported</span></div><p class="sheet-updated">Last updated ' + escapeHtml(date) + '</p>' + (source.state === "attention" ? '<div class="attention-note"><span class="attention-symbol">!</span><span><strong>Reconnect to update</strong><small>Your imported songs are still here.</small></span></div>' : "") + (soundcloud ? '<label class="file-picker"><span>Choose a replacement export</span><input id="soundcloud-file" type="file" accept=".csv,.json,text/csv,application/json"></label>' : "") + '<div class="sheet-actions">' + (spotify ? spotifyActions : '<button class="button primary" data-action="import-soundcloud">Replace import</button>') + '<button class="button quiet" data-action="view-imported">View imported music</button></div>' + (spotify && model.spotifyScope ? spotifyScopeChooser(model.spotifyScope) : "");
+      const sourceItems = (source.raw_item_count_is_lower_bound ? "at least " : "") + number(source.raw_item_count || source.song_count) + " source items";
+      const scopeDetail = (source.playlist_count ? number(source.playlist_count) + " " + (source.playlist_count === 1 ? "playlist" : "playlists") + (source.include_liked ? " + Liked Songs" : "") + "; " : "") + sourceItems + " became " + number(source.song_count) + " unique " + (source.song_count === 1 ? "song" : "songs") + (source.playlist_only_count ? ", including " + number(source.playlist_only_count) + " playlist-only" : "") + ".";
+      body = '<p class="sheet-lead">Your imported music is part of this library.</p><div class="sheet-stat"><strong>' + number(source.song_count) + '</strong><span>unique songs imported</span></div><p class="sheet-updated">' + escapeHtml(scopeDetail) + '</p><p class="sheet-updated">Last updated ' + escapeHtml(date) + '</p>' + (source.state === "attention" ? '<div class="attention-note"><span class="attention-symbol">!</span><span><strong>Reconnect to update</strong><small>Your imported songs are still here.</small></span></div>' : "") + (soundcloud ? '<label class="file-picker"><span>Choose a replacement export</span><input id="soundcloud-file" type="file" accept=".csv,.json,text/csv,application/json"></label>' : "") + '<div class="sheet-actions">' + (spotify ? spotifyActions : '<button class="button primary" data-action="import-soundcloud">Replace import</button>') + '<button class="button quiet" data-action="view-imported">View imported music</button></div>' + (spotify && model.spotifyScope ? spotifyScopeChooser(model.spotifyScope) : "");
     } else if (spotify) {
       body = '<p class="sheet-lead">Bring your listening history into this music library.</p><div class="sheet-preview"><span class="preview-mark">' + icons.sparkle + '</span><div><strong>Ready to bring it in</strong><small>Liked songs and saved albums stay in your library.</small></div></div><div class="sheet-actions"><button class="button primary" data-action="' + (source.connected ? 'update-spotify' : 'reconnect-source') + '">' + (source.connected ? 'Add Spotify music' : 'Connect Spotify') + '</button></div>' + (source.connected && model.spotifyScope ? spotifyScopeChooser(model.spotifyScope) : "");
     } else {

@@ -759,7 +759,7 @@ def test_fresh_authenticated_sources_creates_user_scoped_workspace(client, confi
 
 def test_public_journey_restores_owned_workspace_state(client, app, config):
     from csv_to_clonehero.database import Database
-    from csv_to_clonehero.providers.base import LibrarySnapshot, ProviderTrack
+    from csv_to_clonehero.providers.base import LibrarySnapshot, ProviderPlaylist, ProviderTrack, SourceImportReport
     from csv_to_clonehero.server.auth import user_workspace_key
     from tests.conftest import make_chart
 
@@ -770,8 +770,16 @@ def test_public_journey_restores_owned_workspace_state(client, app, config):
         workspace = db.get_workspace(user_workspace_key("user-1"))
         snapshot = LibrarySnapshot(
             "soundcloud",
-            [ProviderTrack("soundcloud", "sc-1", "Song", "Artist")],
+            [ProviderTrack(
+                "soundcloud", "sc-1", "Song", "Artist",
+                playlist_ids=["set-1"], playlist_names=["Set One"],
+            )],
+            [ProviderPlaylist("soundcloud", "set-1", "Set One")],
             metadata={"import": "upload"},
+            import_report=SourceImportReport(
+                total_rows=3, accepted_rows=2, skipped_rows=1,
+                duplicate_rows=1, unique_tracks=1,
+            ),
         )
         db.upsert_library_snapshot(workspace["id"], snapshot)
         track_id = next(iter(db.get_workspace_library_track_ids(workspace["id"])))
@@ -804,6 +812,18 @@ def test_public_journey_restores_owned_workspace_state(client, app, config):
     assert payload["spotify_scope"]["include_liked"] is True
     assert payload["combined"]["tracks"] == 1
     assert payload["sources"][0]["provider"] == "soundcloud"
+    expected_source_counts = {
+        "unique_tracks": 1,
+        "playlists": 1,
+        "playlist_memberships": 1,
+        "raw_items": 3,
+        "accepted_items": 2,
+        "skipped_items": 1,
+        "duplicate_items": 1,
+    }
+    assert {
+        key: payload["sources"][0][key] for key in expected_source_counts
+    } == expected_source_counts
     assert payload["job"]["status"] == "complete"
     assert "workspace_key" not in payload["job"]
     assert payload["review"] == {

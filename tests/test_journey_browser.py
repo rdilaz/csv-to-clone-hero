@@ -15,7 +15,7 @@ from pathlib import Path
 import pytest
 
 from csv_to_clonehero.database import Database
-from csv_to_clonehero.providers.base import LibrarySnapshot, ProviderTrack
+from csv_to_clonehero.providers.base import LibrarySnapshot, ProviderPlaylist, ProviderTrack
 from csv_to_clonehero.webapp import create_app
 
 from .conftest import FakeSource
@@ -44,10 +44,13 @@ def browser_page(config, request):
     if request.node.get_closest_marker("music_ready"):
         db = Database(config.database_path)
         try:
+            first = _track("spotify", "one", "Artist", "One")
+            first.playlist_ids = ["playlist-1"]
+            first.playlist_names = ["Road trip"]
             db.upsert_library_snapshot(workspace, LibrarySnapshot("spotify", [
-                _track("spotify", "one", "Artist", "One"),
+                first,
                 _track("spotify", "two", "Artist", "Two"),
-            ]))
+            ], [ProviderPlaylist("spotify", "playlist-1", "Road trip")]))
         finally:
             db.close()
     server = make_server("127.0.0.1", 0, app, threaded=True)
@@ -92,6 +95,7 @@ def test_music_ready_counts_and_format_chooser(browser_page):
     page = browser_page
     assert page.get_by_role("heading", name="2 songs").is_visible()
     assert page.get_by_text("Spotify", exact=True).count() >= 1
+    assert page.get_by_text("songs, 1 playlist", exact=True).is_visible()
     page.get_by_role("button", name="Download my song list").click()
     assert page.get_by_role("dialog", name="Choose a format").is_visible()
     with page.expect_download() as download_info:

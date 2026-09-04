@@ -1,10 +1,19 @@
 """Database layer unit tests."""
 
+import json
+
 import pytest
 from pydantic import ValidationError
 
 from csv_to_clonehero.config import ExpansionConfig
 from csv_to_clonehero.database import Database, SCHEMA_VERSION
+from csv_to_clonehero.providers.base import (
+    LibrarySnapshot,
+    ProviderPlaylist,
+    ProviderTrack,
+    SourceImportReport,
+    merge_provider_tracks,
+)
 
 from .conftest import make_chart
 
@@ -37,6 +46,271 @@ def test_playlist_creator_metadata_roundtrip(tmp_path):
     assert row is not None
     assert row["owner_id"] == "user-1"
     assert row["owner_name"] == "Test User"
+    db.close()
+
+
+def test_provider_playlist_scope_persists_memberships_and_replaces_only_its_source(tmp_path):
+    db = Database(tmp_path / "state.db")
+    workspace = db.create_workspace(workspace_key="provider-scope")
+    spotify_tracks = merge_provider_tracks([
+        ProviderTrack(
+            "spotify", "sp-1", "Song", "Artist",
+            playlist_ids=["p-one"], playlist_names=["One"], liked=True,
+        ),
+        ProviderTrack(
+            "spotify", "sp-1", "Song", "Artist",
+            playlist_ids=["p-two"], playlist_names=["Two"],
+        ),
+    ])
+    db.upsert_library_snapshot(
+        workspace,
+        LibrarySnapshot(
+            "spotify",
+            spotify_tracks,
+            [
+                ProviderPlaylist("spotify", "p-one", "One"),
+                ProviderPlaylist("spotify", "p-two", "Two"),
+                ProviderPlaylist(
+                    "spotify", "p-empty", "Empty",
+                    metadata={"owner_id": "owner", "total_tracks": 0},
+                ),
+            ],
+            metadata={"import": "api"},
+            import_report=SourceImportReport(
+                total_rows=3,
+                accepted_rows=2,
+                skipped_rows=1,
+                unique_tracks=1,
+                duplicate_rows=1,
+                liked_count=1,
+            ),
+        ),
+    )
+    db.upsert_library_snapshot(
+        workspace,
+        LibrarySnapshot(
+            "soundcloud",
+            [ProviderTrack(
+                "soundcloud", "sc-1", "Song", "Artist",
+                playlist_ids=["set-1"], playlist_names=["Set"],
+            )],
+            [ProviderPlaylist("soundcloud", "set-1", "Set")],
+            metadata={"import": "export"},
+        ),
+    )
+
+    assert len(db.get_neutral_library_tracks(workspace)) == 1
+    playlists = db.get_library_playlists(workspace)
+    assert {(row["provider"], row["provider_id"]) for row in playlists} == {
+        ("spotify", "p-one"),
+        ("spotify", "p-two"),
+        ("spotify", "p-empty"),
+        ("soundcloud", "set-1"),
+    }
+    empty = next(row for row in playlists if row["provider_id"] == "p-empty")
+    assert empty["track_count"] == 0
+    assert json.loads(empty["metadata_json"])["owner_id"] == "owner"
+    memberships = db.get_library_playlist_memberships(workspace)
+    assert {row["playlist_provider_id"] for row in memberships} == {"p-one", "p-two", "set-1"}
+    assert len({row["library_track_id"] for row in memberships}) == 1
+
+    spotify = dict(db.get_source_summary(workspace, "spotify")[0])
+    assert spotify["total_rows"] == 3
+    assert spotify["accepted_rows"] == 2
+    assert spotify["skipped_rows"] == 1
+    assert spotify["duplicate_rows"] == 1
+    assert spotify["unique_tracks"] == 1
+    assert spotify["playlist_count"] == 3
+    assert spotify["membership_count"] == 2
+    assert spotify["liked_count"] == 1
+
+    db.upsert_library_snapshot(
+        workspace,
+        LibrarySnapshot(
+            "spotify",
+            [ProviderTrack(
+                "spotify", "sp-1", "Song", "Artist",
+                playlist_ids=["p-two"], playlist_names=["Two"],
+            )],
+            [
+                ProviderPlaylist("spotify", "p-two", "Two"),
+                ProviderPlaylist("spotify", "p-empty", "Empty"),
+            ],
+            metadata={"import": "api"},
+        ),
+    )
+
+    assert {row["provider_id"] for row in db.get_library_playlists(workspace, provider="spotify")} == {
+        "p-two", "p-empty",
+    }
+    assert [row["playlist_provider_id"] for row in db.get_library_track_playlists(workspace, provider="spotify")] == ["p-two"]
+    assert [row["provider_id"] for row in db.get_library_playlists(workspace, provider="soundcloud")] == ["set-1"]
+    assert db.get_source_summary(workspace, "soundcloud")[0]["membership_count"] == 1
+    db.close()
+
+
+def test_v20_migration_recovers_v19_playlist_scope_from_provenance(tmp_path):
+    path = tmp_path / "state.db"
+    db = Database(path)
+    workspace = db.create_workspace(workspace_key="v19-playlists")
+    tracks = merge_provider_tracks([
+        ProviderTrack(
+            "spotify", "sp-1", "Song", "Artist",
+            playlist_ids=["p-one"], playlist_names=["One"],
+        )
+    ])
+    db.upsert_library_snapshot(
+        workspace,
+        LibrarySnapshot(
+            "spotify",
+            tracks,
+            [
+                ProviderPlaylist("spotify", "p-one", "One"),
+                ProviderPlaylist("spotify", "p-empty", "Empty"),
+            ],
+            metadata={"import": "api"},
+        ),
+        scope={"playlist_ids": ["p-one", "p-empty"], "include_liked": True},
+    )
+    with db._conn:
+        db._conn.execute("DELETE FROM library_playlists")
+        db._conn.execute("UPDATE schema_version SET version=19")
+    db.close()
+
+    migrated = Database(path)
+    assert migrated._conn.execute(
+        "SELECT MAX(version) FROM schema_version"
+    ).fetchone()[0] == SCHEMA_VERSION
+    assert {row["provider_id"] for row in migrated.get_library_playlists(workspace)} == {
+        "p-one", "p-empty",
+    }
+    assert [
+        row["playlist_provider_id"]
+        for row in migrated.get_library_playlist_memberships(workspace)
+    ] == ["p-one"]
+    migrated.close()
+
+
+def test_partial_playlist_refresh_preserves_prior_membership(tmp_path):
+    db = Database(tmp_path / "state.db")
+    workspace = db.create_workspace(workspace_key="partial-playlist")
+    db.upsert_library_snapshot(
+        workspace,
+        LibrarySnapshot(
+            "spotify",
+            [ProviderTrack(
+                "spotify", "sp-1", "Song", "Artist",
+                playlist_ids=["playlist-1"], playlist_names=["Playlist One"],
+                liked=True,
+            )],
+            [ProviderPlaylist("spotify", "playlist-1", "Playlist One")],
+            metadata={"import": "api"},
+        ),
+    )
+    db.upsert_library_snapshot(
+        workspace,
+        LibrarySnapshot(
+            "spotify",
+            [],
+            [ProviderPlaylist(
+                "spotify", "playlist-1", "Playlist One",
+                metadata={"access_status": "error", "access_reason": "temporary"},
+            )],
+            metadata={"import": "api", "partial": True},
+            import_report=SourceImportReport(error_count=1),
+        ),
+    )
+
+    assert len(db.get_neutral_library_tracks(workspace, provider="spotify")) == 1
+    assert [
+        row["playlist_provider_id"]
+        for row in db.get_library_playlist_memberships(workspace, "spotify")
+    ] == ["playlist-1"]
+    summary = db.get_source_summary(workspace, "spotify")[0]
+    assert summary["tracks"] == 1
+    assert summary["import_status"] == "partial"
+    assert summary["source_item_count"] == 1
+    assert summary["source_item_count_is_lower_bound"] == 1
+    assert summary["liked_count"] == 0
+    assert summary["playlist_only_tracks"] == 1
+    db.close()
+
+
+def test_provider_summary_aggregates_multiple_sources_without_duplicate_songs(tmp_path):
+    db = Database(tmp_path / "state.db")
+    workspace = db.create_workspace(workspace_key="provider-aggregate")
+    db.upsert_library_snapshot(
+        workspace,
+        LibrarySnapshot(
+            "soundcloud",
+            [ProviderTrack(
+                "soundcloud", "api-1", "Shared", "Artist",
+                playlist_ids=["api-set"], playlist_names=["API Set"],
+            )],
+            [ProviderPlaylist("soundcloud", "api-set", "API Set")],
+            metadata={"import": "api"},
+            import_report=SourceImportReport(total_rows=1, accepted_rows=1, unique_tracks=1),
+        ),
+    )
+    db.upsert_library_snapshot(
+        workspace,
+        LibrarySnapshot(
+            "soundcloud",
+            [
+                ProviderTrack("soundcloud", "export-1", "Shared", "Artist"),
+                ProviderTrack(
+                    "soundcloud", "export-2", "Other", "Artist",
+                    playlist_ids=["api-set"], playlist_names=["API Set"],
+                ),
+            ],
+            [ProviderPlaylist("soundcloud", "api-set", "API Set")],
+            metadata={"import": "export"},
+            import_report=SourceImportReport(total_rows=2, accepted_rows=2, unique_tracks=2),
+        ),
+    )
+
+    summary = db.get_provider_summaries(workspace)[0]
+    assert summary["tracks"] == 2
+    assert summary["playlist_count"] == 1
+    assert summary["source_item_count"] == 3
+    assert db.get_combined_summary(workspace)["source_items"] == 3
+    db.close()
+
+
+def test_partial_playlist_membership_follows_provider_identity_metadata_change(tmp_path):
+    db = Database(tmp_path / "state.db")
+    workspace = db.create_workspace(workspace_key="partial-remap")
+    db.upsert_library_snapshot(
+        workspace,
+        LibrarySnapshot(
+            "spotify",
+            [ProviderTrack(
+                "spotify", "sp-1", "Old title", "Artist",
+                playlist_ids=["playlist-1"], playlist_names=["Playlist One"],
+            )],
+            [ProviderPlaylist("spotify", "playlist-1", "Playlist One")],
+            metadata={"import": "api"},
+        ),
+    )
+    db.upsert_library_snapshot(
+        workspace,
+        LibrarySnapshot(
+            "spotify",
+            [ProviderTrack("spotify", "sp-1", "New title", "Artist", liked=True)],
+            [ProviderPlaylist(
+                "spotify", "playlist-1", "Playlist One",
+                metadata={"access_status": "inaccessible"},
+            )],
+            metadata={"import": "api", "partial": True},
+            import_report=SourceImportReport(inaccessible_count=1),
+        ),
+    )
+
+    memberships = db.get_library_playlist_memberships(workspace, "spotify")
+    assert len(memberships) == 1
+    assert memberships[0]["title"] == "New title"
+    current = db.get_neutral_library_tracks(workspace, provider="spotify")
+    assert [row["title"] for row in current] == ["New title"]
     db.close()
 
 

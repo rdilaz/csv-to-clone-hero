@@ -823,10 +823,23 @@ def create_app(
                     "provider": source["provider"],
                     "status": source["status"],
                     "tracks": int(source["tracks"] or 0),
+                    "unique_tracks": int(source["unique_tracks"] or 0),
                     "provenance": int(source["provenance"] or 0),
+                    "playlists": int(source["playlist_count"] or 0),
+                    "playlist_memberships": int(source["membership_count"] or 0),
+                    "playlist_unique_tracks": int(source["playlist_unique_tracks"] or 0),
+                    "liked": int(source["liked_count"] or 0),
+                    "liked_in_playlists": int(source["liked_in_playlists"] or 0),
+                    "playlist_only": int(source["playlist_only_tracks"] or 0),
+                    "liked_only": int(source["liked_only_tracks"] or 0),
+                    "raw_items": int(source["source_item_count"] or 0),
+                    "raw_items_lower_bound": bool(source["source_item_count_is_lower_bound"]),
+                    "accepted_items": int(source["accepted_rows"] or 0),
+                    "skipped_items": int(source["skipped_rows"] or 0),
+                    "duplicate_items": int(source["duplicate_rows"] or 0),
                     "updated_at": source["updated_at"],
                 }
-                for source in db.get_source_summary(workspace_id)
+                for source in db.get_provider_summaries(workspace_id)
             ]
             newest_jobs = jobs.list_for_user(int(user["id"]), limit=1)
             download = downloads.latest_for_user_workspace(int(user["id"]), workspace_id)
