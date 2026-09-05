@@ -1,15 +1,21 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 420 120" role="img" aria-labelledby="title">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 430 132" role="img" aria-labelledby="title">
   <title id="title">Riff</title>
   <defs>
     <mask id="signal-cut">
-      <rect width="420" height="120" fill="white"/>
-      <path d="M-8 55H428" stroke="black" stroke-width="11"/>
+      <rect width="430" height="132" fill="white"/>
+
+      <path d="M-4 60h438v12H-4Z" fill="black"/>
+
+      <!-- Fine scan faults survive in the compact lockup without breaking the large silhouette. -->
+      <path d="M5 20h20v3H5Zm74-13h13l5 4H79Zm72 14h22v3h-22Zm57-7h27v3h-27Zm91 15h18v3h-18Zm33-14h24v3h-24Zm72 16h23v3h-23Z" fill="black"/>
+      <path d="M25 115h11v3H25Zm130-3h18v3h-18Zm55-18h22v3h-22Zm122 4h20v3h-20Z" fill="black"/>
     </mask>
   </defs>
-  <g fill="#f5f2e8" mask="url(#signal-cut)">
-    <path fill-rule="evenodd" d="M4 8h69l17 17v27L74 68l28 44H70L47 72H31v40H4V8Zm27 23v20h31l4-4V35l-4-4H31Z"/>
-    <path d="M118 8h28v104h-28z"/>
-    <path d="M172 8h91v24h-63v19h53v23h-53v38h-28z"/>
-    <path d="M291 8h125v24h-97v19h57v23h-57v38h-28z"/>
+
+  <g fill="#f4f0e6" mask="url(#signal-cut)">
+    <path fill-rule="evenodd" d="M5 7h77c27 0 43 15 43 39 0 17-9 29-25 35l34 44H91L65 84H43v41H5V7Zm38 29v23h35c9 0 13-4 13-12 0-7-4-11-13-11H43Z"/>
+    <path d="M149 7h38v118h-38z"/>
+    <path d="M208 7h111v31h-73v21h61v31h-61v35h-38z"/>
+    <path d="M331 7h96v31h-58v22h52v31h-52v34h-38z"/>
   </g>
 </svg>

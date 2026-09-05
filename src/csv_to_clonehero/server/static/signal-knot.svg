@@ -1,58 +1,148 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 760" role="img" aria-labelledby="title desc">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 800" role="img" aria-labelledby="title desc">
   <title id="title">Signal knot</title>
-  <desc id="desc">An original angular loop built from violet and cyan chart-like facets.</desc>
+  <desc id="desc">An original fractured signal form made from translucent violet and cyan facets, wireframe paths, and an irregular central void.</desc>
   <defs>
-    <linearGradient id="violet" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0" stop-color="#dcd2ff"/>
-      <stop offset=".52" stop-color="#8d6cff"/>
-      <stop offset="1" stop-color="#3d2e91"/>
+    <linearGradient id="violetGlass" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#ece7ff" stop-opacity=".82"/>
+      <stop offset=".38" stop-color="#a99aff" stop-opacity=".52"/>
+      <stop offset="1" stop-color="#5f45c9" stop-opacity=".14"/>
     </linearGradient>
-    <linearGradient id="cyan" x1="1" y1="0" x2="0" y2="1">
-      <stop offset="0" stop-color="#d9fffb"/>
-      <stop offset=".48" stop-color="#66e9e5"/>
-      <stop offset="1" stop-color="#176f7b"/>
+    <linearGradient id="violetDeep" x1="1" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#b7a7ff" stop-opacity=".58"/>
+      <stop offset="1" stop-color="#452b9d" stop-opacity=".1"/>
     </linearGradient>
-    <linearGradient id="bridge" x1="0" y1="0" x2="1" y2="0">
-      <stop offset="0" stop-color="#805cff"/>
-      <stop offset="1" stop-color="#55e5e2"/>
+    <linearGradient id="cyanGlass" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#ddfffb" stop-opacity=".76"/>
+      <stop offset=".44" stop-color="#79e7e0" stop-opacity=".62"/>
+      <stop offset="1" stop-color="#168993" stop-opacity=".12"/>
     </linearGradient>
+    <linearGradient id="crossSignal" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#8d6cff" stop-opacity=".18"/>
+      <stop offset=".5" stop-color="#e4dcff" stop-opacity=".62"/>
+      <stop offset="1" stop-color="#58ddd8" stop-opacity=".34"/>
+    </linearGradient>
+    <radialGradient id="ghostField">
+      <stop offset="0" stop-color="#8d6cff" stop-opacity=".12"/>
+      <stop offset=".58" stop-color="#463177" stop-opacity=".04"/>
+      <stop offset="1" stop-color="#080b20" stop-opacity="0"/>
+    </radialGradient>
+    <pattern id="dust" width="47" height="43" patternUnits="userSpaceOnUse">
+      <circle cx="7" cy="11" r=".8" fill="#d9d2ff" opacity=".28"/>
+      <circle cx="31" cy="29" r=".55" fill="#7ce8e3" opacity=".2"/>
+      <circle cx="42" cy="6" r=".45" fill="#f4f0e6" opacity=".14"/>
+    </pattern>
+    <g id="crosshair" fill="none" stroke="currentColor" stroke-width="1.2">
+      <path d="M-8 0H8M0-8V8"/>
+      <rect x="-2" y="-2" width="4" height="4"/>
+    </g>
   </defs>
 
-  <g fill="none" stroke="#8f72ff" opacity=".08">
-    <path d="M24 602 150 170 438 50 699 232 648 585 348 719Z" stroke-width="48"/>
-    <path d="M48 583 170 190 430 76 671 246 621 563 350 692Z" stroke-width="24"/>
+  <!-- A sparse field is part of the master so every crop shares the same signal atmosphere. -->
+  <ellipse cx="492" cy="408" rx="355" ry="316" fill="url(#ghostField)"/>
+  <rect x="34" y="42" width="832" height="708" fill="url(#dust)" opacity=".6"/>
+  <g fill="none" stroke="#7e73bd" stroke-width="1" opacity=".13" vector-effect="non-scaling-stroke">
+    <path d="M42 154H858M42 278H858M42 402H858M42 526H858M42 650H858" stroke-dasharray="2 13"/>
+    <path d="M116 65V741M260 65V741M404 65V741M548 65V741M692 65V741M836 65V741" stroke-dasharray="3 15"/>
+    <path d="M24 774 452 444 876 774M68 774 452 498 832 774M128 774 452 552 772 774M205 774 452 607 695 774"/>
+    <path d="M24 774H876M79 721H821M147 664H753"/>
+  </g>
+  <g color="#a99aff" opacity=".48">
+    <use href="#crosshair" x="84" y="355"/>
+    <use href="#crosshair" x="206" y="117"/>
+    <use href="#crosshair" x="686" y="105"/>
+    <use href="#crosshair" x="826" y="302"/>
+    <use href="#crosshair" x="760" y="650"/>
+    <use href="#crosshair" x="238" y="724"/>
+  </g>
+  <g color="#58ddd8" opacity=".35">
+    <use href="#crosshair" x="80" y="574"/>
+    <use href="#crosshair" x="852" y="498"/>
   </g>
 
-  <g stroke="#bcafff" stroke-width="2" stroke-linejoin="round">
-    <path d="M89 463 148 180 302 70 274 303 204 394Z" fill="url(#violet)"/>
-    <path d="M302 70 505 122 421 321 274 303Z" fill="url(#violet)"/>
-    <path d="M505 122 660 287 476 353 421 321Z" fill="#6c53d6"/>
-  </g>
-  <g stroke="#9ff8f2" stroke-width="2" stroke-linejoin="round">
-    <path d="M660 287 626 519 494 471 476 353Z" fill="url(#cyan)"/>
-    <path d="M626 519 444 661 350 487 494 471Z" fill="url(#cyan)"/>
-    <path d="M444 661 228 625 350 487Z" fill="#37bfc3"/>
-  </g>
-  <g stroke="#9fa9e9" stroke-width="2" stroke-linejoin="round">
-    <path d="M228 625 89 463 204 394 350 487Z" fill="url(#bridge)"/>
-    <path d="M204 394 274 303 421 321 476 353 494 471 350 487Z" fill="#080b20"/>
-  </g>
-
+  <!-- Offset under-signals imply a damaged transmission without a heavy SVG filter. -->
   <g fill="none" stroke-linecap="round" stroke-linejoin="round">
-    <path d="M89 463 302 70 660 287 626 519 444 661 228 625 89 463Z" stroke="#d6d0ff" stroke-width="2" opacity=".65"/>
-    <path d="m148 180 126 123 28-233m-98 324 70-91 147 18 84-199M350 487l-146-93-115 69m261 24 144-16 132 48m-132-48-18-118 184-66" stroke="#e8e5ff" stroke-width="1.5" opacity=".58"/>
-    <path d="M302 70 350 487 660 287M89 463l405 8M228 625l193-304 205 198" stroke="#f5f2e8" stroke-width="1" opacity=".28"/>
+    <path d="M145 430 300 225 430 235 595 75 560 285 670 360 830 500 620 480 500 690 370 605 240 675 260 505Z" stroke="#8d6cff" stroke-width="18" opacity=".042"/>
+    <path d="M260 505 370 605 500 690 485 455 620 480 830 500" stroke="#58ddd8" stroke-width="13" opacity=".065"/>
+    <path d="M300 225 455 295 555 330 590 430 485 455 415 535 300 465" stroke="#c9beff" stroke-width="7" opacity=".045"/>
   </g>
 
-  <g fill="#f5f2e8">
-    <circle cx="302" cy="70" r="4"/>
-    <circle cx="660" cy="287" r="4"/>
-    <circle cx="626" cy="519" r="4"/>
-    <circle cx="228" cy="625" r="4"/>
-    <circle cx="89" cy="463" r="4"/>
+  <!-- Small translucent triangles build an interrupted ribbon rather than a polygon ring. -->
+  <g stroke-linejoin="round" vector-effect="non-scaling-stroke">
+    <path d="M145 430 300 225 232 376Z" fill="#7760d4" fill-opacity=".3" stroke="#b8aaff" stroke-width="1.2"/>
+    <path d="M300 225 325 365 232 376Z" fill="url(#violetGlass)" fill-opacity=".82" stroke="#d8d0ff" stroke-width="1.35"/>
+    <path d="M145 430 232 376 300 465Z" fill="#a99aff" fill-opacity=".32" stroke="#b8aaff" stroke-width="1.1"/>
+    <path d="M232 376 325 365 300 465Z" fill="url(#violetDeep)" fill-opacity=".62" stroke="#c5baff" stroke-width="1.15"/>
+
+    <path d="M300 225 430 235 382 298Z" fill="#8d6cff" fill-opacity=".22" stroke="#c8bcff" stroke-width="1.1"/>
+    <path d="M430 235 455 295 382 298Z" fill="url(#violetGlass)" fill-opacity=".56" stroke="#e0d9ff" stroke-width="1.2"/>
+    <path d="M430 235 595 75 505 217Z" fill="#b9acff" fill-opacity=".38" stroke="#e3deff" stroke-width="1.35"/>
+    <path d="M595 75 555 330 505 217Z" fill="url(#violetGlass)" fill-opacity=".82" stroke="#ece8ff" stroke-width="1.5"/>
+    <path d="M505 217 555 330 455 295Z" fill="#755fcf" fill-opacity=".12" stroke="#b9adf7" stroke-width="1.05"/>
+    <path d="M595 75 560 285 555 330Z" fill="#8a75df" fill-opacity=".32" stroke="#d3caff" stroke-width="1.25"/>
+
+    <path d="M560 285 670 360 612 350Z" fill="#8d6cff" fill-opacity=".07" stroke="#9f91e4" stroke-width="1"/>
+    <path d="M670 360 590 430 612 350Z" fill="url(#violetDeep)" fill-opacity=".18" stroke="#b4a7f1" stroke-width="1.1"/>
+    <path d="M670 360 830 500 590 430Z" fill="#a99aff" fill-opacity=".055" stroke="#bcaeff" stroke-width="1.15"/>
+    <path d="M830 500 620 480 590 430Z" fill="#a99aff" fill-opacity=".3" stroke="#e0d9ff" stroke-width="1.35"/>
+
+    <path d="M620 480 500 690 486 558Z" fill="#58ddd8" fill-opacity=".11" stroke="#8dece7" stroke-width="1.1"/>
+    <path d="M620 480 485 455 486 558Z" fill="url(#cyanGlass)" fill-opacity=".72" stroke="#c3fbf7" stroke-width="1.4"/>
+    <path d="M500 690 415 535 486 558Z" fill="url(#cyanGlass)" fill-opacity=".82" stroke="#baf8f4" stroke-width="1.5"/>
+    <path d="M500 690 370 605 415 535Z" fill="#6adbd8" fill-opacity=".5" stroke="#a9f5f0" stroke-width="1.25"/>
+    <path d="M370 605 240 675 260 505Z" fill="#7661cd" fill-opacity=".14" stroke="#9e90e9" stroke-width="1.05"/>
+    <path d="M370 605 260 505 300 465 415 535Z" fill="url(#violetDeep)" fill-opacity=".38" stroke="#b8aaff" stroke-width="1.2"/>
+
+    <path d="M325 365 455 295 555 330 590 430 485 455 415 535 300 465Z" fill="#080b20" fill-opacity=".7" stroke="#71699b" stroke-width=".9"/>
+
+    <!-- The cyan blade passes under the right wire structure and exits the loop. -->
+    <path d="M415 535 485 455 830 500 620 480 486 558Z" fill="url(#crossSignal)" fill-opacity=".72" stroke="#baf8f4" stroke-width="1.45"/>
+    <path d="M300 465 455 295 555 330 485 455 415 535Z" fill="#7660c7" fill-opacity=".08" stroke="#9c8cdd" stroke-width="1"/>
   </g>
-  <g fill="#6debe7" opacity=".7">
-    <circle cx="350" cy="487" r="3"/>
-    <circle cx="494" cy="471" r="3"/>
+
+  <!-- Dense triangulation crosses the open void and escapes into the signal field. -->
+  <g fill="none" stroke-linecap="round" stroke-linejoin="round" vector-effect="non-scaling-stroke">
+    <path d="M145 430 300 225 430 235 595 75 560 285 670 360 830 500 620 480 500 690 370 605 240 675 260 505 145 430" stroke="#c9beff" stroke-width="1.35" opacity=".72"/>
+    <path d="M300 225 325 365 300 465 260 505M430 235 455 295 325 365M595 75 555 330 455 295M560 285 590 430 555 330M670 360 485 455 590 430M830 500 485 455M620 480 415 535M500 690 415 535M370 605 300 465" stroke="#ddd7ff" stroke-width=".95" opacity=".58"/>
+    <path d="M145 430 325 365 595 75M240 675 415 535 830 500M300 225 485 455 500 690M260 505 555 330 620 480" stroke="#f4f0e6" stroke-width=".75" opacity=".28"/>
+    <path d="M300 465 430 235 555 330 830 500M325 365 485 455 370 605M415 535 590 430 560 285" stroke="#a99aff" stroke-width="1.05" opacity=".64"/>
+    <path d="M415 535 486 558 620 480 830 500M485 455 500 690M370 605 486 558" stroke="#79e7e0" stroke-width="1.25" opacity=".76"/>
+
+    <path d="M232 376 382 298 505 217 612 350 590 430 486 558 370 605" stroke="#c3b8ff" stroke-width=".72" opacity=".48"/>
+    <path d="M300 225 430 235 595 75 560 285" stroke="#ece8ff" stroke-width="2" opacity=".62"/>
+    <path d="M145 430 300 465 260 505 370 605 500 690" stroke="#d7ceff" stroke-width="1.8" opacity=".52"/>
+    <path d="M415 535 485 455 830 500" stroke="#c9fffb" stroke-width="2.1" opacity=".76"/>
+    <path d="M500 690 486 558 620 480" stroke="#79e7e0" stroke-width="2" opacity=".66"/>
+    <path d="M145 430 34 402M300 225 206 117M595 75 686 105M830 500 868 402M620 480 852 498M500 690 760 650M240 675 80 574" stroke="#8d80d7" stroke-width=".8" opacity=".4" stroke-dasharray="2 8"/>
+    <path d="M260 505 42 526M455 295 404 65M590 430 836 402M415 535 260 741" stroke="#58ddd8" stroke-width=".7" opacity=".3" stroke-dasharray="4 9"/>
+  </g>
+
+  <g fill="#a99aff" opacity=".09">
+    <circle cx="300" cy="225" r="12"/>
+    <circle cx="595" cy="75" r="14"/>
+    <circle cx="830" cy="500" r="11"/>
+  </g>
+  <g fill="#79e7e0" opacity=".1">
+    <circle cx="415" cy="535" r="11"/>
+    <circle cx="500" cy="690" r="13"/>
+  </g>
+  <g fill="#f4f0e6">
+    <circle cx="300" cy="225" r="3.1"/>
+    <circle cx="595" cy="75" r="3.8"/>
+    <circle cx="830" cy="500" r="3"/>
+    <circle cx="500" cy="690" r="3.4"/>
+    <circle cx="145" cy="430" r="2.8"/>
+  </g>
+  <g fill="#79e7e0">
+    <circle cx="415" cy="535" r="3"/>
+    <circle cx="486" cy="558" r="2.6"/>
+    <circle cx="620" cy="480" r="2.5"/>
+  </g>
+  <g fill="#a99aff" opacity=".8">
+    <circle cx="325" cy="365" r="2.2"/>
+    <circle cx="455" cy="295" r="2.2"/>
+    <circle cx="555" cy="330" r="2.2"/>
+    <circle cx="590" cy="430" r="2.2"/>
+    <circle cx="485" cy="455" r="2.2"/>
+    <circle cx="300" cy="465" r="2.2"/>
   </g>
 </svg>
