@@ -1,9 +1,10 @@
 {% extends "base.html" %}
 {% block title %}Something went wrong{% endblock %}
 {% block content %}
-<section class="card">
+<section class="card static-page static-page--error">
+  <p class="kicker">SIGNAL CHECK</p>
   <h1>Something went wrong</h1>
   <p class="error">{{ message or "An unexpected error occurred." }}</p>
-  <p><a href="/">Back home</a></p>
+  <p><a class="button" href="/">Back home</a></p>
 </section>
 {% endblock %}

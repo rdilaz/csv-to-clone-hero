@@ -89,7 +89,8 @@ def test_healthz_is_public(client):
 def test_landing_is_public(client):
     r = client.get("/")
     assert r.status_code == 200
-    assert b"Continue with Spotify" in r.data
+    assert b"Connect Spotify" in r.data
+    assert b"cause-bar" in r.data
     assert b"Get every song" not in r.data
     assert b"score the best match" not in r.data
     assert b"Enchor" in r.data
@@ -98,6 +99,13 @@ def test_landing_is_public(client):
     assert b"Community charts" in r.data
     assert b"Clone Hero" in r.data
     assert b"Songs folder" not in r.data
+
+
+def test_support_banner_can_be_disabled_without_changing_the_shell(client, config):
+    config.monetization.gofundme_banner = False
+    html = client.get("/").get_data(as_text=True)
+    assert "cause-bar" not in html
+    assert "Signal Check" in html
 
 
 def test_enabled_gofundme_banner_uses_canonical_fallback(client):
@@ -124,11 +132,11 @@ def test_authenticated_review_shell_prioritizes_human_decisions(client):
     _sign_in(client)
     html = client.get("/").get_data(as_text=True)
 
-    assert "CONFIRM CHARTS" in html
-    assert "Best Matches" in html
-    assert "All Safe Charts" in html
-    assert "Maximum Playable" in html
-    assert "Quick confirmation" in html
+    assert '<p class="kicker">CONFIRM</p>' in html
+    assert "Select recommended" in html
+    assert "Select same-recording charts" in html
+    assert "Include alternate recordings" in html
+    assert "Choose your charts" in html
     assert "Advanced review settings" not in html
     assert "Selection cutoff" not in html
     assert "Change folder" not in html
@@ -166,6 +174,29 @@ def test_public_shell_uses_csp_compatible_external_assets(client):
     assert "script-src 'self'" in csp
     assert "style-src 'self'" in csp
     assert "'unsafe-inline'" not in csp
+
+
+@pytest.mark.parametrize(
+    ("filename", "mimetype"),
+    [
+        ("riff-wordmark.svg", "image/svg+xml"),
+        ("signal-knot.svg", "image/svg+xml"),
+        ("ibm-plex-sans-latin1.woff2", "font/woff2"),
+        ("space-grotesk.woff2", "font/woff2"),
+        ("OFL-IBM-Plex.txt", "text/plain"),
+        ("OFL-Space-Grotesk.txt", "text/plain"),
+    ],
+)
+def test_signal_check_assets_are_served_from_the_public_package(
+    client, filename, mimetype
+):
+    response = client.get(f"/static/{filename}")
+    assert response.status_code == 200
+    if filename.endswith(".woff2"):
+        assert response.mimetype in {mimetype, "application/octet-stream"}
+    else:
+        assert response.mimetype == mimetype
+    assert len(response.data) > 100
 
 
 def test_anonymous_soundcloud_import_requires_spotify_session(client):

@@ -3,8 +3,9 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="theme-color" content="#0b0d0c">
-  <title>{% block title %}Riff{% endblock %}</title>
+  <meta name="theme-color" content="#080b20">
+  <title>{% block title %}Riff | Signal Check{% endblock %}</title>
+  <link rel="icon" type="image/svg+xml" href="{{ url_for('static', filename='signal-knot.svg') }}">
   <link rel="stylesheet" href="{{ url_for('static', filename='public.css') }}">
   {% block head %}{% endblock %}
 </head>
@@ -14,7 +15,7 @@
   {% if config.monetization.gofundme_enabled and config.monetization.gofundme_banner and config.monetization.effective_gofundme_url %}
   <aside class="cause-bar" aria-label="Community support">
     <div class="shell cause-bar__inner">
-      <a class="cause-bar__link" href="{{ config.monetization.effective_gofundme_url }}" target="_blank" rel="noopener noreferrer" aria-label="Support the creator of Clone Hero on GoFundMe (opens in a new tab)"><strong>Support the creator of Clone Hero.</strong> Help during his cancer fight. <span>Visit GoFundMe</span></a>
+      <a class="cause-bar__link" href="{{ config.monetization.effective_gofundme_url }}" target="_blank" rel="noopener noreferrer" aria-label="Support the creator of Clone Hero on GoFundMe (opens in a new tab)"><strong>Support the creator of Clone Hero.</strong> <span class="cause-bar__context">Help during his cancer fight.</span> <span class="cause-bar__action">Visit GoFundMe</span></a>
     </div>
   </aside>
   {% endif %}
@@ -22,11 +23,11 @@
   <header class="site-header">
     <div class="shell site-header__inner">
       <a class="brand" href="/" aria-label="Riff home">
-        <span class="brand__mark" aria-hidden="true"><i></i><i></i><i></i><i></i></span>
-        <span><strong>Riff</strong><small>music to Clone Hero</small></span>
+        <img class="brand__wordmark" src="{{ url_for('static', filename='riff-wordmark.svg') }}" alt="" aria-hidden="true">
+        <span class="brand__product">Signal Check</span>
       </a>
       <nav class="site-nav" aria-label="Primary navigation">
-        <a href="/about">Mission</a>
+        <a href="/about">About</a>
         {% if user %}
         <span class="user-name">{{ user.display_name }}</span>
         <button class="text-button" id="logoutButton" type="button">Sign out</button>
@@ -49,8 +50,8 @@
 
   <footer class="site-footer">
     <div class="shell site-footer__inner">
-      <span>&copy; {{ now_year }} ryo</span>
-      <span>Community charts via <a href="https://enchor.us" target="_blank" rel="noopener">Enchor</a></span>
+      <span>&copy; {{ now_year }} Riff</span>
+      <span>Community charts via <a href="https://enchor.us" target="_blank" rel="noopener noreferrer">Enchor</a></span>
       <nav aria-label="Legal">
         <a href="/terms">Terms</a>
         <a href="/privacy">Privacy</a>
