@@ -5,10 +5,6 @@
       <rect width="430" height="132" fill="white"/>
 
       <path d="M-4 60h438v12H-4Z" fill="black"/>
-
-      <!-- Fine scan faults survive in the compact lockup without breaking the large silhouette. -->
-      <path d="M5 20h20v3H5Zm74-13h13l5 4H79Zm72 14h22v3h-22Zm57-7h27v3h-27Zm91 15h18v3h-18Zm33-14h24v3h-24Zm72 16h23v3h-23Z" fill="black"/>
-      <path d="M25 115h11v3H25Zm130-3h18v3h-18Zm55-18h22v3h-22Zm122 4h20v3h-20Z" fill="black"/>
     </mask>
   </defs>
 
