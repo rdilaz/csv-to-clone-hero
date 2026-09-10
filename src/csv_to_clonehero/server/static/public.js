@@ -10,6 +10,7 @@
     scope: null,
     scopeRequest: 0,
     jobId: null,
+    jobRequest: 0,
     pollTimer: null,
     progressAnnouncement: "",
     activityOffset: 0,
@@ -30,6 +31,10 @@
     expansionJobId: null,
     expansionPollTimer: null,
     expansionPolling: false,
+    expansionBusy: false,
+    expansionReturnFocus: false,
+    expansionLoading: false,
+    expansionPollRequest: 0,
     expansionRequest: 0,
     expansionOffset: 0,
     expansionCards: [],
@@ -39,6 +44,14 @@
     selectionTotalKnown: false,
     openDisclosures: new Set(),
     closedDisclosures: new Set(),
+    disclosurePreferences: {},
+    deliveryRecord: {},
+    deliveryRequest: 0,
+    deliveryBusy: false,
+    deliveryLoading: false,
+    deliveryPages: null,
+    availableDownload: null,
+    expiryTimer: null,
   };
 
   async function api(path, options = {}) {
@@ -134,8 +147,8 @@
         control.dataset.riffOriginallyDisabled = String(control.disabled);
       }
       const originallyDisabled = control.dataset.riffOriginallyDisabled === "true";
-      control.disabled = originallyDisabled || state.selectionBusy || state.selectionStale;
-      if (!state.selectionBusy && !state.selectionStale) {
+      control.disabled = originallyDisabled || state.selectionBusy || state.selectionStale || state.expansionBusy;
+      if (!state.selectionBusy && !state.selectionStale && !state.expansionBusy) {
         delete control.dataset.riffOriginallyDisabled;
       }
     });
@@ -169,6 +182,7 @@
   async function uploadSoundCloud(form, messageNode) {
     const input = $("input[type=file]", form);
     const button = $("button[type=submit]", form);
+    if (button?.disabled) return null;
     if (!input?.files?.[0]) {
       messageNode.textContent = "Choose a CSV or JSON export first.";
       messageNode.classList.add("is-error");
@@ -221,6 +235,7 @@
       else item.removeAttribute("aria-current");
     });
     document.body.dataset.riffStage = name;
+    rememberDelivery({stage: name});
     syncSelectionBand();
     if (focus) {
       const heading = $("#" + ids[name] + " h1");
@@ -242,11 +257,20 @@
     try {
       const journey = await api("/api/journey");
       state.journey = journey;
+      try {
+        state.deliveryRecord = JSON.parse(sessionStorage.getItem(`riff:delivery:${journey.workspace_id}`) || "{}");
+        state.disclosurePreferences = JSON.parse(sessionStorage.getItem(`riff:disclosures:${journey.workspace_id}`) || "{}");
+        if (!state.deliveryRecord || typeof state.deliveryRecord !== "object" || Array.isArray(state.deliveryRecord)) state.deliveryRecord = {};
+        if (!state.disclosurePreferences || typeof state.disclosurePreferences !== "object" || Array.isArray(state.disclosurePreferences)) state.disclosurePreferences = {};
+        for (const [key, open] of Object.entries(state.disclosurePreferences)) {
+          (open ? state.openDisclosures : state.closedDisclosures).add(key);
+        }
+        $$('details[data-disclosure-key]').forEach(details => {
+          const key = details.dataset.disclosureKey;
+          if (Object.hasOwn(state.disclosurePreferences, key)) details.open = Boolean(state.disclosurePreferences[key]);
+        });
+      } catch (_) { /* Storage is optional; server selections remain authoritative. */ }
       renderSources(journey);
-      if (journey.download?.url) {
-        renderDone(journey.download, null);
-        return;
-      }
       if (["queued", "running"].includes(journey.job?.status) && journey.job?.kind === "expansion") {
         await openConfirm(false);
         if (!state.expansionPolling) attachExpansionJob(journey.job.id);
@@ -254,6 +278,19 @@
       }
       if (["queued", "running"].includes(journey.job?.status)) {
         attachJob(journey.job.id);
+        return;
+      }
+      if (state.deliveryRecord.pending || state.deliveryRecord.stage === "download") {
+        await openDownload(false);
+        return;
+      }
+      if (!["add", "confirm", "find"].includes(state.deliveryRecord.stage) && (journey.download?.url || state.deliveryRecord.stage === "done")) {
+        const receipt = state.deliveryRecord.receipt;
+        renderDone(journey.download, !journey.download || receipt?.token === journey.download?.token ? receipt?.summary : null, false);
+        return;
+      }
+      if (state.deliveryRecord.stage === "add") {
+        await openAddMusic(false, journey);
         return;
       }
       if (isTerminal(journey.job) || journey.review?.total > 0) {
@@ -297,6 +334,8 @@
   }
 
   async function openAddMusic(focus = true, journey = state.journey) {
+    if (state.deliveryBusy || state.expansionBusy || state.selectionBusy) return;
+    state.deliveryRequest += 1;
     state.reviewRequest += 1;
     state.expansionRequest += 1;
     showStage("add", focus);
@@ -464,6 +503,7 @@
 
   async function saveSoundCloudScope() {
     const button = $("#saveSoundcloudScope");
+    if (button?.disabled) return;
     const message = $("#soundcloudScopeMessage");
     setButtonBusy(button, true, "Saving...");
     try {
@@ -613,6 +653,7 @@
 
   async function startDiscovery() {
     const button = $("#findChartsButton");
+    if (button?.disabled) return;
     clearError();
     setButtonBusy(button, true, "Preparing search...");
     try {
@@ -679,7 +720,7 @@
     showStage("find");
     if (state.pollTimer) window.clearTimeout(state.pollTimer);
     state.pollTimer = null;
-    void pollJob(expectedJobId);
+    void pollJob(expectedJobId, ++state.jobRequest);
   }
 
   function progressNumbers(job) {
@@ -815,32 +856,34 @@
     return friendlyEta(estimate * (1 - uncertainty), estimate * (1 + uncertainty));
   }
 
-  async function pollJob(expectedJobId = state.jobId) {
-    if (!expectedJobId || expectedJobId !== state.jobId) return;
+  async function pollJob(expectedJobId = state.jobId, requestId = state.jobRequest) {
+    if (!expectedJobId || expectedJobId !== state.jobId || requestId !== state.jobRequest) return;
+    $("#retryJobButton").hidden = true;
     try {
       const {job} = await api(`/api/jobs/${expectedJobId}`);
-      if (expectedJobId !== state.jobId) return;
+      if (expectedJobId !== state.jobId || requestId !== state.jobRequest) return;
       renderProgress(job);
       if ($("#activityDetails")?.open) loadActivity();
       if (isTerminal(job)) {
         window.clearTimeout(state.pollTimer);
         state.pollTimer = null;
-        state.journey = await api("/api/journey");
-        if (expectedJobId !== state.jobId) return;
-        if (job.status === "failed") showError("The search stopped before it finished. Your completed work is saved; start again when ready.");
-        else if (job.status !== "complete") showError("The search was interrupted. Saved results are available, but some songs may still need checking.");
+        const journey = await api("/api/journey");
+        if (expectedJobId !== state.jobId || requestId !== state.jobRequest) return;
+        state.journey = journey;
         await openConfirm(true);
+        if (job.status !== "complete" || job.result?.partial) showError(job.error || "The search was incomplete. Review the currently available results or search again; some work may need to be repeated.");
         return;
       }
     } catch (error) {
-      if (expectedJobId !== state.jobId) return;
+      if (expectedJobId !== state.jobId || requestId !== state.jobRequest) return;
       window.clearTimeout(state.pollTimer);
       state.pollTimer = null;
       showError(error.message);
+      $("#retryJobButton").hidden = false;
       return;
     }
-    if (expectedJobId === state.jobId) {
-      state.pollTimer = window.setTimeout(() => { void pollJob(expectedJobId); }, 1500);
+    if (expectedJobId === state.jobId && requestId === state.jobRequest) {
+      state.pollTimer = window.setTimeout(() => { void pollJob(expectedJobId, requestId); }, 1500);
     }
   }
 
@@ -885,7 +928,15 @@
     const params = new URLSearchParams({limit: "50", offset: String(state.activityOffset)});
     const search = $("#activitySearch")?.value.trim();
     if (search) params.set("search", search);
-    const data = await api(`/api/jobs/${expectedJobId}/songs?${params}`);
+    let data;
+    try {
+      data = await api(`/api/jobs/${expectedJobId}/songs?${params}`);
+    } catch (error) {
+      if (requestId === state.activityRequest && expectedJobId === state.jobId) {
+        $("#activityList").innerHTML = `<li>${escapeHtml(error.message)} Reopen Matching details to retry.</li>`;
+      }
+      return;
+    }
     if (requestId !== state.activityRequest || expectedJobId !== state.jobId) return;
     state.activityTotal = Number(data.total || 0);
     $("#activityList").innerHTML = (data.songs || []).map(song => `<li><strong>${escapeHtml(song.artist)} - ${escapeHtml(song.title)}</strong><span>${escapeHtml(activityLabel(song.classification || song.status))}</span></li>`).join("") || "<li>No song activity yet.</li>";
@@ -900,12 +951,20 @@
   }
 
   async function cancelDiscovery() {
-    if (!state.jobId || !window.confirm("Cancel this search? Completed progress will remain saved.")) return;
+    const button = $("#cancelJobButton");
+    if (!state.jobId || button.disabled || !window.confirm("Cancel this search? Some work may need to be repeated.")) return;
+    setButtonBusy(button, true, "Cancelling...");
     try { await api(`/api/jobs/${state.jobId}/cancel`, {method: "POST", body: "{}"}); }
     catch (error) { showError(error.message); }
+    finally { setButtonBusy(button, false); }
   }
 
   async function openConfirm(focus = true) {
+    if (state.deliveryBusy) return;
+    state.deliveryRequest += 1;
+    state.jobRequest += 1;
+    window.clearTimeout(state.pollTimer);
+    rememberDelivery({pending: false});
     showStage("confirm", focus);
     state.reviewOffset = 0;
     if (!$("#expansionPanel")) {
@@ -939,7 +998,16 @@
     const focusKey = preferredFocusKey || snapshot.focusKey;
     if (!focusKey) return;
     const target = $$('[data-focus-key]').find(node => node.dataset.focusKey === focusKey);
-    if (target) {
+    if (target && preferredFocusKey) {
+      for (let parent = target.parentElement; parent; parent = parent.parentElement) {
+        if (parent.matches("details") && !parent.open) {
+          parent.open = true;
+          state.closedDisclosures.delete(parent.dataset.disclosureKey);
+          state.openDisclosures.add(parent.dataset.disclosureKey);
+        }
+      }
+    }
+    if (target && !target.disabled && target.getClientRects().length) {
       target.focus({preventScroll: true});
       window.scrollTo({left: snapshot.scrollX, top: snapshot.scrollY, behavior: "auto"});
       return;
@@ -1023,7 +1091,7 @@
     $("#selectedSongLabel").textContent = state.exactSelectedSongsKnown && state.exactSelectedSongs === 1 ? "song" : "songs";
     $("#expansionSelectedCount").textContent = state.expansionSelectionKnown ? state.expansionSelected.toLocaleString() : "...";
     const hasConfirmedSelection = exactConfirmed > 0 || expansionConfirmed > 0;
-    $("#continueDownloadButton").disabled = !hasConfirmedSelection || state.selectionBusy || state.selectionStale;
+    $("#continueDownloadButton").disabled = !hasConfirmedSelection || state.selectionBusy || state.selectionStale || state.expansionBusy;
     $("#continueDownloadButton").textContent = "Continue";
     $("#continueDownloadButton").setAttribute(
       "aria-label",
@@ -1042,6 +1110,7 @@
       ? "Last confirmed totals shown. Refresh the selection summary."
       : state.selectionTotalKnown ? modeLabels[state.selectionMode] || modeLabels.none : "Updating the combined selection total...";
     syncSelectionBand();
+    syncExpansionStart();
   }
 
   function syncSelectionBand() {
@@ -1062,7 +1131,7 @@
       const viewportBottom = (visualViewport?.offsetTop || 0) + viewportHeight;
       const bandHeight = rail.getBoundingClientRect().height;
       const bandTop = viewportBottom - bandHeight;
-      const focusedAction = document.activeElement?.matches?.('.candidate-row [data-selection]') ? document.activeElement : null;
+      const focusedAction = document.activeElement?.matches?.('.candidate-row [data-selection], [data-expansion-selection]') ? document.activeElement : null;
       const firstAction = focusedAction || $('.candidate-row [data-selection]:not(:disabled)');
       const actionBox = firstAction?.getBoundingClientRect();
       const keyboardOpen = visualViewport && viewportHeight < window.innerHeight * .72;
@@ -1230,10 +1299,21 @@
   function bindReviewActions() {
     $$('[data-selection]').forEach(button => button.addEventListener("click", () => updateSelection(button)));
     bindDisclosureState($("#reviewCards"));
+    syncSelectionControls();
   }
 
   function bindDisclosureState(root) {
     if (!root) return;
+    $$('details[data-disclosure-key] > summary', root).forEach(summary => summary.addEventListener("click", () => {
+      window.setTimeout(() => {
+        const details = summary.parentElement;
+        if (!details?.isConnected) return;
+        state.disclosurePreferences[details.dataset.disclosureKey] = details.open;
+        try {
+          sessionStorage.setItem(`riff:disclosures:${state.journey?.workspace_id}`, JSON.stringify(state.disclosurePreferences));
+        } catch (_) { /* Disclosures still persist through in-page reconciliation. */ }
+      }, 0);
+    }));
     $$('details[data-disclosure-key]', root).forEach(details => details.addEventListener("toggle", () => {
       const key = details.dataset.disclosureKey;
       if (details.open) {
@@ -1247,7 +1327,8 @@
   }
 
   async function updateSelection(button) {
-    if (state.selectionBusy) return;
+    if (state.selectionBusy || state.selectionStale || state.expansionBusy) return;
+    const snapshot = captureReviewUi();
     const possible = button.dataset.possible === "true";
     if (possible && !window.confirm("This possible match has uncertain song identity. Select it anyway?")) return;
     state.selectionBusy = true;
@@ -1279,11 +1360,12 @@
       setButtonBusy(button, false);
       syncSelectionControls();
       refreshSelectionUi();
+      if (!state.selectionStale) restoreReviewUi(snapshot, focusKey);
     }
   }
 
   async function bulkSelect(scope) {
-    if (state.selectionBusy) return;
+    if (state.selectionBusy || state.selectionStale || state.expansionBusy) return;
     const button = scope === "best_matches" ? $("#selectBestButton") : scope === "all_safe_charts" ? $("#selectAllButton") : scope === "maximum_playable" ? $("#selectMaximumButton") : $("#clearSelectionButton");
     state.selectionBusy = true;
     syncSelectionControls();
@@ -1350,6 +1432,8 @@
       return true;
     }
     const requestId = ++state.expansionRequest;
+    const snapshot = captureReviewUi();
+    const retainedCount = options.reconciliation ? state.expansionCards.length : 0;
     const choices = $("#expansionChoices");
     const status = $("#expansionStatus");
     const start = $("#startExpansionButton");
@@ -1360,23 +1444,40 @@
         api(`/api/expansion/results?limit=25&offset=${state.expansionOffset}`),
       ]);
       if (requestId !== state.expansionRequest) return false;
+      if (!append && retainedCount > 25) {
+        for (let offset = 25; offset < retainedCount && offset < Number(resultData.total || 0); offset += 25) {
+          const next = await api(`/api/expansion/results?limit=25&offset=${offset}`);
+          if (requestId !== state.expansionRequest) return false;
+          resultData.songs.push(...next.songs);
+          resultData.has_more = next.has_more;
+        }
+      }
       const artists = artistData?.artists || [];
+      if (artistData) {
+        choices.dataset.available = String(Boolean(artistData.available));
+        choices.dataset.maxArtists = String(artistData.max_artists || 25);
+        if (!["queued", "running"].includes(artistData.job?.status)) setExpansionBusy(false);
+      }
       if (artistData && !artistData.available) {
         choices.innerHTML = `<p class="empty-state">${escapeHtml(artistData.reason || "Artist expansion is not available yet.")}</p>`;
         start.disabled = true;
       } else if (artistData) {
+        const sameGeneration = choices.dataset.generation === String(artistData.exact_generation_id || "");
+        const checks = choices.dataset.loaded && sameGeneration ? new Set($$("input:checked", choices).map(input => input.value)) : null;
         choices.innerHTML = artists.map(artist => `<label>
-          <input type="checkbox" value="${escapeHtml(artist.artist_norm)}" ${artist.selected ? "checked" : ""}>
-          <span><strong>${escapeHtml(artist.artist)}</strong><small>${Number(artist.eligible_songs || 0).toLocaleString()} eligible songs · up to ${Number(artist.cap || 0).toLocaleString()} recommended</small></span>
+          <input type="checkbox" value="${escapeHtml(artist.artist_norm)}" ${(checks ? checks.has(artist.artist_norm) : artist.selected) ? "checked" : ""}>
+          <span><strong>${escapeHtml(artist.artist)}</strong><small>${Number(artist.eligible_songs || 0).toLocaleString()} eligible ${Number(artist.eligible_songs) === 1 ? "song" : "songs"} / ${chartCount(Number(artist.eligible_charts || 0))}; up to ${Number(artist.cap || 0).toLocaleString()} ${Number(artist.cap) === 1 ? "song" : "songs"} recommended</small></span>
         </label>`).join("") || `<p class="empty-state">No imported artists have additional eligible catalog songs.</p>`;
-        start.disabled = artists.length === 0;
+        choices.dataset.loaded = "true";
+        choices.dataset.generation = String(artistData.exact_generation_id || "");
         choices.onchange = () => {
           const count = $$("input:checked", choices).length;
-          start.disabled = count === 0 || count > Number(artistData.max_artists || 25);
+          start.disabled = state.expansionBusy || state.selectionBusy || state.selectionStale || count === 0 || count > Number(artistData.max_artists || 25);
           status.textContent = count > Number(artistData.max_artists || 25)
             ? `Choose no more than ${Number(artistData.max_artists || 25)} artists.`
             : `${count.toLocaleString()} ${count === 1 ? "artist" : "artists"} selected.`;
         };
+        choices.onchange();
       }
       const pageCards = resultData.songs || [];
       state.expansionCards = append
@@ -1388,28 +1489,39 @@
       if (expansionSelected !== null) {
         state.expansionSelected = expansionSelected;
         state.expansionSelectionKnown = true;
-      }
+      } else state.expansionSelectionKnown = false;
       refreshSelectionUi();
       $("#expansionResults").hidden = cards.length === 0;
       $("#expansionResultCount").textContent = Number(resultData.total || 0).toLocaleString();
       $("#expansionCards").innerHTML = cards.map(expansionCard).join("");
       const more = $("#loadMoreExpansion");
       more.hidden = !resultData.has_more;
-      more.onclick = () => loadExpansion(true);
+      more.onclick = async () => {
+        if (state.expansionLoading || state.selectionBusy || state.expansionBusy) return;
+        state.expansionLoading = true;
+        setButtonBusy(more, true, "Loading...");
+        try { await loadExpansion(true); }
+        finally { state.expansionLoading = false; setButtonBusy(more, false); }
+      };
       bindExpansionActions();
+      restoreReviewUi(snapshot, options.focusKey || "");
       const job = artistData?.job;
       if (job && ["queued", "running"].includes(job.status)) {
         status.textContent = job.message || "Preparing expansion recommendations...";
         start.disabled = true;
         attachExpansionJob(job.id);
-      } else if (job?.status === "complete" && cards.length) {
-        status.textContent = `${Number(resultData.total || 0).toLocaleString()} additional songs are ready to review.`;
+      } else if (job?.status === "complete") {
+        status.textContent = `${Number(resultData.total || 0).toLocaleString()} additional songs are ready to review. No charts are selected automatically.`;
+      } else if (isTerminal(job)) {
+        status.textContent = job.error || `Artist expansion ${job.status}. Review the currently available recommendations, or find again for the checked artists.`;
       }
+      $("#retryExpansionButton").hidden = true;
       return true;
     } catch (error) {
       if (requestId !== state.expansionRequest) return false;
-      if (options.reconciliation) state.expansionSelectionKnown = false;
-      choices.innerHTML = `<p class="empty-state">${escapeHtml(error.message || "Expansion choices could not be loaded.")}</p>`;
+      state.expansionSelectionKnown = false;
+      status.textContent = `${error.message || "Expansion choices could not be loaded."} Refresh expansion status to retry; saved choices are not cleared.`;
+      $("#retryExpansionButton").hidden = false;
       start.disabled = true;
       refreshSelectionUi();
       return false;
@@ -1433,24 +1545,28 @@
 
   function expansionCandidateAction(song, candidate) {
     const focusKey = `${song.song_key}:${candidate.candidate_id}`;
-    if (candidate.selected) return `<button class="button button--secondary" type="button" data-expansion-selection="clear" data-artist="${escapeHtml(candidate.artist_norm)}" data-candidate="${candidate.candidate_id}" data-expansion-focus="${escapeHtml(focusKey)}">Clear choice</button>`;
+    const label = `${escapeHtml(candidate.title)} chart by ${escapeHtml(candidate.charter || "unknown charter")}`;
+    if (candidate.selected) return `<button class="button button--secondary" type="button" data-expansion-selection="clear" data-artist="${escapeHtml(candidate.artist_norm)}" data-candidate="${candidate.candidate_id}" data-expansion-focus="${escapeHtml(focusKey)}" data-focus-key="expansion:${escapeHtml(focusKey)}" aria-label="Selected expansion ${label}. Clear this choice.">Selected</button>`;
     if (!candidate.selectable) return `<button class="button button--secondary" type="button" disabled>Unavailable</button>`;
     const possible = candidate.result_tier === "POSSIBLE_MATCH";
-    return `<button class="button button--secondary" type="button" data-expansion-selection="select" data-artist="${escapeHtml(candidate.artist_norm)}" data-candidate="${candidate.candidate_id}" data-possible="${possible}" data-expansion-focus="${escapeHtml(focusKey)}">${possible ? "Review and select" : "Select"}</button>`;
+    return `<button class="button button--secondary" type="button" data-expansion-selection="select" data-artist="${escapeHtml(candidate.artist_norm)}" data-candidate="${candidate.candidate_id}" data-possible="${possible}" data-expansion-focus="${escapeHtml(focusKey)}" data-focus-key="expansion:${escapeHtml(focusKey)}" aria-label="${possible ? "Review and select" : "Select"} expansion ${label}">${possible ? "Review and select" : "Select"}</button>`;
   }
 
   function bindExpansionActions() {
     $$('[data-expansion-selection]').forEach(button => button.addEventListener("click", () => updateExpansionSelection(button)));
     bindDisclosureState($("#expansionCards"));
+    syncSelectionControls();
   }
 
   async function updateExpansionSelection(button) {
-    if (state.selectionBusy) return;
+    if (state.selectionBusy || state.expansionBusy || state.selectionStale) return;
+    const snapshot = captureReviewUi();
     const possible = button.dataset.possible === "true";
     if (possible && !window.confirm("This possible expansion match needs explicit confirmation. Select it?")) return;
     const focusKey = button.dataset.expansionFocus;
     const action = button.dataset.expansionSelection === "clear" ? "Additional chart choice cleared." : "Additional chart selected.";
     state.selectionBusy = true;
+    state.expansionRequest += 1;
     syncSelectionControls();
     refreshSelectionUi();
     clearSelectionFeedback();
@@ -1466,7 +1582,7 @@
       state.selectionMode = "custom";
       state.expansionSelectionKnown = false;
       refreshSelectionUi();
-      const refreshed = await loadExpansion(false, {reconciliation: true});
+      const refreshed = await loadExpansion(false, {reconciliation: true, focusKey: `expansion:${focusKey}`});
       if (refreshed) {
         const replacement = $$('[data-expansion-focus]').find(node => node.dataset.expansionFocus === focusKey);
         replacement?.focus({preventScroll: true});
@@ -1488,21 +1604,62 @@
       setButtonBusy(button, false);
       syncSelectionControls();
       refreshSelectionUi();
+      if (!state.selectionStale) restoreReviewUi(snapshot, `expansion:${focusKey}`);
     }
   }
 
   async function startExpansion() {
     const button = $("#startExpansionButton");
+    if (button.disabled || state.expansionBusy || state.selectionBusy || state.selectionStale) return;
     const selected = $$("#expansionChoices input:checked").map(input => input.value);
+    if (!selected.length) return;
+    if (state.expansionSelected && !window.confirm("Finding again replaces the entire expansion set, including saved choices for artists you unchecked. Your imported music choices stay unchanged. Continue?")) return;
     clearError();
+    setExpansionBusy(true);
     setButtonBusy(button, true, "Starting...");
     try {
       const result = await api("/api/expansion", {method: "POST", body: JSON.stringify({artists: selected})});
       attachExpansionJob(result.job.id);
     } catch (error) {
-      showError(error.message);
+      if (error.data?.job?.kind === "expansion") {
+        attachExpansionJob(error.data.job.id);
+        return;
+      }
       setButtonBusy(button, false);
+      button.disabled = true;
+      await loadExpansion();
+      showError(error.message);
     }
+  }
+
+  function setExpansionBusy(busy) {
+    if (busy && ["startExpansionButton", "retryExpansionButton"].includes(document.activeElement?.id)) {
+      state.expansionReturnFocus = true;
+    }
+    state.expansionBusy = busy;
+    $("#expansionResults").setAttribute("aria-busy", String(busy));
+    if (busy) {
+      $("#expansionCards").replaceChildren();
+      $("#expansionResults").hidden = true;
+    }
+    $$("#expansionChoices input").forEach(input => { input.disabled = busy; });
+    $("#searchAgainButton").disabled = busy;
+    if (busy) $("#startExpansionButton").disabled = true;
+    syncSelectionControls();
+    refreshSelectionUi();
+    if (!busy && state.expansionReturnFocus) {
+      const button = $("#startExpansionButton");
+      if (document.activeElement === document.body && !button.disabled && button.getClientRects().length) button.focus({preventScroll: true});
+      state.expansionReturnFocus = false;
+    }
+  }
+
+  function syncExpansionStart() {
+    const choices = $("#expansionChoices");
+    const button = $("#startExpansionButton");
+    if (!choices || !button) return;
+    const count = $$("input:checked", choices).length;
+    button.disabled = choices.dataset.available !== "true" || state.expansionBusy || state.selectionBusy || state.selectionStale || count === 0 || count > Number(choices.dataset.maxArtists || 25);
   }
 
   function attachExpansionJob(jobId) {
@@ -1512,15 +1669,17 @@
     state.expansionJobId = expectedJobId;
     state.expansionPollTimer = null;
     state.expansionPolling = true;
-    void pollExpansionJob(expectedJobId);
+    setExpansionBusy(true);
+    $("#retryExpansionButton").hidden = true;
+    void pollExpansionJob(expectedJobId, ++state.expansionPollRequest);
   }
 
-  async function pollExpansionJob(expectedJobId = state.expansionJobId) {
-    if (!state.expansionPolling || !expectedJobId || expectedJobId !== state.expansionJobId) return;
+  async function pollExpansionJob(expectedJobId = state.expansionJobId, requestId = state.expansionPollRequest) {
+    if (!state.expansionPolling || !expectedJobId || expectedJobId !== state.expansionJobId || requestId !== state.expansionPollRequest) return;
     const status = $("#expansionStatus");
     try {
       const {job} = await api(`/api/jobs/${expectedJobId}`);
-      if (!state.expansionPolling || expectedJobId !== state.expansionJobId) return;
+      if (!state.expansionPolling || expectedJobId !== state.expansionJobId || requestId !== state.expansionPollRequest) return;
       const done = Number(job.progress?.completed_artists || 0);
       const total = Number(job.progress?.total_artists || 0);
       status.textContent = job.status === "queued"
@@ -1531,76 +1690,334 @@
         state.expansionPollTimer = null;
         state.expansionPolling = false;
         state.expansionJobId = null;
+        setExpansionBusy(false);
         setButtonBusy($("#startExpansionButton"), false);
         if (job.status !== "complete") showError(job.error || "Artist expansion did not finish.");
         await loadExpansion();
         return;
       }
     } catch (error) {
-      if (expectedJobId !== state.expansionJobId) return;
+      if (expectedJobId !== state.expansionJobId || requestId !== state.expansionPollRequest) return;
       window.clearTimeout(state.expansionPollTimer);
       state.expansionPollTimer = null;
       state.expansionPolling = false;
+      status.textContent = "Expansion status could not be refreshed. Its outcome is unknown; refresh status before continuing.";
+      $("#retryExpansionButton").hidden = false;
       showError(error.message);
       return;
     }
-    if (state.expansionPolling && expectedJobId === state.expansionJobId) {
-      state.expansionPollTimer = window.setTimeout(() => { void pollExpansionJob(expectedJobId); }, 1200);
+    if (state.expansionPolling && expectedJobId === state.expansionJobId && requestId === state.expansionPollRequest) {
+      state.expansionPollTimer = window.setTimeout(() => { void pollExpansionJob(expectedJobId, requestId); }, 1200);
     }
   }
 
-  function openDownload() {
+  function rememberDelivery(values) {
+    state.deliveryRecord = {...state.deliveryRecord, ...values};
+    if (state.journey?.workspace_id == null) return;
+    try {
+      sessionStorage.setItem(`riff:delivery:${state.journey.workspace_id}`, JSON.stringify(state.deliveryRecord));
+    } catch (_) { /* Optional UI receipt, never selection or download authority. */ }
+  }
+
+  function chartCount(value) {
+    return `${value.toLocaleString()} ${value === 1 ? "chart" : "charts"}`;
+  }
+
+  function deliverySnapshot() {
+    return {exact: state.exactSelected, songs: state.exactSelectedSongsKnown ? state.exactSelectedSongs : null, expansion: state.expansionSelected, total: state.selected};
+  }
+
+  function syncDeliveryControls() {
+    const blocked = state.deliveryBusy || state.deliveryLoading;
+    $("#prepareDownloadButton").disabled = blocked || !state.selectionTotalKnown || state.selected < 1;
+    $("#backToChartsButton").disabled = blocked;
+    $("#refreshDownloadButton").disabled = blocked;
+    $("#previousDownloadButton").disabled = blocked;
+    $("#deliverySelectionMore").disabled = blocked;
+    $("#downloadBusyIndicator").hidden = !state.deliveryBusy;
+    $("#prepareDownloadButton").setAttribute("aria-busy", String(state.deliveryBusy));
+    $("#downloadSelectionCount").textContent = state.selectionTotalKnown ? state.selected.toLocaleString() : "...";
+    $("#downloadExactSummary").textContent = state.exactSelectionKnown
+      ? `${chartCount(state.exactSelected)} for ${state.exactSelectedSongsKnown ? `${state.exactSelectedSongs.toLocaleString()} imported ${state.exactSelectedSongs === 1 ? "song" : "songs"}` : "an unavailable imported-song count"}`
+      : "Selected chart count unavailable. Refresh before preparing.";
+    $("#downloadExpansionSummary").textContent = state.expansionSelectionKnown
+      ? `${chartCount(state.expansionSelected)} beyond your music`
+      : "Additional chart count unavailable. It is not assumed to be zero.";
+  }
+
+  function renderDeliveryPage(exact, expansion, append = false) {
+    const groups = [...(exact.tracks || []).map(song => ({...song, origin: "From your music"})), ...(expansion.songs || []).map(song => ({...song, origin: "Artist expansion"}))];
+    const html = groups.map(song => {
+      const candidates = (song.candidates || []).filter(candidate => candidate.selected);
+      if (!candidates.length) return "";
+      return `<article class="delivery-song"><p class="eyebrow">${song.origin}</p><h3>${escapeHtml(song.artist)} - ${escapeHtml(song.title)}</h3><ul>${candidates.map(candidate => `<li><strong>${escapeHtml(candidate.title)}</strong><span>${escapeHtml(candidate.charter || "Charter not listed")} / ${escapeHtml(candidate.source)} / ${escapeHtml(tierPresentation(candidate).label)}</span></li>`).join("")}</ul></article>`;
+    }).join("");
+    const host = $("#deliverySelectionList");
+    if (append) host.insertAdjacentHTML("beforeend", html);
+    else host.innerHTML = html || "<p>No selected chart details on this page.</p>";
+    const previous = state.deliveryPages;
+    state.deliveryPages = {
+      exactOffset: exact.tracks ? Number(exact.offset || 0) + exact.tracks.length : previous?.exactOffset || 0,
+      exactTotal: exact.total ?? previous?.exactTotal ?? 0,
+      expansionOffset: expansion.songs ? Number(expansion.offset || 0) + expansion.songs.length : previous?.expansionOffset || 0,
+      expansionTotal: expansion.total ?? previous?.expansionTotal ?? 0,
+    };
+    const pages = state.deliveryPages;
+    const more = pages.exactOffset < pages.exactTotal || (state.expansionSelected > 0 && pages.expansionOffset < pages.expansionTotal);
+    $("#deliverySelectionMore").hidden = !more;
+    $("#deliverySelectionStatus").textContent = more
+      ? "More song groups remain. Load more to inspect the rest of your selected charts."
+      : "All currently selected chart details are shown.";
+  }
+
+  async function loadMoreDelivery() {
+    if (state.deliveryBusy || state.deliveryLoading || !state.deliveryPages) return;
+    const requestId = state.deliveryRequest;
+    const pages = state.deliveryPages;
+    state.deliveryLoading = true;
+    syncDeliveryControls();
+    try {
+      const [exact, expansion] = await Promise.all([
+        pages.exactOffset < pages.exactTotal ? api(`/api/workspace?selected=true&limit=25&offset=${pages.exactOffset}`) : Promise.resolve({}),
+        pages.expansionOffset < pages.expansionTotal ? api(`/api/expansion/results?limit=25&offset=${pages.expansionOffset}`) : Promise.resolve({}),
+      ]);
+      if (requestId !== state.deliveryRequest) return;
+      renderDeliveryPage(exact, expansion, true);
+    } catch (error) {
+      if (requestId === state.deliveryRequest) $("#deliverySelectionStatus").textContent = `${error.message} Use Load more chart details to retry.`;
+    } finally {
+      if (requestId === state.deliveryRequest) {
+        state.deliveryLoading = false;
+        syncDeliveryControls();
+      }
+    }
+  }
+
+  async function openDownload(focus = true) {
+    if (state.deliveryBusy || state.deliveryLoading || state.expansionBusy) return;
     if (state.selectionBusy || state.selectionStale) {
       showSelectionError("Refresh the selection summary before continuing.");
       return;
     }
-    if (state.selected < 1) {
-      showSelectionError("Select at least one chart before continuing.");
-      return;
+    state.reviewRequest += 1;
+    state.expansionRequest += 1;
+    const focusedControl = focus === false && $("#stageDownload").contains(document.activeElement)
+      ? document.activeElement : null;
+    const requestId = ++state.deliveryRequest;
+    state.deliveryLoading = true;
+    state.selectionTotalKnown = false;
+    clearError();
+    showStage("download", focus !== false);
+    $("#downloadStatus").textContent = state.deliveryRecord.pending
+      ? "Checking whether a ZIP became available. Preparation has no live status or resume endpoint."
+      : "Checking the current saved chart selections...";
+    $("#refreshDownloadButton").hidden = true;
+    $("#previousDownloadButton").hidden = true;
+    syncDeliveryControls();
+    try {
+      const journey = await api("/api/journey");
+      if (requestId !== state.deliveryRequest) return;
+      state.journey = journey;
+      state.availableDownload = journey.download || null;
+      const created = availableNumber(journey.download, ["created_at"]);
+      const previousCreated = availableNumber(state.deliveryRecord, ["previousCreatedAt"]);
+      const newerArchive = state.deliveryRecord.previousToken === null || (created !== null && previousCreated !== null && created > previousCreated);
+      if (state.deliveryRecord.pending && journey.download?.token && journey.download.token !== state.deliveryRecord.previousToken && newerArchive) {
+        rememberDelivery({pending: false});
+        renderDone(journey.download, null, focus !== false || Boolean(focusedControl));
+        return;
+      }
+      if (["queued", "running"].includes(journey.job?.status)) {
+        throw new Error("A search or artist expansion is still active. Return to chart choices and wait for it to finish before preparing a ZIP.");
+      }
+      const [exact, expansion] = await Promise.all([
+        api("/api/workspace?selected=true&limit=25&offset=0"),
+        $("#expansionPanel") ? api("/api/expansion/results?limit=25&offset=0") : Promise.resolve({songs: [], total: 0, summary: {selected: 0}}),
+      ]);
+      if (requestId !== state.deliveryRequest) return;
+      const exactCount = availableNumber(exact.summary, ["selected_charts", "selection_count"]);
+      const songCount = availableNumber(exact.summary, ["selected_tracks", "selected"]);
+      const expansionCount = availableNumber(expansion.summary, ["selected"]);
+      state.exactSelectionKnown = exactCount !== null;
+      state.exactSelectedSongsKnown = songCount !== null;
+      state.expansionSelectionKnown = expansionCount !== null;
+      if (exactCount !== null) state.exactSelected = exactCount;
+      if (songCount !== null) state.exactSelectedSongs = songCount;
+      if (expansionCount !== null) state.expansionSelected = expansionCount;
+      refreshSelectionUi();
+      renderDeliveryPage(exact, expansion);
+      if (!state.selectionTotalKnown) throw new Error("The combined selection count is unavailable. Refresh before preparing; no unknown count is assumed to be zero.");
+      $("#downloadStatus").textContent = state.deliveryRecord.pending
+        ? "No new ZIP is confirmed yet. The earlier request may still be running or may have stopped. Refresh to check again, or explicitly retry preparation; the server rejects overlapping builds."
+        : state.selected > 0
+          ? "Ready to prepare. Riff will recheck your saved choices and validate each artifact."
+          : "No eligible selected charts remain. Return to chart choices to review unavailable charts or select alternatives.";
+      $("#prepareDownloadButton").textContent = state.deliveryRecord.pending ? "Retry preparation" : "Prepare my Riff library";
+      $("#refreshDownloadButton").hidden = false;
+      $("#previousDownloadButton").hidden = !journey.download?.token;
+    } catch (error) {
+      if (requestId !== state.deliveryRequest) return;
+      state.selectionTotalKnown = false;
+      state.exactSelectionKnown = false;
+      state.expansionSelectionKnown = false;
+      $("#downloadStatus").textContent = error.message;
+      $("#refreshDownloadButton").hidden = false;
+      showError(error.message);
+    } finally {
+      if (requestId === state.deliveryRequest) {
+        state.deliveryLoading = false;
+        syncDeliveryControls();
+        if (!$("#stageDownload").hidden && focusedControl?.isConnected && !focusedControl.disabled && !focusedControl.hidden && (document.activeElement === document.body || document.activeElement === focusedControl)) {
+          focusedControl.focus({preventScroll: true});
+        }
+      }
     }
-    $("#downloadSelectionCount").textContent = state.selected.toLocaleString();
-    showStage("download", true);
   }
 
   async function prepareDownload() {
-    const button = $("#prepareDownloadButton");
-    const status = $("#downloadStatus");
+    if (state.deliveryBusy || state.deliveryLoading || !state.selectionTotalKnown || state.selected < 1) return;
+    const requestId = ++state.deliveryRequest;
+    const selection = deliverySnapshot();
+    state.deliveryBusy = true;
+    rememberDelivery({pending: true, previousToken: state.availableDownload?.token || null, previousCreatedAt: availableNumber(state.availableDownload, ["created_at"])});
     clearError();
-    setButtonBusy(button, true, "Validating and packaging...");
-    status.textContent = "Riff is downloading and validating each selected chart. Keep this page open while the ZIP is prepared.";
+    $("#prepareDownloadButton").textContent = "Validating and packaging...";
+    $("#downloadStatus").textContent = `Preparing your ${chartCount(selection.total)} from saved choices. Riff is downloading, validating, and packaging artifacts. Keep this page open. No percentage, per-chart progress, or time estimate is provided by the server.`;
+    syncDeliveryControls();
     try {
       const result = await api("/api/download", {method: "POST", body: "{}"});
+      if (requestId !== state.deliveryRequest) return;
+      if (!result.download?.token) throw new Error("The server did not return a download link. Refresh preparation status before retrying.");
+      rememberDelivery({pending: false, receipt: {token: result.download.token, summary: result.summary || null, selection, requested: false}});
       renderDone({...result.download, url: `/api/download/${result.download.token}`}, result.summary);
     } catch (error) {
-      status.textContent = "";
+      if (requestId !== state.deliveryRequest) return;
+      state.selectionTotalKnown = false;
+      state.exactSelectionKnown = false;
+      state.expansionSelectionKnown = false;
+      $("#downloadStatus").textContent = "No new delivery is confirmed. Refresh preparation status to check for a completed ZIP and reconcile current eligible choices before retrying. A retry prepares a new archive, not just failed files.";
+      $("#refreshDownloadButton").hidden = false;
+      $("#previousDownloadButton").hidden = !state.availableDownload?.token;
       showError(error.message);
     } finally {
-      setButtonBusy(button, false);
+      if (requestId === state.deliveryRequest) {
+        state.deliveryBusy = false;
+        $("#prepareDownloadButton").textContent = "Retry preparation";
+        syncDeliveryControls();
+      }
     }
   }
 
-  function renderDone(download, summary) {
-    const link = $("#downloadLibraryLink");
-    link.href = download.url || `/api/download/${download.token}`;
-    if (summary) {
-      const ready = Number(summary.ready || summary.published || state.selected);
-      $("#doneSummary").textContent = `${ready.toLocaleString()} validated ${ready === 1 ? "chart is" : "charts are"} packaged. Download the ZIP, then add its song folders to Clone Hero.`;
+  function renderDone(download, summary, focus = true) {
+    state.availableDownload = download || null;
+    const receipt = state.deliveryRecord.receipt;
+    const selection = !download || receipt?.token === download?.token ? receipt?.selection : null;
+    const published = availableNumber(summary, ["published"]);
+    const ready = availableNumber(summary, ["ready"]);
+    const selected = availableNumber(summary, ["selected"]);
+    const failed = availableNumber(summary, ["failed"]);
+    const remaining = availableNumber(summary, ["remaining"]);
+    const expires = availableNumber(download, ["expires_at"]);
+    const available = Boolean(download?.token && (expires === null || expires * 1000 > Date.now()) && summary?.success !== false && published !== 0);
+    const hasIssues = (failed !== null && failed > 0) || (remaining !== null && remaining > 0) || Boolean(summary?.errors?.length) || (selection && selected !== null && selection.total !== selected);
+    $("#doneTitle").textContent = !available ? "This download is not available." : hasIssues ? "Your ZIP is ready, with exceptions." : published === null ? "Your ZIP is available." : "Your Riff library is ready.";
+    $("#doneSummary").textContent = !available
+      ? "No usable delivery link is confirmed. It may have been used, expired, or lost after a server restart. Review your choices or prepare a new download; Riff cannot verify a saved copy on this device."
+      : published !== null
+        ? `${published.toLocaleString()} validated chart ${published === 1 ? "artifact is" : "artifacts are"} packaged in one ZIP. Download the ZIP, then add its song folders to Clone Hero.`
+        : "A previously prepared ZIP is available. Its artifact count and failure breakdown were not returned on restore, so Riff cannot confirm how many of your choices it contains.";
+    const rows = [];
+    if (published !== null) rows.push([available ? "Packaged artifacts" : "Last packaged artifacts", published.toLocaleString()]);
+    if (ready !== null) rows.push(["Selections represented", `${ready.toLocaleString()}${selected !== null ? ` of ${selected.toLocaleString()} processed` : ""}`]);
+    if (published !== null && ready !== null && ready >= published) rows.push(["Duplicate selections collapsed", (ready - published).toLocaleString()]);
+    if (selection) {
+      rows.push(["Selected before preparation", `${chartCount(selection.exact)} from your music${selection.songs !== null ? ` / ${selection.songs.toLocaleString()} imported ${selection.songs === 1 ? "song" : "songs"}` : ""}; ${chartCount(selection.expansion)} from artist expansion`]);
     }
-    const expires = Number(download.expires_at || 0);
-    $("#downloadExpiry").textContent = expires ? `This single-use link expires at ${new Date(expires * 1000).toLocaleTimeString([], {hour: "numeric", minute: "2-digit"})}.` : "This is a short-lived, single-use download link.";
-    showStage("done", true);
-    announce("Your Riff library is ready to download.");
+    $("#doneCounts").innerHTML = rows.map(([label, value]) => `<div><dt>${escapeHtml(label)}</dt><dd>${escapeHtml(value)}</dd></div>`).join("");
+    $("#doneCounts").hidden = !rows.length;
+    const warnings = [];
+    if (failed === null || remaining === null) warnings.push("Failure and remaining-selection counts are unavailable. A ready ZIP is not proof that every selected chart was included.");
+    else if (failed || remaining) warnings.push(`${failed.toLocaleString()} failed selections; ${remaining.toLocaleString()} remaining selections were not delivered.`);
+    if (selection && selected !== null && selection.total !== selected) warnings.push(`The tray had ${selection.total.toLocaleString()} selected chart entries; the server processed ${selected.toLocaleString()} after revalidation and selection deduplication. The difference is not claimed as delivered.`);
+    if (failed === 0 && remaining === 0 && !hasIssues) warnings.push("No failed or remaining selections reported.");
+    const errors = Array.isArray(summary?.errors) ? summary.errors : [];
+    const details = hasIssues || errors.length ? `<details data-disclosure-key="delivery:errors"${disclosureOpenAttribute("delivery:errors", false)}><summary>Delivery notes and errors (${errors.length})</summary><p>Review chart choices to inspect eligibility or select alternatives. Preparing again rechecks all current selections, not just failed files. Rejected or unavailable artifacts may no longer be eligible. Invalid/download-failure categories are included in the failure total, not additional failures.</p>${errors.length ? `<ul>${errors.map(message => `<li>${escapeHtml(message)}</li>`).join("")}</ul>` : ""}</details>` : "";
+    $("#doneWarnings").innerHTML = warnings.map(message => `<p>${escapeHtml(message)}</p>`).join("") + details;
+    $("#doneWarnings").hidden = !warnings.length && !errors.length;
+    $("#doneWarnings").classList.toggle("is-clear", failed === 0 && remaining === 0 && !hasIssues);
+    bindDisclosureState($("#doneWarnings"));
+    const link = $("#downloadLibraryLink");
+    const requested = Boolean(receipt?.requested && receipt?.token && receipt.token === download?.token);
+    link.hidden = !available;
+    link.setAttribute("aria-disabled", String(requested || !available));
+    if (available && !requested) link.href = download.url || `/api/download/${download.token}`;
+    else link.removeAttribute("href");
+    $("#downloadExpiry").textContent = !available ? "No current single-use link. Prepare a new ZIP to obtain one." : expires !== null ? `Single-use link. Expires ${new Date(expires * 1000).toLocaleString()}.` : "This is a short-lived, single-use download link.";
+    $("#downloadHandoff").textContent = requested
+      ? "Download requested. Check your browser's Downloads list. Riff cannot confirm saving, and a consumed link cannot be reused."
+      : "Ready to download is not confirmation that your browser saved the ZIP.";
+    $("#refreshLinkButton").hidden = available && !requested;
+    window.clearTimeout(state.expiryTimer);
+    if (available && expires !== null) {
+      state.expiryTimer = window.setTimeout(() => {
+        link.removeAttribute("href");
+        link.setAttribute("aria-disabled", "true");
+        $("#doneTitle").textContent = "This download link has expired.";
+        if (published === null) $("#doneSummary").textContent = "The prepared ZIP is no longer available through this link. Prepare a new download to obtain a current report and link.";
+        $("#downloadExpiry").textContent = "This link has expired. Prepare a new download; your saved choices remain on the server.";
+        if (!$("#stageDone").hidden) announce("The download link expired. Prepare a new download when ready.");
+      }, Math.min(2147483647, Math.max(0, expires * 1000 - Date.now())));
+    }
+    showStage("done", focus);
+    if (focus) announce($("#doneTitle").textContent);
   }
 
   async function prepareAgain() {
-    state.journey = await api("/api/journey");
-    state.exactSelected = Number(state.journey.review?.selected || 0);
-    if ($("#expansionPanel")) {
-      const expansion = await api("/api/expansion/results").catch(() => ({summary: {selected: 0}}));
-      state.expansionSelected = Number(expansion.summary?.selected || 0);
+    if (state.deliveryBusy || state.deliveryLoading) return;
+    rememberDelivery({pending: false});
+    await openDownload();
+  }
+
+  function requestLibraryDownload(event) {
+    const link = event.currentTarget;
+    if (link.getAttribute("aria-disabled") === "true" || !link.hasAttribute("href")) {
+      event.preventDefault();
+      return;
     }
-    refreshSelectionUi();
-    openDownload();
+    const token = state.availableDownload?.token;
+    const old = state.deliveryRecord.receipt;
+    rememberDelivery({receipt: {...(old?.token === token ? old : {}), token, requested: true}});
+    link.setAttribute("aria-disabled", "true");
+    // Leave the native navigation intact. Fetching or probing would consume the token.
+    window.setTimeout(() => { link.removeAttribute("href"); }, 0);
+    $("#downloadHandoff").textContent = "Download requested. Check your browser's Downloads list. Riff cannot confirm saving, and a consumed link cannot be reused.";
+    $("#refreshLinkButton").hidden = false;
+    announce($("#downloadHandoff").textContent);
+  }
+
+  async function refreshLibraryLink() {
+    const button = $("#refreshLinkButton");
+    if (button.disabled || state.deliveryBusy) return;
+    const requestId = ++state.deliveryRequest;
+    setButtonBusy(button, true, "Checking availability...");
+    clearError();
+    try {
+      const journey = await api("/api/journey");
+      if (requestId !== state.deliveryRequest || $("#stageDone").hidden) return;
+      state.journey = journey;
+      const receipt = state.deliveryRecord.receipt;
+      const matches = receipt?.token && receipt.token === journey.download?.token;
+      if (matches) rememberDelivery({receipt: {...receipt, requested: false}});
+      renderDone(journey.download, matches || !journey.download ? receipt?.summary : null, false);
+      const link = $("#downloadLibraryLink");
+      const target = !link.hidden && link.hasAttribute("href") ? link : $("#doneTitle");
+      if (target !== link) target.setAttribute("tabindex", "-1");
+      target.focus({preventScroll: true});
+    } catch (error) {
+      if (requestId === state.deliveryRequest) showError(error.message);
+    } finally {
+      setButtonBusy(button, false);
+    }
   }
 
   function debounce(callback, delay = 220) {
@@ -1619,7 +2036,7 @@
     });
     window.visualViewport?.addEventListener("resize", syncSelectionBand);
     document.addEventListener("focusin", event => {
-      if (event.target?.matches?.('.candidate-row [data-selection]')) syncSelectionBand();
+      if (event.target?.matches?.('.candidate-row [data-selection], [data-expansion-selection]')) syncSelectionBand();
     });
     $("#soundcloudForm")?.addEventListener("submit", importAuthenticatedSoundCloud);
     $("#selectAllPlaylistsButton")?.addEventListener("click", () => setAllSpotifyPlaylists(true));
@@ -1627,6 +2044,7 @@
     $("#refreshSpotifyButton")?.addEventListener("click", () => refreshSpotify(false));
     $("#findChartsButton")?.addEventListener("click", startDiscovery);
     $("#cancelJobButton")?.addEventListener("click", cancelDiscovery);
+    $("#retryJobButton")?.addEventListener("click", () => { clearError(); attachJob(state.jobId); });
     $("#activityDetails")?.addEventListener("toggle", event => { if (event.currentTarget.open) loadActivity(); });
     $("#activitySearch")?.addEventListener("input", debounce(() => { state.activityOffset = 0; loadActivity(); }));
     $("#activityPrev")?.addEventListener("click", () => { state.activityOffset = Math.max(0, state.activityOffset - 50); loadActivity(); });
@@ -1646,12 +2064,26 @@
     $("#reviewPrev")?.addEventListener("click", () => { state.reviewOffset = Math.max(0, state.reviewOffset - 25); loadReview(); });
     $("#reviewNext")?.addEventListener("click", () => { state.reviewOffset += 25; loadReview(); });
     $("#startExpansionButton")?.addEventListener("click", startExpansion);
+    $("#retryExpansionButton")?.addEventListener("click", () => {
+      clearError();
+      if (state.expansionJobId) attachExpansionJob(state.expansionJobId);
+      else void loadExpansion();
+    });
     $("#continueDownloadButton")?.addEventListener("click", openDownload);
     $("#backToChartsButton")?.addEventListener("click", () => openConfirm(true));
     $("#searchAgainButton")?.addEventListener("click", () => openAddMusic(true));
     $("#prepareDownloadButton")?.addEventListener("click", prepareDownload);
-    $("#downloadLibraryLink")?.addEventListener("click", () => announce("Your browser download has started. Riff cannot confirm when your browser finishes saving it."));
+    $("#refreshDownloadButton")?.addEventListener("click", () => openDownload(false));
+    $("#previousDownloadButton")?.addEventListener("click", () => {
+      const receipt = state.deliveryRecord.receipt;
+      renderDone(state.availableDownload, receipt?.token === state.availableDownload?.token ? receipt.summary : null);
+    });
+    $("#deliverySelectionMore")?.addEventListener("click", loadMoreDelivery);
+    bindDisclosureState($("#stageDownload"));
+    $("#downloadLibraryLink")?.addEventListener("click", requestLibraryDownload);
+    $("#refreshLinkButton")?.addEventListener("click", refreshLibraryLink);
     $("#prepareAgainButton")?.addEventListener("click", prepareAgain);
+    $("#doneReviewButton")?.addEventListener("click", () => openConfirm(true));
     restore();
   }
 

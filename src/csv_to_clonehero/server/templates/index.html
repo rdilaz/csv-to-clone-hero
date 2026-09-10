@@ -124,6 +124,7 @@
         </details>
         <div class="progress-footer">
           <button class="text-button" id="cancelJobButton" type="button">Cancel search</button>
+          <button class="text-button" id="retryJobButton" type="button" hidden>Refresh search status</button>
           <p class="progress-eta"><span>Estimated time left</span><strong id="progressEta">Estimating...</strong></p>
         </div>
       </div>
@@ -181,8 +182,10 @@
       <div class="expansion-choices" id="expansionChoices" aria-live="polite"><p>Loading eligible artists...</p></div>
       <div class="expansion-actions">
         <button class="button button--secondary" id="startExpansionButton" type="button" disabled>Find more songs by selected artists</button>
+        <button class="text-button" id="retryExpansionButton" type="button" hidden>Refresh expansion status</button>
         <p id="expansionStatus" role="status" aria-live="polite"></p>
       </div>
+      <p class="fine-print">Optional, not part of your imported song count. Finding again replaces the entire expansion set, including choices for unchecked artists; your music selections stay unchanged.</p>
       <div class="expansion-results" id="expansionResults" hidden>
         <div class="review-toolbar"><div><h2>Expansion recommendations</h2><p><span id="expansionResultCount">0</span> additional songs available</p></div></div>
       <div id="expansionCards"></div>
@@ -213,25 +216,44 @@
       <h1 id="downloadTitle">Prepare your Riff library.</h1>
       <p>Riff will download and validate your selected charts, then package them into one ZIP for your browser.</p>
     </header>
-    <div class="download-card">
-      <div class="zip-art" aria-hidden="true"><span>ZIP</span></div>
-      <div><span class="eyebrow">YOUR RIFF LIBRARY</span><strong><span id="downloadSelectionCount">0</span> selected charts</strong><p>Only validated playable chart files are included. The delivery link expires shortly and works once.</p></div>
+    <div class="delivery-ledger">
+      <div class="delivery-total"><span class="eyebrow">YOUR SELECTION</span><strong id="downloadSelectionCount">...</strong><span>selected charts</span></div>
+      <dl class="delivery-counts">
+        <div><dt>From your music</dt><dd id="downloadExactSummary">Checking saved choices...</dd></div>
+        <div><dt>Artist expansion</dt><dd id="downloadExpansionSummary">Checking additional charts...</dd></div>
+      </dl>
     </div>
-    <div class="boundary-note"><strong>Browser download only</strong><span>Riff cannot see or write to folders on your computer.</span></div>
-    <div class="primary-action">
-      <button class="button button--large" id="prepareDownloadButton" type="button">Prepare my Riff library</button>
+    <div class="delivery-status">
+      <p class="kicker">PREPARATION STATUS</p>
+      <p id="downloadStatus" role="status" aria-live="polite">Checking the current saved selection.</p>
+      <div class="delivery-busy" id="downloadBusyIndicator" aria-hidden="true" hidden><span></span></div>
+    </div>
+    <div class="primary-action delivery-actions">
+      <button class="button button--large" id="prepareDownloadButton" type="button" disabled>Prepare my Riff library</button>
+      <button class="text-button" id="refreshDownloadButton" type="button" hidden>Refresh preparation status</button>
       <button class="text-button" id="backToChartsButton" type="button">Change chart choices</button>
-      <p id="downloadStatus" role="status" aria-live="polite"></p>
+      <button class="text-button" id="previousDownloadButton" type="button" hidden>View the earlier ZIP</button>
     </div>
+    <details class="delivery-details" id="deliveryDetails" data-disclosure-key="delivery:selection">
+      <summary>Selected chart details</summary>
+      <p class="fine-print">Saved selections, not a delivery manifest. The preparation report gives the final artifact count.</p>
+      <div id="deliverySelectionList"></div>
+      <p class="fine-print" id="deliverySelectionStatus" role="status"></p>
+      <button class="button button--secondary" id="deliverySelectionMore" type="button" hidden>Load more chart details</button>
+    </details>
+    <div class="boundary-note"><strong>Browser download only</strong><span>Riff cannot see or write to folders on your computer. Duplicate selections may share one file; validation can exclude charts. Keep this page open during preparation; no live percentage or resume status is available.</span></div>
   </section>
 
   <section class="journey-stage done-stage" id="stageDone" aria-labelledby="doneTitle" hidden>
-    <div class="done-mark" aria-hidden="true"><span></span></div>
-    <p class="kicker">DONE</p>
+    <p class="kicker">DONE / DELIVERY REPORT</p>
     <h1 id="doneTitle">Your Riff library is ready.</h1>
-    <p class="lede" id="doneSummary">Your selected charts passed Riff's checks and are packaged for download.</p>
-    <a class="button button--large" id="downloadLibraryLink" href="#">Download library</a>
+    <p class="lede" id="doneSummary"></p>
+    <dl class="delivery-counts done-counts" id="doneCounts" hidden></dl>
+    <div class="delivery-warnings" id="doneWarnings" role="status" hidden></div>
+    <a class="button button--large" id="downloadLibraryLink" download="riff-library.zip" hidden>Download library</a>
     <p class="expiry-note" id="downloadExpiry"></p>
+    <p class="fine-print" id="downloadHandoff" role="status">Ready to download is not confirmation that your browser saved the ZIP.</p>
+    <button class="text-button" id="refreshLinkButton" type="button" hidden>Check download availability</button>
     <div class="install-steps">
       <h2>Put it into Clone Hero</h2>
       <ol>
@@ -242,6 +264,7 @@
       </ol>
     </div>
     <button class="text-button" id="prepareAgainButton" type="button">Prepare a new download</button>
+    <button class="text-button" id="doneReviewButton" type="button">Review chart choices</button>
   </section>
 </div>
 {% endif %}

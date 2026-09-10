@@ -1097,6 +1097,134 @@ def test_public_journey_restores_owned_workspace_state(client, app, config):
     assert "path" not in payload["download"]
 
 
+@pytest.mark.parametrize("song_count", [1, 2], ids=["one-song", "two-songs"])
+@pytest.mark.parametrize("expansion_mode", ["disabled", "empty", "variants"])
+def test_public_journey_restores_song_and_chart_selection_counts(
+    client, app, config, song_count, expansion_mode
+):
+    from csv_to_clonehero.database import Database
+    from csv_to_clonehero.providers.base import LibrarySnapshot, ProviderTrack
+    from tests.conftest import make_chart
+
+    config.server.enable_expansion = expansion_mode != "disabled"
+    _sign_in(client)
+    workspace_id = client.get("/api/journey").get_json()["workspace_id"]
+    db = Database(config.database_path)
+    try:
+        db.upsert_library_snapshot(workspace_id, LibrarySnapshot("spotify", [
+            ProviderTrack("spotify", f"count-{index}", title, "Artist")
+            for index, title in enumerate(["First Song", "Second Song"][:song_count])
+        ]))
+        tracks = sorted(
+            db.get_library_tracks(workspace_id=workspace_id), key=lambda track: track.title
+        )
+        generation = db.create_discovery_scan(
+            workspace_id, scan_key="selection-counts", kind="exact", status="complete",
+            metadata={"workflow": "combined_catalog"},
+        )
+        task = db.upsert_discovery_task(
+            workspace_id, scan_id=generation, source="test",
+            query_key="selection-counts", status="complete",
+        )
+        first_song_candidates = []
+        for index, track in enumerate(tracks):
+            for variant in range(3 if index == 0 else 1):
+                chart = make_chart(
+                    track.title, "Artist", chart_id=1000 + index * 10 + variant,
+                    charter=f"Charter {variant}",
+                )
+                db.upsert_workspace_candidate(
+                    workspace_id, track.track_key, chart, score=99,
+                    eligibility="RECOMMENDED", decision="AUTO_ACCEPT", task_id=task,
+                )
+                db.select_workspace_candidate(workspace_id, track.track_key, chart)
+                if index == 0:
+                    first_song_candidates.append(chart.db_id)
+        expansion_candidates = []
+        if expansion_mode == "variants":
+            for variant in range(2):
+                chart = make_chart(
+                    "Additional Song", "Artist", chart_id=1100 + variant,
+                    charter=f"Expansion Charter {variant}",
+                )
+                db.upsert_workspace_candidate(
+                    workspace_id, None, chart, kind="expansion", artist_norm="artist",
+                    score=99, eligibility="RECOMMENDED", decision="AUTO_ACCEPT",
+                    metadata={"exact_generation_id": generation},
+                )
+                db.select_workspace_candidate(
+                    workspace_id, None, chart, kind="expansion", artist_norm="artist",
+                    metadata={"selection_origin": "explicit", "possible_confirmed": True},
+                )
+                expansion_candidates.append(chart.db_id)
+        db.update_workspace(
+            workspace_id, status="complete", phase="complete",
+            metadata={"workflow": "public_catalog"},
+        )
+    finally:
+        db.close()
+
+    page = client.get("/api/workspace?limit=1&selected=true").get_json()
+    assert page["total"] == song_count
+    assert len(page["tracks"]) == 1
+    assert page["tracks"][0]["selected_count"] == 3
+    assert set(page["tracks"][0]["selected_candidate_ids"]) == set(first_song_candidates)
+    assert {key: page["summary"][key] for key in (
+        "total", "selected", "selected_tracks", "selected_charts", "selection_count",
+    )} == {
+        "total": song_count, "selected": song_count, "selected_tracks": song_count,
+        "selected_charts": song_count + 2, "selection_count": song_count + 2,
+    }
+    empty_page = client.get("/api/workspace?search=not-in-this-library").get_json()
+    assert empty_page["total"] == 0
+    assert empty_page["tracks"] == []
+    assert empty_page["summary"] == page["summary"]
+
+    restored = app.test_client()
+    _sign_in(restored)
+    journey = restored.get("/api/journey").get_json()
+    assert journey["workspace_id"] == workspace_id
+    assert journey["combined"]["tracks"] == song_count
+    assert journey["review"] == {
+        key: value for key, value in page["summary"].items() if key != "selection_count"
+    }
+    assert journey["download"] is None
+    expansion = restored.get("/api/expansion/results?limit=1")
+    if expansion_mode == "disabled":
+        assert expansion.status_code == 404
+    else:
+        assert expansion.status_code == 200
+        results = expansion.get_json()
+        assert results["total"] == int(expansion_mode == "variants")
+        assert results["summary"] == {
+            "total": int(expansion_mode == "variants"),
+            "selected": len(expansion_candidates),
+        }
+        if expansion_candidates:
+            assert results["songs"][0]["selected_count"] == 2
+            assert set(results["songs"][0]["selected_candidate_ids"]) == set(expansion_candidates)
+        else:
+            assert results["songs"] == []
+        later_page = restored.get("/api/expansion/results?limit=1&offset=1").get_json()
+        assert later_page["songs"] == []
+        assert later_page["summary"] == results["summary"]
+
+    cleared = restored.post("/api/selection", json={
+        "track_key": tracks[0].track_key,
+        "candidate_id": first_song_candidates[1], "action": "clear",
+    })
+    assert cleared.status_code == 200
+    review = restored.get("/api/journey").get_json()["review"]
+    assert review["selected_charts"] == song_count + 1
+    assert review["selected_tracks"] == song_count
+    assert restored.post("/api/selection/bulk", json={"action": "clear"}).status_code == 200
+    review = restored.get("/api/journey").get_json()["review"]
+    assert review["selected_charts"] == review["selected_tracks"] == review["selected"] == 0
+    assert review["total"] == song_count
+    if expansion_mode != "disabled":
+        assert restored.get("/api/expansion/results").get_json()["summary"] == results["summary"]
+
+
 def test_workspace_paging_search_filters_and_summary_are_bounded(client, config):
     from csv_to_clonehero.database import Database
     from csv_to_clonehero.server.auth import user_workspace_key
@@ -1243,6 +1371,103 @@ def test_public_download_route_is_owner_scoped_and_single_use(
     assert owned.status_code == 200
     assert owned.data == b"PK\x03\x04owner-only"
     assert client.get(f"/api/download/{token}").status_code in {404, 410}
+
+
+def test_public_download_build_dto_restores_metadata_and_consumes_archive(
+    client, app, config, monkeypatch
+):
+    import zipfile
+
+    from csv_to_clonehero.database import Database
+    from csv_to_clonehero.providers.base import LibrarySnapshot, ProviderTrack
+    from tests.conftest import FakeSource, make_chart, valid_sng_bytes
+
+    _sign_in(client)
+    workspace_id = client.get("/api/journey").get_json()["workspace_id"]
+    content = valid_sng_bytes("Song")
+    charts = [make_chart("Song", "Artist", chart_id=1200 + index) for index in range(2)]
+    source = FakeSource(files={chart.md5: content for chart in charts})
+    source.download_hash_verified = False
+    config.export.download_workers = 1
+    monkeypatch.setattr("csv_to_clonehero.sources.build_sources", lambda _config: [source])
+    db = Database(config.database_path)
+    try:
+        db.upsert_library_snapshot(workspace_id, LibrarySnapshot("spotify", [
+            ProviderTrack("spotify", "download-dto", "Song", "Artist")
+        ]))
+        track = db.get_library_tracks(workspace_id=workspace_id)[0]
+        generation = db.create_discovery_scan(
+            workspace_id, scan_key="download-dto", kind="exact", status="complete"
+        )
+        task = db.upsert_discovery_task(
+            workspace_id, scan_id=generation, source="test",
+            query_key="download-dto", status="complete",
+        )
+        for chart in charts:
+            db.upsert_workspace_candidate(
+                workspace_id, track.track_key, chart, score=99,
+                eligibility="RECOMMENDED", decision="AUTO_ACCEPT", task_id=task,
+            )
+            db.select_workspace_candidate(workspace_id, track.track_key, chart)
+        db.update_workspace(workspace_id, status="complete", phase="complete")
+    finally:
+        db.close()
+
+    response = client.post("/api/download", json={})
+    assert response.status_code == 200, response.get_json()
+    payload = response.get_json()
+    assert set(payload) == {"download", "summary"}
+    download = payload["download"]
+    assert set(download) == {"token", "expires_at", "ttl_seconds", "size_bytes"}
+    assert isinstance(download["token"], str) and download["token"]
+    assert download["ttl_seconds"] == app.extensions["downloads"].ttl_seconds
+    assert download["size_bytes"] > 0
+    assert payload["summary"] == {
+        "success": True, "published": 1, "failed": 0, "invalid": 0,
+        "download_failures": 0, "already_present": 0, "ready": 2,
+        "selected": 2, "remaining": 0, "status": "success",
+        "bytes": download["size_bytes"], "errors": [],
+    }
+    assert source.downloads == [chart.md5 for chart in charts]
+    archive_path = Path(app.extensions["downloads"].resolve(download["token"])["path"])
+
+    restored = app.test_client()
+    _sign_in(restored)
+    journey = restored.get("/api/journey").get_json()
+    restored_download = journey["download"]
+    assert set(restored_download) == set(download) | {"url", "created_at"}
+    assert {key: restored_download[key] for key in download} == download
+    assert restored_download["url"] == f"/api/download/{download['token']}"
+    assert restored_download["created_at"] < restored_download["expires_at"]
+    assert "summary" not in journey
+    assert journey["workspace_id"] == workspace_id
+    assert journey["review"]["selected_charts"] == 2
+    assert journey["review"]["selected_tracks"] == 1
+    assert journey["job"] is None
+    assert restored.get("/api/jobs").get_json() == {"jobs": []}
+
+    streamed = restored.get(restored_download["url"], buffered=True)
+    assert streamed.status_code == 200
+    assert streamed.mimetype == "application/zip"
+    assert streamed.headers["Content-Disposition"] == 'attachment; filename="riff-library.zip"'
+    assert int(streamed.headers["Content-Length"]) == len(streamed.data) == download["size_bytes"]
+    with zipfile.ZipFile(io.BytesIO(streamed.data)) as archive:
+        songs = [name for name in archive.namelist() if name.endswith(".sng")]
+        assert len(songs) == 1
+        assert archive.read(songs[0]) == content
+    assert not archive_path.exists()
+    assert restored.get(restored_download["url"]).status_code == 404
+    after = restored.get("/api/journey").get_json()
+    assert after["download"] is None
+    assert after["review"] == journey["review"]
+    db = Database(config.database_path)
+    try:
+        assert {row["candidate_id"] for row in db.list_workspace_selections(workspace_id)} == {
+            chart.db_id for chart in charts
+        }
+        assert db.get_workspace_owned_track_ids(workspace_id) == set()
+    finally:
+        db.close()
 
 
 def test_browser_exporter_has_single_route(app):
