@@ -3,7 +3,10 @@
 import hashlib
 import io
 import json
+import os
 import zipfile
+
+import pytest
 
 from csv_to_clonehero.database import Database
 from csv_to_clonehero.downloader import DownloadManager
@@ -100,7 +103,19 @@ def test_checksum_mismatch_rejected(config):
     db.close()
 
 
-def test_path_escape_refused(config):
+@pytest.mark.parametrize(
+    "escape_relpath",
+    [
+        # "/" is a path separator on every OS, so this escapes everywhere.
+        "../../evil.sng",
+        # The host's own separator: "..\..\evil.sng" on Windows (the case this
+        # test was written for) and "../../evil.sng" on POSIX, where "\" is an
+        # ordinary filename character rather than a separator.
+        os.path.join("..", "..", "evil.sng"),
+    ],
+    ids=["forward-slash", "native-separator"],
+)
+def test_path_escape_refused(config, escape_relpath):
     db = Database(config.database_path)
     content = _valid_chart_bytes()
     md5 = hashlib.md5(content).hexdigest()
@@ -109,8 +124,7 @@ def test_path_escape_refused(config):
     _make_selection(db, chart)
 
     manager = DownloadManager(config, db)
-    success, message, _ = manager.download_selection(chart, source, "..\\..\\evil.sng"
-    )
+    success, message, _ = manager.download_selection(chart, source, escape_relpath)
     assert not success
     assert "outside library root" in message
     db.close()

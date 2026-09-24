@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 import io
+import shutil
 import socket
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -13,9 +15,9 @@ import pytest
 from scripts.local_journey_e2e import (
     AcceptanceError,
     AcceptanceArtifacts,
-    DEFAULT_CONFIG,
     DEFAULT_REAL_CATALOG,
     DEFAULT_REAL_DB,
+    REPOSITORY,
     ExpectedRunContract,
     JourneySnapshotReducer,
     MATCHING_START_NOT_OBSERVABLE,
@@ -37,6 +39,20 @@ from scripts.local_journey_e2e import (
     resolve_python,
     run_observe_existing,
 )
+
+
+@pytest.fixture
+def source_config(tmp_path_factory) -> Path:
+    """Secrets-free stand-in for the developer's gitignored ``config.yaml``.
+
+    The harness default (``DEFAULT_CONFIG``) only exists on a machine where the
+    app has been configured, so CI and fresh clones seed the isolated harness
+    from the committed, commit-safe ``config.example.yaml`` instead. It lives
+    outside ``tmp_path`` because some tests assert on that directory's entries.
+    """
+    path = tmp_path_factory.mktemp("source-config") / "config.yaml"
+    shutil.copyfile(REPOSITORY / "config.example.yaml", path)
+    return path
 
 
 def _snapshot(
@@ -553,7 +569,7 @@ def test_dead_owned_run_recovers_interrupted_and_releases_lease(
         db.close()
 
 
-def test_intentional_real_process_stop_recovers_durable_run(tmp_path):
+def test_intentional_real_process_stop_recovers_durable_run(tmp_path, source_config):
     import httpx
     from csv_to_clonehero.database import Database
 
@@ -565,12 +581,14 @@ def test_intentional_real_process_stop_recovers_durable_run(tmp_path):
     config_path, database, _catalog = _acceptance_config(
         artifacts,
         target="isolated",
-        source_config_path=DEFAULT_CONFIG,
+        source_config_path=source_config,
         real_database=DEFAULT_REAL_DB,
         real_catalog=DEFAULT_REAL_CATALOG,
     )
     server = OwnedServer(
-        resolve_python(),
+        # The interpreter running pytest has the package installed; a
+        # repository .venv (the harness default) does not exist in CI.
+        resolve_python(sys.executable),
         config_path,
         port,
         artifacts.root / "server.log",
@@ -754,7 +772,7 @@ def test_attach_mode_refuses_wrong_run(tmp_path, monkeypatch):
     assert exc_info.value.error_code == "OBSERVE_WRONG_RUN"
 
 
-def test_real_cli_subprocess_owns_cleans_and_completes_journey(tmp_path):
+def test_real_cli_subprocess_owns_cleans_and_completes_journey(tmp_path, source_config):
     probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     probe.bind(("127.0.0.1", 0))
     port = probe.getsockname()[1]
@@ -771,6 +789,10 @@ def test_real_cli_subprocess_owns_cleans_and_completes_journey(tmp_path):
             str(port),
             "--timeout",
             "60",
+            "--config",
+            str(source_config),
+            "--python",
+            sys.executable,
             "--artifacts-dir",
             str(tmp_path),
         ]

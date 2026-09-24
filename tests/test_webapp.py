@@ -1990,12 +1990,19 @@ def test_upload_accepts_itunes_txt_and_xml(client, config):
     assert names == ["My iTunes Export.txt"]
 
 
-def test_upload_sanitizes_filename(client, config):
-    data = {"files": (io.BytesIO(b"Song,Artist\nX,Y\n"), "..\\..\\evil?.csv")}
+@pytest.mark.parametrize(
+    "client_filename",
+    ["..\\..\\evil?.csv", "../../evil?.csv"],
+    ids=["windows-client", "posix-client"],
+)
+def test_upload_sanitizes_filename(client, config, client_filename):
+    # The uploading browser's OS picks the separator, so both must be stripped
+    # regardless of the OS the server runs on.
+    data = {"files": (io.BytesIO(b"Song,Artist\nX,Y\n"), client_filename)}
     response = client.post("/api/upload", data=data, content_type="multipart/form-data")
     saved = response.get_json()["saved"][0]
     assert ".." not in saved and "?" not in saved
-    assert saved.endswith(".csv")
+    assert saved == "evil_.csv"
     assert (config.input_path / saved).exists()
 
 
@@ -2148,9 +2155,12 @@ def test_output_path_check_rejects_bad_paths(client, config):
         json={"path": str(config.input_path / "out")},
     ).get_json()
     assert inside["ok"] is False
-    # Drive root
-    root = client.post("/api/output-path/check", json={"path": "C:\\\\"}).get_json()
+    # Drive/filesystem root of the host OS ("C:\" on Windows, "/" on POSIX,
+    # where "C:\" is just a relative folder name).
+    filesystem_root = config.base_dir.anchor
+    root = client.post("/api/output-path/check", json={"path": filesystem_root}).get_json()
     assert root["ok"] is False
+    assert "drive root" in root["error"]
     # Folder that would contain the state DB
     state_holder = client.post(
         "/api/output-path/check", json={"path": str(config.base_dir)}
@@ -3061,8 +3071,11 @@ def test_simple_run_end_to_end(config, monkeypatch):
         assert result["downloaded"] == 1
         assert result["no_match"] == 3
         # Downloads went to the per-run override folder (hybrid layout)...
+        # The album "DAMN." is written as "DAMN": sanitize_component strips
+        # trailing dots, which Windows cannot store. Win32 also drops a
+        # trailing dot on lookup, so "DAMN." only happened to match there.
         target = (
-            config.base_dir / "chosen_songs" / "Kendrick Lamar" / "DAMN."
+            config.base_dir / "chosen_songs" / "Kendrick Lamar" / "DAMN"
             / "Kendrick Lamar - Humble [TestCharter].sng"
         )
         assert target.exists()

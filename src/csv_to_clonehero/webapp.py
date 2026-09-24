@@ -29,7 +29,7 @@ import uuid
 from collections import deque
 from dataclasses import fields, is_dataclass
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any, Callable, Iterable, Mapping
 from urllib.parse import parse_qs, urlsplit
 
@@ -9267,7 +9267,10 @@ def create_app(
         input_dir.mkdir(parents=True, exist_ok=True)
         saved, rejected = [], []
         for item in uploaded:
-            name = Path(item.filename or "").name
+            # The client's OS, not the server's, decides the separator in an
+            # uploaded filename, so strip both "/" and "\" (and any drive
+            # prefix) the same way on every host.
+            name = PureWindowsPath(item.filename or "").name
             suffix = Path(name).suffix.lower()
             if suffix not in SUPPORTED_EXTENSIONS:
                 rejected.append(name)
