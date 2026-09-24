@@ -1471,6 +1471,21 @@ def _hash_file(path: Path, algorithm: str = "sha256") -> str:
     return digest.hexdigest()
 
 
+def _discard_staged_file(path: Path) -> None:
+    """Remove a staging file that may not exist, on every platform.
+
+    ``unlink(missing_ok=True)`` only absorbs ``FileNotFoundError``. When a
+    regular file sits where the parent folder should be, Windows reports that
+    as path-not-found (``FileNotFoundError``) but POSIX raises
+    ``NotADirectoryError``; either way there is nothing to remove, and the
+    caller's copy step reports the real per-item failure.
+    """
+    try:
+        path.unlink()
+    except (FileNotFoundError, NotADirectoryError):
+        pass
+
+
 def _copy_file(source: Path, target: Path) -> int:
     target.parent.mkdir(parents=True, exist_ok=True)
     written = 0
@@ -2802,12 +2817,12 @@ class ExportService:
                     errors.append(f"{item_result.target_relpath}: {item_result.failure}")
                     continue
             part = target.with_name(target.name + ".part")
-            part.unlink(missing_ok=True)
+            _discard_staged_file(part)
             try:
                 _copy_file(artifact.path, part)
                 parts.append((index, part, target))
             except OSError as exc:
-                part.unlink(missing_ok=True)
+                _discard_staged_file(part)
                 item_result.status = "failed"
                 item_result.result = "stage_failed"
                 item_result.failure = str(exc)
