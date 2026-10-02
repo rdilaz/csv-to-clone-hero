@@ -31,10 +31,6 @@ DATABASE_URL_ENV = "DATABASE_URL"  # optional absolute sqlite path override
 CATALOG_PATH_ENV = "CATALOG_PATH"  # operator-managed catalog on persistent state
 NOTIFICATIONS_API_KEY_ENV = "NOTIFICATIONS_API_KEY"  # transactional email key
 GOFUNDME_URL_ENV = "GOFUNDME_URL"
-DEFAULT_GOFUNDME_URL = (
-    "https://www.gofundme.com/f/"
-    "cancer-deudas-y-a-punto-de-perder-nuestro-hogar-apoyanos"
-)
 
 # Required in production (when server.enforce_secret_key is true). Keep the
 # defaults empty so the existing offline CLI and test flows keep working.
@@ -613,15 +609,15 @@ class MonetizationConfig(BaseModel):
     ads_enabled: bool = True
     ad_banner_slot: str = ""
     ad_sidebar_slot: str = ""
-    gofundme_enabled: bool = True
+    gofundme_enabled: bool = False
     gofundme_url_env: str = GOFUNDME_URL_ENV
     gofundme_url: str = ""
-    gofundme_banner: bool = True
+    gofundme_banner: bool = False
 
     @property
     def effective_gofundme_url(self) -> str:
         env_value = os.environ.get(self.gofundme_url_env, "").strip()
-        return env_value or self.gofundme_url.strip() or DEFAULT_GOFUNDME_URL
+        return env_value or self.gofundme_url.strip()
 
 
 class AdminConfig(BaseModel):

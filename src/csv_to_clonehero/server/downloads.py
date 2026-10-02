@@ -351,6 +351,9 @@ def build_archive(
         managed_sync=False,
         continue_on_error=True,
         include_manifest_in_zip=True,
+        minimum_free_bytes=max(
+            0, int(getattr(config.export, "minimum_free_bytes", 0) or 0)
+        ),
         download_workers=min(
             16,
             max(1, int(getattr(config.export, "download_workers", 3) or 3)),

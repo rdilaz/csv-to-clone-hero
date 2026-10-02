@@ -545,3 +545,47 @@ def db_workspace(config):
     db = Database(config.database_path)
     yield db, 1  # workspace id 1 has no selections yet
     db.close()
+
+
+@pytest.mark.parametrize("reserve", [0, -1, 2048])
+def test_public_archive_honors_configured_disk_reserve(config, monkeypatch, reserve):
+    from csv_to_clonehero.database import Database
+    from tests.conftest import FakeSource, make_chart, make_track, valid_sng_bytes
+
+    content = valid_sng_bytes("Reserve Song")
+    digest = hashlib.md5(content).hexdigest()
+    config.export.minimum_free_bytes = reserve
+    monkeypatch.setattr(
+        "csv_to_clonehero.exporter._default_disk_usage",
+        lambda _path: (100_000, 90_000, len(content) + 1024),
+    )
+    db = Database(config.database_path)
+    try:
+        workspace = db.create_workspace(workspace_key="disk-reserve")
+        track = db.upsert_spotify_tracks([make_track("Reserve Song", "Artist", "reserve")])[0]
+        db.replace_workspace_library_tracks(workspace, [track])
+        chart = make_chart("Reserve Song", "Artist", chart_id=601, md5=digest)
+        db.upsert_workspace_candidate(
+            workspace, track.track_key, chart, score=99,
+            eligibility="RECOMMENDED", decision="AUTO_ACCEPT", kind="exact",
+        )
+        db.select_workspace_candidate(workspace, track.track_key, chart, kind="exact")
+        selections = [dict(row) for row in db.list_workspace_selections(workspace)]
+        source = FakeSource(files={digest: content})
+        staging = config.state_path / "downloads"
+        if reserve > 0:
+            with pytest.raises(DownloadError, match="free|required"):
+                build_archive(config, db, workspace, [source], staging)
+            assert source.downloads == []
+            assert list(staging.iterdir()) == []
+            observation = db.get_chart_artifact_validation(chart.source, chart.chart_id)
+            assert observation is None or observation["state"] not in {"REJECTED", "UNAVAILABLE"}
+        else:
+            archive, summary = build_archive(config, db, workspace, [source], staging)
+            assert archive.is_file()
+            assert summary["success"] is True
+            assert source.downloads == [digest]
+            assert not list(staging.glob(".assembly-*"))
+        assert [dict(row) for row in db.list_workspace_selections(workspace)] == selections
+    finally:
+        db.close()

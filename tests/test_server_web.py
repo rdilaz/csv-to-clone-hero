@@ -90,7 +90,7 @@ def test_landing_is_public(client):
     r = client.get("/")
     assert r.status_code == 200
     assert b"Connect Spotify" in r.data
-    assert b"cause-bar" in r.data
+    assert b"cause-bar" not in r.data
     assert b"Get every song" not in r.data
     assert b"score the best match" not in r.data
     assert b"Enchor" in r.data
@@ -101,31 +101,45 @@ def test_landing_is_public(client):
     assert b"Songs folder" not in r.data
 
 
+def test_support_links_are_disabled_by_default(client, config, monkeypatch):
+    assert config.monetization.effective_gofundme_url == ""
+    assert not config.monetization.gofundme_enabled
+    assert not config.monetization.gofundme_banner
+    monkeypatch.setenv("GOFUNDME_URL", "https://example.test/community-support")
+    assert "cause-bar" not in client.get("/").get_data(as_text=True)
+    assert "https://example.test/community-support" not in client.get("/about").get_data(as_text=True)
+
+
 def test_support_banner_can_be_disabled_without_changing_the_shell(client, config):
+    config.monetization.gofundme_enabled = True
+    config.monetization.gofundme_url = "https://example.test/community-support"
     config.monetization.gofundme_banner = False
     html = client.get("/").get_data(as_text=True)
     assert "cause-bar" not in html
     assert "Signal Check" in html
 
 
-def test_enabled_gofundme_banner_uses_canonical_fallback(client):
-    from csv_to_clonehero.config import DEFAULT_GOFUNDME_URL
-
+def test_enabled_gofundme_banner_requires_explicit_destination(client, config):
+    config.monetization.gofundme_enabled = True
+    config.monetization.gofundme_banner = True
+    assert "cause-bar" not in client.get("/").get_data(as_text=True)
+    config.monetization.gofundme_url = "https://example.test/community-support"
     html = client.get("/").get_data(as_text=True)
-    assert f'href="{DEFAULT_GOFUNDME_URL}"' in html
+    assert 'href="https://example.test/community-support"' in html
     assert 'target="_blank"' in html
     assert 'rel="noopener noreferrer"' in html
     assert "Support the creator of Clone Hero" in html
 
 
-def test_gofundme_environment_url_overrides_fallback(client, monkeypatch):
+def test_gofundme_environment_url_overrides_configured_url(client, config, monkeypatch):
+    config.monetization.gofundme_enabled = True
+    config.monetization.gofundme_banner = True
+    config.monetization.gofundme_url = "https://example.test/old-support"
     override = "https://example.test/community-support"
     monkeypatch.setenv("GOFUNDME_URL", override)
-
     html = client.get("/").get_data(as_text=True)
-
     assert f'href="{override}"' in html
-    assert "cancer-deudas-y-a-punto-de-perder-nuestro-hogar-apoyanos" not in html
+    assert "https://example.test/old-support" not in html
 
 
 def test_authenticated_review_shell_prioritizes_human_decisions(client):

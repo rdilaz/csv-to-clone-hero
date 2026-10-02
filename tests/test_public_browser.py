@@ -98,8 +98,13 @@ def _capture(page, name):
     page.screenshot(path=str(destination / name), full_page=False)
 
 
-def test_public_landing_mobile_and_desktop(public_server):
+@pytest.mark.parametrize("support_enabled", [False, True])
+def test_public_landing_mobile_and_desktop(public_server, support_enabled):
     _app, base_url, _cookie_name, _cookie = public_server
+    support_config = _app.extensions["config"].monetization
+    support_config.gofundme_enabled = support_enabled
+    support_config.gofundme_banner = support_enabled
+    support_config.gofundme_url = "https://example.test/community-support"
     with playwright.sync_playwright() as runtime:
         try:
             browser = runtime.chromium.launch(headless=True)
@@ -118,15 +123,15 @@ def test_public_landing_mobile_and_desktop(public_server):
                 support = page.get_by_role(
                     "link", name="Support the creator of Clone Hero on GoFundMe"
                 )
-                assert support.is_visible()
-                assert support.get_attribute("href") == (
-                    "https://www.gofundme.com/f/"
-                    "cancer-deudas-y-a-punto-de-perder-nuestro-hogar-apoyanos"
-                )
-                assert support.get_attribute("target") == "_blank"
-                assert support.get_attribute("rel") == "noopener noreferrer"
-                support.focus()
-                assert support.evaluate("element => document.activeElement === element")
+                if support_enabled:
+                    assert support.is_visible()
+                    assert support.get_attribute("href") == "https://example.test/community-support"
+                    assert support.get_attribute("target") == "_blank"
+                    assert support.get_attribute("rel") == "noopener noreferrer"
+                    support.focus()
+                    assert support.evaluate("element => document.activeElement === element")
+                else:
+                    assert support.count() == 0
                 assert page.get_by_text("Your music", exact=True).is_visible()
                 assert page.get_by_text("Community charts", exact=True).is_visible()
                 _assert_no_overflow(page)
