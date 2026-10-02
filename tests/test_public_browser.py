@@ -213,10 +213,15 @@ def test_running_find_eta_restores_without_overflow(public_server, viewport):
     "viewport",
     [{"width": 390, "height": 844}, {"width": 1440, "height": 900}],
 )
+@pytest.mark.parametrize("support_enabled", [False, True])
 def test_signal_check_confirm_keeps_multi_chart_selection_truthful(
-    public_server, viewport
+    public_server, viewport, support_enabled
 ):
     _app, base_url, cookie_name, cookie = public_server
+    support = _app.extensions["config"].monetization
+    support.gofundme_enabled = support_enabled
+    support.gofundme_banner = support_enabled
+    support.gofundme_url = "https://example.test/community-support"
     fixtures = SignalCheckFixtures("confirm")
 
     with playwright.sync_playwright() as runtime:
@@ -255,9 +260,14 @@ def test_signal_check_confirm_keeps_multi_chart_selection_truthful(
             band_box = page.locator("#selectionRail").bounding_box()
             assert group_box is not None and action_box is not None and band_box is not None
             if viewport["width"] == 390:
-                banner_box = page.locator(".cause-bar").bounding_box()
-                assert banner_box is not None and banner_box["height"] <= 44
-                assert group_box["y"] <= 380 + banner_box["height"]
+                banner_height = 0
+                if support_enabled:
+                    banner_box = page.locator(".cause-bar").bounding_box()
+                    assert banner_box is not None and banner_box["height"] <= 44
+                    banner_height = banner_box["height"]
+                else:
+                    assert page.locator(".cause-bar").count() == 0
+                assert group_box["y"] <= 380 + banner_height
             assert "is-in-flow" not in (page.locator("#selectionRail").get_attribute("class") or "")
             assert action_box["y"] + action_box["height"] + 7 <= band_box["y"]
         else:
@@ -644,8 +654,13 @@ def test_signal_check_ignores_out_of_order_review_reads(public_server):
         browser.close()
 
 
-def test_signal_check_reflows_at_320_and_respects_reduced_motion(public_server):
+@pytest.mark.parametrize("support_enabled", [False, True])
+def test_signal_check_reflows_at_320_and_respects_reduced_motion(public_server, support_enabled):
     _app, base_url, cookie_name, cookie = public_server
+    support = _app.extensions["config"].monetization
+    support.gofundme_enabled = support_enabled
+    support.gofundme_banner = support_enabled
+    support.gofundme_url = "https://example.test/community-support"
     fixtures = SignalCheckFixtures("confirm")
 
     with playwright.sync_playwright() as runtime:
@@ -670,7 +685,12 @@ def test_signal_check_reflows_at_320_and_respects_reduced_motion(public_server):
             for box in [page.locator(".journey-steps li").nth(index).bounding_box() for index in range(5)]
         )
         assert page.locator(".selection-options").get_attribute("open") is None
-        for selector in [".cause-bar__link", ".brand", ".selection-options > summary", ".concern-details > summary"]:
+        selectors = [".brand", ".selection-options > summary", ".concern-details > summary"]
+        if support_enabled:
+            selectors.append(".cause-bar__link")
+        else:
+            assert page.locator(".cause-bar__link").count() == 0
+        for selector in selectors:
             box = page.locator(selector).first.bounding_box()
             assert box is not None and box["height"] >= 44
         identity_style = page.locator(".candidate-identity h4").first.evaluate(

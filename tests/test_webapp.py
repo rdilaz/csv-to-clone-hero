@@ -1998,8 +1998,21 @@ def test_upload_accepts_itunes_txt_and_xml(client, config):
 def test_upload_sanitizes_filename(client, config, client_filename):
     # The uploading browser's OS picks the separator, so both must be stripped
     # regardless of the OS the server runs on.
-    data = {"files": (io.BytesIO(b"Song,Artist\nX,Y\n"), client_filename)}
-    response = client.post("/api/upload", data=data, content_type="multipart/form-data")
+    # Preserve literal backslashes across the multipart quoted-string boundary.
+    # Werkzeug's test builder does not escape them, while newer parsers correctly
+    # consume an unescaped backslash as a quoted-pair escape before our route runs.
+    quoted_filename = client_filename.replace("\\", "\\\\").replace('"', '\\"')
+    boundary = "riff-upload-filename-test"
+    data = (
+        f"--{boundary}\r\n"
+        f'Content-Disposition: form-data; name="files"; filename="{quoted_filename}"\r\n'
+        "Content-Type: text/csv\r\n\r\nSong,Artist\nX,Y\n"
+        f"\r\n--{boundary}--\r\n"
+    ).encode()
+    response = client.post(
+        "/api/upload", data=data,
+        content_type=f"multipart/form-data; boundary={boundary}",
+    )
     saved = response.get_json()["saved"][0]
     assert ".." not in saved and "?" not in saved
     assert saved == "evil_.csv"
