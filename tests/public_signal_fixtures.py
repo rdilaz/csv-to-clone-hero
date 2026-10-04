@@ -82,6 +82,11 @@ class SignalCheckFixtures:
         self.download_ttl_seconds = 900
         self.clock: Callable[[], float] = time.time
         self.last_export_summary: dict[str, Any] | None = None
+        self.async_download = False
+        self.download_job: dict[str, Any] | None = None
+        self.download_job_polls = 0
+        self.download_complete_after_polls: int | None = 2
+        self._download_job_id = 76
         self._downloads: dict[str, dict[str, Any]] = {}
         self._download_prefix = f"signal-{uuid4().hex}-"
         self._download_lock = RLock()
@@ -177,7 +182,7 @@ class SignalCheckFixtures:
         }
         if self._expansion_status is not None:
             job = self.expansion_job()
-        return {
+        journey = {
             "workspace_id": 1,
             "workspace_status": workspace_status,
             "workspace": {
@@ -227,6 +232,9 @@ class SignalCheckFixtures:
             "review": summary,
             "download": self.download,
         }
+        if self.async_download:
+            journey["download_job"] = deepcopy(self.download_job)
+        return journey
 
     @staticmethod
     def _review(
@@ -651,6 +659,49 @@ class SignalCheckFixtures:
                 self._downloads.pop(next(iter(self._downloads)))
         return 200, {"download": dict(metadata), "summary": summary}
 
+    def start_download_job(self) -> tuple[int, dict[str, Any]]:
+        if self.download_job and self.download_job["status"] in {"queued", "running"}:
+            return 202, {"job": deepcopy(self.download_job), "created": False}
+        self._download_job_id += 1
+        self.download_job_polls = 0
+        self.download_job = {
+            "id": self._download_job_id,
+            "kind": "download",
+            "status": "queued",
+            "phase": "queued",
+            "message": "ZIP preparation queued",
+            "result": None,
+            "error": None,
+        }
+        return 202, {"job": deepcopy(self.download_job), "created": True}
+
+    def poll_download_job(self) -> tuple[int, dict[str, Any]]:
+        job = self.download_job
+        if job is None:
+            return 404, {"error": "job not found"}
+        if job["status"] in {"queued", "running"}:
+            self.download_job_polls += 1
+            job["status"] = "running"
+            job["phase"] = "packaging"
+            job["message"] = "Validating selected charts and preparing ZIP"
+            if (self.download_complete_after_polls is not None
+                    and self.download_job_polls >= self.download_complete_after_polls):
+                status, response = self.prepare_download()
+                if status == 200:
+                    job["status"] = "complete"
+                    job["phase"] = "complete"
+                    job["message"] = "ZIP prepared"
+                    job["result"] = {
+                        "summary": response["summary"],
+                        "archive_created_at": self.download["created_at"],
+                        "size_bytes": response["download"]["size_bytes"],
+                    }
+                else:
+                    job["status"] = "failed"
+                    job["phase"] = "failed"
+                    job["error"] = response["error"]
+        return 200, {"job": deepcopy(job)}
+
     def summary(self) -> dict[str, object]:
         tracks = self.tracks()
         selected_tracks = sum(bool(track["selected"]) for track in tracks)
@@ -881,7 +932,17 @@ class SignalCheckFixtures:
             except (TypeError, ValueError):
                 return 400, {"error": "invalid expansion paging parameters"}
         if path == "/api/download" and method == "POST":
-            return self.prepare_download()
+            return self.start_download_job() if self.async_download else self.prepare_download()
+        if self.async_download and path == f"/api/jobs/{self._download_job_id}" and method == "GET":
+            return self.poll_download_job()
+        if self.async_download and path == f"/api/jobs/{self._download_job_id}/cancel" and method == "POST":
+            if self.download_job is None:
+                return 404, {"error": "job not found"}
+            if self.download_job["status"] in {"queued", "running"}:
+                self.download_job["status"] = "cancelled"
+                self.download_job["phase"] = "cancelled"
+                self.download_job["message"] = "ZIP preparation cancelled"
+            return 200, {"job": deepcopy(self.download_job)}
         if path.startswith("/api/download/") and method == "GET":
             token = path.removeprefix("/api/download/")
             with self._download_lock:

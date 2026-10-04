@@ -7,6 +7,7 @@ import io
 import json
 import shutil
 import subprocess
+import threading
 from pathlib import Path
 
 import pytest
@@ -1428,20 +1429,36 @@ def test_public_download_build_dto_restores_metadata_and_consumes_archive(
         db.close()
 
     response = client.post("/api/download", json={})
-    assert response.status_code == 200, response.get_json()
+    assert response.status_code == 202, response.get_json()
     payload = response.get_json()
-    assert set(payload) == {"download", "summary"}
-    download = payload["download"]
-    assert set(download) == {"token", "expires_at", "ttl_seconds", "size_bytes"}
+    assert set(payload) == {"job", "created"}
+    assert payload["created"] is True
+    assert payload["job"]["kind"] == "download"
+    job_id = payload["job"]["id"]
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        terminal = client.get(f"/api/jobs/{job_id}").get_json()["job"]
+        if terminal["status"] in {"complete", "partial", "failed", "cancelled"}:
+            break
+        time.sleep(0.05)
+    assert terminal["status"] == "complete", terminal
+    assert "token" not in json.dumps(terminal)
+    assert "path" not in terminal["result"]
+    summary = terminal["result"]["summary"]
+
+    journey = client.get("/api/journey").get_json()
+    download = journey["download"]
+    assert set(download) == {"token", "created_at", "expires_at", "ttl_seconds", "size_bytes", "url"}
     assert isinstance(download["token"], str) and download["token"]
     assert download["ttl_seconds"] == app.extensions["downloads"].ttl_seconds
     assert download["size_bytes"] > 0
-    assert payload["summary"] == {
+    assert summary == {
         "success": True, "published": 1, "failed": 0, "invalid": 0,
         "download_failures": 0, "already_present": 0, "ready": 2,
         "selected": 2, "remaining": 0, "status": "success",
         "bytes": download["size_bytes"], "errors": [],
     }
+    assert journey["download_job"]["result"]["archive_created_at"] == download["created_at"]
     assert source.downloads == [chart.md5 for chart in charts]
     archive_path = Path(app.extensions["downloads"].resolve(download["token"])["path"])
 
@@ -1449,7 +1466,7 @@ def test_public_download_build_dto_restores_metadata_and_consumes_archive(
     _sign_in(restored)
     journey = restored.get("/api/journey").get_json()
     restored_download = journey["download"]
-    assert set(restored_download) == set(download) | {"url", "created_at"}
+    assert set(restored_download) == set(download)
     assert {key: restored_download[key] for key in download} == download
     assert restored_download["url"] == f"/api/download/{download['token']}"
     assert restored_download["created_at"] < restored_download["expires_at"]
@@ -1458,12 +1475,14 @@ def test_public_download_build_dto_restores_metadata_and_consumes_archive(
     assert journey["review"]["selected_charts"] == 2
     assert journey["review"]["selected_tracks"] == 1
     assert journey["job"] is None
-    assert restored.get("/api/jobs").get_json() == {"jobs": []}
+    assert journey["download_job"]["id"] == job_id
+    assert restored.get("/api/jobs").get_json()["jobs"][0]["id"] == job_id
 
     streamed = restored.get(restored_download["url"], buffered=True)
     assert streamed.status_code == 200
     assert streamed.mimetype == "application/zip"
     assert streamed.headers["Content-Disposition"] == 'attachment; filename="riff-library.zip"'
+    assert streamed.headers["Cache-Control"] == "private, no-store"
     assert int(streamed.headers["Content-Length"]) == len(streamed.data) == download["size_bytes"]
     with zipfile.ZipFile(io.BytesIO(streamed.data)) as archive:
         songs = [name for name in archive.namelist() if name.endswith(".sng")]
@@ -1482,6 +1501,318 @@ def test_public_download_build_dto_restores_metadata_and_consumes_archive(
         assert db.get_workspace_owned_track_ids(workspace_id) == set()
     finally:
         db.close()
+
+
+def _seed_async_download_choice(config, workspace_id):
+    from csv_to_clonehero.database import Database
+    from tests.conftest import make_chart, make_track
+
+    db = Database(config.database_path)
+    try:
+        track = db.upsert_spotify_tracks([make_track("Queued Song", "Artist", "queued-song")])[0]
+        db.replace_workspace_library_tracks(workspace_id, [track])
+        db.create_discovery_scan(workspace_id, scan_key="queued", kind="exact", status="complete")
+        chart = make_chart("Queued Song", "Artist", chart_id=2451)
+        db.upsert_workspace_candidate(
+            workspace_id, track.track_key, chart, score=99,
+            eligibility="RECOMMENDED", decision="AUTO_ACCEPT", kind="exact",
+        )
+        db.select_workspace_candidate(workspace_id, track.track_key, chart)
+    finally:
+        db.close()
+
+
+def _wait_download_job(client, job_id, *, timeout=5):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        job = client.get(f"/api/jobs/{job_id}").get_json()["job"]
+        if job["status"] in {"complete", "partial", "failed", "cancelled", "interrupted"}:
+            return job
+        time.sleep(0.02)
+    raise AssertionError(f"download job {job_id} did not finish")
+
+
+def test_async_download_post_is_prompt_unique_owner_scoped_and_blocks_workspace_reset(
+    client, app, config, monkeypatch
+):
+    import csv_to_clonehero.server.jobs as job_module
+    import csv_to_clonehero.server.web as web
+    from csv_to_clonehero.database import Database
+
+    _sign_in(client)
+    workspace_id = client.get("/api/journey").get_json()["workspace_id"]
+    _seed_async_download_choice(config, workspace_id)
+    started = threading.Event()
+    release = threading.Event()
+    builds = []
+
+    def slow_build(_config, _db, workspace, _sources, staging, **kwargs):
+        builds.append(workspace)
+        started.set()
+        assert release.wait(5)
+        archive = staging / "slow-build.zip"
+        archive.write_bytes(b"PK\x03\x04synthetic")
+        return archive, {
+            "success": True, "published": 1, "failed": 0, "remaining": 0,
+            "selected": 1, "bytes": archive.stat().st_size, "errors": [],
+        }
+
+    monkeypatch.setattr(job_module, "build_archive", slow_build)
+    try:
+        began = time.monotonic()
+        first = client.post("/api/download", json={})
+        assert first.status_code == 202
+        assert time.monotonic() - began < 1.0
+        job_id = first.get_json()["job"]["id"]
+        assert first.get_json()["created"] is True
+        assert started.wait(3)
+        duplicate = client.post("/api/download", json={})
+        assert duplicate.status_code == 202
+        assert duplicate.get_json()["created"] is False
+        assert duplicate.get_json()["job"]["id"] == job_id
+        journey = client.get("/api/journey").get_json()
+        assert journey["download_job"]["id"] == job_id
+        assert journey["job"] is None
+        assert journey["download"] is None
+        assert client.post(f"/api/workspaces/{workspace_id}/reset").status_code == 409
+        assert client.delete(f"/api/workspaces/{workspace_id}").status_code == 409
+        assert client.post("/api/selection", json={"action": "clear", "kind": "exact"}).status_code == 409
+        assert client.post("/api/selection", json={"action": "clear", "kind": "expansion"}).status_code == 409
+        assert client.post("/api/selection/bulk", json={"action": "clear"}).status_code == 409
+
+        monkeypatch.setattr(web, "_fetch_profile", lambda *_: {"id": "other-user", "display_name": "Other"})
+        other = app.test_client()
+        _sign_in(other)
+        assert other.get(f"/api/jobs/{job_id}").status_code == 404
+        assert other.get("/api/journey").get_json()["download_job"] is None
+        assert other.post("/api/selection/bulk", json={"action": "clear"}).status_code == 200
+    finally:
+        release.set()
+    job = _wait_download_job(client, job_id)
+    assert job["status"] == "complete", job
+    assert builds == [workspace_id]
+    download = client.get("/api/journey").get_json()["download"]
+    assert download["created_at"] == job["result"]["archive_created_at"]
+    db = Database(config.database_path)
+    try:
+        persisted = dict(db.get_job(job_id))
+        assert "token" not in persisted["result_json"]
+        assert "slow-build.zip" not in persisted["result_json"]
+    finally:
+        db.close()
+
+
+def test_queued_download_fails_closed_when_selected_chart_changes(client, app, config, monkeypatch):
+    import csv_to_clonehero.server.jobs as job_module
+    from csv_to_clonehero.database import Database
+    from tests.conftest import make_chart
+
+    _sign_in(client)
+    workspace_id = client.get("/api/journey").get_json()["workspace_id"]
+    _seed_async_download_choice(config, workspace_id)
+    manager = app.extensions["jobs"]
+    manager.shutdown(timeout=2)
+    called = []
+    monkeypatch.setattr(job_module, "build_archive", lambda *a, **k: called.append(True))
+    response = client.post("/api/download", json={})
+    assert response.status_code == 202
+    job_id = response.get_json()["job"]["id"]
+    db = Database(config.database_path)
+    try:
+        track = db.get_spotify_tracks(True)[0]
+        replacement = make_chart("Queued Song", "Artist", chart_id=2452)
+        db.upsert_workspace_candidate(
+            workspace_id, track.track_key, replacement, score=99,
+            eligibility="RECOMMENDED", decision="AUTO_ACCEPT", kind="exact",
+        )
+        db.clear_workspace_selection(workspace_id, kind="exact")
+        db.select_workspace_candidate(workspace_id, track.track_key, replacement)
+        assert len(db.list_workspace_selections(workspace_id)) == 1
+    finally:
+        db.close()
+    manager.start()
+    job = _wait_download_job(client, job_id)
+    assert job["status"] == "failed"
+    assert "choices changed" in job["error"].lower()
+    assert called == []
+    assert client.get("/api/journey").get_json()["download"] is None
+
+
+def test_download_discards_archive_if_choices_change_during_build(client, app, config, monkeypatch):
+    import csv_to_clonehero.server.jobs as job_module
+    from csv_to_clonehero.database import Database
+    from tests.conftest import make_chart
+
+    _sign_in(client)
+    workspace_id = client.get("/api/journey").get_json()["workspace_id"]
+    _seed_async_download_choice(config, workspace_id)
+    started = threading.Event()
+    release = threading.Event()
+    archive = app.extensions["downloads"].root / "changed-during-build.zip"
+
+    def slow_build(_config, _db, _workspace, _sources, _staging, **_kwargs):
+        started.set()
+        assert release.wait(5)
+        archive.write_bytes(b"PK\x03\x04synthetic")
+        return archive, {
+            "success": True, "published": 1, "failed": 0, "remaining": 0,
+            "selected": 1, "errors": [],
+        }
+
+    monkeypatch.setattr(job_module, "build_archive", slow_build)
+    queued = client.post("/api/download", json={})
+    assert queued.status_code == 202
+    job_id = queued.get_json()["job"]["id"]
+    try:
+        assert started.wait(3)
+        # A request already past the HTTP guard can commit its selection write.
+        # The same-count swap must still invalidate the archive before handoff.
+        db = Database(config.database_path)
+        try:
+            track = db.get_spotify_tracks(True)[0]
+            replacement = make_chart("Queued Song", "Artist", chart_id=2452)
+            db.upsert_workspace_candidate(
+                workspace_id, track.track_key, replacement, score=99,
+                eligibility="RECOMMENDED", decision="AUTO_ACCEPT", kind="exact",
+            )
+            db.clear_workspace_selection(workspace_id, kind="exact")
+            db.select_workspace_candidate(workspace_id, track.track_key, replacement)
+            assert len(db.list_workspace_selections(workspace_id)) == 1
+        finally:
+            db.close()
+    finally:
+        release.set()
+    job = _wait_download_job(client, job_id)
+    assert job["status"] == "failed"
+    assert "choices changed" in job["error"].lower()
+    assert not archive.exists()
+    assert client.get("/api/journey").get_json()["download"] is None
+
+
+def test_completed_download_job_after_restart_has_no_stale_link(client, app, config, monkeypatch):
+    import csv_to_clonehero.server.jobs as job_module
+
+    _sign_in(client)
+    workspace_id = client.get("/api/journey").get_json()["workspace_id"]
+    _seed_async_download_choice(config, workspace_id)
+
+    def synthetic_build(_config, _db, _workspace, _sources, staging, **_kwargs):
+        archive = staging / "restart-build.zip"
+        archive.write_bytes(b"PK\x03\x04synthetic")
+        return archive, {"success": True, "published": 1, "failed": 0, "remaining": 0, "selected": 1, "errors": []}
+
+    monkeypatch.setattr(job_module, "build_archive", synthetic_build)
+    queued = client.post("/api/download", json={}).get_json()["job"]
+    assert _wait_download_job(client, queued["id"])["status"] == "complete"
+    assert client.get("/api/journey").get_json()["download"] is not None
+    app.extensions["jobs"].shutdown(timeout=2)
+    app.extensions["downloads"].close()
+
+    restarted = create_app(config)
+    try:
+        visitor = restarted.test_client()
+        _sign_in(visitor)
+        journey = visitor.get("/api/journey").get_json()
+        assert journey["download_job"]["status"] == "complete"
+        assert journey["download"] is None
+    finally:
+        restarted.extensions["jobs"].shutdown(timeout=2)
+        restarted.extensions["downloads"].close()
+
+
+def test_async_download_cancellation_and_failed_registration_leave_no_archive(
+    client, app, config, monkeypatch
+):
+    import csv_to_clonehero.server.jobs as job_module
+    from csv_to_clonehero.server.downloads import DownloadError
+
+    _sign_in(client)
+    workspace_id = client.get("/api/journey").get_json()["workspace_id"]
+    _seed_async_download_choice(config, workspace_id)
+    started = threading.Event()
+
+    def cancelled_build(_config, _db, _workspace, _sources, _staging, **kwargs):
+        started.set()
+        assert kwargs["cancellation_event"].wait(5)
+        raise DownloadError("Preparation cancelled")
+
+    monkeypatch.setattr(job_module, "build_archive", cancelled_build)
+    queued = client.post("/api/download", json={}).get_json()["job"]
+    assert started.wait(3)
+    assert client.post(f"/api/jobs/{queued['id']}/cancel", json={}).status_code == 200
+    assert _wait_download_job(client, queued["id"])["status"] == "cancelled"
+    assert client.get("/api/journey").get_json()["download"] is None
+
+    def prepared_build(_config, _db, _workspace, _sources, staging, **_kwargs):
+        archive = staging / "registration-failed.zip"
+        archive.write_bytes(b"PK\x03\x04synthetic")
+        return archive, {"success": True, "published": 1, "failed": 0, "remaining": 0, "selected": 1, "errors": []}
+
+    monkeypatch.setattr(job_module, "build_archive", prepared_build)
+    monkeypatch.setattr(app.extensions["downloads"], "create", lambda *a: (_ for _ in ()).throw(OSError("registry failed")))
+    retry = client.post("/api/download", json={}).get_json()["job"]
+    failed = _wait_download_job(client, retry["id"])
+    assert failed["status"] == "failed"
+    assert not (app.extensions["downloads"].root / "registration-failed.zip").exists()
+    assert client.get("/api/journey").get_json()["download"] is None
+
+
+def test_download_cancel_at_final_handoff_revokes_archive(client, app, config, monkeypatch):
+    import csv_to_clonehero.server.jobs as job_module
+    from csv_to_clonehero.database import Database
+
+    _sign_in(client)
+    workspace_id = client.get("/api/journey").get_json()["workspace_id"]
+    _seed_async_download_choice(config, workspace_id)
+    archive = app.extensions["downloads"].root / "cancel-at-handoff.zip"
+
+    def prepared_build(_config, _db, _workspace, _sources, _staging, **_kwargs):
+        archive.write_bytes(b"PK\x03\x04synthetic")
+        return archive, {
+            "success": True, "published": 1, "failed": 0, "remaining": 0,
+            "selected": 1, "errors": [],
+        }
+
+    real_finish = Database.finish_download_job_if_active
+
+    def cancel_before_finish(db, job_id, **kwargs):
+        db.request_job_cancel(job_id)
+        return real_finish(db, job_id, **kwargs)
+
+    monkeypatch.setattr(job_module, "build_archive", prepared_build)
+    monkeypatch.setattr(Database, "finish_download_job_if_active", cancel_before_finish)
+    queued = client.post("/api/download", json={})
+    assert queued.status_code == 202
+    job = _wait_download_job(client, queued.get_json()["job"]["id"])
+    assert job["status"] == "cancelled"
+    assert job["result"] == {}
+    assert client.get("/api/journey").get_json()["download"] is None
+    assert not archive.exists()
+
+
+def test_async_partial_archive_preserves_failure_report_and_live_link(client, app, config, monkeypatch):
+    import csv_to_clonehero.server.jobs as job_module
+
+    _sign_in(client)
+    workspace_id = client.get("/api/journey").get_json()["workspace_id"]
+    _seed_async_download_choice(config, workspace_id)
+
+    def partial_build(_config, _db, _workspace, _sources, staging, **_kwargs):
+        archive = staging / "partial-build.zip"
+        archive.write_bytes(b"PK\x03\x04synthetic")
+        return archive, {
+            "success": True, "published": 1, "failed": 1, "remaining": 1,
+            "selected": 2, "errors": ["A chart was unavailable"],
+        }
+
+    monkeypatch.setattr(job_module, "build_archive", partial_build)
+    queued = client.post("/api/download", json={}).get_json()["job"]
+    job = _wait_download_job(client, queued["id"])
+    assert job["status"] == "partial"
+    assert job["result"]["summary"]["failed"] == 1
+    journey = client.get("/api/journey").get_json()
+    assert journey["download_job"]["status"] == "partial"
+    assert journey["download"]["created_at"] == job["result"]["archive_created_at"]
 
 
 def test_browser_exporter_has_single_route(app):

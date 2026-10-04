@@ -41,7 +41,7 @@ from csv_to_clonehero.matching import (
 )
 from csv_to_clonehero.normalization import normalize_artist, normalize_title
 from csv_to_clonehero.server.auth import build_oauth, build_soundcloud_oauth, user_workspace_key
-from csv_to_clonehero.server.downloads import BrowserDownloads, DownloadError, build_archive
+from csv_to_clonehero.server.downloads import BrowserDownloads, DownloadError, selection_snapshot
 from csv_to_clonehero.server.jobs import JobManager
 from csv_to_clonehero.server.safeguards import (
     get_discovery_availability,
@@ -97,8 +97,8 @@ def create_app(
 
     app.jinja_env.globals["now_year"] = str(datetime.now().year)
 
-    jobs = JobManager(config, cipher, source_factory=source_factory)
     downloads = BrowserDownloads(config, secret_key)
+    jobs = JobManager(config, cipher, source_factory=source_factory, downloads=downloads)
 
     app.extensions["jobs"] = jobs
     app.extensions["downloads"] = downloads
@@ -603,6 +603,8 @@ def create_app(
             active_expansion = db.get_active_job(
                 int(user["id"]), workspace_key=key, kind="expansion"
             )
+            if db.get_active_job(int(user["id"]), workspace_key=key, kind="download") is not None:
+                return jsonify({"error": "Wait for ZIP preparation to finish before searching again."}), 409
             if active_expansion is not None:
                 existing = jobs.get(int(active_expansion["id"]))
                 return jsonify({
@@ -742,6 +744,8 @@ def create_app(
             active_discovery = db.get_active_job(
                 int(user["id"]), workspace_key=key, kind="discovery"
             )
+            if db.get_active_job(int(user["id"]), workspace_key=key, kind="download") is not None:
+                return jsonify({"error": "Wait for ZIP preparation to finish before expanding artists."}), 409
             if active_discovery is not None:
                 return jsonify({"error": "Wait for exact matching to finish first."}), 409
             job, created = jobs.enqueue_unique(
@@ -851,7 +855,17 @@ def create_app(
             cards = _review_cards(config, db, workspace_id, minimum_score)
             scope = db.get_workspace_scope_data(workspace_id)
             source_rows = _public_source_rows(db, workspace_id)
-            newest_jobs = jobs.list_for_user(int(user["id"]), limit=1)
+            key = user_workspace_key(user["spotify_user_id"])
+            journey_jobs = [
+                jobs.latest_for_user_workspace(int(user["id"]), workspace_key=key, kind=kind)
+                for kind in ("discovery", "expansion")
+            ]
+            newest_job = max((job for job in journey_jobs if job is not None), key=lambda job: job.id, default=None)
+            download_job = jobs.latest_for_user_workspace(
+                int(user["id"]),
+                workspace_key=key,
+                kind="download",
+            )
             download = downloads.latest_for_user_workspace(int(user["id"]), workspace_id)
             if download is not None:
                 download["url"] = url_for("stream_download", token=download["token"])
@@ -871,7 +885,8 @@ def create_app(
                 ),
                 "sources": source_rows,
                 "combined": db.get_combined_summary(workspace_id),
-                "job": _job_mapping_public(newest_jobs[0]) if newest_jobs else None,
+                "job": _job_public(newest_job) if newest_job is not None else None,
+                "download_job": _job_public(download_job) if download_job is not None else None,
                 "review": _review_summary(cards),
                 "download": download,
             })
@@ -951,6 +966,12 @@ def create_app(
         db = _user_db()
         try:
             workspace = _ensure_workspace(db, user)
+            if db.get_active_job(
+                int(user["id"]),
+                workspace_key=user_workspace_key(user["spotify_user_id"]),
+                kind="download",
+            ) is not None:
+                return jsonify({"error": "Wait for ZIP preparation to finish before changing chart choices."}), 409
             candidate_id = int(payload.get("candidate_id") or 0)
             track_value = payload.get("track_id") or payload.get("track_key")
             candidate_kind = str(payload.get("kind") or "exact")
@@ -1130,6 +1151,12 @@ def create_app(
             workspace = _ensure_workspace(db, user)
             if not workspace:
                 return jsonify({"error": "No workspace exists yet."}), 400
+            if db.get_active_job(
+                int(user["id"]),
+                workspace_key=user_workspace_key(user["spotify_user_id"]),
+                kind="download",
+            ) is not None:
+                return jsonify({"error": "Wait for ZIP preparation to finish before changing chart choices."}), 409
             threshold = db.get_workspace_minimum_score(workspace)
             changed = 0
             if action == "select":
@@ -1249,17 +1276,20 @@ def create_app(
         db = _user_db()
         try:
             workspace = _ensure_workspace(db, user)
-            with downloads.building(workspace):
-                archive, summary = build_archive(
-                    config, db, workspace, None, downloads.root
-                )
-                download = downloads.create(int(user["id"]), workspace, archive)
-            return jsonify({"download": download, "summary": summary})
-        except DownloadError as exc:
-            return jsonify({"error": str(exc)}), 400
-        except Exception as exc:  # noqa: BLE001
-            log.exception("download build failed")
-            return jsonify({"error": "Could not create your download right now; try again in a moment."}), 500
+            key = user_workspace_key(user["spotify_user_id"])
+            for kind in ("discovery", "expansion"):
+                if db.get_active_job(int(user["id"]), workspace_key=key, kind=kind) is not None:
+                    return jsonify({"error": "Wait for matching to finish before preparing a ZIP."}), 409
+            snapshot = selection_snapshot(db, workspace)
+            if not snapshot["selection_count"]:
+                return jsonify({"error": "No charts selected yet; pick at least one chart to download."}), 400
+            if snapshot["generation_id"] < 0:
+                return jsonify({"error": "Run matching again before preparing a ZIP."}), 409
+            job, created = jobs.enqueue_unique(
+                int(user["id"]), "download", workspace_key=key,
+                initial_progress=snapshot,
+            )
+            return jsonify({"job": _job_public(job), "created": created}), 202
         finally:
             db.close()
 
@@ -2272,6 +2302,7 @@ def _zip_response(generator, filename: str, size: int):
         "Content-Type": "application/zip",
         "Content-Disposition": f'attachment; filename="{filename}"',
         "X-Content-Type-Options": "nosniff",
+        "Cache-Control": "private, no-store",
     }
     if size:
         headers["Content-Length"] = str(size)

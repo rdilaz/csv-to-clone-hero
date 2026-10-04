@@ -22,12 +22,14 @@ import threading
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from csv_to_clonehero.config import AppConfig
 from csv_to_clonehero.database import Database
 from csv_to_clonehero.sources.base import ChartSource
 from csv_to_clonehero.server.auth import build_oauth, build_soundcloud_oauth, build_spotify_client
+from csv_to_clonehero.server.downloads import BrowserDownloads, build_archive, selection_snapshot
 from csv_to_clonehero.server.notifications import EmailSender
 from csv_to_clonehero.server.security import TokenCipher
 from csv_to_clonehero.server.throttle import global_gate
@@ -50,6 +52,7 @@ class JobResult:
     error: str = ""
     progress: dict[str, Any] = field(default_factory=dict)
     result: dict[str, Any] = field(default_factory=dict)
+    created_at: float | None = None
     started_at: float | None = None
     finished_at: float | None = None
     cancel_requested: bool = False
@@ -119,6 +122,7 @@ def _from_row(row: Any) -> JobResult:
         error=payload["error"],
         progress=payload["progress"],
         result=payload["result"],
+        created_at=payload["created_at"],
         started_at=payload["started_at"],
         finished_at=payload["finished_at"],
         cancel_requested=payload["cancel_requested"],
@@ -135,6 +139,7 @@ class JobManager:
         cipher: TokenCipher,
         *,
         source_factory: Callable[[AppConfig], list[ChartSource]] | None = None,
+        downloads: BrowserDownloads | None = None,
         sender: EmailSender | None = None,
         poll_interval: float = 1.0,
         auto_start: bool = True,
@@ -142,6 +147,7 @@ class JobManager:
         self.config = config
         self.cipher = cipher
         self.source_factory = source_factory or _default_source_factory
+        self.downloads = downloads
         self.sender = sender or EmailSender(config.notifications)
         self.poll_interval = max(0.1, float(poll_interval))
         self._cv = threading.Condition()
@@ -250,6 +256,14 @@ class JobManager:
         finally:
             db.close()
 
+    def latest_for_user_workspace(self, user_id: int, *, workspace_key: str, kind: str) -> JobResult | None:
+        db = Database(self.config.database_path)
+        try:
+            row = db.get_latest_job(user_id, workspace_key=workspace_key, kind=kind)
+            return _from_row(row) if row is not None else None
+        finally:
+            db.close()
+
     # ---- worker ------------------------------------------------------------
     def _loop(self) -> None:
         global_gate()  # ensure the shared gate exists
@@ -332,8 +346,115 @@ class JobManager:
             self._run_discovery(job)
         elif job.kind == "expansion":
             self._run_expansion(job)
+        elif job.kind == "download":
+            self._run_download(job)
         else:
             raise ValueError(f"unknown job kind: {job.kind}")
+
+    def _run_download(self, job: JobResult) -> None:
+        """Prepare one user-owned ZIP off the request thread.
+
+        The durable job records status and a safe report. Signed delivery
+        tokens and staging paths remain solely in BrowserDownloads memory.
+        """
+        if self.downloads is None:
+            raise RuntimeError("Download preparation is unavailable.")
+        db = Database(self.config.database_path)
+        archive: Path | None = None
+        registered_token: str | None = None
+        try:
+            workspace = db.get_workspace(job.workspace_key)
+            user = db.get_user(job.user_id)
+            if (
+                workspace is None
+                or user is None
+                or str(workspace["workspace_key"]) != Database.workspace_key_for_user(
+                    str(user["spotify_user_id"])
+                )
+            ):
+                raise RuntimeError("The selected workspace is no longer available.")
+            workspace_id = int(workspace["id"])
+            current_snapshot = selection_snapshot(db, workspace_id)
+            if (
+                not current_snapshot["selection_count"]
+                or current_snapshot["generation_id"] != job.progress.get("generation_id")
+                or current_snapshot["selection_fingerprint"] != job.progress.get("selection_fingerprint")
+            ):
+                raise RuntimeError("Chart choices changed while the download was queued. Review and prepare again.")
+
+            self._mark(
+                job.id, status="running", phase="preparing",
+                message="Validating and packaging selected charts",
+                progress={**job.progress, "completed": 0, "total": current_snapshot["selection_count"]},
+            )
+            cancel_event = self._cancel_events[job.id]
+            last_update = 0.0
+
+            def on_progress(completed: int, total: int, label: str) -> None:
+                nonlocal last_update
+                now = time.monotonic()
+                if now - last_update < 0.5 and completed < total:
+                    return
+                last_update = now
+                packaging = label == "Writing ZIP archive"
+                self._mark(
+                    job.id, status="running", phase="packaging" if packaging else "validating",
+                    message="Packaging ZIP archive" if packaging else "Validating selected charts",
+                    progress={**job.progress, "completed": completed, "total": total},
+                    heartbeat_at=time.time(),
+                )
+
+            with self.downloads.building(workspace_id):
+                archive, summary = build_archive(
+                    self.config, db, workspace_id, None, self.downloads.root,
+                    progress=on_progress, cancellation_event=cancel_event,
+                )
+                after_build = selection_snapshot(db, workspace_id)
+                if (
+                    after_build["generation_id"] != current_snapshot["generation_id"]
+                    or after_build["selection_count"] != current_snapshot["selection_count"]
+                    or after_build["selection_fingerprint"] != current_snapshot["selection_fingerprint"]
+                ):
+                    raise RuntimeError("Chart choices changed while the ZIP was prepared. Review and prepare again.")
+                if self._cancelled(job.id) or self._shutdown_event.is_set():
+                    self._mark(job.id, status="cancelled", phase="cancelled", message="Download preparation cancelled")
+                    return
+                download = self.downloads.create(job.user_id, workspace_id, archive)
+                registered_token = download["token"]
+                archive = None  # BrowserDownloads now owns and sweeps the ZIP.
+                if self._cancelled(job.id) or self._shutdown_event.is_set():
+                    self.downloads.revoke(registered_token)
+                    registered_token = None
+                    self._mark(job.id, status="cancelled", phase="cancelled", message="Download preparation cancelled")
+                    return
+            partial = bool(summary.get("failed") or summary.get("remaining") or summary.get("errors"))
+            finished = db.finish_download_job_if_active(
+                job.id,
+                status="partial" if partial else "complete",
+                message="ZIP ready with exceptions" if partial else "ZIP ready",
+                progress={**job.progress, "completed": summary.get("selected", 0), "total": summary.get("selected", 0)},
+                result={
+                    "summary": summary,
+                    "archive_created_at": download["created_at"],
+                    "size_bytes": download["size_bytes"],
+                },
+            )
+            if finished is None:
+                self.downloads.revoke(registered_token)
+                registered_token = None
+                if self._cancelled(job.id):
+                    self._mark(job.id, status="cancelled", phase="cancelled", message="Download preparation cancelled")
+                return
+            self._handles[job.id] = _from_row(finished)
+            registered_token = None
+        except Exception:
+            if registered_token is not None:
+                self.downloads.revoke(registered_token)
+            raise
+        finally:
+            if archive is not None:
+                archive.unlink(missing_ok=True)
+            db.close()
 
     def _run_expansion(self, job: JobResult) -> None:
         """Build a confirmed expansion solely from the validated local catalog."""
