@@ -1,7 +1,7 @@
 """Offline Chromium regressions for the public Download and Done transitions.
 
 The real Flask page, CSS, and JavaScript run unchanged. Only API traffic is
-synthetic; held routes model the synchronous export POST without a progress API.
+synthetic, including held and job based ZIP preparation responses.
 """
 
 from __future__ import annotations
@@ -120,6 +120,136 @@ def _assert_no_delivery_progress(page):
     assert page.get_by_role("progressbar").count() == 0
     assert not re.search(r"\d+(?:\.\d+)?\s*%", stage.inner_text())
     assert not re.search(r"\b\d+\s+(?:seconds?|minutes?|hours?)\b", stage.inner_text())
+
+
+def test_async_download_job_survives_reload_without_duplicate_export(delivery_page):
+    fixtures = SignalCheckFixtures("confirm")
+    fixtures.async_download = True
+    fixtures.download_complete_after_polls = None
+    page, requests = delivery_page(fixtures)
+    page.locator("#continueDownloadButton").click()
+    _assert_download_counts(page)
+    page.locator("#prepareDownloadButton").click()
+    playwright.expect(page.locator("#downloadBusyIndicator")).to_be_visible()
+    playwright.expect(page.locator("#prepareDownloadButton")).to_be_disabled()
+    page.locator("#prepareDownloadButton").dispatch_event("click")
+    playwright.expect(page.locator("#downloadStatus")).to_contain_text("leave")
+    assert len(_posts(requests, "/api/download")) == 1
+    assert fixtures.download_attempts == 0
+    assert fixtures.download_job["kind"] == "download"
+    assert fixtures.start_download_job()[1]["created"] is False
+    assert fixtures.download_attempts == 0
+
+    page.reload(wait_until="networkidle")
+    playwright.expect(page.locator("#stageDownload")).to_be_visible()
+    playwright.expect(page.locator("#downloadBusyIndicator")).to_be_visible()
+    assert len(_posts(requests, "/api/download")) == 1
+    fixtures.download_complete_after_polls = fixtures.download_job_polls + 1
+    playwright.expect(page.locator("#stageDone")).to_be_visible(timeout=10000)
+    playwright.expect(_done_count(page, "Packaged artifacts")).to_have_text("3")
+    assert fixtures.download_attempts == 1
+    assert len(_posts(requests, "/api/download")) == 1
+    assert "token" not in fixtures.download_job["result"]
+    assert "path" not in fixtures.download_job["result"]
+    with page.expect_download() as event:
+        page.locator("#downloadLibraryLink").click()
+    assert event.value.failure() is None
+    with ZipFile(event.value.path()) as archive:
+        assert len(archive.namelist()) == 3
+
+
+def test_async_download_failure_reconciles_before_retry(delivery_page):
+    fixtures = SignalCheckFixtures("confirm")
+    fixtures.async_download = True
+    fixtures.download_complete_after_polls = 1
+    fixtures.fail_next_download = "Chart provider unavailable."
+    page, requests = delivery_page(fixtures)
+    page.locator("#continueDownloadButton").click()
+    page.locator("#prepareDownloadButton").click()
+    playwright.expect(page.locator("#downloadStatus")).to_contain_text("Chart provider unavailable.")
+    playwright.expect(page.locator("#prepareDownloadButton")).to_be_disabled()
+    assert fixtures.download_job["status"] == "failed"
+    assert len(_posts(requests, "/api/download")) == 1
+    page.locator("#refreshDownloadButton").click()
+    _assert_download_counts(page)
+    playwright.expect(page.locator("#prepareDownloadButton")).to_be_enabled()
+    page.locator("#prepareDownloadButton").click()
+    playwright.expect(page.locator("#stageDone")).to_be_visible(timeout=10000)
+    assert len(_posts(requests, "/api/download")) == 2
+    assert fixtures.download_attempts == 2
+
+
+def test_async_download_restart_does_not_claim_stale_link(delivery_page):
+    fixtures = SignalCheckFixtures("confirm")
+    fixtures.async_download = True
+    fixtures.download_complete_after_polls = 1
+    page, requests = delivery_page(fixtures)
+    status, prior = fixtures.prepare_download()
+    assert status == 200
+    page.locator("#continueDownloadButton").click()
+    page.locator("#prepareDownloadButton").click()
+    playwright.expect(page.locator("#stageDone")).to_be_visible(timeout=10000)
+    latest = fixtures.download
+    assert latest["token"] != prior["download"]["token"]
+    with fixtures._download_lock:
+        fixtures._downloads.pop(latest["token"])
+    page.reload(wait_until="networkidle")
+    playwright.expect(page.locator("#stageDownload")).to_be_visible()
+    playwright.expect(page.locator("#downloadStatus")).to_contain_text("single-use ZIP link is unavailable")
+    playwright.expect(page.locator("#prepareDownloadButton")).to_be_enabled()
+    playwright.expect(page.locator("#previousDownloadButton")).to_be_visible()
+    assert page.locator("#downloadLibraryLink").is_hidden()
+    assert len(_posts(requests, "/api/download")) == 1
+
+
+def test_async_download_can_be_cancelled_without_losing_choices(delivery_page):
+    fixtures = SignalCheckFixtures("confirm")
+    fixtures.async_download = True
+    fixtures.download_complete_after_polls = None
+    page, requests = delivery_page(fixtures)
+    page.locator("#continueDownloadButton").click()
+    page.locator("#prepareDownloadButton").click()
+    cancel = page.locator("#cancelDownloadButton")
+    playwright.expect(cancel).to_be_visible()
+    cancel.click()
+    playwright.expect(page.locator("#downloadStatus")).to_contain_text("Preparation cancelled")
+    playwright.expect(cancel).to_be_hidden()
+    assert fixtures.download_attempts == 0
+    assert len(_posts(requests, "/api/download")) == 1
+    page.locator("#refreshDownloadButton").click()
+    _assert_download_counts(page)
+    playwright.expect(page.locator("#prepareDownloadButton")).to_be_enabled()
+    fixtures.download_complete_after_polls = 1
+    page.locator("#prepareDownloadButton").click()
+    playwright.expect(page.locator("#stageDone")).to_be_visible(timeout=10000)
+    assert len(_posts(requests, "/api/download")) == 2
+    assert fixtures.download_attempts == 1
+
+
+def test_async_download_poll_error_requires_refresh_before_retry(delivery_page):
+    fixtures = SignalCheckFixtures("confirm")
+    fixtures.async_download = True
+    fixtures.download_complete_after_polls = None
+    fail_poll = {"once": True}
+
+    def route_api(route):
+        path = urlsplit(route.request.url).path
+        if path == "/api/jobs/77" and route.request.method == "GET" and fail_poll["once"]:
+            fail_poll["once"] = False
+            route.fulfill(status=503, json={"error": "Status temporarily unavailable."})
+            return
+        fixtures.fulfill(route)
+
+    page, requests = delivery_page(fixtures, route_api=route_api)
+    page.locator("#continueDownloadButton").click()
+    page.locator("#prepareDownloadButton").click()
+    playwright.expect(page.locator("#downloadStatus")).to_contain_text("outcome is unknown")
+    playwright.expect(page.locator("#prepareDownloadButton")).to_be_disabled()
+    assert len(_posts(requests, "/api/download")) == 1
+    fixtures.download_complete_after_polls = 1
+    page.locator("#refreshDownloadButton").click()
+    playwright.expect(page.locator("#stageDone")).to_be_visible(timeout=10000)
+    assert len(_posts(requests, "/api/download")) == 1
 
 
 @pytest.mark.parametrize("songs", [1, 2], ids=["one-song", "multiple-songs"])
@@ -411,7 +541,7 @@ def test_delivery_pending_post_reload_reconciles_without_automatic_duplicate(del
     page.clock.set_fixed_time(datetime.fromtimestamp(NOW.timestamp() + 20, timezone.utc))
     page.locator("#prepareDownloadButton").click()
     playwright.expect(page.locator("#prepareDownloadButton")).to_have_attribute("aria-busy", "true")
-    playwright.expect(page.locator("#downloadStatus")).to_contain_text("Keep this page open")
+    playwright.expect(page.locator("#downloadStatus")).to_contain_text("Starting preparation")
     assert len(pending) == 1
     _assert_no_delivery_progress(page)
     before = len(_posts(requests))

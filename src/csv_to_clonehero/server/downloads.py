@@ -150,7 +150,8 @@ class BrowserDownloads:
     def create(self, user_id: int, workspace_id: int, archive_path: Path) -> dict[str, Any]:
         stamp = secrets.token_urlsafe(24)
         key = _safe_basename(stamp)
-        expires_at = time.time() + self.ttl_seconds
+        created_at = time.time()
+        expires_at = created_at + self.ttl_seconds
         expiry_int = int(expires_at)
         payload = f"{key}:{expiry_int}"
         token = f"{key}.{expiry_int}.{_sign(payload, self.key)}"
@@ -164,7 +165,7 @@ class BrowserDownloads:
                 "size": archive_path.stat().st_size,
                 "signed": f"{key}.{expiry_int}",
                 "token": token,
-                "created_at": time.time(),
+                "created_at": created_at,
             }
             retained = sorted(
                 (
@@ -181,6 +182,7 @@ class BrowserDownloads:
                 self._revoke_meta(meta)
         return {
             "token": token,
+            "created_at": created_at,
             "expires_at": expires_at,
             "ttl_seconds": self.ttl_seconds,
             "size_bytes": archive_path.stat().st_size,
@@ -307,6 +309,30 @@ def _safe_basename(value: str) -> str:
     return name or "download"
 
 
+def selection_snapshot(db: Database, workspace_id: int) -> dict[str, Any]:
+    """Bind a queued archive to one exact generation and set of choices.
+
+    Persist only the digest and counts in the job; artist/title data and the
+    full selection list stay in the workspace tables.
+    """
+    current = db.get_current_exact_generation(workspace_id)
+    latest = db.get_latest_exact_generation(workspace_id)
+    generation_id = int(current["id"]) if current is not None else -1 if latest is not None else 0
+    choices = []
+    for row in db.list_workspace_selections(workspace_id):
+        item = dict(row)
+        choices.append(tuple(str(item.get(key) or "") for key in (
+            "kind", "track_id", "candidate_id", "artist_norm", "metadata_json"
+        )))
+    choices.sort()
+    encoded = json.dumps(choices, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return {
+        "generation_id": generation_id,
+        "selection_count": len(choices),
+        "selection_fingerprint": "sha256:" + hashlib.sha256(encoded).hexdigest(),
+    }
+
+
 def build_archive(
     config: AppConfig,
     db: Database,
@@ -315,6 +341,7 @@ def build_archive(
     staging_dir: Path,
     *,
     progress: Callable[[int, int, str], None] | None = None,
+    cancellation_event: threading.Event | None = None,
 ) -> tuple[Path, dict[str, Any]]:
     """Assemble the selected charts into one ZIP and return (archive, summary).
 
@@ -390,6 +417,7 @@ def build_archive(
             options=options,
             eligibility_checker=checker,
             progress=progress,
+            cancellation_event=cancellation_event,
         )
         artifact_refs = {
             (str(item.get("source") or "").casefold(), int(item.get("chart_id") or 0)):

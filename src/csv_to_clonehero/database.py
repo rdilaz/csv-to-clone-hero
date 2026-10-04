@@ -3371,7 +3371,7 @@ class Database:
         key = str(workspace_key)
         self._conn.execute("BEGIN IMMEDIATE")
         try:
-            if self.get_active_job(int(user_id), workspace_key=key) is not None:
+            if self.get_active_job(int(user_id), workspace_key=key, kind=None) is not None:
                 self._conn.rollback()
                 return False
             row = self._conn.execute(
@@ -3393,6 +3393,12 @@ class Database:
             ):
                 self._conn.execute(f"DELETE FROM {table} WHERE workspace_id = ?", (workspace_id,))
             now = time.time()
+            self._conn.execute(
+                """UPDATE background_jobs SET workspace_key = '', updated_at = ?
+                   WHERE user_id = ? AND workspace_key = ?
+                     AND status NOT IN ('queued', 'running')""",
+                (now, int(user_id), key),
+            )
             self._conn.execute(
                 """UPDATE discovery_workspaces SET status = 'ready_for_scope',
                    phase = 'ready_for_scope', total_tasks = 0, completed_tasks = 0,
@@ -3420,7 +3426,7 @@ class Database:
         key = str(workspace_key)
         self._conn.execute("BEGIN IMMEDIATE")
         try:
-            if self.get_active_job(int(user_id), workspace_key=key) is not None:
+            if self.get_active_job(int(user_id), workspace_key=key, kind=None) is not None:
                 self._conn.rollback()
                 return False, False
             cursor = self._conn.execute(
@@ -7790,19 +7796,30 @@ class Database:
         user_id: int,
         *,
         workspace_key: str,
-        kind: str = "discovery",
+        kind: str | None = "discovery",
         exclude_job_id: int | None = None,
     ) -> sqlite3.Row | None:
         sql = (
-            "SELECT * FROM background_jobs WHERE user_id = ? AND kind = ? "
+            "SELECT * FROM background_jobs WHERE user_id = ? "
             "AND workspace_key = ? AND status IN ('queued', 'running')"
         )
-        values: list[Any] = [int(user_id), str(kind), str(workspace_key or "")]
+        values: list[Any] = [int(user_id), str(workspace_key or "")]
+        if kind is not None:
+            sql += " AND kind = ?"
+            values.append(str(kind))
         if exclude_job_id is not None:
             sql += " AND id != ?"
             values.append(int(exclude_job_id))
         sql += " ORDER BY id LIMIT 1"
         return self._conn.execute(sql, values).fetchone()
+
+    def get_latest_job(self, user_id: int, *, workspace_key: str, kind: str) -> sqlite3.Row | None:
+        """Return the newest job for one owned workspace and kind."""
+        return self._conn.execute(
+            "SELECT * FROM background_jobs WHERE user_id = ? AND workspace_key = ? "
+            "AND kind = ? ORDER BY id DESC LIMIT 1",
+            (int(user_id), str(workspace_key or ""), str(kind)),
+        ).fetchone()
 
     def recover_running_jobs(self) -> int:
         """Mark jobs owned by a previous server process as interrupted."""
@@ -7888,6 +7905,38 @@ class Database:
                 values,
             )
         return self.get_job(job_id)
+
+    def finish_download_job_if_active(
+        self,
+        job_id: int,
+        *,
+        status: str,
+        message: str,
+        progress: Mapping[str, Any],
+        result: Mapping[str, Any],
+    ) -> sqlite3.Row | None:
+        """Publish a prepared ZIP result only if cancellation has not won.
+
+        The token is held outside the database. The caller must revoke it when
+        this conditional update fails.
+        """
+        if status not in {"complete", "partial"}:
+            raise ValueError("download completion status must be complete or partial")
+        now = time.time()
+        with self._conn:
+            cursor = self._conn.execute(
+                """UPDATE background_jobs
+                   SET status = ?, phase = 'complete', message = ?,
+                       progress_json = ?, result_json = ?,
+                       finished_at = ?, updated_at = ?
+                   WHERE id = ? AND kind = 'download' AND status = 'running'
+                     AND cancel_requested = 0""",
+                (
+                    status, message, _json_text(dict(progress), {}),
+                    _json_text(dict(result), {}), now, now, int(job_id),
+                ),
+            )
+        return self.get_job(job_id) if cursor.rowcount else None
 
     def claim_job(self, job_id: int, *, started_at: float | None = None) -> sqlite3.Row | None:
         """Atomically move a queued job to running (single worker guarantee)."""

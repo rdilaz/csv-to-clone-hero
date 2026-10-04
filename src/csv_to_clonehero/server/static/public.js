@@ -51,6 +51,11 @@
     deliveryLoading: false,
     deliveryPages: null,
     availableDownload: null,
+    downloadJobId: null,
+    downloadPollTimer: null,
+    downloadPollRequest: 0,
+    downloadPolling: false,
+    downloadCancelBusy: false,
     expiryTimer: null,
   };
 
@@ -278,6 +283,12 @@
       }
       if (["queued", "running"].includes(journey.job?.status)) {
         attachJob(journey.job.id);
+        return;
+      }
+      if (journey.download_job && (state.deliveryRecord.pending
+          || ["download", "done"].includes(state.deliveryRecord.stage)
+          || ["queued", "running"].includes(journey.download_job.status))) {
+        await openDownload(false);
         return;
       }
       if (state.deliveryRecord.pending || state.deliveryRecord.stage === "download") {
@@ -1727,9 +1738,102 @@
     return {exact: state.exactSelected, songs: state.exactSelectedSongsKnown ? state.exactSelectedSongs : null, expansion: state.expansionSelected, total: state.selected};
   }
 
+  function downloadMatchesJob(download, job) {
+    const archiveCreated = availableNumber(job?.result, ["archive_created_at"]);
+    const downloadCreated = availableNumber(download, ["created_at"]);
+    return Boolean(download?.token && archiveCreated !== null && downloadCreated === archiveCreated);
+  }
+
+  function stopDownloadPolling() {
+    window.clearTimeout(state.downloadPollTimer);
+    state.downloadPollTimer = null;
+    state.downloadPolling = false;
+    state.downloadJobId = null;
+    state.deliveryBusy = false;
+    syncDeliveryControls();
+  }
+
+  function attachDownloadJob(jobId) {
+    const expectedJobId = Number(jobId);
+    if (!Number.isSafeInteger(expectedJobId) || expectedJobId < 1) throw new Error("The server did not return a valid preparation job. Refresh its status before retrying.");
+    if (state.downloadPolling && state.downloadJobId === expectedJobId) return;
+    window.clearTimeout(state.downloadPollTimer);
+    state.downloadJobId = expectedJobId;
+    state.downloadPolling = true;
+    state.deliveryBusy = true;
+    $("#prepareDownloadButton").textContent = "Preparing your ZIP...";
+    $("#downloadStatus").textContent = "Preparation is queued or running on the server. You can leave this page and return; your saved choices remain in your workspace.";
+    syncDeliveryControls();
+    void pollDownloadJob(expectedJobId, ++state.downloadPollRequest);
+  }
+
+  async function pollDownloadJob(expectedJobId, requestId) {
+    const current = () => state.downloadPolling && state.downloadJobId === expectedJobId && state.downloadPollRequest === requestId;
+    if (!current()) return;
+    try {
+      const {job} = await api(`/api/jobs/${expectedJobId}`);
+      if (!current()) return;
+      if (!job || Number(job.id) !== expectedJobId || job.kind !== "download") {
+        throw new Error("The server returned an unexpected preparation job. Refresh its status before retrying.");
+      }
+      if (["queued", "running"].includes(job.status)) {
+        $("#downloadStatus").textContent = job?.status === "queued"
+          ? "Your ZIP is queued on the server. You can leave and return to check its status."
+          : `${job?.message || "Riff is validating and packaging your selected charts."} You can leave and return to check its status.`;
+        state.downloadPollTimer = window.setTimeout(() => { void pollDownloadJob(expectedJobId, requestId); }, 1500);
+        return;
+      }
+      if (!["complete", "partial", "failed", "cancelled", "interrupted"].includes(job.status)) {
+        throw new Error("The server returned an unknown preparation status. Refresh its status before retrying.");
+      }
+      if (!["complete", "partial"].includes(job.status)) {
+        stopDownloadPolling();
+        rememberDelivery({pending: false});
+        state.selectionTotalKnown = false;
+        $("#prepareDownloadButton").textContent = "Refresh choices to retry";
+        $("#downloadStatus").textContent = job.status === "cancelled"
+          ? "Preparation cancelled. Your saved choices remain; refresh them before preparing again."
+          : job.error || "ZIP preparation did not finish. Refresh your saved choices before retrying.";
+        $("#refreshDownloadButton").hidden = false;
+        if (job.status !== "cancelled") showError($("#downloadStatus").textContent);
+        syncDeliveryControls();
+        return;
+      }
+      const journey = await api("/api/journey");
+      if (!current()) return;
+      state.journey = journey;
+      if (!downloadMatchesJob(journey.download, job)) {
+        stopDownloadPolling();
+        rememberDelivery({pending: false});
+        state.selectionTotalKnown = false;
+        $("#prepareDownloadButton").textContent = "Refresh choices to retry";
+        $("#downloadStatus").textContent = "Preparation finished, but its single-use ZIP link is unavailable. The server may have restarted or the link expired. Refresh your choices before preparing again.";
+        $("#refreshDownloadButton").hidden = false;
+        showError($("#downloadStatus").textContent);
+        syncDeliveryControls();
+        return;
+      }
+      const selection = state.deliveryRecord.pendingSelection || null;
+      rememberDelivery({pending: false, pendingSelection: null, receipt: {token: journey.download.token, summary: job.result?.summary || null, selection, requested: false}});
+      stopDownloadPolling();
+      if (!$("#stageDownload").hidden) renderDone(journey.download, job.result?.summary || null);
+    } catch (error) {
+      if (!current()) return;
+      stopDownloadPolling();
+      state.selectionTotalKnown = false;
+      $("#prepareDownloadButton").textContent = "Refresh choices to retry";
+      $("#downloadStatus").textContent = "Preparation status could not be refreshed. Its outcome is unknown; use Refresh status before retrying.";
+      $("#refreshDownloadButton").hidden = false;
+      showError(error.message);
+      syncDeliveryControls();
+    }
+  }
+
   function syncDeliveryControls() {
     const blocked = state.deliveryBusy || state.deliveryLoading;
     $("#prepareDownloadButton").disabled = blocked || !state.selectionTotalKnown || state.selected < 1;
+    $("#cancelDownloadButton").hidden = !state.downloadPolling;
+    $("#cancelDownloadButton").disabled = !state.downloadPolling || state.downloadCancelBusy;
     $("#backToChartsButton").disabled = blocked;
     $("#refreshDownloadButton").disabled = blocked;
     $("#previousDownloadButton").disabled = blocked;
@@ -1743,6 +1847,30 @@
     $("#downloadExpansionSummary").textContent = state.expansionSelectionKnown
       ? `${chartCount(state.expansionSelected)} beyond your music`
       : "Additional chart count unavailable. It is not assumed to be zero.";
+  }
+
+  async function cancelDownload() {
+    if (!state.downloadPolling || !state.downloadJobId || state.downloadCancelBusy) return;
+    const jobId = state.downloadJobId;
+    state.downloadCancelBusy = true;
+    $("#cancelDownloadButton").textContent = "Cancelling...";
+    syncDeliveryControls();
+    try {
+      const {job} = await api(`/api/jobs/${jobId}/cancel`, {method: "POST", body: "{}"});
+      if (!job || Number(job.id) !== jobId || job.kind !== "download") throw new Error("The server did not confirm this cancellation request.");
+      if (state.downloadJobId !== jobId || !state.downloadPolling) return;
+      $("#downloadStatus").textContent = "Cancellation requested. The current chart transfer may need to finish before preparation stops.";
+      if (["cancelled", "failed", "interrupted"].includes(job.status)) {
+        window.clearTimeout(state.downloadPollTimer);
+        void pollDownloadJob(jobId, state.downloadPollRequest);
+      }
+    } catch (error) {
+      if (state.downloadJobId === jobId && state.downloadPolling) showError(error.message);
+    } finally {
+      state.downloadCancelBusy = false;
+      $("#cancelDownloadButton").textContent = "Cancel preparation";
+      syncDeliveryControls();
+    }
   }
 
   function renderDeliveryPage(exact, expansion, append = false) {
@@ -1809,7 +1937,7 @@
     clearError();
     showStage("download", focus !== false);
     $("#downloadStatus").textContent = state.deliveryRecord.pending
-      ? "Checking whether a ZIP became available. Preparation has no live status or resume endpoint."
+      ? "Checking the server's ZIP preparation status."
       : "Checking the current saved chart selections...";
     $("#refreshDownloadButton").hidden = true;
     $("#previousDownloadButton").hidden = true;
@@ -1819,10 +1947,25 @@
       if (requestId !== state.deliveryRequest) return;
       state.journey = journey;
       state.availableDownload = journey.download || null;
+      const downloadJob = journey.download_job;
+      if (["queued", "running"].includes(downloadJob?.status)) {
+        rememberDelivery({pending: true});
+        attachDownloadJob(downloadJob.id);
+        return;
+      }
+      if (["complete", "partial"].includes(downloadJob?.status) && downloadMatchesJob(journey.download, downloadJob)) {
+        const receipt = state.deliveryRecord.receipt;
+        const selection = state.deliveryRecord.pendingSelection || (receipt?.token === journey.download.token ? receipt.selection : null);
+        rememberDelivery({pending: false, pendingSelection: null, receipt: {token: journey.download.token, summary: downloadJob.result?.summary || null, selection, requested: false}});
+        renderDone(journey.download, downloadJob.result?.summary || null, focus !== false || Boolean(focusedControl));
+        return;
+      }
+      const completedUnavailable = ["complete", "partial"].includes(downloadJob?.status) && !downloadMatchesJob(journey.download, downloadJob);
+      if (completedUnavailable || ["failed", "cancelled", "interrupted"].includes(downloadJob?.status)) rememberDelivery({pending: false});
       const created = availableNumber(journey.download, ["created_at"]);
       const previousCreated = availableNumber(state.deliveryRecord, ["previousCreatedAt"]);
       const newerArchive = state.deliveryRecord.previousToken === null || (created !== null && previousCreated !== null && created > previousCreated);
-      if (state.deliveryRecord.pending && journey.download?.token && journey.download.token !== state.deliveryRecord.previousToken && newerArchive) {
+      if (!downloadJob && state.deliveryRecord.pending && journey.download?.token && journey.download.token !== state.deliveryRecord.previousToken && newerArchive) {
         rememberDelivery({pending: false});
         renderDone(journey.download, null, focus !== false || Boolean(focusedControl));
         return;
@@ -1847,8 +1990,12 @@
       refreshSelectionUi();
       renderDeliveryPage(exact, expansion);
       if (!state.selectionTotalKnown) throw new Error("The combined selection count is unavailable. Refresh before preparing; no unknown count is assumed to be zero.");
-      $("#downloadStatus").textContent = state.deliveryRecord.pending
-        ? "No new ZIP is confirmed yet. The earlier request may still be running or may have stopped. Refresh to check again, or explicitly retry preparation; the server rejects overlapping builds."
+      $("#downloadStatus").textContent = completedUnavailable
+        ? "Preparation finished, but its single-use ZIP link is unavailable. The server may have restarted or the link expired. You can prepare again from your saved choices."
+        : ["failed", "cancelled", "interrupted"].includes(downloadJob?.status)
+          ? downloadJob.error || "Preparation did not finish. Review your choices and prepare again."
+        : state.deliveryRecord.pending
+        ? "No new ZIP is confirmed yet. Refresh its status before explicitly retrying preparation."
         : state.selected > 0
           ? "Ready to prepare. Riff will recheck your saved choices and validate each artifact."
           : "No eligible selected charts remain. Return to chart choices to review unavailable charts or select alternatives.";
@@ -1878,17 +2025,23 @@
     if (state.deliveryBusy || state.deliveryLoading || !state.selectionTotalKnown || state.selected < 1) return;
     const requestId = ++state.deliveryRequest;
     const selection = deliverySnapshot();
+    let queued = false;
     state.deliveryBusy = true;
-    rememberDelivery({pending: true, previousToken: state.availableDownload?.token || null, previousCreatedAt: availableNumber(state.availableDownload, ["created_at"])});
+    rememberDelivery({pending: true, pendingSelection: selection, previousToken: state.availableDownload?.token || null, previousCreatedAt: availableNumber(state.availableDownload, ["created_at"])});
     clearError();
     $("#prepareDownloadButton").textContent = "Validating and packaging...";
-    $("#downloadStatus").textContent = `Preparing your ${chartCount(selection.total)} from saved choices. Riff is downloading, validating, and packaging artifacts. Keep this page open. No percentage, per-chart progress, or time estimate is provided by the server.`;
+    $("#downloadStatus").textContent = `Starting preparation for your ${chartCount(selection.total)} from saved choices. Riff will validate and package the artifacts on the server.`;
     syncDeliveryControls();
     try {
       const result = await api("/api/download", {method: "POST", body: "{}"});
       if (requestId !== state.deliveryRequest) return;
+      if (result.job?.id) {
+        queued = true;
+        attachDownloadJob(result.job.id);
+        return;
+      }
       if (!result.download?.token) throw new Error("The server did not return a download link. Refresh preparation status before retrying.");
-      rememberDelivery({pending: false, receipt: {token: result.download.token, summary: result.summary || null, selection, requested: false}});
+      rememberDelivery({pending: false, pendingSelection: null, receipt: {token: result.download.token, summary: result.summary || null, selection, requested: false}});
       renderDone({...result.download, url: `/api/download/${result.download.token}`}, result.summary);
     } catch (error) {
       if (requestId !== state.deliveryRequest) return;
@@ -1901,9 +2054,11 @@
       showError(error.message);
     } finally {
       if (requestId === state.deliveryRequest) {
-        state.deliveryBusy = false;
-        $("#prepareDownloadButton").textContent = "Retry preparation";
-        syncDeliveryControls();
+        if (!queued) {
+          state.deliveryBusy = false;
+          $("#prepareDownloadButton").textContent = "Retry preparation";
+          syncDeliveryControls();
+        }
       }
     }
   }
@@ -2074,6 +2229,7 @@
     $("#searchAgainButton")?.addEventListener("click", () => openAddMusic(true));
     $("#prepareDownloadButton")?.addEventListener("click", prepareDownload);
     $("#refreshDownloadButton")?.addEventListener("click", () => openDownload(false));
+    $("#cancelDownloadButton")?.addEventListener("click", cancelDownload);
     $("#previousDownloadButton")?.addEventListener("click", () => {
       const receipt = state.deliveryRecord.receipt;
       renderDone(state.availableDownload, receipt?.token === state.availableDownload?.token ? receipt.summary : null);

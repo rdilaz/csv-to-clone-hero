@@ -157,8 +157,16 @@ an older image after a schema change.
   checksum-valid, or `mode=live_fallback` with a catalog diagnostic otherwise.
 - Watch job statuses for `partial`, `failed`, `cancelled`, and `interrupted`.
   Cached successful queries remain resumable.
+- `POST /api/download` queues a ZIP preparation job and returns HTTP 202 with
+  its ID. The authenticated browser polls `GET /api/jobs/<id>` and reads the
+  single-use link from `/api/journey` only after the job completes. Preparation
+  uses the same one-worker queue as matching; do not add another service worker
+  to make large ZIPs appear faster.
 - Public chart ZIPs are short-lived and single-use. They are assembled in
-  transient staging and removed after streaming or expiry.
+  transient staging and removed after streaming or expiry. The job result
+  records a report and archive timestamp, never the token or file path. A
+  container restart can leave a completed job without a usable link; the user
+  must prepare a new ZIP from saved choices in that case.
 - User refresh tokens are encrypted at rest. Logs and diagnostics must not
   contain tokens, cookies, or OAuth authorization values.
 
@@ -172,4 +180,5 @@ an older image after a schema change.
 | Enchor returns 429 | Only one container instance, one job worker, low `network.concurrency`, seven-day cache |
 | Jobs remain interrupted | Container restart, database health, and job heartbeat/status rows |
 | ZIP creation fails | Selected eligible candidates, Enchor availability, writable `/data`, and container logs |
+| ZIP job completes but link is unavailable | Container restart, token expiry or consumption; ask the user to prepare again from saved choices |
 | Site is unreachable | Cloudflare Tunnel route, Compose health, port binding, `/healthz` |
