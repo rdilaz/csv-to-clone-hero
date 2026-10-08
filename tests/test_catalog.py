@@ -1,5 +1,6 @@
 import hashlib
 import json
+import os
 from dataclasses import asdict
 
 from csv_to_clonehero.catalog import CatalogLoadError, EnchorCatalog, export_catalog, load_enchor_catalog
@@ -283,3 +284,85 @@ def test_catalog_cache_retains_only_current_full_catalog(tmp_path):
     assert snapshot_changed is not eligibility_changed
     assert snapshot_changed.has_chart(2)
     assert load_enchor_catalog.cache_info().currsize == 1
+
+
+def test_snapshot_cache_uses_header_when_size_and_timestamp_are_identical(tmp_path):
+    path = tmp_path / "catalog.jsonl"
+    write_snapshot(path, [candidate(1, "Artist", "First")])
+    original_stat = path.stat()
+    first = load_enchor_catalog(path)
+    write_snapshot(path, [candidate(2, "Artist", "Other")])
+    assert path.stat().st_size == original_stat.st_size
+    os.utime(path, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+
+    second = load_enchor_catalog(path)
+
+    assert second is not first
+    assert second.available and second.has_chart(2) and not second.has_chart(1)
+    assert load_enchor_catalog(path) is second
+
+
+def test_snapshot_cache_recovers_from_corrupt_header_with_identical_stat(tmp_path):
+    path = tmp_path / "catalog.jsonl"
+    write_snapshot(path, [candidate(1, "Artist", "First")])
+    original_stat, valid = path.stat(), path.read_bytes()
+    first = load_enchor_catalog(path)
+    path.write_bytes(b"!" + valid[1:])
+    os.utime(path, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+
+    invalid = load_enchor_catalog(path)
+
+    assert invalid is not first and not invalid.available
+    path.write_bytes(valid)
+    os.utime(path, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+    assert load_enchor_catalog(path).available
+
+
+def test_zero_body_catalog_with_oversized_valid_header_is_unavailable(tmp_path):
+    path = tmp_path / "catalog.jsonl"
+    write_snapshot(path, [])
+    header = json.loads(path.read_text(encoding="utf-8"))
+    header["padding"] = " " * (64 * 1024)
+    path.write_text(json.dumps(header) + "\n", encoding="utf-8")
+
+    invalid = load_enchor_catalog(path)
+
+    assert not invalid.available
+    assert "header is too large" in invalid.diagnostic
+
+
+def test_warm_snapshot_cache_reads_only_bounded_header(tmp_path, monkeypatch):
+    from pathlib import Path
+
+    path = tmp_path / "catalog.jsonl"
+    write_snapshot(path, [candidate(1, "Artist", "First")])
+    first = load_enchor_catalog(path)
+    real_open = Path.open
+    header_reads = []
+
+    class HeaderOnlyStream:
+        def __init__(self, stream):
+            self.stream = stream
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            self.stream.close()
+
+        def readline(self, limit=-1):
+            assert 0 < limit <= 64 * 1024
+            header_reads.append(limit)
+            return self.stream.readline(limit)
+
+        def read(self, *args):
+            raise AssertionError("warm cache must not read the full catalog body")
+
+    def header_only_open(self, *args, **kwargs):
+        stream = real_open(self, *args, **kwargs)
+        return HeaderOnlyStream(stream) if self == path else stream
+
+    monkeypatch.setattr(Path, "open", header_only_open)
+
+    assert load_enchor_catalog(path) is first
+    assert len(header_reads) == 1

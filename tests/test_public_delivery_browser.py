@@ -191,6 +191,11 @@ def test_async_download_restart_does_not_claim_stale_link(delivery_page):
     playwright.expect(page.locator("#stageDone")).to_be_visible(timeout=10000)
     latest = fixtures.download
     assert latest["token"] != prior["download"]["token"]
+    # Clock equality must not let the prior ZIP satisfy the completed job.
+    assert latest["created_at"] == fixtures.download_job["result"]["archive_created_at"]
+    assert latest["created_at"] == fixtures._downloads[prior["download"]["token"]]["created_at"]
+    assert latest["archive_id"] != prior["download"]["archive_id"]
+    assert fixtures.download_job["result"]["archive_id"] == latest["archive_id"]
     with fixtures._download_lock:
         fixtures._downloads.pop(latest["token"])
     page.reload(wait_until="networkidle")
@@ -200,6 +205,26 @@ def test_async_download_restart_does_not_claim_stale_link(delivery_page):
     playwright.expect(page.locator("#previousDownloadButton")).to_be_visible()
     assert page.locator("#downloadLibraryLink").is_hidden()
     assert len(_posts(requests, "/api/download")) == 1
+    assert not any(request.method == "GET" and urlsplit(request.url).path.startswith("/api/download/") for request in requests)
+
+
+def test_async_download_restore_without_archive_identity_fails_closed(delivery_page):
+    fixtures = SignalCheckFixtures("confirm")
+    fixtures.async_download = True
+    fixtures.download_complete_after_polls = 1
+    page, requests = delivery_page(fixtures)
+    page.locator("#continueDownloadButton").click()
+    page.locator("#prepareDownloadButton").click()
+    playwright.expect(page.locator("#stageDone")).to_be_visible(timeout=10000)
+    fixtures.download_job["result"].pop("archive_id")
+
+    page.reload(wait_until="networkidle")
+
+    playwright.expect(page.locator("#stageDownload")).to_be_visible()
+    playwright.expect(page.locator("#downloadStatus")).to_contain_text("single-use ZIP link is unavailable")
+    assert page.locator("#downloadLibraryLink").is_hidden()
+    assert len(_posts(requests, "/api/download")) == 1
+    assert not any(request.method == "GET" and urlsplit(request.url).path.startswith("/api/download/") for request in requests)
 
 
 def test_async_download_can_be_cancelled_without_losing_choices(delivery_page):

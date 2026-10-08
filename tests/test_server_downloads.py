@@ -43,6 +43,32 @@ def test_sign_and_resolve(downloads):
     assert resolved["workspace_id"] == 99
 
 
+@pytest.mark.parametrize("clock_step", [0, -1])
+def test_archive_identity_and_retention_do_not_depend_on_wall_clock(downloads, monkeypatch, clock_step):
+    from types import SimpleNamespace
+    import csv_to_clonehero.server.downloads as download_module
+
+    now = [1000.0]
+    monkeypatch.setattr(download_module, "time", SimpleNamespace(time=lambda: now[0]))
+    archives = []
+    for index in range(4):
+        now[0] = 1000.0 + index * clock_step
+        path = downloads.root / f"clock-{index}.zip"
+        path.write_bytes(b"synthetic archive")
+        archives.append(downloads.create(7, 99, path))
+
+    assert len({archive["archive_id"] for archive in archives}) == 4
+    assert downloads.latest_for_user_workspace(7, 99)["archive_id"] == archives[-1]["archive_id"]
+    assert downloads.latest_for_user_workspace(8, 99) is None
+    assert downloads.resolve(archives[0]["token"]) is None
+    assert downloads.resolve(archives[-1]["token"]) is not None
+    assert downloads.resolve(archives[-1]["archive_id"]) is None
+
+    downloads.revoke(archives[-1]["token"])
+
+    assert downloads.latest_for_user_workspace(7, 99)["archive_id"] == archives[-2]["archive_id"]
+
+
 def test_resolve_rejects_tampered_token(downloads):
     archive = downloads.root / "b.zip"
     archive.write_bytes(b"data")

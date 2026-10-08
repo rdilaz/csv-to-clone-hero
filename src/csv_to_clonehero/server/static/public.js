@@ -1739,9 +1739,8 @@
   }
 
   function downloadMatchesJob(download, job) {
-    const archiveCreated = availableNumber(job?.result, ["archive_created_at"]);
-    const downloadCreated = availableNumber(download, ["created_at"]);
-    return Boolean(download?.token && archiveCreated !== null && downloadCreated === archiveCreated);
+    const archiveId = job?.result?.archive_id;
+    return Boolean(download?.token && typeof archiveId === "string" && archiveId && download.archive_id === archiveId);
   }
 
   function stopDownloadPolling() {
