@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import logging
+import secrets
 import time
 import uuid
 from typing import Any, Callable
@@ -307,6 +308,18 @@ def create_app(
         state = request.args.get("state", "")
         code = request.args.get("code", "")
         expected_state = session.get("oauth_state")
+        if (
+            not isinstance(expected_state, str)
+            or not expected_state
+            or not state
+            or not secrets.compare_digest(expected_state.encode("utf-8"), state.encode("utf-8"))
+        ):
+            log.warning("oauth callback state validation failed")
+            return render_template(
+                "error.html",
+                message="Spotify sign-in expired or could not be verified. Start sign-in again.",
+                config=config,
+            ), 400
         verifier = session.get("oauth_verifier")
         redirect_uri = session.get("oauth_redirect_uri")
         oauth = _guest_oauth(config)
