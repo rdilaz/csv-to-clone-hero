@@ -6947,7 +6947,10 @@ class Database:
         This is the cheap part of a cache hit: one indexed lookup and a few
         comparisons. It never materializes cached candidates, so callers that
         only need freshness (estimates, planners) stay fast on large caches.
+        A zero TTL disables reuse even when the clock has not advanced.
         """
+        if ttl_days == 0:
+            return None
         row = self._conn.execute(
             """SELECT id, searched_at, error, result_cap, source_total,
                       cap_reached, returned_count, complete, source_name,

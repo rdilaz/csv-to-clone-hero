@@ -435,6 +435,7 @@ class JobManager:
                 progress={**job.progress, "completed": summary.get("selected", 0), "total": summary.get("selected", 0)},
                 result={
                     "summary": summary,
+                    "archive_id": download["archive_id"],
                     "archive_created_at": download["created_at"],
                     "size_bytes": download["size_bytes"],
                 },

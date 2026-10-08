@@ -649,6 +649,7 @@ class SignalCheckFixtures:
         token = f"{self._download_prefix}{self.download_attempts}.{int(expires_at)}.synthetic"
         metadata = {
             "token": token,
+            "archive_id": f"synthetic-archive-{uuid4().hex}",
             "expires_at": expires_at,
             "ttl_seconds": self.download_ttl_seconds,
             "size_bytes": len(zip_bytes),
@@ -693,6 +694,7 @@ class SignalCheckFixtures:
                     job["message"] = "ZIP prepared"
                     job["result"] = {
                         "summary": response["summary"],
+                        "archive_id": response["download"]["archive_id"],
                         "archive_created_at": self.download["created_at"],
                         "size_bytes": response["download"]["size_bytes"],
                     }

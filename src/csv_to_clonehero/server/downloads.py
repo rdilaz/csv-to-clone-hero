@@ -155,6 +155,9 @@ class BrowserDownloads:
         expiry_int = int(expires_at)
         payload = f"{key}:{expiry_int}"
         token = f"{key}.{expiry_int}.{_sign(payload, self.key)}"
+        # Receipt identity is independent of the bearer URL and wall clock.
+        # It associates a job with its archive and never authorizes delivery.
+        archive_id = secrets.token_hex(16)
         archive_path = Path(archive_path)
         with self._lock:
             self._index[key] = {
@@ -165,23 +168,22 @@ class BrowserDownloads:
                 "size": archive_path.stat().st_size,
                 "signed": f"{key}.{expiry_int}",
                 "token": token,
+                "archive_id": archive_id,
                 "created_at": created_at,
             }
-            retained = sorted(
-                (
-                    (old_key, meta)
-                    for old_key, meta in self._index.items()
-                    if int(meta.get("user_id", -1)) == int(user_id)
-                    and int(meta.get("workspace_id", -1)) == int(workspace_id)
-                ),
-                key=lambda item: float(item[1].get("created_at", 0)),
-                reverse=True,
-            )
+            # Registry insertion order survives equal or backward clock ticks.
+            retained = [
+                (old_key, meta)
+                for old_key, meta in reversed(self._index.items())
+                if int(meta.get("user_id", -1)) == int(user_id)
+                and int(meta.get("workspace_id", -1)) == int(workspace_id)
+            ]
             for old_key, meta in retained[_MAX_RETAINED_PER_WORKSPACE:]:
                 self._index.pop(old_key, None)
                 self._revoke_meta(meta)
         return {
             "token": token,
+            "archive_id": archive_id,
             "created_at": created_at,
             "expires_at": expires_at,
             "ttl_seconds": self.ttl_seconds,
@@ -276,9 +278,10 @@ class BrowserDownloads:
             ]
             if not matches:
                 return None
-            meta = max(matches, key=lambda item: float(item.get("created_at", 0)))
+            meta = matches[-1]
             return {
                 "token": meta["token"],
+                "archive_id": meta["archive_id"],
                 "expires_at": meta["expires_at"],
                 "ttl_seconds": self.ttl_seconds,
                 "size_bytes": meta["size"],

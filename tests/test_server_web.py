@@ -1448,7 +1448,7 @@ def test_public_download_build_dto_restores_metadata_and_consumes_archive(
 
     journey = client.get("/api/journey").get_json()
     download = journey["download"]
-    assert set(download) == {"token", "created_at", "expires_at", "ttl_seconds", "size_bytes", "url"}
+    assert set(download) == {"token", "archive_id", "created_at", "expires_at", "ttl_seconds", "size_bytes", "url"}
     assert isinstance(download["token"], str) and download["token"]
     assert download["ttl_seconds"] == app.extensions["downloads"].ttl_seconds
     assert download["size_bytes"] > 0
@@ -1459,6 +1459,7 @@ def test_public_download_build_dto_restores_metadata_and_consumes_archive(
         "bytes": download["size_bytes"], "errors": [],
     }
     assert journey["download_job"]["result"]["archive_created_at"] == download["created_at"]
+    assert journey["download_job"]["result"]["archive_id"] == download["archive_id"]
     assert source.downloads == [chart.md5 for chart in charts]
     archive_path = Path(app.extensions["downloads"].resolve(download["token"])["path"])
 
@@ -1788,6 +1789,49 @@ def test_download_cancel_at_final_handoff_revokes_archive(client, app, config, m
     assert job["result"] == {}
     assert client.get("/api/journey").get_json()["download"] is None
     assert not archive.exists()
+
+
+def test_async_archive_identity_distinguishes_prior_zip_after_latest_loss(client, app, config, monkeypatch):
+    from types import SimpleNamespace
+    import csv_to_clonehero.server.downloads as download_module
+    import csv_to_clonehero.server.jobs as job_module
+    from csv_to_clonehero.database import Database
+
+    _sign_in(client)
+    workspace_id = client.get("/api/journey").get_json()["workspace_id"]
+    _seed_async_download_choice(config, workspace_id)
+    fixed_time = time.time()
+    monkeypatch.setattr(download_module, "time", SimpleNamespace(time=lambda: fixed_time))
+    registry = app.extensions["downloads"]
+    db = Database(config.database_path)
+    try:
+        user_id = db.get_user("user-1")["id"]
+    finally:
+        db.close()
+    prior_path = registry.root / "prior-clock.zip"
+    prior_path.write_bytes(b"PK\x03\x04synthetic prior")
+    prior = registry.create(user_id, workspace_id, prior_path)
+
+    def prepared_build(_config, _db, _workspace, _sources, staging, **_kwargs):
+        archive = staging / "current-clock.zip"
+        archive.write_bytes(b"PK\x03\x04synthetic current")
+        return archive, {"success": True, "published": 1, "failed": 0, "remaining": 0, "selected": 1, "errors": []}
+
+    monkeypatch.setattr(job_module, "build_archive", prepared_build)
+    queued = client.post("/api/download", json={}).get_json()["job"]
+    job = _wait_download_job(client, queued["id"])
+    assert job["status"] == "complete"
+    current = client.get("/api/journey").get_json()["download"]
+    assert current["created_at"] == prior["created_at"] == job["result"]["archive_created_at"]
+    assert current["archive_id"] == job["result"]["archive_id"] != prior["archive_id"]
+    assert current["token"] not in json.dumps(job["result"])
+    assert registry.resolve(current["archive_id"]) is None
+
+    registry.revoke(current["token"])
+
+    restored = client.get("/api/journey").get_json()
+    assert restored["download"]["archive_id"] == prior["archive_id"]
+    assert restored["download_job"]["result"]["archive_id"] != restored["download"]["archive_id"]
 
 
 def test_async_partial_archive_preserves_failure_report_and_live_link(client, app, config, monkeypatch):
