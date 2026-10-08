@@ -547,14 +547,24 @@ def db_workspace(config):
     db.close()
 
 
-@pytest.mark.parametrize("reserve", [0, -1, 2048])
-def test_public_archive_honors_configured_disk_reserve(config, monkeypatch, reserve):
+@pytest.mark.parametrize("reserve, from_environment", [
+    (0, False), (-1, False), (2048, False), (2048, True),
+])
+def test_public_archive_honors_configured_disk_reserve(config, monkeypatch, reserve, from_environment):
     from csv_to_clonehero.database import Database
     from tests.conftest import FakeSource, make_chart, make_track, valid_sng_bytes
 
     content = valid_sng_bytes("Reserve Song")
     digest = hashlib.md5(content).hexdigest()
-    config.export.minimum_free_bytes = reserve
+    if from_environment:
+        from csv_to_clonehero.config import load_config
+
+        path = config.base_dir / "config.yaml"
+        path.write_text("export:\n  minimum_free_bytes: 0\n", encoding="utf-8")
+        monkeypatch.setenv("EXPORT_MINIMUM_FREE_BYTES", str(reserve))
+        config = load_config(path)
+    else:
+        config.export.minimum_free_bytes = reserve
     monkeypatch.setattr(
         "csv_to_clonehero.exporter._default_disk_usage",
         lambda _path: (100_000, 90_000, len(content) + 1024),

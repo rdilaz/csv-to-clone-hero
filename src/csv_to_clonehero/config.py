@@ -29,6 +29,7 @@ TOKEN_ENCRYPTION_KEY_ENV = "TOKEN_ENCRYPTION_KEY"  # Fernet key for refresh toke
 APP_BASE_URL_ENV = "APP_BASE_URL"  # public HTTPS origin
 DATABASE_URL_ENV = "DATABASE_URL"  # optional absolute sqlite path override
 CATALOG_PATH_ENV = "CATALOG_PATH"  # operator-managed catalog on persistent state
+EXPORT_MINIMUM_FREE_BYTES_ENV = "EXPORT_MINIMUM_FREE_BYTES"  # non-secret disk reserve
 NOTIFICATIONS_API_KEY_ENV = "NOTIFICATIONS_API_KEY"  # transactional email key
 GOFUNDME_URL_ENV = "GOFUNDME_URL"
 
@@ -449,7 +450,7 @@ class ExportConfig(BaseModel):
     managed_sync: bool = False
     overwrite_owned: bool = True
     include_manifest_in_zip: bool = True
-    minimum_free_bytes: int = 0
+    minimum_free_bytes: int = Field(default=0, ge=0, strict=True)
     # Number of concurrent download workers; 1 is serial. Enchor's file CDN
     # tolerates a handful of parallel streams, which hides per-request latency.
     download_workers: int = 3
@@ -1010,6 +1011,21 @@ def load_config(config_path: str | Path | None = None) -> AppConfig:
                 config_path.write_text("# CSV to Clone Hero configuration\n", encoding="utf-8")
 
     raw = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    reserve = os.environ.get(EXPORT_MINIMUM_FREE_BYTES_ENV, "").strip()
+    if reserve:
+        try:
+            reserve_bytes = int(reserve)
+        except ValueError:
+            raise ValueError(
+                f"{EXPORT_MINIMUM_FREE_BYTES_ENV} must be a non-negative integer"
+            ) from None
+        if reserve_bytes < 0:
+            raise ValueError(
+                f"{EXPORT_MINIMUM_FREE_BYTES_ENV} must be a non-negative integer"
+            )
+        raw = dict(raw)
+        raw["export"] = dict(raw.get("export") or {})
+        raw["export"]["minimum_free_bytes"] = reserve_bytes
     config = AppConfig.model_validate(raw)
     config.base_dir = config_path.resolve().parent
     return config
