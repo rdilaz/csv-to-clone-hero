@@ -467,6 +467,135 @@ def test_oauth_callback_signs_in(client, config):
     assert me.get_json()["display_name"] == "Alice"
 
 
+@pytest.fixture
+def callback_oauth(client, monkeypatch):
+    """Use real PKCE/token parsing with memory-only, no-network boundaries."""
+    import httpx
+    import csv_to_clonehero.server.web as web
+    from csv_to_clonehero.spotify import InMemoryCredentialStore, SpotifyOAuth
+
+    token_requests = []
+    oauth_calls = []
+    profile_calls = []
+
+    def token_endpoint(request):
+        token_requests.append(request)
+        return httpx.Response(200, json={
+            "access_token": "synthetic-access",
+            "refresh_token": "synthetic-refresh",
+            "expires_in": 3600,
+            "scope": "user-read-private user-library-read",
+        })
+
+    http = httpx.Client(transport=httpx.MockTransport(token_endpoint))
+    oauth = SpotifyOAuth(
+        client_id="synthetic-public-client",
+        redirect_uri="https://riff.ryo-nd.com/api/auth/spotify/callback",
+        credential_store=InMemoryCredentialStore(),
+        http_client=http,
+    )
+
+    def guest_oauth(_config):
+        oauth_calls.append(True)
+        return oauth
+
+    def profile(_config, token):
+        profile_calls.append(True)
+        return {"id": "user-1", "display_name": "Alice"}
+
+    monkeypatch.setattr(web, "_guest_oauth", guest_oauth)
+    monkeypatch.setattr(web, "_fetch_profile", profile)
+    yield token_requests, oauth_calls, profile_calls
+    oauth.close()
+    http.close()
+
+
+@pytest.mark.parametrize(("expected", "returned"), [
+    (None, "expected-state"),
+    ("", "expected-state"),
+    (123, "expected-state"),
+    ("expected-state", None),
+    ("expected-state", ""),
+    ("expected-state", "different-state"),
+    ("expected-state", "non-ascii-\u2603"),
+])
+def test_oauth_callback_rejects_unverified_state_before_exchange(client, callback_oauth, expected, returned):
+    token_requests, oauth_calls, profile_calls = callback_oauth
+    with client.session_transaction() as sess:
+        if expected is not None:
+            sess["oauth_state"] = expected
+        sess["oauth_verifier"] = "A" * 43
+        sess["oauth_redirect_uri"] = "https://riff.ryo-nd.com/api/auth/spotify/callback"
+    query = {"code": "synthetic-code"}
+    if returned is not None:
+        query["state"] = returned
+
+    response = client.get("/api/auth/spotify/callback", query_string=query)
+
+    assert response.status_code == 400
+    assert b"Start sign-in again" in response.data
+    assert token_requests == oauth_calls == profile_calls == []
+    assert client.get("/api/me").status_code == 401
+
+
+def test_oauth_callback_valid_pkce_relogin_preserves_workspace(client, config, callback_oauth):
+    from urllib.parse import parse_qs, urlsplit
+    from csv_to_clonehero.database import Database
+    from csv_to_clonehero.server.auth import user_workspace_key
+
+    token_requests, _oauth_calls, profile_calls = callback_oauth
+
+    def sign_in():
+        authorization = client.get("/login", follow_redirects=False)
+        assert authorization.status_code == 302
+        query = parse_qs(urlsplit(authorization.headers["Location"]).query)
+        assert query["code_challenge_method"] == ["S256"]
+        response = client.get("/api/auth/spotify/callback", query_string={
+            "code": "synthetic-code", "state": query["state"][0],
+        })
+        assert response.status_code == 302
+        assert client.get("/api/me").get_json()["display_name"] == "Alice"
+        return query["redirect_uri"][0]
+
+    redirect_uri = sign_in()
+    saved = client.post("/api/spotify/scope", json={"include_liked": True}).get_json()["workspace"]
+    assert sign_in() == redirect_uri
+    assert len(token_requests) == len(profile_calls) == 2
+    for request in token_requests:
+        assert request.method == "POST"
+        assert str(request.url) == "https://accounts.spotify.com/api/token"
+        assert parse_qs(request.content.decode())["redirect_uri"] == [redirect_uri]
+    db = Database(config.database_path)
+    try:
+        workspace = db.get_workspace(user_workspace_key("user-1"))
+        assert workspace is not None and int(workspace["id"]) == saved["id"]
+        assert db.get_workspace_scope_data(int(workspace["id"]))["include_liked"] is True
+    finally:
+        db.close()
+
+
+def test_oauth_callback_from_older_login_cannot_swap_current_state(client, callback_oauth):
+    from urllib.parse import parse_qs, urlsplit
+
+    token_requests, oauth_calls, profile_calls = callback_oauth
+    first = parse_qs(urlsplit(client.get("/login").headers["Location"]).query)["state"][0]
+    second = parse_qs(urlsplit(client.get("/login").headers["Location"]).query)["state"][0]
+    assert first != second
+    calls_before_callback = len(oauth_calls)
+
+    rejected = client.get("/api/auth/spotify/callback", query_string={"code": "old-code", "state": first})
+
+    assert rejected.status_code == 400
+    assert len(oauth_calls) == calls_before_callback
+    assert token_requests == profile_calls == []
+    with client.session_transaction() as sess:
+        assert sess["oauth_state"] == second
+    accepted = client.get("/api/auth/spotify/callback", query_string={"code": "current-code", "state": second})
+    assert accepted.status_code == 302
+    assert len(token_requests) == len(profile_calls) == 1
+    assert client.get("/api/me").status_code == 200
+
+
 def test_oauth_callback_denial_returns_safe_error_page(client):
     response = client.get("/api/auth/spotify/callback?error=access_denied")
 
