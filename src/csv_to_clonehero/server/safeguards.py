@@ -123,6 +123,7 @@ def get_discovery_availability(config: AppConfig, db: Database) -> dict[str, Any
             "supported": True,
             "out_of": catalog.known_chart_count,
             "eligible_charts": catalog.chart_count,
+            "eligible_songs": getattr(catalog, "song_count", None),
             "snapshot_id": catalog.snapshot_id,
             "catalog_sha256": catalog.sha256,
             "message": f"Local catalog ready with {catalog.chart_count:,} eligible charts.",

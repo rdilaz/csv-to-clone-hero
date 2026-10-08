@@ -6,7 +6,7 @@
   <meta name="theme-color" content="#080b20">
   <title>{% block title %}Riff | Signal Check{% endblock %}</title>
   <link rel="icon" type="image/svg+xml" href="{{ url_for('static', filename='signal-knot.svg') }}">
-  <link rel="stylesheet" href="{{ url_for('static', filename='public.css', v='riff-v2-20261008') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='public.css', v='riff-v2-20261008-library') }}">
   {% block head %}{% endblock %}
 </head>
 <body data-authenticated="{{ 'true' if user else 'false' }}" data-riff-release="riff-v2-20261008">
@@ -61,6 +61,6 @@
     </div>
   </footer>
   <div class="sr-only" id="announcer" role="status" aria-live="polite" aria-atomic="true"></div>
-  <script src="{{ url_for('static', filename='public.js', v='riff-v2-20261008') }}" defer></script>
+  <script src="{{ url_for('static', filename='public.js', v='riff-v2-20261008-library') }}" defer></script>
 </body>
 </html>

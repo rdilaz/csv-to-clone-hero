@@ -19,7 +19,8 @@
     reviewOffset: 0,
     reviewTotal: 0,
     reviewRequest: 0,
-    reviewFilter: "recommended",
+    reviewFilter: "all",
+    catalogRequest: 0,
     reviewSearch: "",
     selected: 0,
     exactSelected: 0,
@@ -754,7 +755,7 @@
       state.expansionRequest += 1;
       state.reviewOffset = 0;
       state.reviewSearch = "";
-      state.reviewFilter = "recommended";
+      state.reviewFilter = "all";
       state.exactSelected = 0;
       state.exactSelectedSongs = 0;
       state.exactSelectionKnown = false;
@@ -771,7 +772,7 @@
       clearSelectionFeedback();
       clearSelectionStale();
       if ($("#reviewSearch")) $("#reviewSearch").value = "";
-      $$('[data-review-filter]').forEach(item => item.setAttribute("aria-pressed", String(item.dataset.reviewFilter === "recommended")));
+      $$('[data-review-filter]').forEach(item => item.setAttribute("aria-pressed", String(item.dataset.reviewFilter === "all")));
       resetFindUi();
       showStage("find", true);
       startedFind = true;
@@ -1079,8 +1080,53 @@
       state.expansionSelected = 0;
       state.expansionSelectionKnown = true;
     }
-    await Promise.all([loadReview(), loadExpansion()]);
+    await Promise.all([loadReview(), loadExpansion(), loadCatalogCoverage()]);
     syncSelectionBand();
+  }
+
+  async function loadCatalogCoverage() {
+    const requestId = ++state.catalogRequest;
+    const coverage = $("#catalogCoverage");
+    const brief = $("#catalogCoverageBrief");
+    const snapshot = $("#catalogSnapshot");
+    if (!coverage) return;
+    coverage.textContent = "Loading chart catalog coverage...";
+    if (brief) brief.textContent = "Loading chart catalog coverage...";
+    if (snapshot) snapshot.hidden = true;
+    try {
+      const data = await api("/api/preflight", {timeoutMs: 15000});
+      if (requestId !== state.catalogRequest) return;
+      const preflight = data.preflight || {};
+      const total = availableNumber(preflight, ["out_of"]);
+      const eligible = availableNumber(preflight, ["eligible_charts"]);
+      const songs = availableNumber(preflight, ["eligible_songs"]);
+      if (preflight.mode === "catalog" && preflight.catalog_available === true) {
+        const indexed = total === null ? "Indexed chart count unknown" : `${total.toLocaleString()} indexed chart records`;
+        const usable = eligible === null ? "eligible chart count unknown" : `${eligible.toLocaleString()} eligible charts`;
+        coverage.textContent = `Local catalog: ${indexed}; ${usable}${songs === null ? "" : `; ${songs.toLocaleString()} distinct eligible songs`}.`;
+        if (brief) brief.textContent = `Local catalog · ${total === null ? "indexed count unknown" : `${total.toLocaleString()} indexed charts`} · ${eligible === null ? "eligible count unknown" : `${eligible.toLocaleString()} eligible`}`;
+        if (snapshot && preflight.snapshot_id) {
+          snapshot.textContent = `Snapshot: ${preflight.snapshot_id}`;
+          snapshot.hidden = false;
+        }
+      } else if (preflight.mode === "live_fallback") {
+        const verifiedReport = preflight.success === true && preflight.supported === true && preflight.authoritative === true;
+        const advertised = !verifiedReport || total === null
+          ? "The advertised chart count and its freshness are unknown; the service report is not verified."
+          : `The service advertised ${total.toLocaleString()} chart records (${preflight.fresh === true ? "recent readiness report" : preflight.fresh === false ? "report may be stale" : "freshness unknown"}).`;
+        coverage.textContent = `Live search fallback: no verified local indexed catalog is available. ${advertised} This is a service report, not Riff's indexed pool.`;
+        if (brief) brief.textContent = verifiedReport && total !== null
+          ? `Live fallback · ${total.toLocaleString()} advertised charts · ${preflight.fresh === true ? "recent report" : preflight.fresh === false ? "may be stale" : "freshness unknown"}`
+          : "Live fallback · advertised chart count unknown";
+      } else {
+        coverage.textContent = "Catalog availability and indexed chart counts are not confirmed.";
+        if (brief) brief.textContent = "Indexed chart catalog count unknown";
+      }
+    } catch (_) {
+      if (requestId !== state.catalogRequest) return;
+      coverage.textContent = "Catalog coverage could not be loaded. Indexed and advertised chart counts are unknown.";
+      if (brief) brief.textContent = "Chart catalog counts unknown";
+    }
   }
 
   function reviewParams() {
@@ -1151,8 +1197,10 @@
       const recommended = Number(data.summary?.recommended_songs ?? legacyRecommended);
       const additional = Number(data.summary?.additional_playable_charts || 0);
       const selectable = Number(data.summary?.selectable_charts ?? legacyRecommended);
+      const libraryTotal = availableNumber(data.summary, ["total"]);
+      $("#librarySongCount").textContent = libraryTotal === null ? "Unknown" : libraryTotal.toLocaleString();
       $("#chartsFoundCount").textContent = recommended.toLocaleString();
-      $("#chartsFoundLabel").textContent = recommended === 1 ? "song has a recommended chart." : "songs have recommended charts.";
+      $("#chartsFoundLabel").textContent = recommended === 1 ? "Song with a recommended chart" : "Songs with recommended charts";
       $("#bestMatchCount").textContent = recommended.toLocaleString();
       $("#allMatchCount").textContent = Number(data.summary?.all_safe_charts ?? recommended).toLocaleString();
       $("#maximumMatchCount").textContent = Number(data.summary?.maximum_playable_charts ?? selectable).toLocaleString();
@@ -1162,8 +1210,8 @@
         if (wasStale) clearSelectionFeedback();
       }
       refreshSelectionUi();
-      $("#reviewSummary").textContent = `${recommended.toLocaleString()} songs have recommendations; ${additional.toLocaleString()} additional playable charts are available.`;
-      host.innerHTML = (data.tracks || []).map((track, index) => reviewCard(track, state.reviewOffset + index)).join("") || `<div class="empty-state">No recommendations match this view.</div>`;
+      $("#reviewSummary").textContent = `${state.reviewTotal.toLocaleString()} ${state.reviewTotal === 1 ? "song" : "songs"} in this view; ${additional.toLocaleString()} additional playable charts across your imported music.`;
+      host.innerHTML = (data.tracks || []).map((track, index) => reviewCard(track, state.reviewOffset + index)).join("") || `<div class="empty-state">No imported songs match this view.</div>`;
       host.setAttribute("aria-busy", "false");
       bindReviewActions();
       const page = Math.floor(state.reviewOffset / 25) + 1;
@@ -1194,6 +1242,7 @@
     state.selectionTotalKnown = state.exactSelectionKnown && state.expansionSelectionKnown && !state.selectionStale;
     $("#selectedCount").textContent = state.selectionTotalKnown ? state.selected.toLocaleString() : "...";
     $("#exactSelectedCount").textContent = state.exactSelectionKnown ? state.exactSelected.toLocaleString() : "...";
+    $("#librarySelectedChartCount").textContent = state.exactSelectionKnown && !state.selectionStale ? state.exactSelected.toLocaleString() : "...";
     $("#selectedSongCount").textContent = state.exactSelectedSongsKnown ? state.exactSelectedSongs.toLocaleString() : "...";
     $("#exactSelectedLabel").textContent = state.exactSelectionKnown && state.exactSelected === 1 ? "chart" : "charts";
     $("#selectedSongLabel").textContent = state.exactSelectedSongsKnown && state.exactSelectedSongs === 1 ? "song" : "songs";
@@ -1271,13 +1320,24 @@
     const candidates = (track.candidates || []).filter(candidate => visibleTiers.has(candidate.result_tier));
     const best = candidates.find(candidate => candidate.best) || candidates[0];
     const primary = best;
-    if (!primary) return "";
+    const headingId = `song-group-title-${index + 1}`;
+    if (!primary) {
+      const label = track.review_label || track.review?.label || "Chart status unavailable";
+      const summary = track.review_summary || track.review?.summary || "Chart availability has not been confirmed for this song.";
+      return `<article class="review-card song-group song-group--readonly" aria-labelledby="${headingId}">
+        <header class="song-group__header">
+          <span class="song-group__number" aria-hidden="true">${String(index + 1).padStart(2, "0")}</span>
+          <div class="song-group__identity"><span>${escapeHtml(track.artist)}</span><h3 id="${headingId}">${escapeHtml(track.title)}</h3><p>${escapeHtml(track.album || "Album not provided")}</p></div>
+          <span class="song-group__count">No selectable chart</span>
+        </header>
+        <div class="song-group__status"><strong>${escapeHtml(label)}</strong><p>${escapeHtml(summary)}</p>${track.review_notice ? `<p>${escapeHtml(track.review_notice)}</p>` : ""}</div>
+      </article>`;
+    }
     const groups = [
       ["SAME_RECORDING_CHART_VARIANT", "Other charts for this recording"],
       ["ALTERNATE_RECORDING", "Alternate versions"],
       ["POSSIBLE_MATCH", "Possible matches - review required"],
     ];
-    const headingId = `song-group-title-${index + 1}`;
     return `<article class="review-card song-group" aria-labelledby="${headingId}">
       <header class="song-group__header">
         <span class="song-group__number" aria-hidden="true">${String(index + 1).padStart(2, "0")}</span>
