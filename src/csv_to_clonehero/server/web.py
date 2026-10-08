@@ -21,15 +21,22 @@ Design points (per the product decisions):
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
+import re
+import threading
 import time
 import uuid
+from collections import OrderedDict
 from typing import Any, Callable
 
 from flask import Flask, abort, g, jsonify, redirect, render_template, request, send_file, session, url_for
 
 from csv_to_clonehero.config import AppConfig
-from csv_to_clonehero.catalog_validation import difficulty_preference_key, inspected_difficulty_coverage
+from csv_to_clonehero.catalog_validation import (
+    difficulty_preference_key, inspected_difficulty_coverage,
+    inspected_difficulty_coverage_from_row,
+)
 from csv_to_clonehero.database import Database
 from csv_to_clonehero.matching import (
     ALTERNATE_RECORDING,
@@ -57,6 +64,16 @@ from csv_to_clonehero.sources.base import (
 )
 
 log = logging.getLogger(__name__)
+_REVIEW_SCORE_CACHE: OrderedDict[str, str] = OrderedDict()
+_REVIEW_SCORE_LOCK = threading.RLock()
+_REVIEW_CACHE_LIMIT = 8192
+_LISTENING_DECK_CACHE: OrderedDict[str, tuple[str, list[dict[str, Any]]]] = OrderedDict()
+_DECK_ORDER_CACHE: OrderedDict[tuple[str, str], list[int]] = OrderedDict()
+_STUDIO_CAPABILITIES = {
+    "select_all": True, "selection_scopes": ["library", "expansion", "both"],
+    "selection_policies": ["one_per_song", "all_versions"], "listening_deck": True,
+    "spotify_embed": True, "expansion_spotify_lookup": False,
+}
 
 
 def load_app_config() -> AppConfig:
@@ -80,6 +97,8 @@ def create_app(
     """
     config = config or load_app_config()
     app = Flask(__name__)
+    from csv_to_clonehero.server.http_delivery import ASSET_VERSION, configure_asset_delivery
+    configure_asset_delivery(app)
     app.config["MAX_CONTENT_LENGTH"] = config.server.max_content_length
     app.config["SESSION_COOKIE_HTTPONLY"] = True
     app.config["SESSION_COOKIE_SAMESITE"] = config.sessions.cookie_same_site
@@ -150,6 +169,7 @@ def create_app(
             response.headers["Content-Security-Policy"] = (
                 "default-src 'self'; base-uri 'self'; connect-src 'self'; "
                 "font-src 'self'; form-action 'self'; frame-ancestors 'self'; "
+                "frame-src 'self' https://open.spotify.com; "
                 "img-src 'self' data: https:; object-src 'none'; "
                 "style-src 'self'; script-src 'self'"
             )
@@ -195,6 +215,8 @@ def create_app(
             "time": time.time(),
             "release": "riff-v2-20261008",
             "experience": "signal-check",
+            "ui_release": ASSET_VERSION,
+            "capabilities": _STUDIO_CAPABILITIES,
         })
 
     @app.get("/browser-exporter.js")
@@ -1038,6 +1060,8 @@ def create_app(
                 "offset": offset,
                 "limit": limit,
                 "summary": summary,
+                "capabilities": _STUDIO_CAPABILITIES,
+                "exact_generation_id": _public_generation_id(db, workspace),
             })
         except (TypeError, ValueError):
             return jsonify({"error": "invalid workspace paging or filter parameters"}), 400
@@ -1051,12 +1075,10 @@ def create_app(
         db = _user_db()
         try:
             workspace = _ensure_workspace(db, user)
-            if db.get_active_job(
-                int(user["id"]),
-                workspace_key=user_workspace_key(user["spotify_user_id"]),
-                kind="download",
-            ) is not None:
-                return jsonify({"error": "Wait for ZIP preparation to finish before changing chart choices."}), 409
+            if any(db.get_active_job(
+                int(user["id"]), workspace_key=user_workspace_key(user["spotify_user_id"]), kind=kind,
+            ) is not None for kind in ("discovery", "expansion", "download")):
+                return jsonify({"error": "Wait for matching or ZIP preparation to finish before changing chart choices."}), 409
             candidate_id = int(payload.get("candidate_id") or 0)
             track_value = payload.get("track_id") or payload.get("track_key")
             candidate_kind = str(payload.get("kind") or "exact")
@@ -1167,7 +1189,7 @@ def create_app(
                         "selection_origin": "explicit",
                     },
                 )
-            return jsonify({"ok": True})
+            return jsonify({"ok": True, **db.public_selection_state(workspace)})
         except (TypeError, ValueError) as exc:
             return jsonify({"error": str(exc)}), 400
         finally:
@@ -1226,6 +1248,94 @@ def create_app(
                 return jsonify({"error": "Cancel the active job before deleting this workspace."}), 409
             downloads.revoke_workspace(workspace_id)
             return jsonify({"ok": True, "deleted": deleted})
+        finally:
+            db.close()
+
+    @app.get("/api/listening-deck")
+    def listening_deck():
+        user = _require_user()
+        scope = request.args.get("scope", "both")
+        if scope not in {"library", "expansion", "both"}:
+            return jsonify({"error": "scope must be library, expansion or both"}), 400
+        if scope == "expansion" and not config.server.enable_expansion:
+            abort(404)
+        order = request.args.get("order", "normal")
+        seed = request.args.get("seed", "")
+        if order not in {"normal", "shuffle"} or len(seed) > 64 or (order == "shuffle" and not seed):
+            return jsonify({"error": "Choose normal order or shuffle with a seed of 1 to 64 characters."}), 400
+        try:
+            limit = min(100, max(1, int(request.args.get("limit", 50))))
+            offset = max(0, int(request.args.get("offset", 0)))
+        except (TypeError, ValueError):
+            return jsonify({"error": "invalid listening deck paging parameters"}), 400
+        db = _user_db()
+        try:
+            workspace = _ensure_workspace(db, user)
+            # A single read transaction prevents combining two generations
+            # when expansion or discovery completes between scope queries.
+            with db.atomic_workspace_selection(write=False):
+                generation = _public_generation_id(db, workspace)
+                token, items = _cached_listening_deck(config, db, workspace, scope, generation)
+                state = db.public_selection_state(workspace)
+            expected = request.args.get("generation_token")
+            if expected and expected != token:
+                return jsonify({"error": "The song options changed. Reload the listening deck.", "reload": True}), 409
+            needle = str(request.args.get("q") or "").strip().casefold()[:200]
+            filtered = [item for item in items if not needle or needle in " ".join(str(item.get(key) or "") for key in ("title", "artist", "album")).casefold()]
+            if order == "shuffle":
+                indices = _deck_shuffle_order(token, seed, items)
+                allowed_keys = {item["key"] for item in filtered}
+                filtered = [items[index] for index in indices if items[index]["key"] in allowed_keys]
+            page = _deck_selection_overlay(filtered[offset:offset + limit], state)
+            return jsonify({
+                "items": page, "total": len(filtered),
+                "offset": offset, "limit": limit, "has_more": offset + limit < len(filtered),
+                "exact_generation_id": generation, "generation_token": token,
+                "capabilities": _STUDIO_CAPABILITIES,
+                "order": order, "seed": seed if order == "shuffle" else None,
+            })
+        finally:
+            db.close()
+
+    @app.post("/api/selection/all")
+    def select_all():
+        user = _require_user()
+        payload = request.get_json(silent=True) or {}
+        if not isinstance(payload, dict):
+            return jsonify({"error": "selection options must be an object"}), 400
+        scope = payload.get("scope", "library")
+        policy = payload.get("policy", "one_per_song")
+        confirm = payload.get("confirm_possible", False)
+        if not isinstance(scope, str) or not isinstance(policy, str) or scope not in {"library", "expansion", "both"} or policy not in {"one_per_song", "all_versions"} or type(confirm) is not bool:
+            return jsonify({"error": "Choose a valid scope, policy and confirmation."}), 400
+        if scope == "expansion" and not config.server.enable_expansion:
+            abort(404)
+        if scope in {"expansion", "both"} and not confirm:
+            return jsonify({"error": "Additional songs require explicit review confirmation."}), 400
+        db = _user_db()
+        try:
+            workspace = _ensure_workspace(db, user)
+            with db.atomic_workspace_selection():
+                key = user_workspace_key(user["spotify_user_id"])
+                if any(db.get_active_job(int(user["id"]), workspace_key=key, kind=kind) is not None for kind in ("discovery", "expansion", "download")):
+                    return jsonify({"error": "Wait for matching or ZIP preparation to finish before changing chart choices."}), 409
+                generation = _public_generation_id(db, workspace)
+                if generation is None or generation < 0:
+                    return jsonify({"error": "Complete matching before selecting charts."}), 409
+                choices = _studio_selection_choices(config, db, workspace, scope, policy, confirm)
+                if not choices:
+                    return jsonify({"error": "No compatible chart choices are available."}), 400
+                before = db.public_selection_state(workspace)
+                kinds = ["exact"] if scope == "library" else ["expansion"] if scope == "expansion" else ["exact", "expansion"]
+                db.replace_public_selection(workspace, kinds, choices)
+                state = db.public_selection_state(workspace)
+                old_ids = {(s, item.get("track_key"), item["candidate_id"]) for s, items in before["selected"].items() for item in items}
+                new_ids = {(s, item.get("track_key"), item["candidate_id"]) for s, items in state["selected"].items() for item in items}
+            return jsonify({"ok": True, "scope": scope, "policy": policy,
+                            "changed": len(old_ids ^ new_ids), "exact_generation_id": generation,
+                            "minimum_score": db.get_workspace_minimum_score(workspace), **state})
+        except (TypeError, ValueError) as exc:
+            return jsonify({"error": str(exc)}), 400
         finally:
             db.close()
 
@@ -1995,6 +2105,178 @@ def _job_mapping_public(job: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _studio_cards(config: AppConfig, db: Database, workspace: int, scope: str):
+    if scope in {"library", "both"}:
+        for card in _review_cards(config, db, workspace, db.get_workspace_minimum_score(workspace)):
+            yield "library", card
+    if scope in {"expansion", "both"} and config.server.enable_expansion:
+        for card in _expansion_review_cards(config, db, workspace):
+            yield "expansion", card
+
+
+def _listening_deck_items(config: AppConfig, db: Database, workspace: int, scope: str) -> list[dict[str, Any]]:
+    items = []
+    seen = set()
+    for kind, card in _studio_cards(config, db, workspace, scope):
+        eligible = [item for item in card["candidates"] if item.get("selectable")]
+        if not eligible:
+            continue
+        identity = (normalize_artist(card["artist"]), normalize_title(card["title"]))
+        if identity in seen:
+            continue
+        seen.add(identity)
+        candidate = eligible[0]
+        spotify_id = str(card.get("spotify_id") or "") if kind == "library" else ""
+        # Provider-neutral synthetic IDs and chart artist/title guesses are
+        # never converted to Spotify playback links.
+        spotify_id = spotify_id if re.fullmatch(r"[A-Za-z0-9]{22}", spotify_id) else None
+        track_key = card.get("track_key") if kind == "library" else None
+        items.append({
+            "key": f"{kind}:{track_key or card.get('song_key')}",
+            "title": card["title"], "artist": card["artist"],
+            "album": card.get("album") or candidate.get("album") or "",
+            "chart_title": candidate["title"], "chart_artist": candidate["artist"],
+            "scope": kind, "track_key": track_key,
+            "song_key": card.get("song_key") if kind == "expansion" else None,
+            "candidate_id": int(candidate["candidate_id"]),
+            "artist_norm": candidate.get("artist_norm") if kind == "expansion" else None,
+            "selected": False, "selectable": True,
+            "result_tier": candidate["result_tier"],
+            "difficulty_coverage": candidate["difficulty_coverage"],
+            "spotify_id": spotify_id,
+            "spotify_url": f"https://open.spotify.com/track/{spotify_id}" if spotify_id else None,
+            "_versions": [{
+                "candidate_id": int(version["candidate_id"]),
+                "chart_title": version["title"], "chart_artist": version["artist"],
+                "result_tier": version["result_tier"],
+                "difficulty_coverage": version["difficulty_coverage"],
+            } for version in eligible],
+        })
+    return items
+
+
+def _cached_listening_deck(config: AppConfig, db: Database, workspace: int,
+                          scope: str, generation: int | None):
+    signature = ["listening-deck-v2", workspace, generation, scope,
+                 _review_config_hash(config), db.public_review_revision()]
+    key = hashlib.sha256(json.dumps(signature).encode()).hexdigest()
+    with _REVIEW_SCORE_LOCK:
+        saved = _LISTENING_DECK_CACHE.get(key)
+        if saved is not None:
+            _LISTENING_DECK_CACHE.move_to_end(key)
+            return saved
+    items = _listening_deck_items(config, db, workspace, scope) if generation is not None and generation >= 0 else []
+    token = hashlib.sha256(json.dumps([workspace, generation, scope, items], sort_keys=True).encode()).hexdigest()
+    with _REVIEW_SCORE_LOCK:
+        _LISTENING_DECK_CACHE[key] = (token, items)
+        while len(_LISTENING_DECK_CACHE) > 8 or (len(_LISTENING_DECK_CACHE) > 1 and sum(len(value[1]) for value in _LISTENING_DECK_CACHE.values()) > 100000):
+            _LISTENING_DECK_CACHE.popitem(last=False)
+    return token, items
+
+
+def _deck_shuffle_order(token: str, seed: str, items: list[dict[str, Any]]) -> list[int]:
+    key = (token, seed)
+    with _REVIEW_SCORE_LOCK:
+        saved = _DECK_ORDER_CACHE.get(key)
+        if saved is not None:
+            _DECK_ORDER_CACHE.move_to_end(key)
+            return saved
+    order = sorted(range(len(items)), key=lambda index: hashlib.sha256(f"{seed}|{items[index]['key']}".encode()).digest())
+    with _REVIEW_SCORE_LOCK:
+        _DECK_ORDER_CACHE[key] = order
+        while len(_DECK_ORDER_CACHE) > 16:
+            _DECK_ORDER_CACHE.popitem(last=False)
+    return order
+
+
+def _deck_selection_overlay(items: list[dict[str, Any]], state: dict[str, Any]) -> list[dict[str, Any]]:
+    library = {}
+    for item in state["selected"]["library"]:
+        library.setdefault(item["track_key"], set()).add(item["candidate_id"])
+    expansion = {item["candidate_id"] for item in state["selected"]["expansion"]}
+    expansion_songs = {item.get("song_key") for item in state["selected"]["expansion"] if item.get("song_key")}
+    page = []
+    for item in items:
+        selected = library.get(item["track_key"], set()) if item["scope"] == "library" else expansion
+        version = next((version for version in item["_versions"] if version["candidate_id"] in selected), None)
+        result = {key: value for key, value in item.items() if not key.startswith("_")}
+        result["song_selected"] = bool(library.get(item["track_key"])) if item["scope"] == "library" else item.get("song_key") in expansion_songs
+        if version is not None:
+            result.update(version)
+            result["selected"] = True
+        page.append(result)
+    return page
+
+
+def _studio_selection_choices(config: AppConfig, db: Database, workspace: int,
+                              scope: str, policy: str, confirm: bool) -> list[dict[str, Any]]:
+    tracks = {track.track_key: int(track.db_id) for track in db.get_spotify_tracks(True)}
+    choices = []
+    seen_songs = set()
+    allowed = SELECTABLE_RESULT_TIERS if confirm else {RECOMMENDED_EXACT, SAME_RECORDING_CHART_VARIANT}
+    for kind, card in _studio_cards(config, db, workspace, scope):
+        if kind == "expansion" and not confirm:
+            continue
+        candidates = [item for item in card["candidates"] if item.get("selectable") and item.get("result_tier") in allowed]
+        identity = (normalize_artist(card["artist"]), normalize_title(card["title"]))
+        if policy == "one_per_song":
+            if identity in seen_songs:
+                continue
+            candidates = candidates[:1]
+        if candidates:
+            seen_songs.add(identity)
+        for candidate in candidates:
+            choices.append({
+                "kind": "exact" if kind == "library" else "expansion",
+                "track_id": tracks.get(card["track_key"]) if kind == "library" else None,
+                "candidate_id": candidate["candidate_id"],
+                "artist_norm": candidate.get("artist_norm") or "",
+                "score": candidate["score"], "eligibility": candidate["eligibility"],
+                "metadata": {"selection_origin": "studio_all", "preset": policy,
+                             "result_tier": candidate["result_tier"], "possible_confirmed": confirm},
+            })
+    return choices
+
+
+def _review_config_hash(config: AppConfig) -> str:
+    # base_dir is excluded from the public Pydantic dump. Explicitly bind
+    # process caches to this database and its file identity, including restores.
+    path = config.database_path.resolve()
+    try:
+        stat = path.stat()
+        identity = (stat.st_dev, stat.st_ino)
+    except OSError:
+        identity = ("unavailable", uuid.uuid4().hex)
+    return hashlib.sha256(json.dumps([str(path), identity, config.model_dump()], sort_keys=True, default=str).encode()).hexdigest()
+
+
+def _cached_review_match(
+    config: AppConfig, config_hash: str, workspace: int, generation: int | None,
+    track: Any, candidate: Any, validation: Any, *, artist_norm: str = "",
+    coverage_mode: str = "recommended",
+) -> tuple[str, bool, float, float, dict[str, Any]]:
+    """Bounded content cache; current generations, metadata and ledger invalidate.
+
+    Selection is deliberately not cached. Each response rereads owner-scoped
+    selections and inspection rows, while unchanged scoring avoids repeat work.
+    """
+    payload = ["public-review-v1", workspace, generation, config_hash,
+               vars(track) if track is not None else None, vars(candidate),
+               validation, artist_norm, coverage_mode]
+    key = hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()
+    with _REVIEW_SCORE_LOCK:
+        saved = _REVIEW_SCORE_CACHE.get(key)
+        if saved is not None:
+            _REVIEW_SCORE_CACHE.move_to_end(key)
+            return tuple(json.loads(saved))
+    result = _current_expansion_match(config, artist_norm, candidate, coverage_mode=coverage_mode) if artist_norm else _current_match(config, track, candidate)
+    with _REVIEW_SCORE_LOCK:
+        _REVIEW_SCORE_CACHE[key] = json.dumps(result)
+        while len(_REVIEW_SCORE_CACHE) > _REVIEW_CACHE_LIMIT:
+            _REVIEW_SCORE_CACHE.popitem(last=False)
+    return result
+
+
 def _review_cards(
     config: AppConfig,
     db: Database,
@@ -2004,15 +2286,18 @@ def _review_cards(
     if not workspace:
         return []
     generation_id = _public_generation_id(db, workspace)
+    config_hash = _review_config_hash(config)
     rows = db.get_workspace_candidates(
         workspace,
         kind="exact",
         include_rejected=True,
         generation_id=generation_id,
+        include_artifact_validation=True,
     )
+    all_tracks = db.get_spotify_tracks(True)
     tracks_by_id = {
         int(track.db_id): track
-        for track in db.get_spotify_tracks(True)
+        for track in all_tracks
         if track.db_id is not None
     }
     selection_metadata = {
@@ -2026,15 +2311,13 @@ def _review_cards(
         tid = data.get("track_id")
         if not tid:
             continue
-        candidate = db.get_candidate(int(data.get("candidate_id") or 0))
-        if candidate is None or not db.is_chart_artifact_eligible(
-            candidate.source, candidate.chart_id
-        ):
+        candidate = db.candidate_from_workspace_row(data)
+        validation = db.validation_from_workspace_row(data)
+        if validation and validation["state"] in {"REJECTED", "UNAVAILABLE"}:
             continue
-        current_eligibility, _hard_gate, current_score, current_quality, breakdown = _current_match(
-            config,
-            tracks_by_id.get(int(tid)),
-            candidate,
+        current_eligibility, _hard_gate, current_score, current_quality, breakdown = _cached_review_match(
+            config, config_hash, workspace, generation_id,
+            tracks_by_id.get(int(tid)), candidate, validation,
         )
         result_tier, tier_reasons = classify_result_tier(breakdown)
         selected = bool(data.get("selected"))
@@ -2058,7 +2341,7 @@ def _review_cards(
             "pack_name": candidate.pack_name,
             "instruments": list(candidate.instruments or ()),
             "diff_guitar": candidate.diff_guitar,
-            "difficulty_coverage": inspected_difficulty_coverage(db, candidate),
+            "difficulty_coverage": inspected_difficulty_coverage_from_row(candidate, validation),
             "url": candidate.url,
             "reference": candidate.reference,
             "supports_download": bool(candidate.supports_download),
@@ -2092,7 +2375,7 @@ def _review_cards(
         workspace_track_ids = set(by_track)
     tracks = [
         track
-        for track in db.get_spotify_tracks(True)
+        for track in all_tracks
         if int(track.db_id or 0) in workspace_track_ids
     ]
     workspace_row = db.get_workspace(workspace)
@@ -2282,23 +2565,24 @@ def _expansion_review_cards(
     if generation_id is None or generation_id < 0:
         return []
     minimum_score = db.get_workspace_minimum_score(workspace)
+    config_hash = _review_config_hash(config)
     imported_identities = _workspace_imported_identities(db, workspace)
     grouped: dict[tuple[str, str], list[dict[str, Any]]] = {}
     for row in db.get_workspace_candidates(
-        workspace, kind="expansion", include_rejected=True
+        workspace, kind="expansion", include_rejected=True, include_artifact_validation=True
     ):
         data = dict(row)
         metadata = _json_object(data.get("metadata_json"))
         if int(metadata.get("exact_generation_id") or 0) != generation_id:
             continue
-        candidate = db.get_candidate(int(data.get("candidate_id") or 0))
-        if candidate is None or not db.is_chart_artifact_eligible(
-            candidate.source, candidate.chart_id
-        ):
+        candidate = db.candidate_from_workspace_row(data)
+        validation = db.validation_from_workspace_row(data)
+        if validation and validation["state"] in {"REJECTED", "UNAVAILABLE"}:
             continue
         artist_norm = str(data.get("artist_norm") or "")
-        eligibility, hard_gate, score, quality, breakdown = _current_expansion_match(
-            config, artist_norm, candidate,
+        eligibility, hard_gate, score, quality, breakdown = _cached_review_match(
+            config, config_hash, workspace, generation_id, None, candidate, validation,
+            artist_norm=artist_norm,
             coverage_mode=str(metadata.get("coverage_mode") or "recommended"),
         )
         result_tier, tier_reasons = classify_result_tier(
@@ -2332,7 +2616,7 @@ def _expansion_review_cards(
             "pack_name": candidate.pack_name,
             "instruments": list(candidate.instruments or ()),
             "diff_guitar": candidate.diff_guitar,
-            "difficulty_coverage": inspected_difficulty_coverage(db, candidate),
+            "difficulty_coverage": inspected_difficulty_coverage_from_row(candidate, validation),
             "score": round(score, 1),
             "quality": round(quality, 1),
             "eligibility": eligibility,

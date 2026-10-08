@@ -119,6 +119,10 @@ def test_expert_only_is_labeled_and_selectable_in_exact_and_expansion_choices(de
     assert "Expert only" in row.locator('[data-candidate="101"]').get_attribute("aria-label")
     assert "Inspected note tracks · Guitar: Expert; Bass: Expert" in row.inner_text()
     if width == 390:
+        primary = page.locator("#studio-select-all").bounding_box()
+        initial_rail = page.locator("#selectionRail").bounding_box()
+        assert primary and initial_rail and 0 <= primary["y"] and primary["y"] + primary["height"] + 7 <= initial_rail["y"]
+        row.locator('[data-candidate="101"]').scroll_into_view_if_needed()
         action = row.locator('[data-candidate="101"]').bounding_box()
         rail = page.locator("#selectionRail").bounding_box()
         assert action and rail and action["y"] + action["height"] + 7 <= rail["y"]

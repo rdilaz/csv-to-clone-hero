@@ -2,6 +2,9 @@
 
 More songs and difficulty labels: [Chart coverage](CHART_COVERAGE.md).
 
+The musical setlist interface, whole-library selection, listening deck and
+performance boundaries: [Riff Studio](RIFF_STUDIO.md).
+
 - [`ARCHITECTURE.md`](ARCHITECTURE.md): current local/public surfaces, data
   flow, boundaries, matching methodology, and security model.
 - [`CONFIGURATION.md`](CONFIGURATION.md): configuration precedence, paths,

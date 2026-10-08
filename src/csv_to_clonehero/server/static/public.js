@@ -19,6 +19,8 @@
     reviewOffset: 0,
     reviewTotal: 0,
     reviewRequest: 0,
+    reviewAbort: null,
+    reviewTracks: [],
     reviewFilter: "all",
     catalogRequest: 0,
     reviewSearch: "",
@@ -65,6 +67,8 @@
     downloadPolling: false,
     downloadCancelBusy: false,
     expiryTimer: null,
+    pollBackoff: {},
+    inFlightPolls: new Set(),
   };
 
   async function api(path, options = {}) {
@@ -203,6 +207,7 @@
   }
 
   async function logout() {
+    document.dispatchEvent(new CustomEvent("riff:studio-reset"));
     try { await api("/api/auth/logout", {method: "POST", body: "{}"}); } catch (_) { /* redirect regardless */ }
     window.location.assign("/");
   }
@@ -263,8 +268,10 @@
       else item.removeAttribute("aria-current");
     });
     document.body.dataset.riffStage = name;
+    if (name === "find" || name === "add") document.dispatchEvent(new CustomEvent("riff:studio-reset"));
     rememberDelivery({stage: name});
     syncSelectionBand();
+    emitStudioContext();
     if (focus) {
       const heading = $("#" + ids[name] + " h1");
       heading?.setAttribute("tabindex", "-1");
@@ -775,7 +782,9 @@
       state.selectionMode = "none";
       state.openDisclosures.clear();
       state.closedDisclosures.clear();
-      $("#reviewCards")?.replaceChildren();
+      const reviewHost = $("#reviewCards");
+      reviewHost?.replaceChildren();
+      if (reviewHost) reviewHost._riffMarkup = null;
       clearSelectionFeedback();
       clearSelectionStale();
       if ($("#reviewSearch")) $("#reviewSearch").value = "";
@@ -970,10 +979,19 @@
 
   async function pollJob(expectedJobId = state.jobId, requestId = state.jobRequest) {
     if (!expectedJobId || expectedJobId !== state.jobId || requestId !== state.jobRequest) return;
+    if (document.hidden) {
+      state.pollTimer = window.setTimeout(() => { void pollJob(expectedJobId, requestId); }, 15000);
+      return;
+    }
+    const pollKey = `find:${expectedJobId}`;
+    if (state.inFlightPolls.has(pollKey)) return;
+    state.inFlightPolls.add(pollKey);
+    let delay = 1500;
     $("#retryJobButton").hidden = true;
     try {
       const {job} = await api(`/api/jobs/${expectedJobId}`);
       if (expectedJobId !== state.jobId || requestId !== state.jobRequest) return;
+      delay = nextPollDelay("find", job);
       renderProgress(job);
       if ($("#activityDetails")?.open) loadActivity();
       if (isTerminal(job)) {
@@ -997,9 +1015,11 @@
       showError(error.message);
       $("#retryJobButton").hidden = false;
       return;
+    } finally {
+      state.inFlightPolls.delete(pollKey);
     }
     if (expectedJobId === state.jobId && requestId === state.jobRequest) {
-      state.pollTimer = window.setTimeout(() => { void pollJob(expectedJobId, requestId); }, 1500);
+      state.pollTimer = window.setTimeout(() => { void pollJob(expectedJobId, requestId); }, delay);
     }
   }
 
@@ -1183,11 +1203,14 @@
 
   async function loadReview(options = {}) {
     const requestId = ++state.reviewRequest;
+    state.reviewAbort?.abort();
+    const reviewAbort = new AbortController();
+    state.reviewAbort = reviewAbort;
     const snapshot = captureReviewUi();
     const host = $("#reviewCards");
     host?.setAttribute("aria-busy", "true");
     try {
-      const data = await api(`/api/workspace?${reviewParams()}`);
+      const data = await api(`/api/workspace?${reviewParams()}`, {signal: reviewAbort.signal});
       if (requestId !== state.reviewRequest) return false;
       state.reviewTotal = Number(data.total || 0);
       const exactSelected = availableNumber(data.summary, ["selected_charts", "selection_count"]);
@@ -1218,9 +1241,14 @@
       }
       refreshSelectionUi();
       $("#reviewSummary").textContent = `${state.reviewTotal.toLocaleString()} ${state.reviewTotal === 1 ? "song" : "songs"} in this view; ${additional.toLocaleString()} additional playable charts across your imported music.`;
-      host.innerHTML = (data.tracks || []).map((track, index) => reviewCard(track, state.reviewOffset + index)).join("") || `<div class="empty-state">No imported songs match this view.</div>`;
+      state.reviewTracks = data.tracks || [];
+      const markup = state.reviewTracks.map((track, index) => reviewCard(track, state.reviewOffset + index)).join("") || `<div class="empty-state">No imported songs match this view.</div>`;
+      if (host._riffMarkup !== markup || !host.firstElementChild) {
+        host.innerHTML = markup;
+        host._riffMarkup = markup;
+        bindReviewActions();
+      }
       host.setAttribute("aria-busy", "false");
-      bindReviewActions();
       const page = Math.floor(state.reviewOffset / 25) + 1;
       $("#reviewPage").textContent = `${page} / ${Math.max(1, Math.ceil(state.reviewTotal / 25))}`;
       $("#reviewPrev").disabled = state.reviewOffset === 0;
@@ -1233,6 +1261,7 @@
         announce(message);
       }
       syncSelectionBand();
+      emitStudioContext();
       return true;
     } catch (error) {
       if (requestId !== state.reviewRequest) return false;
@@ -1256,12 +1285,12 @@
     $("#expansionSelectedCount").textContent = state.expansionSelectionKnown ? state.expansionSelected.toLocaleString() : "...";
     const hasConfirmedSelection = exactConfirmed > 0 || expansionConfirmed > 0;
     $("#continueDownloadButton").disabled = !hasConfirmedSelection || state.selectionBusy || state.selectionStale || state.expansionBusy;
-    $("#continueDownloadButton").textContent = "Continue";
+    $("#continueDownloadButton").textContent = "Build my ZIP";
     $("#continueDownloadButton").setAttribute(
       "aria-label",
       state.selectionTotalKnown && state.selected
-        ? `Continue with ${state.selected.toLocaleString()} selected ${state.selected === 1 ? "chart" : "charts"}`
-        : hasConfirmedSelection ? "Continue with the currently confirmed chart selections" : "Continue with selected charts"
+        ? `Build my ZIP with ${state.selected.toLocaleString()} selected ${state.selected === 1 ? "chart" : "charts"}`
+        : hasConfirmedSelection ? "Build my ZIP with the currently confirmed chart selections" : "Build my ZIP with selected charts"
     );
     const modeLabels = {
       best_matches: "Last action: selected recommended charts.",
@@ -1276,6 +1305,7 @@
     syncSelectionBand();
     syncExpansionStart();
     syncExpansionBulk();
+    document.dispatchEvent(new CustomEvent("riff:selection-state", {detail: selectionSnapshot()}));
   }
 
   function syncSelectionBand() {
@@ -1285,6 +1315,11 @@
     const compact = window.matchMedia("(max-width: 1000px)").matches;
     if (!compact || stage.hidden) {
       rail.classList.remove("is-in-flow");
+      if (!stage.hidden && !compact) {
+        const stickyTop = parseFloat(window.getComputedStyle(rail).top) || 0;
+        const tooTall = rail.getBoundingClientRect().height + stickyTop + 16 > window.innerHeight;
+        rail.classList.toggle("is-in-flow", tooTall);
+      }
       stage.style.removeProperty("padding-bottom");
       document.documentElement.style.removeProperty("scroll-padding-bottom");
       return;
@@ -1313,6 +1348,11 @@
     const details = $(".selection-options");
     if (!details) return;
     const viewport = window.matchMedia("(max-width: 1000px)").matches ? "mobile" : "desktop";
+    if (document.body.dataset.riffUi === "riff-studio-20261008") {
+      if (!details.dataset.viewport) details.open = false;
+      details.dataset.viewport = viewport;
+      return;
+    }
     if (details.dataset.viewport === viewport) return;
     details.dataset.viewport = viewport;
     details.open = viewport === "desktop";
@@ -1499,14 +1539,21 @@
   }
 
   function bindReviewActions() {
-    $$('[data-selection]').forEach(button => button.addEventListener("click", () => updateSelection(button)));
+    $$('[data-selection]').forEach(button => {
+      if (button.dataset.riffBound === "true") return;
+      button.dataset.riffBound = "true";
+      button.addEventListener("click", () => updateSelection(button));
+    });
     bindDisclosureState($("#reviewCards"));
     syncSelectionControls();
   }
 
   function bindDisclosureState(root) {
     if (!root) return;
-    $$('details[data-disclosure-key] > summary', root).forEach(summary => summary.addEventListener("click", () => {
+    $$('details[data-disclosure-key] > summary', root).forEach(summary => {
+      if (summary.dataset.riffBound === "true") return;
+      summary.dataset.riffBound = "true";
+      summary.addEventListener("click", () => {
       window.setTimeout(() => {
         const details = summary.parentElement;
         if (!details?.isConnected) return;
@@ -1515,8 +1562,12 @@
           sessionStorage.setItem(`riff:disclosures:${state.journey?.workspace_id}`, JSON.stringify(state.disclosurePreferences));
         } catch (_) { /* Disclosures still persist through in-page reconciliation. */ }
       }, 0);
-    }));
-    $$('details[data-disclosure-key]', root).forEach(details => details.addEventListener("toggle", () => {
+      });
+    });
+    $$('details[data-disclosure-key]', root).forEach(details => {
+      if (details.dataset.riffBound === "true") return;
+      details.dataset.riffBound = "true";
+      details.addEventListener("toggle", () => {
       const key = details.dataset.disclosureKey;
       if (details.open) {
         state.openDisclosures.add(key);
@@ -1525,7 +1576,8 @@
         state.closedDisclosures.add(key);
         state.openDisclosures.delete(key);
       }
-    }));
+      });
+    });
   }
 
   async function updateSelection(button) {
@@ -1542,13 +1594,18 @@
     const focusKey = button.dataset.focusKey;
     const action = button.dataset.selection === "clear" ? "Chart choice cleared." : "Chart selected.";
     try {
-      await api("/api/selection", {method: "POST", body: JSON.stringify({track_key: button.dataset.track, candidate_id: Number(button.dataset.candidate), action: button.dataset.selection, confirm_possible: possible})});
+      const saved = await api("/api/selection", {method: "POST", body: JSON.stringify({track_key: button.dataset.track, candidate_id: Number(button.dataset.candidate), action: button.dataset.selection, confirm_possible: possible})});
       state.selectionMode = "custom";
       if (button.dataset.selection === "select" && button.dataset.disclosureParent) {
         state.closedDisclosures.delete(button.dataset.disclosureParent);
         state.openDisclosures.add(button.dataset.disclosureParent);
       }
-      const refreshed = await loadReview({focusKey, announcement: action, reconciliation: true});
+      const applied = applySelectionResponse(saved);
+      if (applied) {
+        $("#selectionMessage").textContent = `${action} ${chartCount(state.selected)} selected.`;
+        announce($("#selectionMessage").textContent);
+      }
+      const refreshed = applied || await loadReview({focusKey, announcement: action, reconciliation: true});
       if (!refreshed) {
         setButtonBusy(button, false);
         markSelectionStale(action);
@@ -1720,6 +1777,7 @@
         finally { state.expansionLoading = false; setButtonBusy(more, false); }
       };
       bindExpansionActions();
+      emitStudioContext();
       restoreReviewUi(snapshot, options.focusKey || "");
       const job = artistData?.job;
       if (job && ["queued", "running"].includes(job.status)) {
@@ -1769,7 +1827,11 @@
   }
 
   function bindExpansionActions() {
-    $$('[data-expansion-selection]').forEach(button => button.addEventListener("click", () => updateExpansionSelection(button)));
+    $$('[data-expansion-selection]').forEach(button => {
+      if (button.dataset.riffBound === "true") return;
+      button.dataset.riffBound = "true";
+      button.addEventListener("click", () => updateExpansionSelection(button));
+    });
     bindDisclosureState($("#expansionCards"));
     syncSelectionControls();
   }
@@ -1788,7 +1850,7 @@
     clearSelectionFeedback();
     setButtonBusy(button, true, "Saving...");
     try {
-      await api("/api/selection", {method: "POST", body: JSON.stringify({
+      const saved = await api("/api/selection", {method: "POST", body: JSON.stringify({
         kind: "expansion",
         artist_norm: button.dataset.artist,
         candidate_id: Number(button.dataset.candidate),
@@ -1796,9 +1858,12 @@
         confirm_possible: possible,
       })});
       state.selectionMode = "custom";
-      state.expansionSelectionKnown = false;
-      refreshSelectionUi();
-      const refreshed = await loadExpansion(false, {reconciliation: true, focusKey: `expansion:${focusKey}`});
+      const applied = applySelectionResponse(saved);
+      if (!applied) {
+        state.expansionSelectionKnown = false;
+        refreshSelectionUi();
+      }
+      const refreshed = applied || await loadExpansion(false, {reconciliation: true, focusKey: `expansion:${focusKey}`});
       if (refreshed) {
         const replacement = $$('[data-expansion-focus]').find(node => node.dataset.expansionFocus === focusKey);
         replacement?.focus({preventScroll: true});
@@ -1984,10 +2049,19 @@
 
   async function pollExpansionJob(expectedJobId = state.expansionJobId, requestId = state.expansionPollRequest) {
     if (!state.expansionPolling || !expectedJobId || expectedJobId !== state.expansionJobId || requestId !== state.expansionPollRequest) return;
+    if (document.hidden) {
+      state.expansionPollTimer = window.setTimeout(() => { void pollExpansionJob(expectedJobId, requestId); }, 15000);
+      return;
+    }
+    const pollKey = `expansion:${expectedJobId}`;
+    if (state.inFlightPolls.has(pollKey)) return;
+    state.inFlightPolls.add(pollKey);
+    let delay = 1500;
     const status = $("#expansionStatus");
     try {
       const {job} = await api(`/api/jobs/${expectedJobId}`);
       if (!state.expansionPolling || expectedJobId !== state.expansionJobId || requestId !== state.expansionPollRequest) return;
+      delay = nextPollDelay("expansion", job);
       const done = Number(job.progress?.completed_artists || 0);
       const total = Number(job.progress?.total_artists || 0);
       status.textContent = job.status === "queued"
@@ -2013,9 +2087,11 @@
       $("#retryExpansionButton").hidden = false;
       showError(error.message);
       return;
+    } finally {
+      state.inFlightPolls.delete(pollKey);
     }
     if (state.expansionPolling && expectedJobId === state.expansionJobId && requestId === state.expansionPollRequest) {
-      state.expansionPollTimer = window.setTimeout(() => { void pollExpansionJob(expectedJobId, requestId); }, 1200);
+      state.expansionPollTimer = window.setTimeout(() => { void pollExpansionJob(expectedJobId, requestId); }, delay);
     }
   }
 
@@ -2029,6 +2105,97 @@
 
   function chartCount(value) {
     return `${value.toLocaleString()} ${value === 1 ? "chart" : "charts"}`;
+  }
+
+  function selectionSnapshot() {
+    return {
+      workspace: state.journey?.workspace_id ?? null,
+      generation: $("#expansionChoices")?.dataset.generation || "",
+      stage: document.body.dataset.riffStage,
+      busy: state.selectionBusy || state.expansionBusy || state.deliveryBusy,
+      stale: state.selectionStale,
+      known: state.selectionTotalKnown,
+      charts: state.selected,
+    };
+  }
+
+  function emitStudioContext() {
+    document.dispatchEvent(new CustomEvent("riff:studio-context", {
+      detail: {...selectionSnapshot(), tracks: state.reviewTracks},
+    }));
+  }
+
+  function applySelectionResponse(data) {
+    const library = data?.summary?.library;
+    const expansion = data?.summary?.expansion;
+    const counts = [library?.songs, library?.charts, expansion?.songs, expansion?.charts];
+    if (!counts.every(value => Number.isSafeInteger(value) && value >= 0)
+        || !Array.isArray(data?.selected?.library) || !Array.isArray(data?.selected?.expansion)) return false;
+    state.exactSelectedSongs = library.songs;
+    state.exactSelected = library.charts;
+    state.expansionSelected = expansion.charts;
+    state.exactSelectionKnown = state.exactSelectedSongsKnown = state.expansionSelectionKnown = true;
+    const libraryIds = new Set(data.selected.library.map(row => `${row.track_key}:${row.candidate_id}`));
+    const expansionIds = new Set(data.selected.expansion.map(row => Number(row.candidate_id)));
+    for (const track of state.reviewTracks) {
+      for (const candidate of track.candidates || []) {
+        const selected = libraryIds.has(`${track.track_key}:${candidate.candidate_id}`);
+        if (candidate.selected === selected) continue;
+        candidate.selected = selected;
+        const button = $$('[data-selection]').find(node => node.dataset.track === track.track_key && Number(node.dataset.candidate) === candidate.candidate_id);
+        if (button) button.outerHTML = candidateAction(track, candidate, button.dataset.focusKey);
+      }
+    }
+    for (const song of state.expansionCards) {
+      for (const candidate of song.candidates || []) {
+        const selected = expansionIds.has(Number(candidate.candidate_id));
+        if (candidate.selected === selected) continue;
+        candidate.selected = selected;
+        const button = $$('[data-expansion-selection]').find(node => Number(node.dataset.candidate) === candidate.candidate_id);
+        if (button) button.outerHTML = expansionCandidateAction(song, candidate);
+      }
+    }
+    const host = $("#reviewCards");
+    if (host) host._riffMarkup = null;
+    clearSelectionStale();
+    bindReviewActions();
+    bindExpansionActions();
+    refreshSelectionUi();
+    document.dispatchEvent(new CustomEvent("riff:selection-committed", {detail: data}));
+    if (state.reviewFilter === "selected") void loadReview();
+    return true;
+  }
+
+  function beginStudioMutation() {
+    if (state.selectionBusy || state.selectionStale || state.expansionBusy || state.deliveryBusy) return false;
+    state.selectionBusy = true;
+    state.reviewRequest += 1;
+    state.expansionRequest += 1;
+    state.reviewAbort?.abort();
+    clearSelectionFeedback();
+    syncSelectionControls();
+    refreshSelectionUi();
+    return true;
+  }
+
+  function finishStudioMutation() {
+    state.selectionBusy = false;
+    syncSelectionControls();
+    refreshSelectionUi();
+  }
+
+  async function reconcileStudioSelection(message = "Chart choices saved.") {
+    const [reviewed, expanded] = await Promise.all([
+      loadReview({reconciliation: true, preserveStale: true}),
+      loadExpansion(false, {reconciliation: true}),
+    ]);
+    if (!reviewed || !expanded) {
+      markSelectionStale(message);
+      return false;
+    }
+    clearSelectionStale();
+    refreshSelectionUi();
+    return true;
   }
 
   function deliverySnapshot() {
@@ -2066,6 +2233,13 @@
   async function pollDownloadJob(expectedJobId, requestId) {
     const current = () => state.downloadPolling && state.downloadJobId === expectedJobId && state.downloadPollRequest === requestId;
     if (!current()) return;
+    if (document.hidden) {
+      state.downloadPollTimer = window.setTimeout(() => { void pollDownloadJob(expectedJobId, requestId); }, 15000);
+      return;
+    }
+    const pollKey = `download:${expectedJobId}`;
+    if (state.inFlightPolls.has(pollKey)) return;
+    state.inFlightPolls.add(pollKey);
     try {
       const {job} = await api(`/api/jobs/${expectedJobId}`);
       if (!current()) return;
@@ -2076,7 +2250,7 @@
         $("#downloadStatus").textContent = job?.status === "queued"
           ? "Your ZIP is queued on the server. You can leave and return to check its status."
           : `${job?.message || "Riff is validating and packaging your selected charts."} You can leave and return to check its status.`;
-        state.downloadPollTimer = window.setTimeout(() => { void pollDownloadJob(expectedJobId, requestId); }, 1500);
+        state.downloadPollTimer = window.setTimeout(() => { void pollDownloadJob(expectedJobId, requestId); }, nextPollDelay("download", job));
         return;
       }
       if (!["complete", "partial", "failed", "cancelled", "interrupted"].includes(job.status)) {
@@ -2122,7 +2296,18 @@
       $("#refreshDownloadButton").hidden = false;
       showError(error.message);
       syncDeliveryControls();
+    } finally {
+      state.inFlightPolls.delete(pollKey);
     }
+  }
+
+  function nextPollDelay(kind, job) {
+    const meaningfulProgress = Object.fromEntries(Object.entries(job.progress || {}).filter(([key]) => !/elapsed|timestamp|eta|rate|updated_at/.test(key)));
+    const signature = JSON.stringify([job.id, job.status, job.phase, job.message, meaningfulProgress]);
+    const previous = state.pollBackoff[kind];
+    const unchanged = previous?.signature === signature ? previous.unchanged + 1 : 0;
+    state.pollBackoff[kind] = {signature, unchanged};
+    return Math.min(6000, 1500 * (1 + unchanged));
   }
 
   function syncDeliveryControls() {
@@ -2371,7 +2556,7 @@
     const expires = availableNumber(download, ["expires_at"]);
     const available = Boolean(download?.token && (expires === null || expires * 1000 > Date.now()) && summary?.success !== false && published !== 0);
     const hasIssues = (failed !== null && failed > 0) || (remaining !== null && remaining > 0) || Boolean(summary?.errors?.length) || (selection && selected !== null && selection.total !== selected);
-    $("#doneTitle").textContent = !available ? "This download is not available." : hasIssues ? "Your ZIP is ready, with exceptions." : published === null ? "Your ZIP is available." : "Your Riff library is ready.";
+    $("#doneTitle").textContent = !available ? "This download is not available." : hasIssues ? "Your ZIP is ready, with exceptions." : published === null ? "Your ZIP is available." : "Your setlist. Ready to play.";
     $("#doneSummary").textContent = !available
       ? "No usable delivery link is confirmed. It may have been used, expired, or lost after a server restart. Review your choices or prepare a new download; Riff cannot verify a saved copy on this device."
       : published !== null
@@ -2481,6 +2666,21 @@
 
   function bindAuthenticated() {
     syncSelectionOptions();
+    document.addEventListener("visibilitychange", () => {
+      if (document.hidden) return;
+      if (state.pollTimer) {
+        window.clearTimeout(state.pollTimer);
+        void pollJob();
+      }
+      if (state.expansionPollTimer && state.expansionPolling) {
+        window.clearTimeout(state.expansionPollTimer);
+        void pollExpansionJob();
+      }
+      if (state.downloadPollTimer && state.downloadPolling) {
+        window.clearTimeout(state.downloadPollTimer);
+        void pollDownloadJob(state.downloadJobId, state.downloadPollRequest);
+      }
+    });
     window.addEventListener("resize", () => {
       syncSelectionOptions();
       syncSelectionBand();
@@ -2560,6 +2760,11 @@
     restore();
   }
 
+  window.RiffStudioAPI = Object.freeze({
+    api, context: selectionSnapshot, begin: beginStudioMutation, finish: finishStudioMutation,
+    apply: applySelectionResponse, reconcile: reconcileStudioSelection,
+    stale: markSelectionStale, announce, difficulty: difficultyPresentation,
+  });
   $("#logoutButton")?.addEventListener("click", logout);
   if (authenticated && app) bindAuthenticated(); else bindGuest();
 })();

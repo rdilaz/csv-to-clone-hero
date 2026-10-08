@@ -116,7 +116,7 @@ def test_public_landing_mobile_and_desktop(public_server, support_enabled):
                 errors = []
                 page.on("console", lambda message: errors.append(message.text) if message.type == "error" else None)
                 page.goto(base_url + "/", wait_until="networkidle")
-                assert page.get_by_role("heading", name="Music you love. Ready to play.").is_visible()
+                assert page.get_by_role("heading", name="Find your next favorite riff.").is_visible()
                 login = page.get_by_role("link", name="Connect Spotify")
                 assert login.is_visible()
                 assert login.bounding_box()["height"] >= 44
@@ -235,7 +235,7 @@ def test_signal_check_confirm_keeps_multi_chart_selection_truthful(
         page.route("**/api/**", fixtures.fulfill)
         page.goto(base_url + "/", wait_until="networkidle")
 
-        playwright.expect(page.get_by_role("heading", name="Choose your charts")).to_be_visible()
+        playwright.expect(page.get_by_role("heading", name="Build your setlist.")).to_be_visible()
         playwright.expect(page.locator("#selectedCount")).to_have_text("3")
         playwright.expect(page.locator("#exactSelectedCount")).to_have_text("3")
         playwright.expect(page.locator("#selectedSongCount")).to_have_text("1")
@@ -255,6 +255,10 @@ def test_signal_check_confirm_keeps_multi_chart_selection_truthful(
         _assert_no_overflow(page)
 
         if viewport["width"] <= 1000:
+            primary_box = page.locator("#studio-select-all").bounding_box()
+            initial_rail = page.locator("#selectionRail").bounding_box()
+            assert primary_box and initial_rail and 0 <= primary_box["y"] and primary_box["y"] + primary_box["height"] + 7 <= initial_rail["y"]
+            page.locator('[data-candidate="101"]').scroll_into_view_if_needed()
             group_box = page.locator(".song-group").first.bounding_box()
             action_box = page.locator('[data-candidate="101"]').bounding_box()
             band_box = page.locator("#selectionRail").bounding_box()
@@ -267,10 +271,9 @@ def test_signal_check_confirm_keeps_multi_chart_selection_truthful(
                     banner_height = banner_box["height"]
                 else:
                     assert page.locator(".cause-bar").count() == 0
-                # The imported-song totals add useful leading content. The
-                # first chart and its action must still fit above the rail
-                # without scrolling, rather than keep an old pixel budget.
-                assert 0 <= group_box["y"] < action_box["y"]
+                # The studio action is visible initially; individual chart
+                # actions remain clear of the tray when browsing the results.
+                assert group_box["y"] < action_box["y"] and action_box["y"] >= 0
             assert "is-in-flow" not in (page.locator("#selectionRail").get_attribute("class") or "")
             assert action_box["y"] + action_box["height"] + 7 <= band_box["y"]
         else:
@@ -439,7 +442,7 @@ def test_signal_check_keeps_combined_count_unknown_when_expansion_recount_fails(
         )
         playwright.expect(page.locator("#continueDownloadButton")).to_be_enabled()
         assert page.locator("#continueDownloadButton").get_attribute("aria-label") == (
-            "Continue with the currently confirmed chart selections"
+            "Build my ZIP with the currently confirmed chart selections"
         )
         browser.close()
 
@@ -469,6 +472,9 @@ def test_signal_check_selection_summary_reflows_at_tablet_widths(
         page.route("**/api/**", fixtures.fulfill)
         page.goto(base_url + "/", wait_until="networkidle")
 
+        primary = page.locator("#studio-select-all").bounding_box()
+        assert primary and 0 <= primary["y"] and primary["y"] + primary["height"] <= viewport["height"]
+        page.locator('[data-candidate="101"]').scroll_into_view_if_needed()
         rail = page.locator("#selectionRail")
         rail_box = rail.bounding_box()
         continue_box = page.locator("#continueDownloadButton").bounding_box()
@@ -682,6 +688,7 @@ def test_signal_check_reflows_at_320_and_respects_reduced_motion(public_server, 
         page.goto(base_url + "/", wait_until="networkidle")
 
         _assert_no_overflow(page)
+        _assert_in_viewport(page, "#studio-select-all")
         assert page.locator(".journey-steps li").count() == 5
         assert all(
             box and box["x"] >= 0 and box["x"] + box["width"] <= 320
@@ -710,6 +717,7 @@ def test_signal_check_reflows_at_320_and_respects_reduced_motion(public_server, 
             "element => ({outline: getComputedStyle(element).outlineColor, shadow: getComputedStyle(element).boxShadow})"
         )
         assert focus_style["shadow"] != "none"
+        page.locator('[data-candidate="101"]').scroll_into_view_if_needed()
         rail = page.locator("#selectionRail")
         action_box = page.locator('[data-candidate="101"]').bounding_box()
         rail_box = rail.bounding_box()
@@ -1022,7 +1030,7 @@ def test_public_authenticated_journey_to_download_ready(
         assert page.locator("#progressEta").inner_text() == "About 4-6 minutes"
         _assert_in_viewport(page, "#progressEta")
         _assert_no_overflow(page)
-        page.get_by_role("heading", name="Choose your charts").wait_for()
+        page.get_by_role("heading", name="Build your setlist.").wait_for()
         workspace_requests = [
             path for method, path, _body in api_calls
             if method == "GET" and path.startswith("/api/workspace?")
@@ -1059,7 +1067,7 @@ def test_public_authenticated_journey_to_download_ready(
             page.get_by_text("2 combined unique songs in the latest import", exact=True)
         ).to_be_visible()
         page.get_by_role("button", name="Find charts").click()
-        page.get_by_role("heading", name="Choose your charts").wait_for()
+        page.get_by_role("heading", name="Build your setlist.").wait_for()
 
         concern = page.locator(".song-group > .candidate-row .concern-details > summary")
         if has_touch:
@@ -1071,7 +1079,7 @@ def test_public_authenticated_journey_to_download_ready(
         assert page.get_by_text("This chart is an alternate album version.").is_visible()
         _assert_no_overflow(page)
 
-        if has_touch:
+        if page.locator(".selection-options").get_attribute("open") is None:
             page.locator(".selection-options > summary").click()
         page.locator("#selectBestButton").click()
         page.locator("#continueDownloadButton").wait_for(state="visible")
@@ -1081,12 +1089,12 @@ def test_public_authenticated_journey_to_download_ready(
             pytest.fail(f"selection did not settle: calls={api_calls!r}, error={page.locator('#appError').inner_text()!r}")
         assert page.locator("#selectionMode").inner_text() == "Last action: selected recommended charts."
         assert page.get_by_role("button", name="Selected Misery Business chart by Community Charter. Clear this choice.").is_visible()
-        assert page.locator("#continueDownloadButton").inner_text() == "Continue"
-        page.get_by_role("button", name="Continue with 1 selected chart").click()
-        assert page.get_by_role("heading", name="Prepare your Riff library.").is_visible()
+        assert page.locator("#continueDownloadButton").inner_text() == "Build my ZIP"
+        page.get_by_role("button", name="Build my ZIP with 1 selected chart").click()
+        assert page.get_by_role("heading", name="Pack the music. Bring the noise.").is_visible()
         assert "Songs folder" not in page.locator("#stageDownload").inner_text()
         page.get_by_role("button", name="Prepare my Riff library").click()
-        page.get_by_role("heading", name="Your Riff library is ready.").wait_for()
+        page.get_by_role("heading", name="Your setlist. Ready to play.").wait_for()
         download = page.get_by_role("link", name="Download library")
         assert download.is_visible()
         assert download.bounding_box()["height"] >= 44
@@ -1320,7 +1328,7 @@ def test_public_expansion_confirm_and_reload_in_browser(public_server):
         page.route("**/api/**", route_api)
         page.goto(base_url + "/", wait_until="networkidle")
 
-        playwright.expect(page.get_by_role("heading", name="Add more songs by artists you already love.")).to_be_visible()
+        playwright.expect(page.get_by_role("heading", name="More from your favorite artists.")).to_be_visible()
         page.get_by_label("Paramore", exact=False).check()
         page.get_by_role("button", name="Find more songs by selected artists").click()
         playwright.expect(page.locator(".review-card--expansion")).to_contain_text("Decode")
@@ -1335,7 +1343,7 @@ def test_public_expansion_confirm_and_reload_in_browser(public_server):
         playwright.expect(page.locator('[data-expansion-selection="select"]')).to_be_disabled()
         page.locator("#retrySelectionButton").click()
         playwright.expect(page.locator("#selectedCount")).to_have_text("1")
-        assert page.get_by_role("button", name="Continue with 1 selected chart").is_enabled()
+        assert page.get_by_role("button", name="Build my ZIP with 1 selected chart").is_enabled()
         _assert_no_overflow(page)
 
         page.reload(wait_until="networkidle")
