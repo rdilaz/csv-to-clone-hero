@@ -154,8 +154,10 @@
             <div><dt id="chartsFoundLabel">Songs with recommended charts</dt><dd id="chartsFoundCount">...</dd></div>
             <div><dt>Selected charts from your music</dt><dd id="librarySelectedChartCount">...</dd></div>
           </dl>
-          <p class="library-boundary">Selected imports only</p>
-          <p class="catalog-brief" id="catalogCoverageBrief" role="status">Loading chart catalog coverage...</p>
+          <div class="library-context">
+            <div><p class="library-boundary">Selected imports only</p><p class="catalog-brief" id="catalogCoverageBrief" role="status">Loading chart catalog coverage...</p></div>
+            {% if config.server.enable_expansion %}<a class="expansion-jump" href="#expansionTitle" aria-label="Find more songs by artists in your imported music">Artist expansion ↓</a>{% endif %}
+          </div>
         </header>
 
         <section class="selection-tools" aria-labelledby="selectionToolsTitle">
@@ -201,9 +203,16 @@
     {% if config.server.enable_expansion %}
     <section class="expansion-panel" id="expansionPanel" aria-labelledby="expansionTitle">
       <div class="expansion-panel__heading">
-        <div><p class="kicker">OPTIONAL</p><h2 id="expansionTitle">Add more songs by artists you already love.</h2></div>
+        <div><p class="kicker">OPTIONAL</p><h2 id="expansionTitle" tabindex="-1">Add more songs by artists you already love.</h2></div>
         <p>Choose artists from your imported music. Riff only uses verified catalog coverage, skips every song already in your library, and keeps these choices separate from exact matches.</p>
       </div>
+      <fieldset class="expansion-coverage" id="expansionCoverageChoices">
+        <legend>How many additional songs?</legend>
+        <label><input type="radio" name="expansionCoverage" value="all" checked disabled><span>All eligible songs <small>Maximum catalog coverage</small></span></label>
+        <label><input type="radio" name="expansionCoverage" value="recommended"><span>Recommended amount <small>Use the per-artist song limit</small></span></label>
+      </fieldset>
+      <p class="fine-print" id="expansionCoverageExplanation">Loading expansion options...</p>
+      <label class="expansion-all-artists"><input type="checkbox" id="allExpansionArtists" disabled><span>All artists in my imported music <small id="allExpansionArtistCount">Loading eligible artists...</small></span></label>
       <div class="expansion-choices" id="expansionChoices" aria-live="polite"><p>Loading eligible artists...</p></div>
       <div class="expansion-actions">
         <button class="button button--secondary" id="startExpansionButton" type="button" disabled>Find more songs by selected artists</button>
@@ -213,6 +222,8 @@
       <p class="fine-print">Optional, not part of your imported song count. Finding again replaces the entire expansion set, including choices for unchecked artists; your music selections stay unchanged.</p>
       <div class="expansion-results" id="expansionResults" hidden>
         <div class="review-toolbar"><div><h2>Expansion recommendations</h2><p><span id="expansionResultCount">0</span> additional songs available</p></div></div>
+        <button class="button button--secondary" id="selectExpansionSongsButton" type="button" disabled>Select one chart per additional song</button>
+        <p class="fine-print">Prefer inspected charts with multiple guitar difficulty levels when available. Expert-only charts remain included; unknown levels are checked during ZIP preparation.</p>
       <div id="expansionCards"></div>
       <button class="button button--secondary" id="loadMoreExpansion" type="button" hidden>Load more songs</button>
       </div>

@@ -39,6 +39,13 @@
     expansionRequest: 0,
     expansionOffset: 0,
     expansionCards: [],
+    expansionCoverageMode: "all",
+    expansionAllSupported: false,
+    expansionAllArtists: false,
+    expansionAllArtistsSupported: false,
+    expansionEligibleArtists: 0,
+    expansionRecommendedArtists: 0,
+    expansionBulkSupported: false,
     selectionMode: "none",
     selectionBusy: false,
     selectionStale: false,
@@ -1268,6 +1275,7 @@
       : state.selectionTotalKnown ? modeLabels[state.selectionMode] || modeLabels.none : "Updating the combined selection total...";
     syncSelectionBand();
     syncExpansionStart();
+    syncExpansionBulk();
   }
 
   function syncSelectionBand() {
@@ -1356,6 +1364,7 @@
 
   function candidateRow(track, candidate) {
     const tier = tierPresentation(candidate);
+    const levels = difficultyPresentation(candidate);
     const review = candidate.review || {};
     const focusKey = `${track.track_key}:${candidate.candidate_id}`;
     const instruments = (candidate.instruments || []).map(instrument => String(instrument).replace(/_/g, " "));
@@ -1363,8 +1372,8 @@
     const rawDifficulty = candidate.diff_guitar;
     const convertedDifficulty = Number(rawDifficulty);
     const guitarDifficulty = rawDifficulty !== null && rawDifficulty !== undefined && rawDifficulty !== "" && Number.isFinite(convertedDifficulty) && convertedDifficulty >= 0
-      ? `Guitar difficulty ${rawDifficulty}`
-      : "Guitar difficulty not provided";
+      ? `Guitar intensity rating ${rawDifficulty}`
+      : "Guitar intensity rating not provided";
     const concerns = (review.concerns || []).filter(
       concern => !duplicatesTierReason(tier.reason, concern)
     );
@@ -1373,7 +1382,7 @@
     return `<div class="candidate-row ${candidate.selected ? "is-selected" : ""}">
       <div class="candidate-cell candidate-identity">
         <span class="match-badge ${candidate.result_tier === "POSSIBLE_MATCH" ? "match-badge--review" : ""}">${escapeHtml(tier.badge)}</span>
-        <h4>${escapeHtml(candidate.title || "Untitled chart")}</h4>
+        <h4>${escapeHtml(candidate.title || "Untitled chart")}${escapeHtml(levels.suffix)}</h4>
         <p>${escapeHtml(candidate.artist || "Artist not provided")}</p>
       </div>
       <div class="candidate-cell candidate-classification ${tier.uncertain ? "is-uncertain" : ""}">
@@ -1382,31 +1391,56 @@
         ${concerns.length ? `<details class="concern-details" data-disclosure-key="${escapeHtml(concernKey)}"${concernOpen}><summary>${concerns.length} chart ${concerns.length === 1 ? "concern" : "concerns"}</summary><div>${concerns.map(item => `<p>${escapeHtml(item)}</p>`).join("")}</div></details>` : ""}
       </div>
       <div class="candidate-cell candidate-source"><span class="candidate-label">Chart source</span><strong>${escapeHtml(candidate.charter || "Charter not listed")}</strong><small>${escapeHtml(candidate.source || "Source not listed")}</small></div>
-      <div class="candidate-cell candidate-evidence"><span class="candidate-label">Playable parts</span><strong>${escapeHtml(coverage)}</strong><small>${escapeHtml(guitarDifficulty)}</small></div>
+      <div class="candidate-cell candidate-evidence"><span class="candidate-label">Playable parts</span><strong>${escapeHtml(coverage)}</strong><small>${escapeHtml(guitarDifficulty)}</small><small class="difficulty-levels">${escapeHtml(levels.text)}</small></div>
       <div class="review-card__action">${candidateAction(track, candidate, focusKey)}</div>
     </div>`;
   }
 
   function candidateSummary(candidate, concernKey = "") {
     const tier = tierPresentation(candidate);
+    const levels = difficultyPresentation(candidate);
     const review = candidate.review || {};
     const instruments = (candidate.instruments || []).map(instrument => String(instrument).replace(/_/g, " "));
     const coverage = instruments.length ? instruments.join(", ") : "Instrument coverage not provided";
     const convertedDifficulty = Number(candidate.diff_guitar);
     const difficulty = candidate.diff_guitar !== null && candidate.diff_guitar !== undefined && candidate.diff_guitar !== "" && Number.isFinite(convertedDifficulty) && convertedDifficulty >= 0
-      ? `Guitar difficulty ${candidate.diff_guitar}`
-      : "Guitar difficulty not provided";
+      ? `Guitar intensity rating ${candidate.diff_guitar}`
+      : "Guitar intensity rating not provided";
     const version = candidate.pack_name || candidate.source || "Community chart";
     const concerns = (review.concerns || []).filter(concern => !duplicatesTierReason(tier.reason, concern));
     const concernOpen = concernKey ? disclosureOpenAttribute(concernKey, false) : "";
     return `<div class="review-card__chart candidate-summary">
       <span class="match-badge ${candidate.result_tier === "POSSIBLE_MATCH" ? "match-badge--review" : ""}">${escapeHtml(tier.badge)}</span>
-      <h4>${escapeHtml(candidate.artist)} - ${escapeHtml(candidate.title)}</h4>
+      <h4>${escapeHtml(candidate.artist)} - ${escapeHtml(candidate.title)}${escapeHtml(levels.suffix)}</h4>
       <p>${escapeHtml(version)}${candidate.charter ? ` · ${escapeHtml(candidate.charter)}` : ""}</p>
       <p>${escapeHtml(coverage)} · ${escapeHtml(difficulty)}</p>
+      <p class="difficulty-levels">${escapeHtml(levels.text)}</p>
       ${tier.reason ? `<p>${escapeHtml(tier.reason)}</p>` : ""}
       ${concerns.length ? `<details class="concern-details"${concernKey ? ` data-disclosure-key="${escapeHtml(concernKey)}"` : ""}${concernOpen}><summary>${concerns.length} chart ${concerns.length === 1 ? "concern" : "concerns"}</summary><div>${concerns.map(item => `<p>${escapeHtml(item)}</p>`).join("")}</div></details>` : ""}
     </div>`;
+  }
+
+  function difficultyPresentation(candidate) {
+    const coverage = candidate.difficulty_coverage || {};
+    const noteCount = availableNumber(coverage, ["playable_note_count"]);
+    const order = ["easy", "medium", "hard", "expert", "vocals"];
+    const rawParts = coverage.instruments;
+    const parts = rawParts && typeof rawParts === "object" && !Array.isArray(rawParts)
+      ? Object.entries(rawParts).map(([instrument, values]) => [instrument, Array.isArray(values) && values.every(level => order.includes(level)) ? order.filter(level => values.includes(level)) : []]).filter(([, levels]) => levels.length)
+      : [];
+    if (coverage.evidence !== "inspected_notes" || noteCount === null || noteCount <= 0 || !parts.length) {
+      return {suffix: "", text: "Difficulty levels unknown · note tracks not verified"};
+    }
+    const allExpert = coverage.expert_only === true
+      && parts.length === Object.keys(rawParts).length
+      && parts.every(([, levels]) => levels.length === 1 && levels[0] === "expert");
+    const guitarExpert = Array.isArray(coverage.guitar_difficulties)
+      && coverage.guitar_difficulties.length === 1 && coverage.guitar_difficulties[0] === "expert"
+      && parts.some(([instrument, levels]) => instrument === "guitar" && levels.length === 1 && levels[0] === "expert");
+    const describe = value => String(value).replace(/_/g, " ").replace(/^./, character => character.toUpperCase());
+    const text = parts.map(([instrument, levels]) => `${describe(instrument)}: ${levels.map(level => level === "vocals" ? "vocal part" : describe(level)).join(", ")}`).join("; ");
+    const unknownParts = parts.length < Object.keys(rawParts).length ? "; other part levels unknown" : "";
+    return {suffix: allExpert ? " (Expert only)" : guitarExpert ? " (Guitar: Expert only)" : "", text: `Inspected note tracks · ${text}${unknownParts}`};
   }
 
   function tierPresentation(candidate) {
@@ -1454,7 +1488,7 @@
   }
 
   function candidateAction(track, candidate, focusKey = `${track.track_key}:${candidate.candidate_id}`) {
-    const title = candidate.title || track.title || "chart";
+    const title = `${candidate.title || track.title || "chart"}${difficultyPresentation(candidate).suffix}`;
     const charter = candidate.charter || "unknown charter";
     const disclosureKey = `${track.track_key}:${candidate.result_tier}`;
     if (candidate.selected) return `<button class="button" type="button" data-selection="clear" data-track="${escapeHtml(track.track_key)}" data-candidate="${candidate.candidate_id}" data-focus-key="${escapeHtml(focusKey)}" data-disclosure-parent="${escapeHtml(disclosureKey)}" aria-label="Selected ${escapeHtml(title)} chart by ${escapeHtml(charter)}. Clear this choice."><span class="selection-check" aria-hidden="true">✓</span><span>Selected</span></button>`;
@@ -1622,6 +1656,17 @@
       }
       const artists = artistData?.artists || [];
       if (artistData) {
+        state.expansionAllSupported = (artistData.coverage_modes || []).includes("all");
+        state.expansionAllArtistsSupported = artistData.supports_all_artists === true;
+        state.expansionBulkSupported = artistData.supports_bulk_selection === true;
+        state.expansionEligibleArtists = availableNumber(artistData, ["eligible_artist_count"]) ?? artists.length;
+        state.expansionRecommendedArtists = artists.filter(artist => expansionRecommendedSongs(artist) > 0).length;
+        if (!state.expansionAllArtistsSupported) state.expansionAllArtists = false;
+        if (!state.expansionAllSupported) state.expansionCoverageMode = "recommended";
+        const activeMode = artistData.job?.progress?.coverage_mode;
+        if (["queued", "running"].includes(artistData.job?.status) && ["all", "recommended"].includes(activeMode)) state.expansionCoverageMode = activeMode;
+        if (["queued", "running"].includes(artistData.job?.status) && typeof artistData.job?.progress?.all_artists === "boolean") state.expansionAllArtists = artistData.job.progress.all_artists && state.expansionAllArtistsSupported;
+        syncExpansionCoverage();
         choices.dataset.available = String(Boolean(artistData.available));
         choices.dataset.maxArtists = String(artistData.max_artists || 25);
         if (!["queued", "running"].includes(artistData.job?.status)) setExpansionBusy(false);
@@ -1634,14 +1679,17 @@
         const checks = choices.dataset.loaded && sameGeneration ? new Set($$("input:checked", choices).map(input => input.value)) : null;
         choices.innerHTML = artists.map(artist => `<label>
           <input type="checkbox" value="${escapeHtml(artist.artist_norm)}" ${(checks ? checks.has(artist.artist_norm) : artist.selected) ? "checked" : ""}>
-          <span><strong>${escapeHtml(artist.artist)}</strong><small>${Number(artist.eligible_songs || 0).toLocaleString()} eligible ${Number(artist.eligible_songs) === 1 ? "song" : "songs"} / ${chartCount(Number(artist.eligible_charts || 0))}; up to ${Number(artist.cap || 0).toLocaleString()} ${Number(artist.cap) === 1 ? "song" : "songs"} recommended</small></span>
+          <span><strong>${escapeHtml(artist.artist)}</strong><small data-expansion-coverage data-eligible-songs="${Number(artist.eligible_songs || 0)}" data-recommended-eligible-songs="${availableNumber(artist, ["recommended_eligible_songs"]) ?? ""}" data-eligible-charts="${Number(artist.eligible_charts || 0)}" data-cap="${Number(artist.cap || 0)}">${escapeHtml(expansionArtistCoverage(artist))}</small></span>
         </label>`).join("") || `<p class="empty-state">No imported artists have additional eligible catalog songs.</p>`;
         choices.dataset.loaded = "true";
         choices.dataset.generation = String(artistData.exact_generation_id || "");
         choices.onchange = () => {
+          syncExpansionCoverage();
           const count = $$("input:checked", choices).length;
-          start.disabled = state.expansionBusy || state.selectionBusy || state.selectionStale || count === 0 || count > Number(artistData.max_artists || 25);
-          status.textContent = count > Number(artistData.max_artists || 25)
+          syncExpansionStart();
+          status.textContent = state.expansionAllArtists
+            ? `${expansionArtistCount().toLocaleString()} eligible artists included from your imported music.`
+            : count > Number(artistData.max_artists || 25)
             ? `Choose no more than ${Number(artistData.max_artists || 25)} artists.`
             : `${count.toLocaleString()} ${count === 1 ? "artist" : "artists"} selected.`;
         };
@@ -1713,7 +1761,7 @@
 
   function expansionCandidateAction(song, candidate) {
     const focusKey = `${song.song_key}:${candidate.candidate_id}`;
-    const label = `${escapeHtml(candidate.title)} chart by ${escapeHtml(candidate.charter || "unknown charter")}`;
+    const label = `${escapeHtml(candidate.title)}${escapeHtml(difficultyPresentation(candidate).suffix)} chart by ${escapeHtml(candidate.charter || "unknown charter")}`;
     if (candidate.selected) return `<button class="button button--secondary" type="button" data-expansion-selection="clear" data-artist="${escapeHtml(candidate.artist_norm)}" data-candidate="${candidate.candidate_id}" data-expansion-focus="${escapeHtml(focusKey)}" data-focus-key="expansion:${escapeHtml(focusKey)}" aria-label="Selected expansion ${label}. Clear this choice.">Selected</button>`;
     if (!candidate.selectable) return `<button class="button button--secondary" type="button" disabled>Unavailable</button>`;
     const possible = candidate.result_tier === "POSSIBLE_MATCH";
@@ -1780,13 +1828,13 @@
     const button = $("#startExpansionButton");
     if (button.disabled || state.expansionBusy || state.selectionBusy || state.selectionStale) return;
     const selected = $$("#expansionChoices input:checked").map(input => input.value);
-    if (!selected.length) return;
+    if (!state.expansionAllArtists && !selected.length) return;
     if (state.expansionSelected && !window.confirm("Finding again replaces the entire expansion set, including saved choices for artists you unchecked. Your imported music choices stay unchanged. Continue?")) return;
     clearError();
     setExpansionBusy(true);
     setButtonBusy(button, true, "Starting...");
     try {
-      const result = await api("/api/expansion", {method: "POST", body: JSON.stringify({artists: selected})});
+      const result = await api("/api/expansion", {method: "POST", body: JSON.stringify({artists: state.expansionAllArtists ? [] : selected, all_artists: state.expansionAllArtists, coverage_mode: state.expansionCoverageMode})});
       attachExpansionJob(result.job.id);
     } catch (error) {
       if (error.data?.job?.kind === "expansion") {
@@ -1810,7 +1858,8 @@
       $("#expansionCards").replaceChildren();
       $("#expansionResults").hidden = true;
     }
-    $$("#expansionChoices input").forEach(input => { input.disabled = busy; });
+    $$("#expansionChoices input").forEach(input => { input.disabled = busy || state.expansionAllArtists; });
+    syncExpansionCoverage();
     $("#searchAgainButton").disabled = busy;
     if (busy) $("#startExpansionButton").disabled = true;
     syncSelectionControls();
@@ -1822,12 +1871,103 @@
     }
   }
 
+  function expansionArtistCoverage(artist) {
+    const eligible = Number(artist.eligible_songs || 0);
+    const cap = Number(artist.cap || 0);
+    const count = state.expansionCoverageMode === "all" ? eligible : Math.min(expansionRecommendedSongs(artist), cap);
+    return `${eligible.toLocaleString()} eligible songs / ${chartCount(Number(artist.eligible_charts || 0))}; ${state.expansionCoverageMode === "all" ? "include all" : "recommend up to"} ${count.toLocaleString()} ${count === 1 ? "song" : "songs"}`;
+  }
+
+  function expansionRecommendedSongs(artist) {
+    return availableNumber(artist, ["recommended_eligible_songs", "eligible_songs"]) ?? 0;
+  }
+
+  function expansionArtistCount() {
+    return state.expansionCoverageMode === "all" ? state.expansionEligibleArtists : state.expansionRecommendedArtists;
+  }
+
+  function syncExpansionCoverage() {
+    $$('[name="expansionCoverage"]').forEach(input => {
+      input.checked = input.value === state.expansionCoverageMode;
+      input.disabled = state.expansionBusy || (input.value === "all" && !state.expansionAllSupported);
+    });
+    const allArtists = $("#allExpansionArtists");
+    if (allArtists) {
+      allArtists.checked = state.expansionAllArtists;
+      allArtists.disabled = state.expansionBusy || !state.expansionAllArtistsSupported;
+    }
+    const artistCount = $("#allExpansionArtistCount");
+    if (artistCount) artistCount.textContent = state.expansionAllArtistsSupported
+      ? `${expansionArtistCount().toLocaleString()} eligible artists; the selected-artist limit does not apply`
+      : "Choose individual artists below";
+    $$("#expansionChoices input").forEach(input => {
+      const coverage = input.closest("label")?.querySelector("[data-expansion-coverage]");
+      const unavailable = state.expansionCoverageMode === "recommended" && coverage?.dataset.recommendedEligibleSongs === "0";
+      if (unavailable && !state.expansionBusy) input.checked = false;
+      input.disabled = state.expansionBusy || state.expansionAllArtists || unavailable;
+    });
+    const explanation = $("#expansionCoverageExplanation");
+    if (explanation) explanation.textContent = state.expansionCoverageMode === "all"
+      ? "Include every eligible catalog song for the artists you choose. Songs already imported are skipped. Charts still need your selection and download validation."
+      : "Use the recommended per-artist amount. Expert-only charts remain eligible; choosing this amount is not a difficulty filter.";
+    $$('[data-expansion-coverage]').forEach(node => {
+      node.textContent = expansionArtistCoverage({eligible_songs: node.dataset.eligibleSongs, recommended_eligible_songs: node.dataset.recommendedEligibleSongs, eligible_charts: node.dataset.eligibleCharts, cap: node.dataset.cap});
+    });
+  }
+
   function syncExpansionStart() {
     const choices = $("#expansionChoices");
     const button = $("#startExpansionButton");
     if (!choices || !button) return;
     const count = $$("input:checked", choices).length;
-    button.disabled = choices.dataset.available !== "true" || state.expansionBusy || state.selectionBusy || state.selectionStale || count === 0 || count > Number(choices.dataset.maxArtists || 25);
+    const invalidScope = state.expansionAllArtists
+      ? !state.expansionAllArtistsSupported || expansionArtistCount() === 0
+      : count === 0 || count > Number(choices.dataset.maxArtists || 25);
+    button.disabled = choices.dataset.available !== "true" || state.expansionBusy || state.selectionBusy || state.selectionStale || invalidScope;
+  }
+
+  function syncExpansionBulk() {
+    const button = $("#selectExpansionSongsButton");
+    if (!button) return;
+    button.disabled = !state.expansionBulkSupported || !state.expansionCards.length || !state.expansionSelectionKnown || state.expansionBusy || state.selectionBusy || state.selectionStale;
+  }
+
+  async function selectExpansionSongs() {
+    const button = $("#selectExpansionSongsButton");
+    if (!button || button.disabled || state.selectionBusy || state.expansionBusy || state.selectionStale) return;
+    if (!window.confirm("Replace your additional-song choices with one playable chart per expansion song? This includes compatible charts marked for review. Unknown difficulty levels will be checked during ZIP preparation. Your imported-song choices stay unchanged.")) return;
+    state.selectionBusy = true;
+    state.reviewRequest += 1;
+    state.expansionRequest += 1;
+    clearSelectionFeedback();
+    syncSelectionControls();
+    refreshSelectionUi();
+    setButtonBusy(button, true, "Saving choices...");
+    try {
+      await api("/api/expansion/selection/bulk", {method: "POST", body: JSON.stringify({preset: "one_per_song", confirm_possible: true})});
+      const [reviewed, expanded] = await Promise.all([
+        loadReview({reconciliation: true}),
+        loadExpansion(false, {reconciliation: true}),
+      ]);
+      if (!reviewed || !expanded) markSelectionStale("Additional-song choices saved; the updated selection summary is not yet confirmed.");
+      else {
+        const message = "One chart per additional song selected. Your imported-song choices are unchanged.";
+        $("#selectionMessage").textContent = message;
+        announce(message);
+      }
+    } catch (error) {
+      const [reviewed, expanded] = await Promise.all([
+        loadReview({reconciliation: true}),
+        loadExpansion(false, {reconciliation: true}),
+      ]);
+      if (!reviewed || !expanded) markSelectionStale(`${error.message || "Additional-song choices could not be saved."} The save result is not yet confirmed.`);
+      else showSelectionError(error.message || "Additional-song choices could not be saved.");
+    } finally {
+      state.selectionBusy = false;
+      setButtonBusy(button, false);
+      syncSelectionControls();
+      refreshSelectionUi();
+    }
   }
 
   function attachExpansionJob(jobId) {
@@ -2355,6 +2495,20 @@
     $("#refreshSpotifyButton")?.addEventListener("click", () => refreshSpotify(false));
     $("#findChartsButton")?.addEventListener("click", startDiscovery);
     $("#retrySearchButton")?.addEventListener("click", retrySearch);
+    $("#selectExpansionSongsButton")?.addEventListener("click", selectExpansionSongs);
+    $("#allExpansionArtists")?.addEventListener("change", event => {
+      if (event.currentTarget.disabled) return;
+      state.expansionAllArtists = event.currentTarget.checked;
+      syncExpansionCoverage();
+      $("#expansionChoices")?.onchange?.();
+    });
+    $$('[name="expansionCoverage"]').forEach(input => input.addEventListener("change", () => {
+      if (input.checked && !input.disabled) {
+        state.expansionCoverageMode = input.value;
+        syncExpansionCoverage();
+        $("#expansionChoices")?.onchange?.();
+      }
+    }));
     $("#changeMusicButton")?.addEventListener("click", () => { clearError(); openAddMusic(true); });
     $("#savedSearchResultsButton")?.addEventListener("click", async () => {
       clearError();

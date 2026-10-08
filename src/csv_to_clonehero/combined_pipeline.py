@@ -158,7 +158,7 @@ class CombinedDiscoveryResult:
         }
 
 
-MATCH_CACHE_VERSION = "combined-match-v9"
+MATCH_CACHE_VERSION = "combined-match-v10"
 
 
 def matching_cache_fingerprint(track: Any, catalog: Any, config: AppConfig, *, config_fingerprint: str = "") -> str:
@@ -750,6 +750,7 @@ def discover_combined(
                 for item in scored
                 if str(getattr(item[1], "eligibility", "")).upper()
                 in {"RECOMMENDED", "ELIGIBLE_REVIEW"}
+                and item[1].result_tier in SELECTABLE_RESULT_TIERS
             ]
             fallback_recovered = False
             if (
@@ -800,6 +801,7 @@ def discover_combined(
                         for item in scored
                         if str(getattr(item[1], "eligibility", "")).upper()
                         in {"RECOMMENDED", "ELIGIBLE_REVIEW"}
+                        and item[1].result_tier in SELECTABLE_RESULT_TIERS
                     ]
                     fallback_recovered = bool(eligible)
                 if fallback_recovered and not initial_broader_retrieval:
@@ -819,10 +821,12 @@ def discover_combined(
                 }
             strong = any(
                 str(getattr(breakdown, "eligibility", "")).upper() == "RECOMMENDED"
+                and breakdown.result_tier in SELECTABLE_RESULT_TIERS
                 for _, breakdown in scored
             )
             review = any(
                 str(getattr(breakdown, "eligibility", "")).upper() == "ELIGIBLE_REVIEW"
+                and breakdown.result_tier in SELECTABLE_RESULT_TIERS
                 for _, breakdown in scored
             )
             tier_limits = {
@@ -901,7 +905,7 @@ def discover_combined(
                 if str(getattr(breakdown, "eligibility", "")).upper() not in {
                     "RECOMMENDED",
                     "ELIGIBLE_REVIEW",
-                }:
+                } or breakdown.result_tier not in SELECTABLE_RESULT_TIERS:
                     result.rejected_candidates += 1
                 else:
                     result.eligible_candidates += 1
@@ -911,6 +915,7 @@ def discover_combined(
                 classification = "review"
             elif matches and scored and all(
                 bool(getattr(breakdown, "gate_factors", {}).get("hard_gate", False))
+                or breakdown.result_tier == BLOCKED
                 for _, breakdown in scored
             ):
                 classification = "not_playable"
@@ -1189,6 +1194,10 @@ def _primary_rejection_reason(
     if exemplar is None:
         return "no plausible candidate in current catalog snapshot"
     _, breakdown = exemplar
+    if getattr(breakdown, "result_tier", "") == BLOCKED:
+        tier_reasons = list(getattr(breakdown, "result_tier_reasons", ()) or ())
+        if tier_reasons and not bool(getattr(breakdown, "gate_factors", {}).get("hard_gate")):
+            return str(tier_reasons[0])
     reasons = [
         str(reason).casefold()
         for reason in (
@@ -1443,6 +1452,8 @@ def _eligible_artist_catalog(
     config: AppConfig,
     imported_identities: set[tuple[str, str]],
     db: Database | None = None,
+    *,
+    coverage_mode: str = "recommended",
 ) -> list[dict[str, Any]]:
     """Return eligible catalog songs, grouped by normalized song identity."""
     grouped: dict[tuple[str, str], list[tuple[ChartCandidate, Any]]] = {}
@@ -1456,7 +1467,9 @@ def _eligible_artist_catalog(
                 continue
             if db is not None and not db.is_chart_artifact_eligible(chart.source, chart.chart_id):
                 continue
-            breakdown = score_expansion_candidate(artist_norm, chart, config)
+            breakdown = score_expansion_candidate(
+                artist_norm, chart, config, include_compatible=coverage_mode == "all"
+            )
             if (
                 str(getattr(breakdown, "eligibility", "")).upper()
                 not in {RECOMMENDED, ELIGIBLE_REVIEW}
@@ -1498,6 +1511,7 @@ def rank_expansion_artists(
     config: AppConfig | None = None,
     *,
     db: Database | None = None,
+    coverage_mode: str = "recommended",
 ) -> list[dict[str, Any]]:
     """Rank imported primary artists by eligible, non-imported catalog coverage."""
     track_values = list(tracks)
@@ -1513,10 +1527,18 @@ def rank_expansion_artists(
         if config is None:
             eligible_songs = len(catalog_songs)
             eligible_charts = sum(len(rows) for _, rows in catalog_songs)
+            recommended_eligible_songs = eligible_songs
         else:
-            songs = _eligible_artist_catalog(catalog, artist_norm, config, imported, db)
+            songs = _eligible_artist_catalog(
+                catalog, artist_norm, config, imported, db, coverage_mode=coverage_mode
+            )
             eligible_songs = len(songs)
             eligible_charts = sum(len(song["charts"]) for song in songs)
+            floor = float(config.matching.export_eligibility_floor)
+            recommended_eligible_songs = sum(
+                any(float(scored.final_score) >= floor for _, scored in song["charts"])
+                for song in songs
+            )
         if eligible_songs <= 0:
             continue
         ranked.append({
@@ -1527,7 +1549,9 @@ def rank_expansion_artists(
             "catalog_charts": sum(len(rows) for _, rows in catalog_songs),
             "eligible_songs": eligible_songs,
             "eligible_charts": eligible_charts,
+            "recommended_eligible_songs": recommended_eligible_songs,
             "cap": _expansion_cap(config, imported_count) if config is not None else eligible_songs,
+            "coverage_mode": coverage_mode,
         })
     return sorted(
         ranked,
@@ -1551,8 +1575,11 @@ def _persist_expansion(
     *,
     exact_generation_id: int | None = None,
     on_progress: Any = None,
+    coverage_mode: str = "recommended",
 ) -> None:
-    choices = rank_expansion_artists(catalog, tracks, config, db=db)
+    choices = rank_expansion_artists(
+        catalog, tracks, config, db=db, coverage_mode=coverage_mode
+    )
     by_norm = {item["artist_norm"]: item for item in choices}
     selected: list[str] = []
     for value in artists:
@@ -1565,12 +1592,15 @@ def _persist_expansion(
     claimed_song_identities: set[tuple[str, str]] = set()
     for index, artist_norm in enumerate(selected, start=1):
         choice = by_norm[artist_norm]
+        song_limit = int(choice["eligible_songs"] if coverage_mode == "all" else choice["cap"])
         rows: list[dict[str, Any]] = []
         accepted_songs = 0
-        if int(choice["cap"]) <= 0:
+        if song_limit <= 0:
             prepared[artist_norm] = rows
             continue
-        for song in _eligible_artist_catalog(catalog, artist_norm, config, imported, db):
+        for song in _eligible_artist_catalog(
+            catalog, artist_norm, config, imported, db, coverage_mode=coverage_mode
+        ):
             identity = song["identity"]
             if identity in claimed_song_identities:
                 continue
@@ -1586,13 +1616,14 @@ def _persist_expansion(
                     "breakdown_json": breakdown.to_dict(),
                     "metadata": {
                         "song_identity": list(identity),
-                        "artist_cap": int(choice["cap"]),
+                        "artist_cap": song_limit,
+                        "coverage_mode": coverage_mode,
                         "cap_rank": accepted_songs,
                         "exact_generation_id": exact_generation_id,
                         "catalog_snapshot_id": str(getattr(catalog, "snapshot_id", "") or ""),
                     },
                 })
-            if accepted_songs >= int(choice["cap"]):
+            if accepted_songs >= song_limit:
                 break
         prepared[artist_norm] = rows
         if on_progress is not None:
@@ -1617,7 +1648,7 @@ def _persist_expansion(
             request_count=0,
         )
         result.candidates += len(prepared.get(artist_norm, ()))
-    result.eligible_candidates = result.candidates
+        result.eligible_candidates += len(prepared.get(artist_norm, ()))
     result.expansion_artists = choices
 
 
@@ -1627,6 +1658,7 @@ def workspace_expansion_choices(
     workspace_id: int | str,
     *,
     catalog: EnchorCatalog | None = None,
+    coverage_mode: str = "recommended",
 ) -> list[dict[str, Any]]:
     """Compute public choices from the workspace's canonical imported library."""
     catalog = catalog or load_enchor_catalog(config.catalog_path)
@@ -1635,6 +1667,7 @@ def workspace_expansion_choices(
         _workspace_expansion_tracks(db, workspace_id),
         config,
         db=db,
+        coverage_mode=coverage_mode,
     ) if catalog.available else []
 
 
@@ -1663,8 +1696,11 @@ def expand_combined(
     catalog: EnchorCatalog | None = None,
     exact_generation_id: int | None = None,
     on_progress: Any = None,
+    coverage_mode: str = "recommended",
 ) -> CombinedDiscoveryResult:
     """Persist selected artist expansion candidates without network searches."""
+    if coverage_mode not in {"all", "recommended"}:
+        raise ValueError("coverage_mode must be all or recommended")
     catalog = catalog or load_enchor_catalog(config.catalog_path)
     tracks = _workspace_expansion_tracks(db, workspace_id)
     result = CombinedDiscoveryResult(
@@ -1688,6 +1724,7 @@ def expand_combined(
             result,
             exact_generation_id=exact_generation_id,
             on_progress=on_progress,
+            coverage_mode=coverage_mode,
         )
     else:
         result.status = "partial"

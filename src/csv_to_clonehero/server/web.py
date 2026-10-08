@@ -29,6 +29,7 @@ from typing import Any, Callable
 from flask import Flask, abort, g, jsonify, redirect, render_template, request, send_file, session, url_for
 
 from csv_to_clonehero.config import AppConfig
+from csv_to_clonehero.catalog_validation import difficulty_preference_key, inspected_difficulty_coverage
 from csv_to_clonehero.database import Database
 from csv_to_clonehero.matching import (
     ALTERNATE_RECORDING,
@@ -660,7 +661,7 @@ def create_app(
         db = _user_db()
         try:
             workspace = _ensure_workspace(db, user)
-            context = _public_expansion_context(config, db, workspace)
+            context = _public_expansion_context(config, db, workspace, coverage_mode="all")
             prior_selected = {
                 str(row["artist_norm"]): (
                     bool(row["selected"])
@@ -714,6 +715,10 @@ def create_app(
                 **context,
                 "artists": artists,
                 "max_artists": min(25, int(config.expansion.max_artists_per_batch)),
+                "coverage_modes": ["all", "recommended"],
+                "supports_all_artists": True,
+                "supports_bulk_selection": True,
+                "eligible_artist_count": len(artists),
                 "job": _job_mapping_public(expansion_job) if expansion_job else None,
             })
         finally:
@@ -726,6 +731,12 @@ def create_app(
         if not config.server.enable_expansion:
             abort(404)
         payload = request.get_json(silent=True) or {}
+        coverage_mode = payload.get("coverage_mode", "recommended")
+        if not isinstance(coverage_mode, str) or coverage_mode not in {"all", "recommended"}:
+            return jsonify({"error": "coverage_mode must be all or recommended"}), 400
+        all_artists = payload.get("all_artists", False)
+        if not isinstance(all_artists, bool):
+            return jsonify({"error": "all_artists must be true or false"}), 400
         values = payload.get("artists")
         if not isinstance(values, list):
             return jsonify({"error": "artists must be a list"}), 400
@@ -735,18 +746,22 @@ def create_app(
             if norm and norm not in artists:
                 artists.append(norm)
         maximum = min(25, int(config.expansion.max_artists_per_batch))
-        if not artists:
+        if not artists and not all_artists:
             return jsonify({"error": "Choose at least one artist."}), 400
-        if len(artists) > maximum:
+        if len(artists) > maximum and not all_artists:
             return jsonify({"error": f"Choose no more than {maximum} artists at a time."}), 400
 
         db = _user_db()
         try:
             workspace = _ensure_workspace(db, user)
-            context = _public_expansion_context(config, db, workspace)
+            context = _public_expansion_context(config, db, workspace, coverage_mode=coverage_mode)
             if not context["available"]:
                 return jsonify({"error": context["reason"]}), 409
             allowed = {item["artist_norm"] for item in context["artists"]}
+            if all_artists:
+                artists = [item["artist_norm"] for item in context["artists"]]
+                if not artists:
+                    return jsonify({"error": "No compatible additional songs are available."}), 400
             unknown = [artist for artist in artists if artist not in allowed]
             if unknown:
                 return jsonify({"error": "Choose artists from the current eligible list."}), 400
@@ -764,6 +779,8 @@ def create_app(
                 workspace_key=key,
                 initial_progress={
                     "artists": artists,
+                    "all_artists": all_artists,
+                    "coverage_mode": coverage_mode,
                     "exact_generation_id": context["exact_generation_id"],
                     "total_artists": len(artists),
                     "completed_artists": 0,
@@ -805,6 +822,64 @@ def create_app(
             })
         except (TypeError, ValueError):
             return jsonify({"error": "invalid expansion paging parameters"}), 400
+        finally:
+            db.close()
+
+    @app.post("/api/expansion/selection/bulk")
+    def bulk_expansion_selection():
+        user = _require_user()
+        if not config.server.enable_expansion:
+            abort(404)
+        payload = request.get_json(silent=True) or {}
+        if payload.get("preset", "one_per_song") != "one_per_song":
+            return jsonify({"error": "unknown expansion selection preset"}), 400
+        if payload.get("confirm_possible") is not True:
+            return jsonify({"error": "Additional songs require explicit review confirmation."}), 400
+        db = _user_db()
+        try:
+            workspace = _ensure_workspace(db, user)
+            key = user_workspace_key(user["spotify_user_id"])
+            if any(db.get_active_job(int(user["id"]), workspace_key=key, kind=kind)
+                   is not None for kind in ("discovery", "expansion", "download")):
+                return jsonify({"error": "Wait for matching or ZIP preparation to finish before changing chart choices."}), 409
+            generation_id = _public_generation_id(db, workspace)
+            if generation_id is None or generation_id < 0:
+                return jsonify({"error": "Complete matching before choosing additional songs."}), 409
+            cards = _expansion_review_cards(config, db, workspace)
+            choices = []
+            for card in cards:
+                candidate = next((item for item in card["candidates"] if item.get("selectable")), None)
+                if candidate is not None:
+                    choices.append(candidate)
+            if not choices:
+                return jsonify({"error": "No compatible additional songs are available."}), 400
+            db.clear_workspace_selection(workspace, kind="expansion")
+            for item in choices:
+                db.select_workspace_candidate(
+                    workspace, None, int(item["candidate_id"]), kind="expansion",
+                    artist_norm=item["artist_norm"], force=True,
+                    require_workspace_candidate=True,
+                    metadata={
+                        "result_tier": item["result_tier"],
+                        "possible_confirmed": True,
+                        "selection_origin": "expansion_preset",
+                        "preset": "one_per_song",
+                    },
+                )
+            selected_ids = {
+                int(row["candidate_id"])
+                for row in db.list_workspace_selections(workspace, kind="expansion")
+                if str(row["status"]) == "selected"
+            }
+            selected_songs = sum(
+                any(int(item["candidate_id"]) in selected_ids for item in card["candidates"])
+                for card in cards
+            )
+            return jsonify({
+                "ok": True, "songs": selected_songs, "charts": len(selected_ids),
+                "changed": len(selected_ids), "scope": "expansion",
+                "minimum_score": db.get_workspace_minimum_score(workspace),
+            })
         finally:
             db.close()
 
@@ -1030,10 +1105,15 @@ def create_app(
                     )
                     if identity in _workspace_imported_identities(db, workspace):
                         raise ValueError("song is already represented by the imported library")
-                    current = _current_expansion_match(config, artist_norm, candidate)
+                    current = _current_expansion_match(
+                        config, artist_norm, candidate,
+                        coverage_mode=str(row_metadata.get("coverage_mode") or "recommended"),
+                    )
                 current_eligibility, current_hard_gate, current_score, _current_quality, current_breakdown = current
                 if current_hard_gate or current_eligibility == "INCOMPATIBLE":
                     raise ValueError("candidate is blocked by a hard compatibility gate")
+                if candidate_kind == "expansion" and current_eligibility not in {"RECOMMENDED", "ELIGIBLE_REVIEW"}:
+                    raise ValueError("candidate is not included in this expansion mode")
                 result_tier, tier_reasons = classify_result_tier(
                     current_breakdown, kind=candidate_kind
                 )
@@ -1228,13 +1308,19 @@ def create_app(
                         str(data.get(key) or "")
                         for key in ("track_artist", "track_title", "source", "chart_id")
                     ).casefold():
-                        candidate = _json_object(data.get("candidate_json"), {})
+                        candidate_data = _json_object(data.get("candidate_json"))
                         if needle not in " ".join(
-                            str(candidate.get(key) or "")
+                            str(candidate_data.get(key) or "")
                             for key in ("artist", "name", "charter", "url")
                         ).casefold():
                             continue
-                    data["_rank"] = (score, quality, -int(data.get("candidate_id") or 0))
+                    coverage_rank = difficulty_preference_key(
+                        inspected_difficulty_coverage(db, candidate)
+                    ) if scope == "best_matches" else (0, 0)
+                    data["_rank"] = (
+                        *(-value for value in coverage_rank), score, quality,
+                        -int(data.get("candidate_id") or 0),
+                    )
                     selected_rows.append((data, tier))
                 if scope == "best_matches":
                     best_by_track: dict[int, tuple[dict[str, Any], str]] = {}
@@ -1678,6 +1764,8 @@ def _public_expansion_context(
     config: AppConfig,
     db: Database,
     workspace_id: int,
+    *,
+    coverage_mode: str = "recommended",
 ) -> dict[str, Any]:
     if not config.server.enable_expansion:
         return {"enabled": False, "available": False, "reason": "Artist expansion is disabled.", "artists": []}
@@ -1713,7 +1801,7 @@ def _public_expansion_context(
         "available": True,
         "reason": "",
         "artists": workspace_expansion_choices(
-            config, db, workspace_id, catalog=catalog
+            config, db, workspace_id, catalog=catalog, coverage_mode=coverage_mode
         ),
         "exact_generation_id": int(generation["id"]),
         "catalog_snapshot_id": str(catalog.snapshot_id or ""),
@@ -1777,6 +1865,8 @@ def _current_expansion_match(
     config: AppConfig,
     artist_norm: str,
     candidate: Any,
+    *,
+    coverage_mode: str = "recommended",
 ) -> tuple[str, bool, float, float, dict[str, Any]]:
     """Reapply expansion-specific gates without treating it as an exact song."""
     if not artist_norm or candidate is None:
@@ -1788,7 +1878,9 @@ def _current_expansion_match(
     try:
         from csv_to_clonehero.matching import score_expansion_candidate
 
-        scored = score_expansion_candidate(artist_norm, candidate, config)
+        scored = score_expansion_candidate(
+            artist_norm, candidate, config, include_compatible=coverage_mode == "all"
+        )
         breakdown = scored.as_dict()
         eligibility = str(scored.eligibility or "EXCLUDED").upper()
         return (
@@ -1966,6 +2058,7 @@ def _review_cards(
             "pack_name": candidate.pack_name,
             "instruments": list(candidate.instruments or ()),
             "diff_guitar": candidate.diff_guitar,
+            "difficulty_coverage": inspected_difficulty_coverage(db, candidate),
             "url": candidate.url,
             "reference": candidate.reference,
             "supports_download": bool(candidate.supports_download),
@@ -2102,6 +2195,24 @@ def _review_cards(
             tier_order.get(item["result_tier"], 5),
             -item["score"], item["source"], str(item["chart_id"]),
         ))
+        # Preference only reorders the same recording and result tier; it
+        # cannot elevate a different artist/recording or a blocked chart.
+        same_recordings: dict[tuple[str, str, str], list[int]] = {}
+        for candidate_index, item in enumerate(candidates):
+            same_recordings.setdefault((
+                item["result_tier"], normalize_artist(item["artist"]),
+                normalize_title(item["title"]),
+            ), []).append(candidate_index)
+        for positions in same_recordings.values():
+            preferred = sorted(
+                [candidates[position] for position in positions],
+                key=lambda item: (
+                    difficulty_preference_key(item["difficulty_coverage"]),
+                    -item["score"], -item["quality"], item["source"], str(item["chart_id"]),
+                ),
+            )
+            for position, item in zip(positions, preferred):
+                candidates[position] = item
         if candidates:
             # A hard-gated high score is never presented as the best safe
             # recommendation when another usable version exists.
@@ -2187,12 +2298,17 @@ def _expansion_review_cards(
             continue
         artist_norm = str(data.get("artist_norm") or "")
         eligibility, hard_gate, score, quality, breakdown = _current_expansion_match(
-            config, artist_norm, candidate
+            config, artist_norm, candidate,
+            coverage_mode=str(metadata.get("coverage_mode") or "recommended"),
         )
         result_tier, tier_reasons = classify_result_tier(
             breakdown, kind="expansion"
         )
-        selectable = not hard_gate and result_tier in SELECTABLE_RESULT_TIERS
+        selectable = (
+            not hard_gate
+            and eligibility in {"RECOMMENDED", "ELIGIBLE_REVIEW"}
+            and result_tier in SELECTABLE_RESULT_TIERS
+        )
         identity = (
             normalize_artist(str(candidate.artist or "")),
             normalize_title(str(candidate.name or "")),
@@ -2216,6 +2332,7 @@ def _expansion_review_cards(
             "pack_name": candidate.pack_name,
             "instruments": list(candidate.instruments or ()),
             "diff_guitar": candidate.diff_guitar,
+            "difficulty_coverage": inspected_difficulty_coverage(db, candidate),
             "score": round(score, 1),
             "quality": round(quality, 1),
             "eligibility": eligibility,
@@ -2238,6 +2355,8 @@ def _expansion_review_cards(
     for identity, candidates in grouped.items():
         candidates.sort(
             key=lambda item: (
+                not item["selectable"],
+                difficulty_preference_key(item["difficulty_coverage"]),
                 -item["score"], -item["quality"], item["source"], item["chart_id"]
             )
         )

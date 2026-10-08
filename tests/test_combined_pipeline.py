@@ -27,6 +27,63 @@ class FakeCatalog:
         return (("Song", (self.chart,)),) if artist == "artist" else ()
 
 
+@pytest.mark.parametrize("title,artist,chart_title,chart_artist", [
+    ("65th & Ingleside", "Chance the Rapper", "10 Miles Wide", "Escape the Fate"),
+    ("Acid Rain", "Chance the Rapper", "Mad Man", "Haste the Day"),
+])
+def test_blocked_identity_does_not_inflate_catalog_yield_even_with_quality_bonus(
+    config, title, artist, chart_title, chart_artist
+):
+    from tests.conftest import make_chart
+    from csv_to_clonehero.matching import score_candidate, BLOCKED
+
+    wrong = make_chart(chart_title, chart_artist, chart_id=98001, icon="rb2", charter="Harmonix")
+    snapshot = LibrarySnapshot("soundcloud", [ProviderTrack("soundcloud", "wrong-pair", title, artist)])
+
+    class WrongCatalog(FakeCatalog):
+        def candidates(self, _artist, _title):
+            return (wrong,)
+
+    db = Database(config.database_path)
+    try:
+        scored = score_candidate(provider_track_to_track(snapshot.tracks[0]), wrong, config)
+        assert scored.final_score >= 70 and scored.result_tier == BLOCKED
+        for attempt in range(2):
+            result = discover_combined(config, db, [snapshot], workspace_key="combined:blocked-yield", catalog=WrongCatalog(wrong))
+            assert result.strong_match_tracks == result.review_match_tracks == 0
+            assert result.plausible_match_tracks == result.eligible_candidates == 0
+            assert result.rejected_candidates == result.hard_rejected_only_tracks == 1
+            assert result.songs_with_selectable_charts == result.selectable_chart_artifacts == 0
+            assert result.cached_tracks == attempt
+    finally:
+        db.close()
+
+
+def test_blocked_quality_candidate_does_not_suppress_catalog_fallback(config):
+    from tests.conftest import make_chart
+    wrong = make_chart("Mad Man", "Haste the Day", chart_id=98011, icon="rb2", charter="Harmonix")
+    good = make_chart("Acid Rain", "Chance the Rapper", chart_id=98012)
+    calls = []
+
+    class FallbackCatalog(FakeCatalog):
+        def high_recall_candidates(self, _artist, _title, **kwargs):
+            fallback = kwargs.get("include_fuzzy_fallback", False)
+            calls.append(fallback)
+            return CatalogLookup(candidates=(wrong, good) if fallback else (wrong,),
+                                 methods=("artist_fuzzy",), fuzzy_fallback_attempted=fallback)
+
+    db = Database(config.database_path)
+    try:
+        result = discover_combined(config, db, [LibrarySnapshot("soundcloud", [
+            ProviderTrack("soundcloud", "fallback", "Acid Rain", "Chance the Rapper")
+        ])], workspace_key="combined:blocked-fallback", catalog=FallbackCatalog(wrong))
+        assert calls == [False, True]
+        assert result.strong_match_tracks == result.songs_with_selectable_charts == 1
+        assert result.eligible_candidates == result.rejected_candidates == 1
+    finally:
+        db.close()
+
+
 def test_combined_discovery_deduplicates_provenance_and_scores(config):
     from tests.conftest import make_chart
 
@@ -647,7 +704,7 @@ def test_matching_cache_fingerprint_changes_with_track_catalog_and_config(config
     assert matching_cache_fingerprint(track, catalog, config) != baseline
 
 
-def test_matching_semantic_v8_cache_keys_cannot_satisfy_v9(config, monkeypatch):
+def test_matching_semantic_v9_cache_keys_cannot_satisfy_v10(config, monkeypatch):
     from tests.conftest import make_chart, make_track
     import csv_to_clonehero.combined_pipeline as pipeline
 
@@ -655,11 +712,11 @@ def test_matching_semantic_v8_cache_keys_cannot_satisfy_v9(config, monkeypatch):
     catalog = FakeCatalog(make_chart("The Only Exception", "Paramore", chart_id=26))
     manifest = {"snapshot_id": "fixture", "sha256": "fixture-sha", "chart_count": 1}
 
-    assert pipeline.MATCH_CACHE_VERSION == "combined-match-v9"
-    monkeypatch.setattr(pipeline, "MATCH_CACHE_VERSION", "combined-match-v8")
+    assert pipeline.MATCH_CACHE_VERSION == "combined-match-v10"
+    monkeypatch.setattr(pipeline, "MATCH_CACHE_VERSION", "combined-match-v9")
     stale_song = pipeline.matching_cache_fingerprint(track, catalog, config)
     stale_scan = pipeline.matching_scan_fingerprint([track], manifest, config)
-    monkeypatch.setattr(pipeline, "MATCH_CACHE_VERSION", "combined-match-v9")
+    monkeypatch.setattr(pipeline, "MATCH_CACHE_VERSION", "combined-match-v10")
 
     assert pipeline.matching_cache_fingerprint(track, catalog, config) != stale_song
     assert pipeline.matching_scan_fingerprint([track], manifest, config) != stale_scan
