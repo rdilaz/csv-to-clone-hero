@@ -119,7 +119,7 @@ def test_support_banner_can_be_disabled_without_changing_the_shell(client, confi
     config.monetization.gofundme_banner = False
     html = client.get("/").get_data(as_text=True)
     assert "cause-bar" not in html
-    assert "Signal Check" in html
+    assert "Music studio" in html
 
 
 def test_enabled_gofundme_banner_requires_explicit_destination(client, config):
@@ -149,11 +149,11 @@ def test_authenticated_review_shell_prioritizes_human_decisions(client):
     _sign_in(client)
     html = client.get("/").get_data(as_text=True)
 
-    assert '<p class="kicker">CONFIRM</p>' in html
+    assert '<p class="kicker">YOUR MUSIC STUDIO</p>' in html
     assert "Select recommended" in html
     assert "Select same-recording charts" in html
     assert "Include alternate recordings" in html
-    assert "Choose your charts" in html
+    assert '<h1 id="confirmTitle">Build your <em>setlist.</em></h1>' in html
     assert "Advanced review settings" not in html
     assert "Selection cutoff" not in html
     assert "Change folder" not in html
@@ -183,13 +183,17 @@ def test_matching_template_javascript_parses():
 def test_public_shell_uses_csp_compatible_external_assets(client):
     response = client.get("/")
     html = response.get_data(as_text=True)
-    assert '<script src="/static/public.js?v=riff-v2-20261008-yield" defer></script>' in html
-    assert '<link rel="stylesheet" href="/static/public.css?v=riff-v2-20261008-yield">' in html
+    assert '<script src="/static/public.js?v=riff-studio-20261008" defer></script>' in html
+    assert '<link rel="stylesheet" href="/static/public.css?v=riff-studio-20261008">' in html
+    assert '<script src="/static/studio.js?v=riff-studio-20261008" defer></script>' in html
+    assert '<script src="/static/riff-scene.js?v=riff-studio-20261008" defer></script>' in html
+    assert '<link rel="stylesheet" href="/static/studio.css?v=riff-studio-20261008">' in html
     assert "<script>" not in html
     assert " onclick=" not in html
     csp = response.headers["Content-Security-Policy"]
     assert "script-src 'self'" in csp
     assert "style-src 'self'" in csp
+    assert "frame-src 'self' https://open.spotify.com" in csp
     assert "'unsafe-inline'" not in csp
 
 

@@ -25,11 +25,17 @@ def inspected_difficulty_coverage(db: Database, chart: ChartCandidate) -> dict[s
     Instrument intensity ratings are not difficulty levels. Older validator
     observations and incomplete/corrupt count evidence remain unknown.
     """
+    return inspected_difficulty_coverage_from_row(
+        chart, db.get_chart_artifact_validation(chart.source, chart.chart_id)
+    )
+
+
+def inspected_difficulty_coverage_from_row(chart: ChartCandidate, row: Any) -> dict[str, Any]:
+    """Use a joined ledger row without another query for each review card."""
     unknown = {
         "evidence": "unknown", "instruments": {}, "guitar_difficulties": [],
         "expert_only": None, "playable_note_count": None,
     }
-    row = db.get_chart_artifact_validation(chart.source, chart.chart_id)
     if row is None:
         return unknown
     data = dict(row)

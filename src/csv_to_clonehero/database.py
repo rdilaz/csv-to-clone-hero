@@ -10,13 +10,14 @@ import sqlite3
 import time
 import uuid
 from collections.abc import Callable, Iterable, Mapping
+from contextlib import contextmanager
 from dataclasses import asdict, fields, is_dataclass
 from pathlib import Path
 from typing import Any
 
 from csv_to_clonehero.models import ChartCandidate, Track
 
-SCHEMA_VERSION = 20
+SCHEMA_VERSION = 21
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);
@@ -1277,6 +1278,24 @@ class Database:
                 )
             if current < 20:
                 self._backfill_library_playlist_projection()
+            if current < 21:
+                self._conn.execute("CREATE TABLE IF NOT EXISTS public_review_clock (id INTEGER PRIMARY KEY CHECK(id=1), revision INTEGER NOT NULL DEFAULT 0)")
+                self._conn.execute("INSERT OR IGNORE INTO public_review_clock(id,revision) VALUES(1,0)")
+                # Observe direct SQL writes as well as gateway methods.
+                # Selection changes are overlaid separately on cached decks.
+                for table in (
+                    "spotify_tracks", "track_playlists", "playlist_files",
+                    "spotify_playlist_tracks", "spotify_playlists", "spotify_liked_tracks",
+                    "discovery_workspaces", "discovery_scans", "discovery_tasks",
+                    "workspace_candidates", "workspace_library_tracks", "candidate_charts",
+                    "chart_artifact_validations", "library_tracks", "library_track_provenance",
+                    "library_sources", "source_imports", "library_playlists", "library_track_playlists",
+                ):
+                    for action in ("INSERT", "UPDATE", "DELETE"):
+                        self._conn.execute(
+                            f"CREATE TRIGGER IF NOT EXISTS studio_review_{table}_{action.lower()} "
+                            f"AFTER {action} ON {table} BEGIN UPDATE public_review_clock SET revision=revision+1 WHERE id=1; END"
+                        )
             row = self._conn.execute("SELECT COUNT(*) AS c FROM schema_version").fetchone()
             if row["c"] == 0:
                 self._conn.execute(
@@ -4079,6 +4098,7 @@ class Database:
         include_candidate_data: bool = True,
         current_only: bool = False,
         generation_id: int | None = None,
+        include_artifact_validation: bool = False,
     ) -> list[sqlite3.Row]:
         db_id = self._workspace_db_id(workspace_id)
         clauses = ["wc.workspace_id = ?"]
@@ -4110,11 +4130,21 @@ class Database:
         if not include_rejected:
             clauses.append("COALESCE(LOWER(wc.decision), '') NOT IN ('reject', 'rejected', 'incompatible')")
         candidate_json = "c.data_json AS candidate_json" if include_candidate_data else "'' AS candidate_json"
+        validation_fields = (
+            ", av.state AS validation_state, av.artifact_ref AS validation_artifact_ref, "
+            "av.validator_version AS validation_validator_version, "
+            "av.artifact_sha256 AS validation_artifact_sha256, "
+            "av.playable_note_count AS validation_playable_note_count, "
+            "av.validation_json AS validation_validation_json"
+        ) if include_artifact_validation else ""
+        validation_join = (
+            "LEFT JOIN chart_artifact_validations av ON av.source=c.source AND av.chart_id=c.chart_id "
+        ) if include_artifact_validation else ""
         return list(
             self._conn.execute(
                 f"""SELECT wc.*, c.source, c.chart_id, {candidate_json},
                           t.track_key, t.spotify_id, t.title AS track_title,
-                          t.artist_full AS track_artist,
+                          t.artist_full AS track_artist{validation_fields},
                           EXISTS (SELECT 1 FROM workspace_selections ws
                                   WHERE ws.workspace_id = wc.workspace_id
                                     AND (ws.track_id = wc.track_id
@@ -4126,11 +4156,25 @@ class Database:
                    FROM workspace_candidates wc
                    JOIN candidate_charts c ON c.id = wc.candidate_id
                    LEFT JOIN spotify_tracks t ON t.id = wc.track_id
-                   WHERE """ + " AND ".join(clauses) +
+                   """ + validation_join + "WHERE " + " AND ".join(clauses) +
                 " ORDER BY COALESCE(wc.track_id, 0), wc.score DESC, wc.quality DESC, c.source, c.chart_id",
                 params,
             )
         )
+
+    @staticmethod
+    def candidate_from_workspace_row(row: Mapping[str, Any]) -> ChartCandidate:
+        """Hydrate the candidate JSON already loaded by a workspace query."""
+        return _candidate_from_json(int(row["candidate_id"]), str(row["candidate_json"]))
+
+    @staticmethod
+    def validation_from_workspace_row(row: Mapping[str, Any]) -> dict[str, Any] | None:
+        if row["validation_state"] is None:
+            return None
+        return {key: row[f"validation_{key}"] for key in (
+            "state", "artifact_ref", "validator_version", "artifact_sha256",
+            "playable_note_count", "validation_json",
+        )}
 
     def get_workspace_candidate_groups(
         self,
@@ -4357,6 +4401,100 @@ class Database:
 
     select_candidate = select_workspace_candidate
     select_chart = select_workspace_candidate
+
+    @contextmanager
+    def atomic_workspace_selection(self, *, write: bool = True):
+        """Hold a write snapshot across job/generation checks and one bulk edit."""
+        if self._conn.in_transaction:
+            raise ValueError("selection transaction is already active")
+        self._conn.execute("BEGIN IMMEDIATE" if write else "BEGIN")
+        try:
+            yield
+            self._conn.commit()
+        except BaseException:
+            self._conn.rollback()
+            raise
+
+    def replace_public_selection(self, workspace_id: int, kinds: Iterable[str],
+                                 choices: Iterable[Mapping[str, Any]]) -> None:
+        """Replace a reviewed selection in one transaction, including all pages.
+
+        The public API supplies current-gated choices inside a locked snapshot.
+        This layer independently checks membership, stored hard gates and the
+        artifact ledger, and deduplicates artifacts across preserved scopes.
+        """
+        if not self._conn.in_transaction:
+            raise ValueError("bulk selection requires a locked snapshot")
+        kinds = tuple(sorted(set(kinds)))
+        if not kinds or not set(kinds) <= {"exact", "expansion"}:
+            raise ValueError("invalid selection scope")
+        available = {}
+        for row in self.get_workspace_candidates(workspace_id, include_artifact_validation=True):
+            key = (str(row["kind"]), int(row["track_id"] or 0), int(row["candidate_id"]), str(row["artist_norm"] or ""))
+            available[key] = row
+        preserved = self.list_workspace_selections(workspace_id)
+        artifacts = set()
+        for row in preserved:
+            if str(row["kind"]) not in kinds:
+                chart = self.candidate_from_workspace_row(row)
+                artifacts.add((chart.source, chart.md5 or f"chart:{chart.chart_id}"))
+        inserts = []
+        now = time.time()
+        for choice in choices:
+            kind = str(choice["kind"])
+            key = (kind, int(choice.get("track_id") or 0), int(choice["candidate_id"]), str(choice.get("artist_norm") or ""))
+            row = available.get(key)
+            if kind not in kinds or row is None:
+                raise ValueError("chart choice is outside this workspace")
+            breakdown = _load_json(row["breakdown_json"], {})
+            factors = breakdown.get("factors", {})
+            gates = [breakdown.get("gate_factors", {}), factors.get("gates", {}) if isinstance(factors, Mapping) else {}]
+            if str(row["eligibility"]).upper() == "INCOMPATIBLE" or any(isinstance(gate, Mapping) and gate.get("hard_gate") for gate in gates):
+                raise ValueError("chart choice has a hard compatibility gate")
+            if row["validation_state"] in {"REJECTED", "UNAVAILABLE"}:
+                raise ValueError("chart artifact is rejected or unavailable")
+            chart = self.candidate_from_workspace_row(row)
+            identity = (chart.source, chart.md5 or f"chart:{chart.chart_id}")
+            if identity in artifacts:
+                continue
+            artifacts.add(identity)
+            inserts.append((workspace_id, kind, row["track_id"], row["spotify_id"], row["artist_norm"], row["candidate_id"],
+                            choice.get("score", row["score"]), row["breakdown_json"], choice.get("eligibility", row["eligibility"]),
+                            "selected", now, now, _json_text(choice.get("metadata") or {}, {})))
+        placeholders = ",".join("?" for _ in kinds)
+        self._conn.execute(f"DELETE FROM workspace_selections WHERE workspace_id=? AND kind IN ({placeholders})", (workspace_id, *kinds))
+        self._conn.executemany(
+            """INSERT INTO workspace_selections
+               (workspace_id,kind,track_id,spotify_track_id,artist_norm,candidate_id,
+                score,explanation,eligibility,status,selected_at,updated_at,metadata_json)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""", inserts,
+        )
+
+    def public_selection_state(self, workspace_id: int) -> dict[str, Any]:
+        from csv_to_clonehero.normalization import normalize_artist, normalize_title
+
+        rows = self.list_workspace_selections(workspace_id)
+        selected = {"library": [], "expansion": []}
+        identities = {"library": set(), "expansion": set()}
+        for row in rows:
+            scope = "library" if row["kind"] == "exact" else "expansion"
+            item = {"candidate_id": int(row["candidate_id"])}
+            if scope == "library":
+                item["track_key"] = row["track_key"]
+                identities[scope].add(int(row["track_id"] or 0))
+            else:
+                chart = self.candidate_from_workspace_row(row)
+                item["artist_norm"] = str(row["artist_norm"] or "")
+                item["song_key"] = "|".join((normalize_artist(chart.artist), normalize_title(chart.name)))
+                identities[scope].add((chart.artist_norm, chart.name_norm))
+            selected[scope].append(item)
+        summary = {scope: {"songs": len(identities[scope]), "charts": len(selected[scope])} for scope in selected}
+        return {"selected": selected, "summary": summary,
+                "songs": sum(value["songs"] for value in summary.values()),
+                "charts": sum(value["charts"] for value in summary.values())}
+
+    def public_review_revision(self) -> int:
+        return int(self._conn.execute("SELECT revision FROM public_review_clock WHERE id=1").fetchone()["revision"])
 
     def clear_workspace_selection(
         self,
@@ -5463,23 +5601,23 @@ class Database:
     # ------------------------------------------------------------- library UI
     def get_spotify_tracks(self, include_ignored: bool = False) -> list[Track]:
         tracks = self.get_tracks(include_ignored=include_ignored)
+        playlist_names: dict[int, list[str]] = {}
+        for row in self._conn.execute(
+            """SELECT pt.track_id,p.name FROM spotify_playlist_tracks pt
+               JOIN spotify_playlists p ON p.id=pt.playlist_id
+               ORDER BY pt.track_id,pt.position,p.name"""
+        ):
+            playlist_names.setdefault(int(row["track_id"]), []).append(str(row["name"]))
+        liked = {int(row["track_id"]) for row in self._conn.execute(
+            "SELECT track_id FROM spotify_liked_tracks"
+        )}
         result: list[Track] = []
         for track in tracks:
             if not track.spotify_id:
                 continue
             names = list(track.playlists)
-            names.extend(
-                item["name"]
-                for item in self._conn.execute(
-                    """SELECT p.name FROM spotify_playlist_tracks pt
-                       JOIN spotify_playlists p ON p.id = pt.playlist_id
-                       WHERE pt.track_id = ? ORDER BY pt.position, p.name""",
-                    (track.db_id,),
-                )
-            )
-            if self._conn.execute(
-                "SELECT 1 FROM spotify_liked_tracks WHERE track_id = ?", (track.db_id,)
-            ).fetchone():
+            names.extend(playlist_names.get(int(track.db_id or 0), ()))
+            if track.db_id in liked:
                 names.insert(0, "Liked Songs")
             if names:
                 track.playlists = list(dict.fromkeys([*track.playlists, *names]))
@@ -6231,6 +6369,12 @@ class Database:
         sql = "SELECT * FROM spotify_tracks"
         if not include_ignored:
             sql += " WHERE ignored = 0"
+        playlist_names: dict[int, list[str]] = {}
+        for row in self._conn.execute(
+            """SELECT tp.track_id,pf.filename FROM track_playlists tp
+               JOIN playlist_files pf ON pf.id=tp.playlist_file_id"""
+        ):
+            playlist_names.setdefault(int(row["track_id"]), []).append(str(row["filename"]))
         tracks = []
         for row in self._conn.execute(sql):
             track = Track(
@@ -6261,15 +6405,7 @@ class Database:
                 ),
                 added_at=row["added_at"] if "added_at" in row.keys() else None,
             )
-            track.playlists = [
-                r["filename"]
-                for r in self._conn.execute(
-                    """SELECT pf.filename FROM track_playlists tp
-                       JOIN playlist_files pf ON pf.id = tp.playlist_file_id
-                       WHERE tp.track_id = ?""",
-                    (track.db_id,),
-                )
-            ]
+            track.playlists = playlist_names.get(int(track.db_id), [])
             tracks.append(track)
         return tracks
 

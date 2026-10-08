@@ -3,13 +3,14 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="theme-color" content="#080b20">
+  <meta name="theme-color" content="#090a0d">
   <title>{% block title %}Riff | Signal Check{% endblock %}</title>
   <link rel="icon" type="image/svg+xml" href="{{ url_for('static', filename='signal-knot.svg') }}">
-  <link rel="stylesheet" href="{{ url_for('static', filename='public.css', v='riff-v2-20261008-yield') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='public.css', v='riff-studio-20261008') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='studio.css', v='riff-studio-20261008') }}">
   {% block head %}{% endblock %}
 </head>
-<body data-authenticated="{{ 'true' if user else 'false' }}" data-riff-release="riff-v2-20261008">
+<body data-authenticated="{{ 'true' if user else 'false' }}" data-riff-release="riff-v2-20261008" data-riff-ui="riff-studio-20261008">
   <a class="skip-link" href="#main-content">Skip to content</a>
 
   {% if config.monetization.gofundme_enabled and config.monetization.gofundme_banner and config.monetization.effective_gofundme_url %}
@@ -24,9 +25,10 @@
     <div class="shell site-header__inner">
       <a class="brand" href="/" aria-label="Riff home">
         <img class="brand__wordmark" src="{{ url_for('static', filename='riff-wordmark.svg') }}" alt="" aria-hidden="true">
-        <span class="brand__product">Signal Check <span class="release-badge">V2</span></span>
+        <span class="brand__product">Music studio <span class="release-badge">V2</span></span>
       </a>
       <nav class="site-nav" aria-label="Primary navigation">
+        <button class="motion-control" id="riff-motion-toggle" type="button" aria-pressed="false" title="Toggle decorative 3D movement">Motion off</button>
         <a href="/about">About</a>
         {% if user %}
         <span class="user-name">{{ user.display_name }}</span>
@@ -61,6 +63,8 @@
     </div>
   </footer>
   <div class="sr-only" id="announcer" role="status" aria-live="polite" aria-atomic="true"></div>
-  <script src="{{ url_for('static', filename='public.js', v='riff-v2-20261008-yield') }}" defer></script>
+  <script src="{{ url_for('static', filename='public.js', v='riff-studio-20261008') }}" defer></script>
+  <script src="{{ url_for('static', filename='studio.js', v='riff-studio-20261008') }}" defer></script>
+  <script src="{{ url_for('static', filename='riff-scene.js', v='riff-studio-20261008') }}" defer></script>
 </body>
 </html>

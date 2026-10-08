@@ -30,6 +30,7 @@ import threading
 import time
 import uuid
 import zipfile
+import zlib
 from collections.abc import Callable, Iterable, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field, fields, is_dataclass
@@ -50,6 +51,30 @@ MANIFEST_FORMAT = "csv-to-clonehero-manifest"
 MANIFEST_VERSION = 1
 MANIFEST_FILENAME = "csv-to-clonehero-manifest.json"
 SNG_VALIDATION_VERSION = "sng-playability-v2"
+
+
+def _artifact_zip_compression(path: Path, size_bytes: int) -> int:
+    """Avoid recompressing incompressible packages, using bounded samples.
+
+    Small/text-heavy packages retain deflate. Most audio packages contain
+    compressed or masked audio; three 64 KiB probes avoid spending CPU on the
+    entire package when deflate would save less than two percent.
+    """
+    sample_size = 64 * 1024
+    if size_bytes < 4 * sample_size:
+        return zipfile.ZIP_DEFLATED
+    offsets = {0, max(0, size_bytes // 2 - sample_size // 2), max(0, size_bytes - sample_size)}
+    raw = compressed = 0
+    try:
+        with path.open("rb") as stream:
+            for offset in sorted(offsets):
+                stream.seek(offset)
+                sample = stream.read(sample_size)
+                raw += len(sample)
+                compressed += len(zlib.compress(sample, level=1))
+    except OSError:
+        return zipfile.ZIP_DEFLATED
+    return zipfile.ZIP_STORED if raw and compressed >= raw * 0.98 else zipfile.ZIP_DEFLATED
 
 _INVALID_NAME_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 _DRIVE_RE = re.compile(r"^[A-Za-z]:($|/)")
@@ -2932,7 +2957,7 @@ class ExportService:
                         raise ExportError(str(exc)) from exc
                     info = zipfile.ZipInfo(arcname)
                     info.date_time = (1980, 1, 1, 0, 0, 0)
-                    info.compress_type = zipfile.ZIP_DEFLATED
+                    info.compress_type = _artifact_zip_compression(artifact.path, artifact.size_bytes)
                     info.create_system = 0
                     info.external_attr = 0
                     with archive.open(info, "w") as target, artifact.path.open("rb") as source:
