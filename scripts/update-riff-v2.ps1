@@ -98,9 +98,14 @@ function Assert-EnvUnchanged {
 }
 
 function Read-Container([string]$Id) {
-    $format = '{"name":{{json .Name}},"image":{{json .Image}},"labels":{{json .Config.Labels}},"mounts":{{json .Mounts}},"environment":{{json .Config.Env}}}'
+    # A quote-free native argument preserves its exact shape under Windows PowerShell 5.
+    $format = '[{{json .Name}},{{json .Image}},{{json .Config.Labels}},{{json .Mounts}},{{json .Config.Env}}]'
     $raw = Invoke-QuietNative docker @('inspect', $Id, '--format', $format) 'Could not inspect the existing clonehero container.'
-    return (Read-QuietJson $raw.Output 'Container inspection')
+    # Keep nested arrays and nulls as property values instead of enumerating them through a function return.
+    $metadata = Read-QuietJson ('{"fields":' + $raw.Output + '}') 'Container inspection'
+    $fields = $metadata.fields
+    if ($fields -isnot [array] -or $fields.Count -ne 5) { Stop-Riff 'Container inspection returned an unexpected metadata shape.' }
+    return [pscustomobject]@{ name = $fields[0]; image = $fields[1]; labels = $fields[2]; mounts = $fields[3]; environment = $fields[4] }
 }
 
 function Get-DataMount($Container) {
