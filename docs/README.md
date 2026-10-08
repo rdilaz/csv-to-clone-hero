@@ -1,5 +1,7 @@
 # Documentation
 
+More songs and difficulty labels: [Chart coverage](CHART_COVERAGE.md).
+
 - [`ARCHITECTURE.md`](ARCHITECTURE.md): current local/public surfaces, data
   flow, boundaries, matching methodology, and security model.
 - [`CONFIGURATION.md`](CONFIGURATION.md): configuration precedence, paths,

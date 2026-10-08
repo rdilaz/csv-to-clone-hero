@@ -26,7 +26,7 @@ from typing import Any, Callable, Iterable
 
 from csv_to_clonehero.config import AppConfig
 from csv_to_clonehero.database import Database
-from csv_to_clonehero.exporter import ExportOptions, ExportService
+from csv_to_clonehero.exporter import ExportOptions, ExportService, SNG_VALIDATION_VERSION
 from csv_to_clonehero.models import ChartCandidate
 from csv_to_clonehero.sources.base import ChartSource
 
@@ -439,17 +439,23 @@ def build_archive(
                     *identity,
                     artifact_ref=artifact_ref,
                     state="VERIFIED",
-                    validator_version="sng-playability-v1",
+                    validator_version=item.validation_version,
                     artifact_sha256=item.sha256,
                     size_bytes=item.bytes_count,
                     playable_note_count=item.playable_note_count,
+                    validation={
+                        "valid": True,
+                        "validation_version": item.validation_version,
+                        "playable_note_count": item.playable_note_count,
+                        "note_counts": dict(item.note_counts),
+                    },
                 )
             elif item.status == "invalid":
                 db.record_chart_artifact_validation(
                     *identity,
                     artifact_ref=artifact_ref,
                     state="REJECTED",
-                    validator_version="sng-playability-v1",
+                    validator_version=SNG_VALIDATION_VERSION,
                     reason_code="ARTIFACT_VALIDATION_FAILED",
                     reason=item.failure,
                 )
@@ -616,11 +622,15 @@ def _validated_selections(
                 normalize_artist(str(candidate.artist or "")),
                 normalize_title(str(candidate.name or "")),
             )
-            breakdown = score_expansion_candidate(artist_norm, candidate, config)
+            breakdown = score_expansion_candidate(
+                artist_norm, candidate, config,
+                include_compatible=metadata.get("coverage_mode") == "all",
+            )
             current_eligibility = str(getattr(breakdown, "eligibility", "") or "")
             current_tier = classify_result_tier(breakdown, kind="expansion")[0]
             if (
                 bool(getattr(breakdown, "gate_factors", {}).get("hard_gate"))
+                or current_eligibility not in {"RECOMMENDED", "ELIGIBLE_REVIEW"}
                 or current_tier == BLOCKED
                 or current_tier not in SELECTABLE_RESULT_TIERS
             ):

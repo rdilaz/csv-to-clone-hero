@@ -465,6 +465,9 @@ class JobManager:
         if not self.config.server.enable_expansion:
             raise RuntimeError("Artist expansion is disabled.")
         artists = [str(value) for value in job.progress.get("artists", ())]
+        coverage_mode = str(job.progress.get("coverage_mode") or "recommended")
+        if coverage_mode not in {"all", "recommended"}:
+            raise RuntimeError("coverage_mode must be all or recommended")
         expected_generation = int(job.progress.get("exact_generation_id") or 0)
         if not artists:
             raise RuntimeError("Choose at least one artist to expand.")
@@ -526,6 +529,7 @@ class JobManager:
                 catalog=catalog,
                 exact_generation_id=expected_generation,
                 on_progress=on_progress,
+                coverage_mode=coverage_mode,
             )
             current = db.get_current_exact_generation(workspace["id"])
             if current is None or int(current["id"]) != expected_generation:
@@ -543,6 +547,8 @@ class JobManager:
                 "total_artists": len(artists),
                 "completed_artists": len(artists),
                 "recommendations": int(result.candidates),
+                "coverage_mode": coverage_mode,
+                "all_artists": bool(job.progress.get("all_artists", False)),
                 "catalog_snapshot_id": result.catalog_snapshot_id,
                 "network_requests": 0,
             }
@@ -1020,7 +1026,7 @@ def _live_yield_audit(
 ) -> dict[str, Any]:
     """Partition fallback results without converting source failures into absence."""
     from csv_to_clonehero.combined_pipeline import TERMINAL_YIELD_CLASSES, _primary_rejection_reason
-    from csv_to_clonehero.matching import score_candidate
+    from csv_to_clonehero.matching import BLOCKED, SELECTABLE_RESULT_TIERS, score_candidate
 
     histogram = {name: 0 for name in TERMINAL_YIELD_CLASSES}
     persisted = db.get_discovery_song_yield_summary(workspace_id)
@@ -1073,14 +1079,17 @@ def _live_yield_audit(
             candidate = db.get_candidate(int(row["candidate_id"]))
             if candidate is not None:
                 scored.append((candidate, score_candidate(track, candidate, config)))
-        if any(str(value.eligibility).upper() == "RECOMMENDED" for _, value in scored):
+        if any(str(value.eligibility).upper() == "RECOMMENDED"
+               and value.result_tier in SELECTABLE_RESULT_TIERS for _, value in scored):
             histogram["recommended_strong"] += 1
             continue
-        if any(str(value.eligibility).upper() == "ELIGIBLE_REVIEW" for _, value in scored):
+        if any(str(value.eligibility).upper() == "ELIGIBLE_REVIEW"
+               and value.result_tier in SELECTABLE_RESULT_TIERS for _, value in scored):
             histogram["recommended_review"] += 1
             continue
         if scored:
-            hard = all(bool(value.gate_factors.get("hard_gate")) for _, value in scored)
+            hard = all(bool(value.gate_factors.get("hard_gate")) or value.result_tier == BLOCKED
+                       for _, value in scored)
             bucket = "hard_rejected" if hard else "soft_rejected"
             classification = "not_playable" if hard else "no_suitable"
             reason = _primary_rejection_reason(classification, scored)

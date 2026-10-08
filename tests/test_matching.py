@@ -144,6 +144,31 @@ def test_result_tiers_separate_recommendation_alternate_possible_and_blocked(con
     assert score_candidate(exact_track, blocked, config).result_tier == BLOCKED
 
 
+@pytest.mark.parametrize(
+    ("requested_title", "chart_title", "chart_artist"),
+    [
+        ("65th & Ingleside", "10 Miles Wide", "Escape the Fate"),
+        ("Acid Rain", "Mad Man", "Haste the Day"),
+    ],
+)
+@pytest.mark.parametrize("duration", ["unknown", "same", "different"])
+def test_two_uncertain_identity_axes_block_observed_wrong_pairs(
+    config, requested_title, chart_title, chart_artist, duration
+):
+    track = make_track(requested_title, "Chance the Rapper")
+    chart = _high_quality_chart(chart_title, chart_artist)
+    if duration != "unknown":
+        track.duration_ms = 180000
+        chart.song_length_ms = 180000 if duration == "same" else 240000
+    result = score_candidate(track, chart, config)
+
+    assert result.gate_factors["title_identity"] == "borderline"
+    assert result.gate_factors["artist_identity"] == "borderline"
+    assert result.gate_factors["external_identity_match"] is False
+    assert result.result_tier == BLOCKED
+    assert "title/artist uncertainty" in " ".join(result.result_tier_reasons)
+
+
 def test_pick_best_prefers_correct_song_over_higher_quality_wrong_song(config):
     track = make_track("The Only Exception", "Paramore")
     wrong = make_chart("That's What You Get", "Paramore", chart_id=1, charter="Harmonix", icon="rb2")
@@ -441,6 +466,7 @@ def test_huge_quality_cannot_rescue_review_artist_identity(config):
     assert result.quality > 0
     assert result.final_score < config.matching.auto_accept_threshold
     assert result.eligibility == "ELIGIBLE_REVIEW"
+    assert result.result_tier == POSSIBLE_MATCH
 
 
 def test_remaster_matches_chart_strongly(config):
@@ -585,3 +611,103 @@ def test_expansion_full_band_beats_single_instrument(config):
     band = score_expansion_candidate("artist", full_band, config)
     assert any("single-instrument" in label for label, _ in single.penalties)
     assert band.final_score > single.final_score
+
+
+@pytest.mark.parametrize("rated", [True, False])
+def test_expansion_all_mode_keeps_low_quality_compatible_guitar_for_review(config, rated):
+    chart = make_chart(
+        "Song", "Artist", instruments=["guitar"],
+        diff_guitar=3 if rated else None,
+    )
+    default = score_expansion_candidate("artist", chart, config)
+    expanded = score_expansion_candidate("artist", chart, config, include_compatible=True)
+
+    assert default.eligibility == "EXCLUDED"
+    assert expanded.final_score == default.final_score
+    assert expanded.quality == default.quality
+    assert expanded.bonuses == default.bonuses
+    assert expanded.penalties == default.penalties
+    assert expanded.eligibility == "ELIGIBLE_REVIEW"
+    assert expanded.decision == "REVIEW"
+    assert expanded.result_tier == POSSIBLE_MATCH
+    assert expanded.gate_factors["hard_gate"] is False
+    assert expanded.match_factors["expansion_coverage"]["exact_artist_identity"] is True
+    assert expanded.match_factors["expansion_coverage"]["quality_floor_bypassed"] is True
+
+
+@pytest.mark.parametrize("artist", ["ARTIST", "Artist!", "Artist feat. Guest"])
+def test_expansion_all_mode_accepts_exact_normalized_primary_artist(config, artist):
+    chart = make_chart("Song", artist, instruments=["guitar"])
+    result = score_expansion_candidate("artist", chart, config, include_compatible=True)
+    assert result.eligibility == "ELIGIBLE_REVIEW"
+    assert result.decision == "REVIEW"
+    assert result.match_factors["expansion_coverage"]["exact_artist_identity"] is True
+
+
+def test_expansion_all_mode_does_not_promote_fuzzy_artist_identity(config):
+    chart = make_chart("Song", "Metallic", instruments=["guitar"])
+    result = score_expansion_candidate("metallica", chart, config, include_compatible=True)
+    assert result.artist_score >= 80
+    assert result.eligibility == "EXCLUDED"
+    assert result.decision == "REJECT"
+    assert result.match_factors["expansion_coverage"]["exact_artist_identity"] is False
+    assert result.match_factors["expansion_coverage"]["quality_floor_bypassed"] is False
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"instruments": [], "diff_guitar": None},
+        {"instruments": ["drums"], "diff_guitar": None},
+        {"instruments": ["guitarghl"], "diff_guitar": None},
+        {"modchart": True},
+        {"supports_download": False},
+        {"has_issues": True, "issue_severity": "severe"},
+    ],
+)
+def test_expansion_all_mode_cannot_bypass_hard_chart_gates(config, changes):
+    chart = make_chart("Song", "Artist", instruments=["guitar"])
+    for field, value in changes.items():
+        setattr(chart, field, value)
+    result = score_expansion_candidate("artist", chart, config, include_compatible=True)
+    assert result.eligibility not in {"RECOMMENDED", "ELIGIBLE_REVIEW"}
+    assert result.gate_factors["hard_gate"] is True
+    assert result.result_tier == BLOCKED
+
+
+@pytest.mark.parametrize("marker", ["Cover", "Karaoke", "Tribute"])
+def test_expansion_all_mode_does_not_promote_cover_versions(config, marker):
+    chart = make_chart(f"Song ({marker})", "Artist", instruments=["guitar"])
+    result = score_expansion_candidate("artist", chart, config, include_compatible=True)
+    assert result.eligibility == "EXCLUDED"
+    assert result.decision == "REJECT"
+    assert result.match_factors["expansion_coverage"]["quality_floor_bypassed"] is False
+
+
+def test_expansion_all_mode_preserves_normal_recommendation(config):
+    chart = _high_quality_chart("Song", "Artist")
+    default = score_expansion_candidate("artist", chart, config)
+    expanded = score_expansion_candidate("artist", chart, config, include_compatible=True)
+    assert default.eligibility == "RECOMMENDED"
+    assert expanded.eligibility == default.eligibility
+    assert expanded.decision == default.decision
+    assert expanded.final_score == default.final_score
+    assert expanded.quality == default.quality
+    assert expanded.match_factors["expansion_coverage"]["quality_floor_bypassed"] is False
+
+
+def test_inspected_expert_only_guitar_remains_eligible_in_expansion_all_mode(config, tmp_path):
+    from csv_to_clonehero.exporter import validate_sng
+    from .conftest import valid_sng_bytes
+
+    artifact = tmp_path / "expert-only.sng"
+    artifact.write_bytes(valid_sng_bytes())
+    inspected = validate_sng(artifact, require_five_fret_guitar=True)
+    assert inspected.valid
+    assert dict(inspected.note_counts) == {"guitar:expert": 1}
+
+    chart = make_chart("Song", "Artist", instruments=["guitar"], diff_guitar=3)
+    result = score_expansion_candidate("artist", chart, config, include_compatible=True)
+    assert result.final_score < config.matching.review_threshold
+    assert result.eligibility == "ELIGIBLE_REVIEW"
+    assert result.decision == "REVIEW"

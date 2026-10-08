@@ -250,7 +250,7 @@ def test_signal_check_confirm_keeps_multi_chart_selection_truthful(
         alternate = page.locator('details[data-disclosure-key$="ALTERNATE_RECORDING"]')
         assert same_recording.get_attribute("open") is not None
         assert alternate.get_attribute("open") is not None
-        assert page.get_by_text("Guitar difficulty 0", exact=True).is_visible()
+        assert page.get_by_text("Guitar intensity rating 0", exact=True).is_visible()
         assert page.get_by_text("Different live recording.", exact=True).is_visible()
         _assert_no_overflow(page)
 
@@ -304,7 +304,7 @@ def test_signal_check_confirm_keeps_multi_chart_selection_truthful(
         page.get_by_role("button", name="Possible matches").click()
         possible = page.locator('[data-candidate="201"][data-selection="select"]')
         playwright.expect(possible).to_be_visible()
-        assert page.get_by_text("Guitar difficulty not provided", exact=True).is_visible()
+        assert page.get_by_text("Guitar intensity rating not provided", exact=True).is_visible()
         posts_before = len([
             body for method, path, body in fixtures.request_log
             if method == "POST" and path == "/api/selection" and body.get("candidate_id") == 201
@@ -1326,7 +1326,7 @@ def test_public_expansion_confirm_and_reload_in_browser(public_server):
         playwright.expect(page.locator(".review-card--expansion")).to_contain_text("Decode")
         assert expansion_job_polls["count"] == 1
         playwright.expect(page.locator(".review-card--expansion")).to_contain_text("guitar, drums")
-        playwright.expect(page.locator(".review-card--expansion")).to_contain_text("Guitar difficulty 4")
+        playwright.expect(page.locator(".review-card--expansion")).to_contain_text("Guitar intensity rating 4")
         fail_expansion_recount["value"] = True
         page.locator('[data-expansion-selection="select"]').click()
         playwright.expect(page.locator("#selectedCount")).to_have_text("...")
