@@ -110,12 +110,24 @@
       <div class="matching-copy progress-module">
         <p class="kicker">FIND CHARTS</p>
         <h1 id="findTitle">Finding your charts</h1>
+        <section class="search-recovery" id="searchRecovery" aria-labelledby="searchRecoveryTitle" hidden>
+          <p class="kicker">SEARCH PAUSED</p>
+          <h2 id="searchRecoveryTitle">Your music is still here.</h2>
+          <p id="searchRecoveryMessage" role="status" aria-live="polite"></p>
+          <p class="fine-print">Your saved music choices are kept. You can try again or choose different music.</p>
+          <div class="search-recovery__actions">
+            <button class="button" id="retrySearchButton" type="button">Try search again</button>
+            <button class="text-button" id="changeMusicButton" type="button">Change music</button>
+            <button class="text-button" id="savedSearchResultsButton" type="button" hidden>View saved results</button>
+          </div>
+          <p class="fine-print" id="savedSearchResultsNote" hidden>Saved results may be from an earlier search.</p>
+        </section>
         <p class="progress-phase"><span>Current phase</span><strong id="progressMessage">Preparing your music...</strong></p>
         <p class="progress-percent" id="progressPercent">Working...</p>
         <div class="thin-progress is-indeterminate" id="progressDisc" role="progressbar" aria-label="Chart matching progress" aria-valuemin="0" aria-valuemax="100"><span id="progressBar"></span></div>
         <p class="progress-count" id="progressCount">Starting...</p>
         <p class="current-song"><span>Checking now</span><strong id="currentSong">Waiting for the first song...</strong></p>
-        <p class="calm-note"><strong>Safe to leave.</strong> You can close this page and come back. Progress is saved to your account.</p>
+        <p class="calm-note" id="searchLeaveNote"><strong>Safe to leave.</strong> Once the search starts, progress is saved to your account. You can close this page and come back.</p>
         <details class="activity-details" id="activityDetails">
           <summary>Matching details</summary>
           <div class="activity-toolbar"><label for="activitySearch">Filter songs</label><input id="activitySearch" type="search" autocomplete="off"></div>

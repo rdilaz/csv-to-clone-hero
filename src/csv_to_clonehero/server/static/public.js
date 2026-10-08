@@ -63,8 +63,23 @@
     const headers = new Headers(options.headers || {});
     if (options.body && !(options.body instanceof FormData)) headers.set("Content-Type", "application/json");
     headers.set("X-Riff-Request", "1");
-    const response = await fetch(path, {...options, headers, credentials: "same-origin"});
-    const data = await response.json().catch(() => ({}));
+    const {timeoutMs, ...requestOptions} = options;
+    const controller = timeoutMs ? new AbortController() : null;
+    const timer = controller ? window.setTimeout(() => controller.abort(), timeoutMs) : null;
+    let response;
+    let data;
+    try {
+      response = await fetch(path, {...requestOptions, headers, credentials: "same-origin", ...(controller ? {signal: controller.signal} : {})});
+      data = await response.json().catch(error => {
+        if (controller?.signal.aborted) throw error;
+        return {};
+      });
+    } catch (error) {
+      if (controller?.signal.aborted) throw new Error("The chart service took too long to respond. Your music choices are kept. Try again.");
+      throw error;
+    } finally {
+      if (timer !== null) window.clearTimeout(timer);
+    }
     if (response.status === 401) {
       window.location.assign("/");
       throw new Error("Your session ended. Sign in again to continue.");
@@ -304,14 +319,13 @@
         await openAddMusic(false, journey);
         return;
       }
+      if (journey.job?.kind !== "expansion" && (["failed", "partial", "cancelled", "interrupted"].includes(journey.job?.status) || allSearchChecksFailed(journey.job))) {
+        showSearchRecovery(searchFailureCopy(journey.job), Boolean(journey.review?.total > 0));
+        return;
+      }
       if (isTerminal(journey.job) || journey.review?.total > 0) {
         await openConfirm(false);
-        if (journey.job?.kind !== "expansion" && ["failed", "partial", "cancelled", "interrupted"].includes(journey.job?.status)) {
-          const copy = journey.job.status === "failed"
-            ? "The last search did not finish. Saved results are shown below; you can search again."
-            : "The last search was incomplete. Review saved results or search again for missing songs.";
-          showError(copy);
-        }
+        if (journey.job?.kind !== "expansion" && incompleteSearch(journey.job)) showError(incompleteSearchCopy);
         return;
       }
       await openAddMusic(false, journey);
@@ -652,14 +666,78 @@
   async function saveScopeIfChosen() {
     const scope = currentScope();
     if (!hasSpotifyScope(scope)) return false;
-    await api("/api/spotify/scope", {method: "POST", body: JSON.stringify(scope)});
-    return true;
+    const response = await api("/api/spotify/scope", {method: "POST", body: JSON.stringify(scope)});
+    const saved = response.workspace?.scope || scope;
+    const workspace = {...(state.scope?.workspace || {}), ...(response.workspace || {}), scope: saved};
+    state.scope = {...(state.scope || {}), workspace};
+    if (state.journey) {
+      state.journey.spotify_scope = saved;
+      state.journey.spotify_library = {...spotifyLibraryFromJourney(state.journey), workspace};
+    }
+    return hasSpotifyScope(saved);
+  }
+
+  const incompleteSearchCopy = "Some songs could not be checked. These are the available results; an unchecked song is not proof that no chart exists. Search again to retry incomplete checks.";
+
+  function allSearchChecksFailed(job) {
+    const result = job?.result || {};
+    const histogram = result.yield_histogram || {};
+    if (Number(histogram.recommended_strong || 0) + Number(histogram.recommended_review || 0) > 0 || Number(result.selectable_chart_artifacts || 0) > 0) return false;
+    const total = Number(result.total_queries || 0);
+    const failed = Number(result.failed_queries || 0);
+    if (total > 0 && failed >= total) return true;
+    const counts = Object.values(histogram).map(Number).filter(value => Number.isFinite(value) && value > 0);
+    const incomplete = Number(histogram.incomplete_evidence || 0);
+    return incomplete > 0 && counts.reduce((sum, value) => sum + value, 0) === incomplete;
+  }
+
+  function incompleteSearch(job) {
+    const result = job?.result || {};
+    return Boolean(result.partial || Number(result.query_errors || result.failed_queries || 0) > 0 || Number(result.yield_histogram?.incomplete_evidence || 0) > 0);
+  }
+
+  function searchFailureCopy(job) {
+    if (job?.status === "cancelled") return "The search was cancelled. Your music choices are kept.";
+    if (job?.status === "interrupted") return "The search was interrupted. Your music choices are kept. Try again to resume checking.";
+    if (job?.status === "partial") return "Some chart checks did not finish. You can review saved results or try again.";
+    return "The chart search did not finish. Your music choices are kept. Try again in a moment.";
+  }
+
+  function showSearchRecovery(message, hasSavedResults = false) {
+    document.body.dataset.riffSearchState = "blocked";
+    $("#findTitle").textContent = "Let's get your search moving.";
+    $("#searchRecoveryMessage").textContent = message;
+    $("#searchRecovery").hidden = false;
+    $("#savedSearchResultsButton").hidden = !hasSavedResults;
+    $("#savedSearchResultsNote").hidden = !hasSavedResults;
+    $("#cancelJobButton").hidden = true;
+    $("#retryJobButton").hidden = true;
+    showStage("find", true);
+    announce(message);
+  }
+
+  async function retrySearch() {
+    const button = $("#retrySearchButton");
+    if (button.disabled) return;
+    clearError();
+    setButtonBusy(button, true, "Restoring your choices...");
+    try {
+      await openAddMusic(false);
+      await startDiscovery();
+    } catch (error) {
+      showSearchRecovery(error.message, Boolean(state.journey?.review?.total > 0));
+    } finally {
+      setButtonBusy(button, false);
+    }
   }
 
   async function ensurePreflight() {
-    let response = await api("/api/preflight");
-    if (!response.preflight?.usable) response = await api("/api/preflight", {method: "POST", body: "{}"});
+    let response = await api("/api/preflight", {timeoutMs: 15000});
+    if (!response.preflight?.usable) response = await api("/api/preflight", {method: "POST", body: "{}", timeoutMs: 45000});
     if (!response.preflight?.usable) throw new Error(response.preflight?.message || "The community chart library is unavailable right now.");
+    $("#progressMessage").textContent = response.preflight?.mode === "catalog"
+      ? "Chart library ready. Starting your search..."
+      : "Community chart service ready. Starting your search...";
   }
 
   async function startDiscovery() {
@@ -667,6 +745,7 @@
     if (button?.disabled) return;
     clearError();
     setButtonBusy(button, true, "Preparing search...");
+    let startedFind = false;
     try {
       const spotifyChosen = await saveScopeIfChosen();
       const imported = Number(state.journey?.combined?.tracks || 0) > 0;
@@ -695,23 +774,33 @@
       $$('[data-review-filter]').forEach(item => item.setAttribute("aria-pressed", String(item.dataset.reviewFilter === "recommended")));
       resetFindUi();
       showStage("find", true);
+      startedFind = true;
       $("#progressMessage").textContent = "Checking the community chart library...";
       await ensurePreflight();
-      const result = await api("/api/jobs", {method: "POST", body: JSON.stringify({kind: "discovery"})});
+      const result = await api("/api/jobs", {method: "POST", body: JSON.stringify({kind: "discovery"}), timeoutMs: 20000});
       attachJob(result.job.id);
     } catch (error) {
       if (error.data?.job?.id) {
         attachJob(error.data.job.id);
         return;
       }
-      showStage("add");
-      showError(error.message);
+      if (startedFind) showSearchRecovery(error.message, Boolean(state.journey?.review?.total > 0));
+      else { showStage("add"); showError(error.message); }
     } finally {
       setButtonBusy(button, false);
     }
   }
 
   function resetFindUi() {
+    document.body.dataset.riffSearchState = "checking";
+    $("#searchRecovery").hidden = true;
+    $("#findTitle").textContent = "Finding your charts";
+    $("#cancelJobButton").hidden = true;
+    $("#retryJobButton").hidden = true;
+    if (state.pollTimer) window.clearTimeout(state.pollTimer);
+    state.pollTimer = null;
+    state.jobId = null;
+    state.jobRequest += 1;
     state.activityOffset = 0;
     state.activityTotal = 0;
     state.activityRequest += 1;
@@ -728,6 +817,10 @@
   function attachJob(jobId) {
     const expectedJobId = Number(jobId);
     state.jobId = expectedJobId;
+    document.body.dataset.riffSearchState = "running";
+    $("#searchRecovery").hidden = true;
+    $("#findTitle").textContent = "Finding your charts";
+    $("#cancelJobButton").hidden = false;
     showStage("find");
     if (state.pollTimer) window.clearTimeout(state.pollTimer);
     state.pollTimer = null;
@@ -881,8 +974,12 @@
         const journey = await api("/api/journey");
         if (expectedJobId !== state.jobId || requestId !== state.jobRequest) return;
         state.journey = journey;
+        if (job.status !== "complete" || allSearchChecksFailed(job)) {
+          showSearchRecovery(searchFailureCopy(job), Boolean(journey.review?.total > 0));
+          return;
+        }
         await openConfirm(true);
-        if (job.status !== "complete" || job.result?.partial) showError(job.error || "The search was incomplete. Review the currently available results or search again; some work may need to be repeated.");
+        if (incompleteSearch(job)) showError(incompleteSearchCopy);
         return;
       }
     } catch (error) {
@@ -2197,6 +2294,13 @@
     $("#clearPlaylistsButton")?.addEventListener("click", () => setAllSpotifyPlaylists(false));
     $("#refreshSpotifyButton")?.addEventListener("click", () => refreshSpotify(false));
     $("#findChartsButton")?.addEventListener("click", startDiscovery);
+    $("#retrySearchButton")?.addEventListener("click", retrySearch);
+    $("#changeMusicButton")?.addEventListener("click", () => { clearError(); openAddMusic(true); });
+    $("#savedSearchResultsButton")?.addEventListener("click", async () => {
+      clearError();
+      await openConfirm(true);
+      showError("These are saved results. The latest search did not finish, so some results may be from an earlier search.");
+    });
     $("#cancelJobButton")?.addEventListener("click", cancelDiscovery);
     $("#retryJobButton")?.addEventListener("click", () => { clearError(); attachJob(state.jobId); });
     $("#activityDetails")?.addEventListener("toggle", event => { if (event.currentTarget.open) loadActivity(); });

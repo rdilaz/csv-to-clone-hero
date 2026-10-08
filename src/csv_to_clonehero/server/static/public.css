@@ -163,6 +163,27 @@ h4 { font-family: var(--font-display); }
 }
 .brand:hover { text-decoration: none; }
 .brand__wordmark { width: 76px; height: auto; }
+.release-badge {
+  margin-left: 8px;
+  padding: 3px 5px;
+  border: 1px solid var(--line-dark);
+  color: var(--cyan);
+  font-size: .58rem;
+  letter-spacing: .04em;
+}
+.search-recovery {
+  margin-block: 24px;
+  padding: clamp(18px, 4vw, 32px);
+  border: 1px solid var(--line);
+  border-left: 4px solid var(--violet-ink);
+  background: var(--surface);
+  color: var(--ink);
+}
+.search-recovery h2 { margin: 4px 0 12px; font-size: clamp(1.3rem, 3vw, 1.8rem); }
+.search-recovery .fine-print { color: var(--muted); }
+.search-recovery__actions { display: flex; flex-wrap: wrap; align-items: center; gap: 12px 20px; margin-top: 20px; }
+.search-recovery .text-button { color: var(--cyan-ink); }
+body[data-riff-search-state="blocked"] #stageFind :is(.progress-phase, .progress-percent, .thin-progress, .progress-count, .current-song, .calm-note, .activity-details, .progress-footer) { display: none; }
 .brand__product {
   display: inline-flex;
   align-items: center;

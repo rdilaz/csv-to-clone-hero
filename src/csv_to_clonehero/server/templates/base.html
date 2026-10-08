@@ -6,10 +6,10 @@
   <meta name="theme-color" content="#080b20">
   <title>{% block title %}Riff | Signal Check{% endblock %}</title>
   <link rel="icon" type="image/svg+xml" href="{{ url_for('static', filename='signal-knot.svg') }}">
-  <link rel="stylesheet" href="{{ url_for('static', filename='public.css') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='public.css', v='riff-v2-20261008') }}">
   {% block head %}{% endblock %}
 </head>
-<body data-authenticated="{{ 'true' if user else 'false' }}">
+<body data-authenticated="{{ 'true' if user else 'false' }}" data-riff-release="riff-v2-20261008">
   <a class="skip-link" href="#main-content">Skip to content</a>
 
   {% if config.monetization.gofundme_enabled and config.monetization.gofundme_banner and config.monetization.effective_gofundme_url %}
@@ -24,7 +24,7 @@
     <div class="shell site-header__inner">
       <a class="brand" href="/" aria-label="Riff home">
         <img class="brand__wordmark" src="{{ url_for('static', filename='riff-wordmark.svg') }}" alt="" aria-hidden="true">
-        <span class="brand__product">Signal Check</span>
+        <span class="brand__product">Signal Check <span class="release-badge">V2</span></span>
       </a>
       <nav class="site-nav" aria-label="Primary navigation">
         <a href="/about">About</a>
@@ -61,6 +61,6 @@
     </div>
   </footer>
   <div class="sr-only" id="announcer" role="status" aria-live="polite" aria-atomic="true"></div>
-  <script src="{{ url_for('static', filename='public.js') }}" defer></script>
+  <script src="{{ url_for('static', filename='public.js', v='riff-v2-20261008') }}" defer></script>
 </body>
 </html>

@@ -188,7 +188,13 @@ def create_app(
     # ---- public pages -------------------------------------------------------
     @app.get("/healthz")
     def healthz():
-        return jsonify({"ok": True, "app": "csv-to-clonehero", "time": time.time()})
+        return jsonify({
+            "ok": True,
+            "app": "csv-to-clonehero",
+            "time": time.time(),
+            "release": "riff-v2-20261008",
+            "experience": "signal-check",
+        })
 
     @app.get("/browser-exporter.js")
     def browser_exporter_asset():
@@ -581,7 +587,11 @@ def create_app(
                 db,
                 jobs.source_factory,
             )
-            return jsonify({"preflight": result}), 200 if result.get("usable") else 503
+            response = jsonify({"preflight": result})
+            response.status_code = 200 if result.get("usable") else 503
+            if result.get("retryable") and result.get("retry_after_seconds", 0) > 0:
+                response.headers["Retry-After"] = str(result["retry_after_seconds"])
+            return response
         finally:
             db.close()
 

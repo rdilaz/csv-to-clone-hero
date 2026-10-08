@@ -85,6 +85,8 @@ def test_healthz_is_public(client):
     r = client.get("/healthz")
     assert r.status_code == 200
     assert r.get_json()["ok"] is True
+    assert r.get_json()["release"] == "riff-v2-20261008"
+    assert r.get_json()["experience"] == "signal-check"
 
 
 def test_landing_is_public(client):
@@ -181,8 +183,8 @@ def test_matching_template_javascript_parses():
 def test_public_shell_uses_csp_compatible_external_assets(client):
     response = client.get("/")
     html = response.get_data(as_text=True)
-    assert '<script src="/static/public.js" defer></script>' in html
-    assert '<link rel="stylesheet" href="/static/public.css">' in html
+    assert '<script src="/static/public.js?v=riff-v2-20261008" defer></script>' in html
+    assert '<link rel="stylesheet" href="/static/public.css?v=riff-v2-20261008">' in html
     assert "<script>" not in html
     assert " onclick=" not in html
     csp = response.headers["Content-Security-Policy"]
@@ -725,6 +727,29 @@ def test_fresh_global_preflight_cannot_be_force_overwritten(client, app, config)
     assert response.status_code == 200
     assert response.get_json()["preflight"]["out_of"] == 100
     assert calls == []
+
+
+def test_busy_public_preflight_is_503_and_retryable_without_adapter_calls(client, app):
+    from csv_to_clonehero.database import Database
+    from csv_to_clonehero.server.throttle import global_gate
+
+    _sign_in(client)
+    calls = []
+    app.extensions["jobs"].source_factory = lambda _config: calls.append(True) or []
+    with global_gate().acquire(tag="existing-job"):
+        response = client.post("/api/preflight", json={})
+    assert response.status_code == 503
+    assert response.headers["Retry-After"] == "1"
+    preflight = response.get_json()["preflight"]
+    assert preflight["mode"] == "live_fallback"
+    assert preflight["status"] == "busy"
+    assert preflight["busy"] and preflight["retryable"] and not preflight["usable"]
+    assert calls == []
+    connection = Database(app.extensions["jobs"].config.database_path)
+    try:
+        assert connection.get_source_preflight("enchor") is None
+    finally:
+        connection.close()
 
 
 def test_track_only_scope_is_rejected(client):

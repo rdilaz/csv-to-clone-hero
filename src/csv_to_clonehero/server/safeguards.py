@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import time
 from dataclasses import asdict, dataclass
 from typing import Any, Callable
@@ -29,35 +30,53 @@ def preflight_public(row: Any, *, now: float | None = None) -> dict[str, Any]:
             "available": False,
             "fresh": False,
             "usable": False,
+            "status": "check_required",
+            "busy": False,
+            "retryable": True,
+            "retry_after_seconds": 0,
             "message": "Check Enchor before starting discovery.",
         }
     current = time.time() if now is None else float(now)
     data = dict(row)
+    metadata = _load_json(data.get("metadata_json"), {}) or {}
+    metadata = metadata if isinstance(metadata, dict) else {}
+    verified = bool(data.get("success") and data.get("supported") and data.get("authoritative"))
+    expires_at = float(data.get("expires_at") or 0)
+    if not verified:
+        # Old deployments cached HTTP-successful but unusable probes for the
+        # success TTL too. Interpret those observations with the short failure
+        # policy without rewriting their original operator evidence.
+        expires_at = min(expires_at, float(data.get("checked_at") or 0) + 60)
     fresh = bool(
-        float(data.get("expires_at") or 0) > current
+        expires_at > current
         and data.get("request_version") == PREFLIGHT_VERSION
     )
-    usable = bool(
-        fresh
-        and data.get("success")
-        and data.get("supported")
-        and data.get("authoritative")
-    )
+    usable = bool(fresh and verified)
     if usable:
         message = f"Enchor reported {int(data.get('out_of') or 0):,} charts."
     elif not fresh:
         message = "The Enchor catalog check is missing or stale."
     else:
-        message = str(data.get("error") or "Enchor could not provide an authoritative broad catalog total.")
+        # Raw adapter errors stay in the persisted operator evidence. Public
+        # readiness must not expose internal paths or request diagnostics.
+        message = (
+            "The community chart service is limiting requests. Your music choices are kept; try again shortly."
+            if metadata.get("rate_limited")
+            else "The community chart service could not be verified. Your music choices are kept; try again shortly."
+        )
     return {
         "available": True,
         "fresh": fresh,
         "usable": usable,
+        "status": "ready" if usable else "stale" if not fresh else "unavailable",
+        "busy": False,
+        "retryable": not usable,
+        "retry_after_seconds": max(1, math.ceil(expires_at - current)) if fresh and not usable else 0,
         "source": data.get("source_name"),
         "endpoint": data.get("endpoint"),
         "request_version": data.get("request_version"),
         "checked_at": data.get("checked_at"),
-        "expires_at": data.get("expires_at"),
+        "expires_at": expires_at,
         "success": bool(data.get("success")),
         "supported": bool(data.get("supported")),
         "authoritative": bool(data.get("authoritative")),
@@ -65,8 +84,12 @@ def preflight_public(row: Any, *, now: float | None = None) -> dict[str, Any]:
         "out_of": data.get("out_of"),
         "returned_count": int(data.get("returned_count") or 0),
         "page": data.get("page"),
-        "error": data.get("error") or "",
-        "metadata": _load_json(data.get("metadata_json"), {}) or {},
+        "error": "" if usable else message,
+        "metadata": {
+            key: metadata[key]
+            for key in ("http_status", "rate_limited")
+            if key in metadata
+        },
         "message": message,
     }
 
@@ -87,7 +110,13 @@ def get_discovery_availability(config: AppConfig, db: Database) -> dict[str, Any
             "available": True,
             "fresh": True,
             "usable": True,
+            "status": "ready",
+            "busy": False,
+            "retryable": False,
+            "retry_after_seconds": 0,
             "mode": "catalog",
+            "catalog_available": True,
+            "catalog_diagnostic": "",
             "source": "enchor",
             "authoritative": True,
             "success": True,
@@ -100,7 +129,8 @@ def get_discovery_availability(config: AppConfig, db: Database) -> dict[str, Any
         }
     live = get_enchor_preflight(db)
     live["mode"] = "live_fallback"
-    live["catalog_diagnostic"] = catalog.diagnostic
+    live["catalog_available"] = False
+    live["catalog_diagnostic"] = "The local chart catalog is unavailable."
     return live
 
 
@@ -109,51 +139,63 @@ def refresh_enchor_preflight(
     db: Database,
     source_factory: Callable[[AppConfig], list[ChartSource]],
 ) -> dict[str, Any]:
-    catalog = get_discovery_availability(config, db)
-    if catalog.get("mode") == "catalog":
-        return catalog
-    cached = get_enchor_preflight(db)
-    if cached.get("fresh"):
-        return cached
+    availability = get_discovery_availability(config, db)
+    if availability.get("mode") == "catalog" or availability.get("fresh"):
+        return availability
 
     sources: list[ChartSource] = []
     result: EnchorCatalogPreflight | None = None
     try:
-        sources = source_factory(config)
-        source = next((item for item in sources if getattr(item, "name", "") == "enchor"), None)
-        if source is None:
-            result = EnchorCatalogPreflight(
-                checked_at=time.time(),
-                error="Enchor is not enabled in the configured chart sources.",
-            )
-        elif not source_is_exportable(source):
-            result = EnchorCatalogPreflight(
-                checked_at=time.time(),
-                error="The configured Enchor source is not exportable.",
-            )
-        else:
-            method = getattr(source, "preflight_catalog", None)
-            if not callable(method):
+        # A request must not wait behind an entire discovery/export job. The
+        # worker queue owns that wait; a public probe reports transient busy
+        # status without recording a failed provider observation.
+        with global_gate().acquire(timeout=0, tag="enchor-preflight") as acquired:
+            if not acquired:
+                return {
+                    **availability,
+                    "status": "busy",
+                    "busy": True,
+                    "retryable": True,
+                    "retry_after_seconds": 1,
+                    "message": "The chart service is busy. Your music choices are kept; try finding charts again shortly.",
+                }
+            # Another request may have completed between the first read and
+            # acquisition. Keep the same catalog/fallback response contract.
+            cached = get_discovery_availability(config, db)
+            if cached.get("mode") == "catalog" or cached.get("fresh"):
+                return cached
+            sources = source_factory(config)
+            source = next((item for item in sources if getattr(item, "name", "") == "enchor"), None)
+            if source is None:
                 result = EnchorCatalogPreflight(
                     checked_at=time.time(),
-                    error="The configured Enchor adapter does not support catalog preflight.",
+                    error="Enchor is not enabled in the configured chart sources.",
+                )
+            elif not source_is_exportable(source):
+                result = EnchorCatalogPreflight(
+                    checked_at=time.time(),
+                    error="The configured Enchor source is not exportable.",
                 )
             else:
-                with global_gate().acquire(tag="enchor-preflight"):
-                    # Another request may have completed while this one waited.
-                    cached = get_enchor_preflight(db)
-                    if cached.get("fresh"):
-                        return cached
-                    result = method()
-                    row = db.record_source_preflight(
-                        asdict(result),
-                        ttl_seconds=(
-                            config.server.enchor_preflight_ttl_seconds
-                            if result.success
-                            else min(60, config.server.enchor_preflight_ttl_seconds)
-                        ),
+                method = getattr(source, "preflight_catalog", None)
+                if not callable(method):
+                    result = EnchorCatalogPreflight(
+                        checked_at=time.time(),
+                        error="The configured Enchor adapter does not support catalog preflight.",
                     )
-                    return preflight_public(row)
+                else:
+                    result = method()
+                # Record while holding the request budget, so another public
+                # probe reuses this observation instead of issuing a duplicate.
+            db.record_source_preflight(
+                asdict(result),
+                ttl_seconds=(
+                    config.server.enchor_preflight_ttl_seconds
+                    if result.success and result.supported and result.authoritative
+                    else min(60, config.server.enchor_preflight_ttl_seconds)
+                ),
+            )
+            return get_discovery_availability(config, db)
     except Exception as exc:  # noqa: BLE001 - persisted as actionable status
         result = EnchorCatalogPreflight(checked_at=time.time(), error=str(exc)[:1000])
     finally:
@@ -164,15 +206,15 @@ def refresh_enchor_preflight(
                 pass
 
     assert result is not None
-    row = db.record_source_preflight(
+    db.record_source_preflight(
         asdict(result),
         ttl_seconds=(
             config.server.enchor_preflight_ttl_seconds
-            if result.success
+            if result.success and result.supported and result.authoritative
             else min(60, config.server.enchor_preflight_ttl_seconds)
         ),
     )
-    return preflight_public(row)
+    return get_discovery_availability(config, db)
 
 
 def validate_discovery_start(

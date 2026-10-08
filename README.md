@@ -1,5 +1,9 @@
 # CSV to Clone Hero
 
+The public product is **Riff V2 / Signal Check**. For the existing Docker-hosted
+site, use the [V2 release guide](docs/V2_RELEASE.md); the local launcher below
+opens a separate single-user interface.
+
 Turn music-library exports or Spotify data into a Clone Hero / YARG song
 library: normalize tracks, find playable charts on
 [Chorus Encore (Enchor)](https://enchor.us), score the matches, and organize
