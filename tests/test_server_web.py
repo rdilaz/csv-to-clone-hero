@@ -183,8 +183,8 @@ def test_matching_template_javascript_parses():
 def test_public_shell_uses_csp_compatible_external_assets(client):
     response = client.get("/")
     html = response.get_data(as_text=True)
-    assert '<script src="/static/public.js?v=riff-v2-20261008" defer></script>' in html
-    assert '<link rel="stylesheet" href="/static/public.css?v=riff-v2-20261008">' in html
+    assert '<script src="/static/public.js?v=riff-v2-20261008-library" defer></script>' in html
+    assert '<link rel="stylesheet" href="/static/public.css?v=riff-v2-20261008-library">' in html
     assert "<script>" not in html
     assert " onclick=" not in html
     csp = response.headers["Content-Security-Policy"]

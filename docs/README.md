@@ -4,6 +4,8 @@
   flow, boundaries, matching methodology, and security model.
 - [`CONFIGURATION.md`](CONFIGURATION.md): configuration precedence, paths,
   secrets, catalog snapshots, and retention rules.
+- [`LIBRARY_COUNTS.md`](LIBRARY_COUNTS.md): full imported-song preview, separate
+  song/chart totals, and how to identify the active chart index.
 - [`runbook.md`](runbook.md): single-host Docker, Cloudflare, backups, restore,
   rollback, and incident checks.
 - [`adr/0001-source-neutral-master-catalog.md`](adr/0001-source-neutral-master-catalog.md):

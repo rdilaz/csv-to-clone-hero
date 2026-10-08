@@ -267,7 +267,10 @@ def test_signal_check_confirm_keeps_multi_chart_selection_truthful(
                     banner_height = banner_box["height"]
                 else:
                     assert page.locator(".cause-bar").count() == 0
-                assert group_box["y"] <= 380 + banner_height
+                # The imported-song totals add useful leading content. The
+                # first chart and its action must still fit above the rail
+                # without scrolling, rather than keep an old pixel budget.
+                assert 0 <= group_box["y"] < action_box["y"]
             assert "is-in-flow" not in (page.locator("#selectionRail").get_attribute("class") or "")
             assert action_box["y"] + action_box["height"] + 7 <= band_box["y"]
         else:
@@ -1025,7 +1028,9 @@ def test_public_authenticated_journey_to_download_ready(
             if method == "GET" and path.startswith("/api/workspace?")
         ]
         assert workspace_requests
-        assert "tier=RECOMMENDED_EXACT%2CSAME_RECORDING_CHART_VARIANT%2CALTERNATE_RECORDING%2CPOSSIBLE_MATCH" in workspace_requests[-1]
+        assert "tier=" not in workspace_requests[-1]
+        assert "selected=" not in workspace_requests[-1]
+        playwright.expect(page.locator('[data-review-filter="all"]')).to_have_attribute("aria-pressed", "true")
         page.get_by_text("Alternate versions (1)", exact=True).click()
         playwright.expect(
             page.get_by_text("Different live recording.", exact=True)

@@ -149,15 +149,27 @@
         <header class="confirm-heading">
           <p class="kicker">CONFIRM</p>
           <h1 id="confirmTitle">Choose your charts</h1>
-          <p><strong id="chartsFoundCount">0</strong> <span id="chartsFoundLabel">songs have recommended charts.</span> Compare variants before they enter your download.</p>
+          <dl class="library-totals" aria-label="Imported music and chart counts">
+            <div><dt>All imported unique songs</dt><dd id="librarySongCount">...</dd></div>
+            <div><dt id="chartsFoundLabel">Songs with recommended charts</dt><dd id="chartsFoundCount">...</dd></div>
+            <div><dt>Selected charts from your music</dt><dd id="librarySelectedChartCount">...</dd></div>
+          </dl>
+          <p class="library-boundary">Selected imports only</p>
+          <p class="catalog-brief" id="catalogCoverageBrief" role="status">Loading chart catalog coverage...</p>
         </header>
 
         <section class="selection-tools" aria-labelledby="selectionToolsTitle">
           <h2 class="sr-only" id="selectionToolsTitle">Selection options</h2>
           <div class="selection-tools__actions">
             <details class="selection-options" open>
-              <summary>Selection options</summary>
+              <summary>Library details &amp; selection options</summary>
               <div>
+                <p class="library-scope">Selected imports only: music you haven't imported is not included. Browse every imported song, including songs without a selectable chart.</p>
+                <aside class="catalog-coverage" aria-labelledby="catalogCoverageTitle">
+                  <h2 id="catalogCoverageTitle">Chart catalog</h2>
+                  <p id="catalogCoverage">Loading chart catalog coverage...</p>
+                  <p class="catalog-snapshot" id="catalogSnapshot" hidden></p>
+                </aside>
                 <button class="button button--compact" id="selectBestButton" type="button">Select recommended <span id="bestMatchCount">0</span></button>
                 <button class="button button--secondary" id="selectAllButton" type="button">Select same-recording charts <span id="allMatchCount">0</span></button>
                 <button class="button button--secondary" id="selectMaximumButton" type="button">Include alternate recordings <span id="maximumMatchCount">0</span></button>
@@ -170,11 +182,12 @@
 
         <section class="review-list" aria-labelledby="quickReviewTitle">
           <div class="review-toolbar">
-            <div><h2 id="quickReviewTitle">Your music</h2><p id="reviewSummary">Loading recommendations...</p></div>
-            <label class="search-field"><span class="sr-only">Search recommendations</span><input id="reviewSearch" type="search" placeholder="Search your music" autocomplete="off"></label>
+            <div><h2 id="quickReviewTitle">All imported songs</h2><p id="reviewSummary">Loading your music...</p></div>
+            <label class="search-field"><span class="sr-only">Search imported songs</span><input id="reviewSearch" type="search" placeholder="Search your music" autocomplete="off"></label>
           </div>
-          <div class="filter-row" role="group" aria-label="Filter chart recommendations">
-            <button type="button" data-review-filter="recommended" aria-pressed="true">All playable</button>
+          <div class="filter-row" role="group" aria-label="Filter imported songs">
+            <button type="button" data-review-filter="all" aria-pressed="true">All imported songs</button>
+            <button type="button" data-review-filter="recommended" aria-pressed="false">All playable</button>
             <button type="button" data-review-filter="strong" aria-pressed="false">Recommended</button>
             <button type="button" data-review-filter="review" aria-pressed="false">Possible matches</button>
             <button type="button" data-review-filter="selected" aria-pressed="false">Selected</button>
