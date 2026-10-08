@@ -16,6 +16,9 @@ the selected config path on first run and is ignored by Git.
    documented public identifiers: `SPOTIFY_CLIENT_ID`, `APP_BASE_URL`,
    `SECRET_KEY`, `TOKEN_ENCRYPTION_KEY`, `DATABASE_URL`, notification settings,
    and `GOFUNDME_URL`.
+   The non-secret `EXPORT_MINIMUM_FREE_BYTES` override is applied while loading
+   configuration and must be a non-negative integer. Blank or unset uses
+   `export.minimum_free_bytes`; the bundled default is zero.
 5. `config.migrate_state_db()` runs at CLI/local-web startup and moves one
    recognized legacy database only when the configured default target is absent.
    Ambiguous state is refused rather than silently merged.

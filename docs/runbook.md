@@ -49,6 +49,27 @@ python -m csv_to_clonehero keys
 Back up `SECRET_KEY` and `TOKEN_ENCRYPTION_KEY` separately from the database.
 Losing the Fernet key makes stored refresh tokens permanently unreadable.
 
+### Disk capacity
+
+Set `EXPORT_MINIMUM_FREE_BYTES` in the existing deployment environment or `.env`
+to a positive integer chosen for this host's capacity and other storage users.
+Compose forwards it to the public application, where it overrides
+`export.minimum_free_bytes` without changing the saved YAML. Blank or unset
+preserves the YAML value; the bundled default is **0**, so leaving it blank does
+not configure a reserve. Negative, boolean, and non-integer values stop startup.
+
+The image does not copy the host's `config.yaml`, and Compose does not mount it.
+Editing only that host file therefore does not configure the running container.
+Verify the effective reserve inside the application before launching. Back up
+the existing environment separately from `/data`.
+
+`storage.max_library_gib` limits one export's chart contents (default 48 GiB),
+not total retained ZIP bytes. One worker serializes builds, but completed ZIPs
+can remain for 15 minutes, up to three per workspace, with no global byte cap.
+Size the persistent volume for retained ZIPs, temporary artifacts and a new
+ZIP, plus the chosen reserve. Watch free capacity and launch with a bounded
+audience until aggregate retention has been measured or separately limited.
+
 ## First Deployment
 
 ```bash

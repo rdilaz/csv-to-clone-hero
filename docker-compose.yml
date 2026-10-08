@@ -21,6 +21,7 @@ services:
       TOKEN_ENCRYPTION_KEY: ${TOKEN_ENCRYPTION_KEY:?TOKEN_ENCRYPTION_KEY is required}
       DATABASE_URL: sqlite:////data/csv_to_clonehero.db
       CATALOG_PATH: ${CATALOG_PATH:-/data/catalog/enchor.jsonl}
+      EXPORT_MINIMUM_FREE_BYTES: ${EXPORT_MINIMUM_FREE_BYTES:-}
       NOTIFICATIONS_API_KEY: ${NOTIFICATIONS_API_KEY:-}
       GOFUNDME_URL: ${GOFUNDME_URL:-}
     ports:
