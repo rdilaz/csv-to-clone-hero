@@ -69,7 +69,8 @@
 - Web UI: `webapp.py` (Flask, 127.0.0.1-only), `python -m csv_to_clonehero
   web`, launcher `WEB_INTERFACE.bat`. The active home page is source-neutral
   (`_UNIFIED_PAGE`): SoundCloud export import plus optional Spotify and local
-  catalog matching. `/advanced` is the full CSV/iTunes review and build UI.
+  catalog matching. `/advanced` redirects to the primary local journey;
+  legacy CSV/iTunes review code is not a mounted alternate frontend.
   The local API exposes a capped live-log ring buffer in `/api/status`, and
   source factories are injectable for tests.
 - Linked Clone Hero library (`webapp.py`): the Songs folder linked via
@@ -80,8 +81,9 @@
   duplicate charts; `/api/spotify/library/clean` quarantines them to a
   `<root> - quarantine` sibling (never deletes). Remote (non-loopback)
   folder exports are allowed ONLY when the destination equals the linked
-  root; every other remote path stays 403 and ZIP browser download is the
-  fallback. Native folder pickers remain loopback-only in all modes.
+  root; every other remote path stays 403. Compatibility ZIP endpoints are
+  mode-gated, not a universal local fallback. Native folder pickers require
+  Windows and loopback; controls must name the Riff host they affect.
 - Downloads are keyed by candidate in the `downloads` table so rebuilds are
   idempotent; selections are rebuilt each run.
 - Deferred options: an interactive organizer / AI playlist builder were
@@ -131,8 +133,8 @@
   `server/downloads.BrowserDownloads` hands it over via a short-lived, signed,
   single-use URL (revoke + sweeper). The local folder exporter may persist
   verified artifacts under `state/export-artifacts` for idempotent rebuilds.
-- The local CSV/`webapp.py` `/advanced` flow stays separate from the public WSGI
-  product. It is protected by local loopback/LAN-token access, not the public
+- The local `webapp.py` journey stays separate from the public WSGI
+  product (`/advanced` redirects locally). It is protected by local loopback/LAN-token access, not the public
   multi-user session model.
 - Ops: `Dockerfile` + `docker-compose.yml` (single host, SQLite `/data`
   volume), `.github/workflows/ci.yml` (offline on push, live Enchor on a
@@ -144,3 +146,8 @@
   code. It is intentionally ignored because a full snapshot is too large for
   ordinary GitHub storage; `catalog-export` is the reproducible acquisition
   utility and the loader refuses incomplete or checksum-invalid snapshots.
+
+- UX recovery release: assets `riff-ux-20261010`, additive SQLite schema 22,
+  owner-workspace selection revision/history/undo and asynchronous preflight.
+  See `docs/UX_RECOVERY_RELEASE.md`. Keep status reconnection read-only after
+  unknown outcomes and never probe signed single-use ZIP links with fetch.

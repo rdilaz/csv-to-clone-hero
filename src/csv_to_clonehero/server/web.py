@@ -28,6 +28,8 @@ import threading
 import time
 import uuid
 from collections import OrderedDict
+from collections.abc import Mapping
+from contextlib import contextmanager
 from typing import Any, Callable
 
 from flask import Flask, abort, g, jsonify, redirect, render_template, request, send_file, session, url_for
@@ -37,7 +39,7 @@ from csv_to_clonehero.catalog_validation import (
     difficulty_preference_key, inspected_difficulty_coverage,
     inspected_difficulty_coverage_from_row,
 )
-from csv_to_clonehero.database import Database
+from csv_to_clonehero.database import Database, SelectionConflict
 from csv_to_clonehero.matching import (
     ALTERNATE_RECORDING,
     BLOCKED,
@@ -123,6 +125,10 @@ def create_app(
     app.extensions["jobs"] = jobs
     app.extensions["downloads"] = downloads
     app.extensions["config"] = config
+
+    @app.errorhandler(SelectionConflict)
+    def selection_conflict(error):
+        return jsonify({"error": str(error), "reload": True}), 409
 
     # ---- request lifecycle --------------------------------------------------
     @app.before_request
@@ -593,30 +599,38 @@ def create_app(
     # ---- Enchor preflight --------------------------------------------------
     @app.get("/api/preflight")
     def preflight_status():
-        _require_user()
+        user = _require_user()
         db = _user_db()
         try:
-            return jsonify({"preflight": get_discovery_availability(config, db)})
+            result = jobs.discovery_availability(db)
+            job = jobs.latest_for_user_workspace(int(user["id"]), workspace_key=user_workspace_key(user["spotify_user_id"]), kind="preflight")
+            if job is not None and job.status in {"queued", "running"}:
+                result.update(status=job.status, busy=True, usable=False,
+                              message=job.message or "Chart-readiness check is queued.")
+            return jsonify({"preflight": result, "job": _job_public(job) if job is not None else None})
         finally:
             db.close()
 
     @app.post("/api/preflight")
     def refresh_preflight():
-        _require_user()
+        user = _require_user()
         db = _user_db()
         try:
-            result = refresh_enchor_preflight(
-                config,
-                db,
-                jobs.source_factory,
-            )
-            response = jsonify({"preflight": result})
-            response.status_code = 200 if result.get("usable") else 503
-            if result.get("retryable") and result.get("retry_after_seconds", 0) > 0:
+            _ensure_workspace(db, user)
+            result = jobs.discovery_availability(db)
+            if result.get("usable"):
+                return jsonify({"preflight": result})
+            if result.get("fresh") and result.get("retry_after_seconds", 0) > 0:
+                response = jsonify({"preflight": result})
+                response.status_code = 503
                 response.headers["Retry-After"] = str(result["retry_after_seconds"])
-            return response
+                return response
         finally:
             db.close()
+        job, _created = jobs.enqueue_unique(int(user["id"]), "preflight", workspace_key=user_workspace_key(user["spotify_user_id"]))
+        result.update(status=job.status, busy=True, usable=False,
+                      message=job.message or "Chart-readiness check is queued.")
+        return jsonify({"preflight": result, "job": _job_public(job)}), 202
 
     # ---- jobs ---------------------------------------------------------------
     @app.get("/api/jobs")
@@ -649,6 +663,7 @@ def create_app(
                 config,
                 user_id=int(user["id"]),
                 workspace_key=key,
+                availability=jobs.discovery_availability(db),
             )
             if not validation.ok:
                 status = 409 if validation.active_job_id is not None else 412
@@ -684,6 +699,8 @@ def create_app(
         try:
             workspace = _ensure_workspace(db, user)
             context = _public_expansion_context(config, db, workspace, coverage_mode="all")
+            prior_metadata = {str(row["artist_norm"]): _json_object(row["metadata_json"])
+                              for row in db.get_workspace_expansion_artists(workspace)}
             prior_selected = {
                 str(row["artist_norm"]): (
                     bool(row["selected"])
@@ -700,6 +717,7 @@ def create_app(
                         "track_count": item["imported_songs"],
                         "cap": item["cap"],
                         "metadata": {
+                            **prior_metadata.get(item["artist_norm"], {}),
                             "catalog_songs": item["catalog_songs"],
                             "catalog_charts": item["catalog_charts"],
                             "eligible_songs": item["eligible_songs"],
@@ -779,6 +797,11 @@ def create_app(
             context = _public_expansion_context(config, db, workspace, coverage_mode=coverage_mode)
             if not context["available"]:
                 return jsonify({"error": context["reason"]}), 409
+            for name, actual in (("selection_revision", db.public_selection_revision(workspace)),
+                                 ("exact_generation_id", context["exact_generation_id"])):
+                expected = payload.get(name)
+                if expected is not None and (type(expected) is not int or expected != actual):
+                    raise SelectionConflict("The choices changed. Refresh the summary before replacing artist expansion.")
             allowed = {item["artist_norm"] for item in context["artists"]}
             if all_artists:
                 artists = [item["artist_norm"] for item in context["artists"]]
@@ -807,6 +830,7 @@ def create_app(
                     "total_artists": len(artists),
                     "completed_artists": 0,
                     "network_requests": 0,
+                    "selection_revision": db.public_selection_revision(workspace),
                 },
             )
             if not created:
@@ -814,10 +838,6 @@ def create_app(
                     "error": "An artist expansion job is already active for this workspace.",
                     "job": _job_public(job),
                 }), 409
-            for row in db.get_workspace_expansion_artists(workspace):
-                db.set_expansion_artist_selected(
-                    workspace, str(row["artist_norm"]), str(row["artist_norm"]) in artists
-                )
             return jsonify({"job": _job_public(job)}), 202
         finally:
             db.close()
@@ -835,6 +855,8 @@ def create_app(
             offset = max(0, int(request.args.get("offset", 0)))
             selected = sum(int(card.get("selected_count") or 0) for card in cards)
             return jsonify({
+                **db.public_selection_receipt(workspace),
+                "exact_generation_id": _public_generation_id(db, workspace),
                 "songs": cards[offset:offset + limit],
                 "total": len(cards),
                 "offset": offset,
@@ -855,52 +877,53 @@ def create_app(
         payload = request.get_json(silent=True) or {}
         if payload.get("preset", "one_per_song") != "one_per_song":
             return jsonify({"error": "unknown expansion selection preset"}), 400
-        if payload.get("confirm_possible") is not True:
-            return jsonify({"error": "Additional songs require explicit review confirmation."}), 400
+        if type(payload.get("confirm_possible", False)) is not bool:
+            return jsonify({"error": "confirmation must be true or false"}), 400
         db = _user_db()
         try:
             workspace = _ensure_workspace(db, user)
-            key = user_workspace_key(user["spotify_user_id"])
-            if any(db.get_active_job(int(user["id"]), workspace_key=key, kind=kind)
-                   is not None for kind in ("discovery", "expansion", "download")):
-                return jsonify({"error": "Wait for matching or ZIP preparation to finish before changing chart choices."}), 409
-            generation_id = _public_generation_id(db, workspace)
-            if generation_id is None or generation_id < 0:
-                return jsonify({"error": "Complete matching before choosing additional songs."}), 409
-            cards = _expansion_review_cards(config, db, workspace)
-            choices = []
-            for card in cards:
-                candidate = next((item for item in card["candidates"] if item.get("selectable")), None)
-                if candidate is not None:
-                    choices.append(candidate)
-            if not choices:
-                return jsonify({"error": "No compatible additional songs are available."}), 400
-            db.clear_workspace_selection(workspace, kind="expansion")
-            for item in choices:
-                db.select_workspace_candidate(
-                    workspace, None, int(item["candidate_id"]), kind="expansion",
-                    artist_norm=item["artist_norm"], force=True,
-                    require_workspace_candidate=True,
-                    metadata={
-                        "result_tier": item["result_tier"],
-                        "possible_confirmed": True,
-                        "selection_origin": "expansion_preset",
-                        "preset": "one_per_song",
-                    },
+            with _public_selection_edit(db, user, workspace, payload, "Replace additional-song choices"):
+                key = user_workspace_key(user["spotify_user_id"])
+                if any(db.get_active_job(int(user["id"]), workspace_key=key, kind=kind)
+                       is not None for kind in ("discovery", "expansion", "download")):
+                    return jsonify({"error": "Wait for matching or ZIP preparation to finish before changing chart choices."}), 409
+                generation_id = _public_generation_id(db, workspace)
+                if generation_id is None or generation_id < 0:
+                    return jsonify({"error": "Complete matching before choosing additional songs."}), 409
+                cards = _expansion_review_cards(config, db, workspace)
+                choices = []
+                for card in cards:
+                    candidate = next((item for item in card["candidates"] if item.get("selectable") and (payload.get("confirm_possible") is True or item.get("result_tier") != POSSIBLE_MATCH)), None)
+                    if candidate is not None:
+                        choices.append(candidate)
+                if not choices:
+                    return jsonify({"error": "No compatible additional songs are available."}), 400
+                db.clear_workspace_selection(workspace, kind="expansion")
+                for item in choices:
+                    db.select_workspace_candidate(
+                        workspace, None, int(item["candidate_id"]), kind="expansion",
+                        artist_norm=item["artist_norm"], force=True,
+                        require_workspace_candidate=True,
+                        metadata={
+                            "result_tier": item["result_tier"],
+                            "possible_confirmed": payload.get("confirm_possible") is True,
+                            "selection_origin": "expansion_preset",
+                            "preset": "one_per_song",
+                        },
+                    )
+                selected_ids = {
+                    int(row["candidate_id"])
+                    for row in db.list_workspace_selections(workspace, kind="expansion")
+                    if str(row["status"]) == "selected"
+                }
+                selected_songs = sum(
+                    any(int(item["candidate_id"]) in selected_ids for item in card["candidates"])
+                    for card in cards
                 )
-            selected_ids = {
-                int(row["candidate_id"])
-                for row in db.list_workspace_selections(workspace, kind="expansion")
-                if str(row["status"]) == "selected"
-            }
-            selected_songs = sum(
-                any(int(item["candidate_id"]) in selected_ids for item in card["candidates"])
-                for card in cards
-            )
             return jsonify({
                 "ok": True, "songs": selected_songs, "charts": len(selected_ids),
                 "changed": len(selected_ids), "scope": "expansion",
-                "minimum_score": db.get_workspace_minimum_score(workspace),
+                "minimum_score": db.get_workspace_minimum_score(workspace), **db.public_selection_state(workspace),
             })
         finally:
             db.close()
@@ -974,9 +997,12 @@ def create_app(
                 kind="download",
             )
             download = downloads.latest_for_user_workspace(int(user["id"]), workspace_id)
+            preflight_job = jobs.latest_for_user_workspace(int(user["id"]), workspace_key=key, kind="preflight")
             if download is not None:
                 download["url"] = url_for("stream_download", token=download["token"])
             return jsonify({
+                **db.public_selection_receipt(workspace_id),
+                "exact_generation_id": _public_generation_id(db, workspace_id),
                 "workspace_id": workspace_id,
                 "workspace_status": str(row["status"] or "") if row is not None else "",
                 "workspace": {
@@ -994,6 +1020,7 @@ def create_app(
                 "combined": db.get_combined_summary(workspace_id),
                 "job": _job_public(newest_job) if newest_job is not None else None,
                 "download_job": _job_public(download_job) if download_job is not None else None,
+                "preflight_job": _job_public(preflight_job) if preflight_job is not None else None,
                 "review": _review_summary(cards),
                 "download": download,
             })
@@ -1053,6 +1080,7 @@ def create_app(
             limit = min(100, max(1, int(request.args.get("limit", 50))))
             offset = max(0, int(request.args.get("offset", 0)))
             return jsonify({
+                **db.public_selection_receipt(workspace),
                 "workspace": workspace,
                 "minimum_score": minimum_score,
                 "tracks": filtered[offset:offset + limit],
@@ -1075,121 +1103,124 @@ def create_app(
         db = _user_db()
         try:
             workspace = _ensure_workspace(db, user)
-            if any(db.get_active_job(
-                int(user["id"]), workspace_key=user_workspace_key(user["spotify_user_id"]), kind=kind,
-            ) is not None for kind in ("discovery", "expansion", "download")):
-                return jsonify({"error": "Wait for matching or ZIP preparation to finish before changing chart choices."}), 409
-            candidate_id = int(payload.get("candidate_id") or 0)
-            track_value = payload.get("track_id") or payload.get("track_key")
-            candidate_kind = str(payload.get("kind") or "exact")
-            if candidate_kind not in {"exact", "expansion"}:
-                raise ValueError("candidate kind must be exact or expansion")
-            artist_norm = str(payload.get("artist_norm") or "")
-            action = str(payload.get("action") or "select")
-            if action in {"clear", "deselect", "remove"}:
-                db.clear_workspace_selection(workspace, track_value, candidate_id=candidate_id, kind=candidate_kind, artist_norm=artist_norm)
-            else:
-                threshold = db.get_workspace_minimum_score(workspace)
-                generation_id = _public_generation_id(db, workspace)
-                matching_rows = db.get_workspace_candidates(
-                    workspace,
-                    track_id=track_value,
-                    kind=candidate_kind,
-                    include_rejected=True,
-                    generation_id=generation_id if candidate_kind == "exact" else None,
-                )
-                candidate_row = next(
-                    (
-                        row for row in matching_rows
-                        if int(row["candidate_id"]) == candidate_id
-                        and (
-                            candidate_kind == "exact"
-                            or not artist_norm
-                            or str(row["artist_norm"]) == normalize_artist(artist_norm)
-                        )
-                    ),
-                    None,
-                )
-                if candidate_row is None:
-                    raise ValueError("candidate does not belong to this workspace track")
-                candidate = db.get_candidate(candidate_id)
-                if candidate_kind == "exact":
-                    track = _track_by_id(db, candidate_row["track_id"])
-                    current = _current_match(config, track, candidate)
+            with _public_selection_edit(db, user, workspace, payload, "Remove chart" if payload.get("action") in {"clear", "deselect", "remove"} else "Add chart"):
+                if any(db.get_active_job(
+                    int(user["id"]), workspace_key=user_workspace_key(user["spotify_user_id"]), kind=kind,
+                ) is not None for kind in ("discovery", "expansion", "download")):
+                    return jsonify({"error": "Wait for matching or ZIP preparation to finish before changing chart choices."}), 409
+                candidate_id = int(payload.get("candidate_id") or 0)
+                track_value = payload.get("track_id") or payload.get("track_key")
+                candidate_kind = str(payload.get("kind") or "exact")
+                if candidate_kind not in {"exact", "expansion"}:
+                    raise ValueError("candidate kind must be exact or expansion")
+                artist_norm = str(payload.get("artist_norm") or "")
+                action = str(payload.get("action") or "select")
+                if action in {"clear", "deselect", "remove"}:
+                    db.clear_workspace_selection(workspace, track_value, candidate_id=candidate_id, kind=candidate_kind, artist_norm=artist_norm)
                 else:
-                    row_metadata = _json_object(candidate_row["metadata_json"])
-                    if int(row_metadata.get("exact_generation_id") or 0) != int(generation_id or 0):
-                        raise ValueError("artist recommendation is stale; run expansion again")
-                    artist_norm = str(candidate_row["artist_norm"] or "")
-                    identity = (
-                        normalize_artist(str(candidate.artist or "")),
-                        normalize_title(str(candidate.name or "")),
+                    threshold = db.get_workspace_minimum_score(workspace)
+                    generation_id = _public_generation_id(db, workspace)
+                    matching_rows = db.get_workspace_candidates(
+                        workspace,
+                        track_id=track_value,
+                        kind=candidate_kind,
+                        include_rejected=True,
+                        generation_id=generation_id if candidate_kind == "exact" else None,
                     )
-                    if identity in _workspace_imported_identities(db, workspace):
-                        raise ValueError("song is already represented by the imported library")
-                    current = _current_expansion_match(
-                        config, artist_norm, candidate,
-                        coverage_mode=str(row_metadata.get("coverage_mode") or "recommended"),
-                    )
-                current_eligibility, current_hard_gate, current_score, _current_quality, current_breakdown = current
-                if current_hard_gate or current_eligibility == "INCOMPATIBLE":
-                    raise ValueError("candidate is blocked by a hard compatibility gate")
-                if candidate_kind == "expansion" and current_eligibility not in {"RECOMMENDED", "ELIGIBLE_REVIEW"}:
-                    raise ValueError("candidate is not included in this expansion mode")
-                result_tier, tier_reasons = classify_result_tier(
-                    current_breakdown, kind=candidate_kind
-                )
-                if result_tier == BLOCKED:
-                    raise ValueError("candidate is blocked by a hard compatibility gate")
-                if result_tier == POSSIBLE_MATCH and not bool(
-                    payload.get("confirm_possible")
-                ):
-                    raise ValueError("possible matches require explicit confirmation")
-                if candidate_kind == "exact":
-                    catalog_sources = list(jobs.source_factory(config))
-                    try:
-                        relevant = [source for source in catalog_sources if str(getattr(source, "name", "")) == str(candidate_row["source"] or "")]
-                        chart_memberships = [
-                            source_catalog_contains_chart(
-                                source,
-                                int(candidate_row["chart_id"]),
-                                source_name=str(candidate_row["source"] or ""),
+                    candidate_row = next(
+                        (
+                            row for row in matching_rows
+                            if int(row["candidate_id"]) == candidate_id
+                            and (
+                                candidate_kind == "exact"
+                                or not artist_norm
+                                or str(row["artist_norm"]) == normalize_artist(artist_norm)
                             )
-                            for source in relevant
-                            if candidate_row["chart_id"] not in (None, "")
-                        ]
-                        if chart_memberships and any(value is True for value in chart_memberships):
-                            pass
-                        elif chart_memberships and all(value is False for value in chart_memberships):
-                            raise ValueError("song is unavailable in the local chart catalog")
-                        else:
-                            memberships = [source_catalog_available(source, str(candidate_row["track_artist"] or ""), str(candidate_row["track_title"] or "")) for source in relevant]
-                            if memberships and all(value is False for value in memberships):
-                                raise ValueError("song is unavailable in the local chart catalog")
-                    finally:
-                        for source in catalog_sources:
-                            try:
-                                source.close()
-                            except Exception:
+                        ),
+                        None,
+                    )
+                    if candidate_row is None:
+                        raise ValueError("candidate does not belong to this workspace track")
+                    candidate = db.get_candidate(candidate_id)
+                    if candidate_kind == "exact":
+                        track = _track_by_id(db, candidate_row["track_id"])
+                        current = _current_match(config, track, candidate)
+                    else:
+                        row_metadata = _json_object(candidate_row["metadata_json"])
+                        if int(row_metadata.get("exact_generation_id") or 0) != int(generation_id or 0):
+                            raise ValueError("artist recommendation is stale; run expansion again")
+                        artist_norm = str(candidate_row["artist_norm"] or "")
+                        identity = (
+                            normalize_artist(str(candidate.artist or "")),
+                            normalize_title(str(candidate.name or "")),
+                        )
+                        if identity in _workspace_imported_identities(db, workspace):
+                            raise ValueError("song is already represented by the imported library")
+                        current = _current_expansion_match(
+                            config, artist_norm, candidate,
+                            coverage_mode=str(row_metadata.get("coverage_mode") or "recommended"),
+                        )
+                    current_eligibility, current_hard_gate, current_score, _current_quality, current_breakdown = current
+                    if current_hard_gate or current_eligibility == "INCOMPATIBLE":
+                        raise ValueError("candidate is blocked by a hard compatibility gate")
+                    if candidate_kind == "expansion" and current_eligibility not in {"RECOMMENDED", "ELIGIBLE_REVIEW"}:
+                        raise ValueError("candidate is not included in this expansion mode")
+                    result_tier, tier_reasons = classify_result_tier(
+                        current_breakdown, kind=candidate_kind
+                    )
+                    if result_tier == BLOCKED:
+                        raise ValueError("candidate is blocked by a hard compatibility gate")
+                    if result_tier == POSSIBLE_MATCH and not bool(
+                        payload.get("confirm_possible")
+                    ):
+                        raise ValueError("possible matches require explicit confirmation")
+                    if candidate_kind == "exact":
+                        catalog_sources = list(jobs.source_factory(config))
+                        try:
+                            relevant = [source for source in catalog_sources if str(getattr(source, "name", "")) == str(candidate_row["source"] or "")]
+                            chart_memberships = [
+                                source_catalog_contains_chart(
+                                    source,
+                                    int(candidate_row["chart_id"]),
+                                    source_name=str(candidate_row["source"] or ""),
+                                )
+                                for source in relevant
+                                if candidate_row["chart_id"] not in (None, "")
+                            ]
+                            if chart_memberships and any(value is True for value in chart_memberships):
                                 pass
-                if current_score < threshold and result_tier not in SELECTABLE_RESULT_TIERS:
-                    raise ValueError(f"candidate score is below the workspace threshold ({threshold:g})")
-                db.select_workspace_candidate(
-                    workspace,
-                    track_value,
-                    candidate_id,
-                    kind=candidate_kind,
-                    artist_norm=artist_norm,
-                    force=True,
-                    require_workspace_candidate=True,
-                    metadata={
-                        "result_tier": result_tier,
-                        "result_tier_reasons": tier_reasons,
-                        "possible_confirmed": bool(payload.get("confirm_possible")),
-                        "selection_origin": "explicit",
-                    },
-                )
+                            elif chart_memberships and all(value is False for value in chart_memberships):
+                                raise ValueError("song is unavailable in the local chart catalog")
+                            else:
+                                memberships = [source_catalog_available(source, str(candidate_row["track_artist"] or ""), str(candidate_row["track_title"] or "")) for source in relevant]
+                                if memberships and all(value is False for value in memberships):
+                                    raise ValueError("song is unavailable in the local chart catalog")
+                        finally:
+                            for source in catalog_sources:
+                                try:
+                                    source.close()
+                                except Exception:
+                                    pass
+                    if current_score < threshold and result_tier not in SELECTABLE_RESULT_TIERS:
+                        raise ValueError(f"candidate score is below the workspace threshold ({threshold:g})")
+                    db.select_workspace_candidate(
+                        workspace,
+                        track_value,
+                        candidate_id,
+                        kind=candidate_kind,
+                        artist_norm=artist_norm,
+                        force=True,
+                        require_workspace_candidate=True,
+                        metadata={
+                            "result_tier": result_tier,
+                            "result_tier_reasons": tier_reasons,
+                            "possible_confirmed": bool(payload.get("confirm_possible")),
+                            "selection_origin": "explicit",
+                        },
+                    )
             return jsonify({"ok": True, **db.public_selection_state(workspace)})
+        except SelectionConflict:
+            raise
         except (TypeError, ValueError) as exc:
             return jsonify({"error": str(exc)}), 400
         finally:
@@ -1288,12 +1319,73 @@ def create_app(
                 filtered = [items[index] for index in indices if items[index]["key"] in allowed_keys]
             page = _deck_selection_overlay(filtered[offset:offset + limit], state)
             return jsonify({
+                **db.public_selection_receipt(workspace),
                 "items": page, "total": len(filtered),
                 "offset": offset, "limit": limit, "has_more": offset + limit < len(filtered),
                 "exact_generation_id": generation, "generation_token": token,
                 "capabilities": _STUDIO_CAPABILITIES,
                 "order": order, "seed": seed if order == "shuffle" else None,
             })
+        finally:
+            db.close()
+
+    @app.get("/api/selection/history")
+    def selection_history():
+        user = _require_user()
+        db = _user_db()
+        try:
+            workspace = _ensure_workspace(db, user)
+            with db.atomic_workspace_selection(write=False):
+                return jsonify({**db.public_selection_state(workspace),
+                                "exact_generation_id": _public_generation_id(db, workspace),
+                                "operations": db.public_selection_history(workspace)})
+        finally:
+            db.close()
+
+    @app.post("/api/selection/undo")
+    def undo_selection():
+        user = _require_user()
+        payload = request.get_json(silent=True) or {}
+        if not isinstance(payload, dict) or type(payload.get("operation_id")) is not int or type(payload.get("selection_revision")) is not int:
+            return jsonify({"error": "A current operation and selection revision are required."}), 400
+        db = _user_db()
+        try:
+            workspace = _ensure_workspace(db, user)
+            with _public_selection_edit(db, user, workspace, payload, "Restore previous choices", record=False):
+                db.undo_public_selection(workspace, payload["operation_id"], payload["selection_revision"], _public_generation_id(db, workspace),
+                                         validate_choice=lambda choice: _public_restore_choice_eligible(config, db, workspace, choice))
+            return jsonify({"ok": True, **db.public_selection_state(workspace),
+                            "exact_generation_id": _public_generation_id(db, workspace)})
+        finally:
+            db.close()
+
+    @app.get("/api/selection/all-preview")
+    def preview_all_selection():
+        user = _require_user()
+        scope = request.args.get("scope", "library")
+        policy = request.args.get("policy", "one_per_song")
+        include = request.args.get("include_possible", "false")
+        if scope not in {"library", "expansion", "both"} or policy not in {"one_per_song", "all_versions"} or include not in {"true", "false"}:
+            return jsonify({"error": "Choose a valid scope, version policy and review setting."}), 400
+        if scope == "expansion" and not config.server.enable_expansion:
+            abort(404)
+        db = _user_db()
+        try:
+            workspace = _ensure_workspace(db, user)
+            with db.atomic_workspace_selection(write=False):
+                generation = _public_generation_id(db, workspace)
+                if generation is None or generation < 0:
+                    raise SelectionConflict("Complete matching before previewing choices.")
+                choices = _studio_selection_choices(config, db, workspace, scope, policy, include == "true")
+                possible = [item for item in _studio_selection_choices(config, db, workspace, scope, policy, True)
+                            if item["metadata"]["result_tier"] == POSSIBLE_MATCH]
+                counts = _selection_choice_counts(db, workspace, scope, choices)
+                possible_counts = _selection_choice_counts(db, workspace, scope, possible)
+                return jsonify({"scope": scope, "policy": policy, "include_possible": include == "true",
+                                "operation": "replace", **counts,
+                                "undo_supported": db.public_selection_undo_supported(workspace),
+                                "possible_songs": possible_counts["songs"], "possible_charts": possible_counts["charts"],
+                                "exact_generation_id": generation, **db.public_selection_receipt(workspace)})
         finally:
             db.close()
 
@@ -1310,12 +1402,10 @@ def create_app(
             return jsonify({"error": "Choose a valid scope, policy and confirmation."}), 400
         if scope == "expansion" and not config.server.enable_expansion:
             abort(404)
-        if scope in {"expansion", "both"} and not confirm:
-            return jsonify({"error": "Additional songs require explicit review confirmation."}), 400
         db = _user_db()
         try:
             workspace = _ensure_workspace(db, user)
-            with db.atomic_workspace_selection():
+            with _public_selection_edit(db, user, workspace, payload, "Replace selected song pool"):
                 key = user_workspace_key(user["spotify_user_id"])
                 if any(db.get_active_job(int(user["id"]), workspace_key=key, kind=kind) is not None for kind in ("discovery", "expansion", "download")):
                     return jsonify({"error": "Wait for matching or ZIP preparation to finish before changing chart choices."}), 409
@@ -1331,9 +1421,12 @@ def create_app(
                 state = db.public_selection_state(workspace)
                 old_ids = {(s, item.get("track_key"), item["candidate_id"]) for s, items in before["selected"].items() for item in items}
                 new_ids = {(s, item.get("track_key"), item["candidate_id"]) for s, items in state["selected"].items() for item in items}
+            state = db.public_selection_state(workspace)
             return jsonify({"ok": True, "scope": scope, "policy": policy,
                             "changed": len(old_ids ^ new_ids), "exact_generation_id": generation,
                             "minimum_score": db.get_workspace_minimum_score(workspace), **state})
+        except SelectionConflict:
+            raise
         except (TypeError, ValueError) as exc:
             return jsonify({"error": str(exc)}), 400
         finally:
@@ -1349,113 +1442,126 @@ def create_app(
         db = _user_db()
         try:
             workspace = _ensure_workspace(db, user)
-            if not workspace:
-                return jsonify({"error": "No workspace exists yet."}), 400
-            if db.get_active_job(
-                int(user["id"]),
-                workspace_key=user_workspace_key(user["spotify_user_id"]),
-                kind="download",
-            ) is not None:
-                return jsonify({"error": "Wait for ZIP preparation to finish before changing chart choices."}), 409
-            threshold = db.get_workspace_minimum_score(workspace)
-            changed = 0
-            if action == "select":
-                scope = str(
-                    payload.get("preset")
-                    or payload.get("scope")
-                    or payload.get("selection_scope")
-                    or payload.get("filter")
-                    or "strong"
-                ).casefold()
-                if scope in {"recommended", "auto", "auto_accept", "strong", "best_matches"}:
-                    allowed_tiers = {RECOMMENDED_EXACT}
-                    scope = "best_matches"
-                elif scope in {"all_safe_charts", "safe", "eligible"}:
-                    allowed_tiers = {RECOMMENDED_EXACT, SAME_RECORDING_CHART_VARIANT}
-                    scope = "all_safe_charts"
-                elif scope in {"maximum_playable", "maximum", "max"}:
-                    allowed_tiers = {
-                        RECOMMENDED_EXACT,
-                        SAME_RECORDING_CHART_VARIANT,
-                        ALTERNATE_RECORDING,
-                    }
-                    scope = "maximum_playable"
-                else:
-                    return jsonify({"error": "unknown selection preset"}), 400
-                db.clear_workspace_selection(workspace, kind="exact")
-                requested = payload.get("track_ids")
-                if isinstance(requested, (str, bytes)):
-                    requested = [requested]
-                requested_ids = {str(value) for value in requested} if requested is not None else None
-                needle = str(payload.get("search") or payload.get("query") or "").strip().casefold()
-                selected_rows: list[tuple[dict[str, Any], str]] = []
-                generation_id = _public_generation_id(db, workspace)
-                rows = db.get_workspace_candidates(
-                    workspace,
-                    kind="exact",
-                    include_rejected=True,
-                    generation_id=generation_id,
-                )
-                for row in rows:
-                    data = dict(row)
-                    if requested_ids is not None and not {
-                        str(data.get("track_id")),
-                        str(data.get("spotify_id")),
-                        str(data.get("track_key")),
-                    } & requested_ids:
-                        continue
-                    candidate = db.get_candidate(int(data.get("candidate_id") or 0))
-                    track = _track_by_id(db, data.get("track_id"))
-                    eligibility, hard_gate, score, quality, current_breakdown = _current_match(
-                        config, track, candidate
+            with _public_selection_edit(db, user, workspace, payload, "Clear imported choices" if action != "select" else "Apply imported selection preset"):
+                if not workspace:
+                    return jsonify({"error": "No workspace exists yet."}), 400
+                if db.get_active_job(
+                    int(user["id"]),
+                    workspace_key=user_workspace_key(user["spotify_user_id"]),
+                    kind="download",
+                ) is not None:
+                    return jsonify({"error": "Wait for ZIP preparation to finish before changing chart choices."}), 409
+                threshold = db.get_workspace_minimum_score(workspace)
+                changed = 0
+                cohort = _public_selection_cohort(config, db, workspace, payload)
+                if action == "select":
+                    scope = str(
+                        payload.get("preset")
+                        or payload.get("scope")
+                        or payload.get("selection_scope")
+                        or payload.get("filter")
+                        or "strong"
+                    ).casefold()
+                    if scope in {"recommended", "auto", "auto_accept", "strong", "best_matches"}:
+                        allowed_tiers = {RECOMMENDED_EXACT}
+                        scope = "best_matches"
+                    elif scope in {"all_safe_charts", "safe", "eligible"}:
+                        allowed_tiers = {RECOMMENDED_EXACT, SAME_RECORDING_CHART_VARIANT}
+                        scope = "all_safe_charts"
+                    elif scope in {"maximum_playable", "maximum", "max"}:
+                        allowed_tiers = {
+                            RECOMMENDED_EXACT,
+                            SAME_RECORDING_CHART_VARIANT,
+                            ALTERNATE_RECORDING,
+                        }
+                        scope = "maximum_playable"
+                    else:
+                        return jsonify({"error": "unknown selection preset"}), 400
+                    if cohort is None:
+                        db.clear_workspace_selection(workspace, kind="exact")
+                    else:
+                        for track_id in cohort:
+                            db.clear_workspace_selection(workspace, track_id, kind="exact")
+                    requested = payload.get("track_ids")
+                    if isinstance(requested, (str, bytes)):
+                        requested = [requested]
+                    requested_ids = {str(value) for value in requested} if requested is not None else None
+                    needle = str(payload.get("search") or payload.get("query") or "").strip().casefold()
+                    selected_rows: list[tuple[dict[str, Any], str]] = []
+                    generation_id = _public_generation_id(db, workspace)
+                    rows = db.get_workspace_candidates(
+                        workspace,
+                        kind="exact",
+                        include_rejected=True,
+                        generation_id=generation_id,
                     )
-                    if hard_gate:
-                        continue
-                    tier = classify_result_tier(current_breakdown)[0]
-                    if tier not in allowed_tiers:
-                        continue
-                    if needle and needle not in " ".join(
-                        str(data.get(key) or "")
-                        for key in ("track_artist", "track_title", "source", "chart_id")
-                    ).casefold():
-                        candidate_data = _json_object(data.get("candidate_json"))
-                        if needle not in " ".join(
-                            str(candidate_data.get(key) or "")
-                            for key in ("artist", "name", "charter", "url")
-                        ).casefold():
+                    for row in rows:
+                        data = dict(row)
+                        if requested_ids is not None and not {
+                            str(data.get("track_id")),
+                            str(data.get("spotify_id")),
+                            str(data.get("track_key")),
+                        } & requested_ids:
                             continue
-                    coverage_rank = difficulty_preference_key(
-                        inspected_difficulty_coverage(db, candidate)
-                    ) if scope == "best_matches" else (0, 0)
-                    data["_rank"] = (
-                        *(-value for value in coverage_rank), score, quality,
-                        -int(data.get("candidate_id") or 0),
-                    )
-                    selected_rows.append((data, tier))
-                if scope == "best_matches":
-                    best_by_track: dict[int, tuple[dict[str, Any], str]] = {}
-                    for data, tier in selected_rows:
-                        track_id = int(data.get("track_id") or 0)
-                        if track_id not in best_by_track or data["_rank"] > best_by_track[track_id][0]["_rank"]:
-                            best_by_track[track_id] = (data, tier)
-                    selected_rows = list(best_by_track.values())
-                for row, tier in selected_rows:
-                    try:
-                        db.select_workspace_candidate(
-                            workspace,
-                            row["track_id"],
-                            int(row["candidate_id"]),
-                            kind="exact",
-                            force=True,
-                            require_workspace_candidate=True,
-                            metadata={"selection_origin": "preset", "preset": scope, "result_tier": tier},
+                        candidate = db.get_candidate(int(data.get("candidate_id") or 0))
+                        track = _track_by_id(db, data.get("track_id"))
+                        eligibility, hard_gate, score, quality, current_breakdown = _current_match(
+                            config, track, candidate
                         )
-                        changed += 1
-                    except ValueError:
-                        continue
-            else:
-                changed = db.clear_workspace_selection(workspace, kind="exact")
-            return jsonify({"ok": True, "changed": changed, "minimum_score": threshold, "scope": scope if action == "select" else "all"})
+                        if hard_gate:
+                            continue
+                        tier = classify_result_tier(current_breakdown)[0]
+                        if tier not in allowed_tiers:
+                            continue
+                        if needle and needle not in " ".join(
+                            str(data.get(key) or "")
+                            for key in ("track_artist", "track_title", "source", "chart_id")
+                        ).casefold():
+                            candidate_data = _json_object(data.get("candidate_json"))
+                            if needle not in " ".join(
+                                str(candidate_data.get(key) or "")
+                                for key in ("artist", "name", "charter", "url")
+                            ).casefold():
+                                continue
+                        coverage_rank = difficulty_preference_key(
+                            inspected_difficulty_coverage(db, candidate)
+                        ) if scope == "best_matches" else (0, 0)
+                        data["_rank"] = (
+                            *(-value for value in coverage_rank), score, quality,
+                            -int(data.get("candidate_id") or 0),
+                        )
+                        selected_rows.append((data, tier))
+                    if scope == "best_matches":
+                        best_by_track: dict[int, tuple[dict[str, Any], str]] = {}
+                        for data, tier in selected_rows:
+                            track_id = int(data.get("track_id") or 0)
+                            if track_id not in best_by_track or data["_rank"] > best_by_track[track_id][0]["_rank"]:
+                                best_by_track[track_id] = (data, tier)
+                        selected_rows = list(best_by_track.values())
+                    for row, tier in selected_rows:
+                        try:
+                            db.select_workspace_candidate(
+                                workspace,
+                                row["track_id"],
+                                int(row["candidate_id"]),
+                                kind="exact",
+                                force=True,
+                                require_workspace_candidate=True,
+                                metadata={"selection_origin": "preset", "preset": scope, "result_tier": tier},
+                            )
+                            changed += 1
+                        except ValueError:
+                            continue
+                else:
+                    if cohort is None:
+                        changed = db.clear_workspace_selection(workspace, kind="exact")
+                    else:
+                        changed = sum(db.clear_workspace_selection(workspace, track_id, kind="exact") for track_id in cohort)
+            return jsonify({"ok": True, "changed": changed, "minimum_score": threshold, "scope": scope if action == "select" else "all", **db.public_selection_state(workspace)})
+        except SelectionConflict:
+            raise
+        except (TypeError, ValueError) as exc:
+            return jsonify({"error": str(exc)}), 400
         finally:
             db.close()
 
@@ -1850,6 +1956,33 @@ def _ensure_workspace(db: Database, user: Any) -> int:
     ))
 
 
+@contextmanager
+def _public_selection_edit(db: Database, user: Any, workspace: int,
+                           payload: dict[str, Any], label: str, *, record: bool = True):
+    """Lock ownership, job status, generation and revision through the edit."""
+    with db.atomic_workspace_selection():
+        key = user_workspace_key(user["spotify_user_id"])
+        row = db.get_workspace(workspace)
+        if row is None or str(row["workspace_key"]) != key:
+            raise SelectionConflict("This workspace is unavailable.")
+        if any(db.get_active_job(int(user["id"]), workspace_key=key, kind=kind) is not None
+               for kind in ("discovery", "expansion", "download")):
+            raise SelectionConflict("Wait for matching or ZIP preparation to finish before changing chart choices.")
+        generation = _public_generation_id(db, workspace)
+        if generation is not None and generation < 0:
+            raise SelectionConflict("The chart results changed. Complete matching before changing choices.")
+        for name, actual in (("selection_revision", db.public_selection_revision(workspace)),
+                             ("exact_generation_id", generation)):
+            expected = payload.get(name)
+            if expected is not None and (type(expected) is not int or expected != actual):
+                raise SelectionConflict("The selection or chart results changed. Refresh the summary before continuing.")
+        if record:
+            with db.record_public_selection_change(workspace, label, generation):
+                yield
+        else:
+            yield
+
+
 def _track_by_id(db: Database, track_id: Any) -> Any | None:
     try:
         expected = int(track_id)
@@ -1859,6 +1992,31 @@ def _track_by_id(db: Database, track_id: Any) -> Any | None:
         (track for track in db.get_spotify_tracks(True) if int(track.db_id or 0) == expected),
         None,
     )
+
+
+def _public_restore_choice_eligible(config: AppConfig, db: Database, workspace: int, choice: Mapping[str, Any]) -> bool:
+    candidate = db.get_candidate(int(choice["candidate_id"]))
+    if candidate is None or not db.is_chart_artifact_eligible(candidate.source, candidate.chart_id):
+        return False
+    if choice["kind"] == "exact":
+        eligibility, hard_gate, _, _, breakdown = _current_match(config, _track_by_id(db, choice["track_id"]), candidate)
+    else:
+        artist_norm = str(choice["artist_norm"] or "")
+        projection = choice if "decision" in choice else db._conn.execute(
+            "SELECT * FROM workspace_candidates WHERE workspace_id=? AND kind='expansion' AND candidate_id=? AND artist_norm=?",
+            (workspace, int(choice["candidate_id"]), artist_norm)).fetchone()
+        if projection is None:
+            return False
+        metadata = _json_object(projection["metadata_json"])
+        if int(metadata.get("exact_generation_id") or 0) != int(_public_generation_id(db, workspace) or 0):
+            return False
+        if (normalize_artist(candidate.artist), normalize_title(candidate.name)) in _workspace_imported_identities(db, workspace):
+            return False
+        eligibility, hard_gate, _, _, breakdown = _current_expansion_match(config, artist_norm, candidate, coverage_mode=str(metadata.get("coverage_mode") or "recommended"))
+        if eligibility not in {"RECOMMENDED", "ELIGIBLE_REVIEW"}:
+            return False
+    tier, _ = classify_result_tier(breakdown, kind=str(choice["kind"]))
+    return not hard_gate and eligibility != "INCOMPATIBLE" and tier in SELECTABLE_RESULT_TIERS
 
 
 def _public_generation_id(db: Database, workspace_id: int) -> int | None:
@@ -2208,15 +2366,60 @@ def _deck_selection_overlay(items: list[dict[str, Any]], state: dict[str, Any]) 
     return page
 
 
+def _public_selection_cohort(config: AppConfig, db: Database, workspace: int,
+                             payload: dict[str, Any]) -> set[int] | None:
+    requested = payload.get("track_ids")
+    needle = str(payload.get("search") or payload.get("query") or "").strip().casefold()
+    if requested is None and not needle:
+        return None
+    if isinstance(requested, (str, bytes)):
+        requested = [requested]
+    requested_ids = {str(value) for value in requested} if requested is not None else None
+    tracks = {track.track_key: track for track in db.get_spotify_tracks(True)}
+    result = set()
+    for card in _review_cards(config, db, workspace, db.get_workspace_minimum_score(workspace)):
+        track = tracks.get(card["track_key"])
+        if track is None:
+            continue
+        if requested_ids is not None and not {str(track.db_id), track.track_key, str(track.spotify_id)} & requested_ids:
+            continue
+        if needle and not _card_matches_search(card, needle):
+            continue
+        result.add(int(track.db_id))
+    return result
+
+
+def _selection_choice_counts(db: Database, workspace: int, scope: str,
+                             choices: list[dict[str, Any]]) -> dict[str, Any]:
+    kinds = {"exact"} if scope == "library" else {"expansion"} if scope == "expansion" else {"exact", "expansion"}
+    artifacts = set()
+    for row in db.list_workspace_selections(workspace):
+        if row["kind"] not in kinds:
+            chart = db.candidate_from_workspace_row(row)
+            artifacts.add((chart.source, chart.md5 or f"chart:{chart.chart_id}"))
+    songs = {"library": set(), "expansion": set()}
+    chart_counts = {"library": 0, "expansion": 0}
+    for choice in choices:
+        chart = db.get_candidate(int(choice["candidate_id"]))
+        identity = (chart.source, chart.md5 or f"chart:{chart.chart_id}")
+        if identity in artifacts:
+            continue
+        artifacts.add(identity)
+        bucket = "library" if choice["kind"] == "exact" else "expansion"
+        songs[bucket].add(choice["track_id"] if bucket == "library" else (normalize_artist(chart.artist), normalize_title(chart.name)))
+        chart_counts[bucket] += 1
+    summary = {bucket: {"songs": len(songs[bucket]), "charts": chart_counts[bucket]} for bucket in songs}
+    return {"songs": sum(item["songs"] for item in summary.values()),
+            "charts": sum(item["charts"] for item in summary.values()), "summary": summary}
+
+
 def _studio_selection_choices(config: AppConfig, db: Database, workspace: int,
                               scope: str, policy: str, confirm: bool) -> list[dict[str, Any]]:
     tracks = {track.track_key: int(track.db_id) for track in db.get_spotify_tracks(True)}
     choices = []
     seen_songs = set()
-    allowed = SELECTABLE_RESULT_TIERS if confirm else {RECOMMENDED_EXACT, SAME_RECORDING_CHART_VARIANT}
+    allowed = SELECTABLE_RESULT_TIERS if confirm else SELECTABLE_RESULT_TIERS - {POSSIBLE_MATCH}
     for kind, card in _studio_cards(config, db, workspace, scope):
-        if kind == "expansion" and not confirm:
-            continue
         candidates = [item for item in card["candidates"] if item.get("selectable") and item.get("result_tier") in allowed]
         identity = (normalize_artist(card["artist"]), normalize_title(card["title"]))
         if policy == "one_per_song":

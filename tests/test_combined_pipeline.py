@@ -27,6 +27,29 @@ class FakeCatalog:
         return (("Song", (self.chart,)),) if artist == "artist" else ()
 
 
+def test_catalog_prepare_is_observable_before_cold_catalog_load(config, monkeypatch):
+    from tests.conftest import make_chart
+    import csv_to_clonehero.combined_pipeline as pipeline
+    events = []
+    catalog = FakeCatalog(make_chart("Song", "Artist", chart_id=88001))
+
+    def load(_path):
+        assert events and events[-1]["phase"] == "catalog_prepare"
+        assert events[-1]["catalog_chart_count"] is None
+        return catalog
+
+    monkeypatch.setattr(pipeline, "completed_scan_fast_path", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(pipeline, "load_enchor_catalog", load)
+    db = Database(config.database_path)
+    try:
+        result = discover_combined(config, db, [LibrarySnapshot("soundcloud", [
+            ProviderTrack("soundcloud", "progress", "Song", "Artist")
+        ])], workspace_key="combined:preload-feedback", on_progress=events.append)
+        assert result.catalog_available is True
+    finally:
+        db.close()
+
+
 @pytest.mark.parametrize("title,artist,chart_title,chart_artist", [
     ("65th & Ingleside", "Chance the Rapper", "10 Miles Wide", "Escape the Fate"),
     ("Acid Rain", "Chance the Rapper", "Mad Man", "Haste the Day"),

@@ -75,6 +75,15 @@ def _catalog_route(fixtures, preflight, *, status=200):
     return route_api
 
 
+def _open_catalog_details(page):
+    """Inspect detailed counts through the same native disclosure a user opens."""
+    playwright.expect(page.locator("#catalogCoverageBrief")).to_be_visible()
+    details = page.locator(".selection-options")
+    if not details.evaluate("element => element.open"):
+        details.locator(":scope > summary").click()
+    playwright.expect(page.locator("#catalogCoverage")).to_be_visible()
+
+
 @pytest.mark.parametrize("width", [320, 390, 1440])
 def test_library_preview_lists_every_imported_song_and_honest_readonly_status(delivery_page, width):
     fixtures = LibraryFixtures()
@@ -97,12 +106,10 @@ def test_library_preview_lists_every_imported_song_and_honest_readonly_status(de
     assert "tier" not in first_query and "selected" not in first_query
     _assert_no_overflow(page)
     _capture(page, f"library-all-{width}.png")
-    if width <= 1000:
-        page.locator(".selection-options > summary").click()
+    _open_catalog_details(page)
     playwright.expect(page.locator(".library-scope")).to_be_visible()
     assert "haven't imported" in page.locator(".library-scope").inner_text()
-    if width <= 1000:
-        page.locator(".selection-options > summary").click()
+    page.locator(".selection-options > summary").click()
     readonly.first.scroll_into_view_if_needed()
     _capture(page, f"library-status-{width}.png")
     page.locator("#reviewNext").click()
@@ -135,6 +142,8 @@ def test_verified_catalog_shows_indexed_records_and_eligible_counts(delivery_pag
     if include_song_count:
         preflight["eligible_songs"] = 80000
     page, requests = delivery_page(fixtures, route_api=_catalog_route(fixtures, preflight))
+    playwright.expect(page.locator("#catalogCoverageBrief")).to_have_text("Local catalog · 120,000 indexed charts · 110,000 eligible")
+    _open_catalog_details(page)
     playwright.expect(page.locator("#catalogCoverage")).to_contain_text("120,000 indexed chart records; 110,000 eligible charts")
     playwright.expect(page.locator("#catalogSnapshot")).to_have_text("Snapshot: test-snapshot-<safe>")
     assert ("80,000 distinct eligible songs" in page.locator("#catalogCoverage").inner_text()) is include_song_count
@@ -153,6 +162,7 @@ def test_verified_catalog_shows_indexed_records_and_eligible_counts(delivery_pag
 def test_live_advertised_counts_are_not_claimed_as_riffs_indexed_catalog(delivery_page, preflight, expected):
     fixtures = LibraryFixtures()
     page, requests = delivery_page(fixtures, route_api=_catalog_route(fixtures, preflight))
+    _open_catalog_details(page)
     playwright.expect(page.locator("#catalogCoverage")).to_contain_text(expected)
     assert "no verified local indexed catalog" in page.locator("#catalogCoverage").inner_text()
     assert "not Riff's indexed pool" in page.locator("#catalogCoverage").inner_text()
@@ -179,6 +189,8 @@ def test_unknown_library_total_and_failed_catalog_read_never_turn_into_zero(deli
 
     page, requests = delivery_page(fixtures, route_api=route_api)
     playwright.expect(page.locator("#librarySongCount")).to_have_text("Unknown")
+    playwright.expect(page.locator("#catalogCoverageBrief")).to_have_text("Chart catalog counts unknown")
+    _open_catalog_details(page)
     playwright.expect(page.locator("#catalogCoverage")).to_contain_text("counts are unknown")
     assert page.locator("#stageConfirm").is_visible()
     assert page.locator("#appError").is_hidden()
@@ -193,6 +205,7 @@ def test_each_live_report_verification_flag_is_required_before_showing_a_count(d
     preflight[failed_field] = False
     page, requests = delivery_page(fixtures, route_api=_catalog_route(fixtures, preflight))
     playwright.expect(page.locator("#catalogCoverageBrief")).to_have_text("Live fallback · advertised chart count unknown")
+    _open_catalog_details(page)
     assert "95,440" not in page.locator("#catalogCoverage").inner_text()
     assert "report is not verified" in page.locator("#catalogCoverage").inner_text()
     assert not [request for request in requests if request.method == "POST"]

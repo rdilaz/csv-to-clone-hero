@@ -17,7 +17,8 @@ from typing import Any
 
 from csv_to_clonehero.models import ChartCandidate, Track
 
-SCHEMA_VERSION = 21
+SCHEMA_VERSION = 22
+PUBLIC_RESTORE_POINT_BYTES = 32 * 1024 * 1024
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);
@@ -402,6 +403,35 @@ CREATE TABLE IF NOT EXISTS workspace_selections (
     updated_at REAL NOT NULL,
     metadata_json TEXT NOT NULL DEFAULT '{}'
 );
+
+CREATE TABLE IF NOT EXISTS public_selection_clock (
+    workspace_id INTEGER PRIMARY KEY REFERENCES discovery_workspaces(id) ON DELETE CASCADE,
+    revision INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS public_selection_operations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    workspace_id INTEGER NOT NULL REFERENCES discovery_workspaces(id) ON DELETE CASCADE,
+    label TEXT NOT NULL,
+    generation_id INTEGER NOT NULL,
+    candidate_revision INTEGER NOT NULL,
+    after_revision INTEGER NOT NULL,
+    before_json TEXT NOT NULL,
+    created_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_public_selection_history ON public_selection_operations(workspace_id,id DESC);
+CREATE TRIGGER IF NOT EXISTS public_selection_insert AFTER INSERT ON workspace_selections BEGIN
+    INSERT INTO public_selection_clock(workspace_id,revision) VALUES(NEW.workspace_id,1)
+    ON CONFLICT(workspace_id) DO UPDATE SET revision=revision+1;
+END;
+CREATE TRIGGER IF NOT EXISTS public_selection_delete AFTER DELETE ON workspace_selections BEGIN
+    INSERT INTO public_selection_clock(workspace_id,revision) SELECT OLD.workspace_id,1
+    WHERE EXISTS(SELECT 1 FROM discovery_workspaces WHERE id=OLD.workspace_id)
+    ON CONFLICT(workspace_id) DO UPDATE SET revision=revision+1;
+END;
+CREATE TRIGGER IF NOT EXISTS public_selection_update AFTER UPDATE ON workspace_selections BEGIN
+    INSERT INTO public_selection_clock(workspace_id,revision) VALUES(NEW.workspace_id,1)
+    ON CONFLICT(workspace_id) DO UPDATE SET revision=revision+1;
+END;
 
 CREATE TABLE IF NOT EXISTS workspace_expansion_artists (
     id INTEGER PRIMARY KEY,
@@ -1154,6 +1184,21 @@ def _normalise_spotify_playlist(value: Any) -> dict[str, Any]:
     }
 
 
+class _SelectionConnection(sqlite3.Connection):
+    """Defer helper context commits to the explicit outer selection transaction."""
+
+    selection_atomic = False
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        if self.selection_atomic:
+            return False
+        return super().__exit__(exc_type, exc_value, traceback)
+
+
+class SelectionConflict(ValueError):
+    """A selection operation no longer describes the user's current workspace."""
+
+
 class Database:
     """SQLite gateway for both local state and public workspace state.
 
@@ -1164,7 +1209,7 @@ class Database:
 
     def __init__(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(str(path), timeout=30.0)
+        self._conn = sqlite3.connect(str(path), timeout=30.0, factory=_SelectionConnection)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA foreign_keys = ON")
         self._conn.execute("PRAGMA busy_timeout = 30000")
@@ -4408,12 +4453,15 @@ class Database:
         if self._conn.in_transaction:
             raise ValueError("selection transaction is already active")
         self._conn.execute("BEGIN IMMEDIATE" if write else "BEGIN")
+        self._conn.selection_atomic = True
         try:
             yield
             self._conn.commit()
         except BaseException:
             self._conn.rollback()
             raise
+        finally:
+            self._conn.selection_atomic = False
 
     def replace_public_selection(self, workspace_id: int, kinds: Iterable[str],
                                  choices: Iterable[Mapping[str, Any]]) -> None:
@@ -4491,7 +4539,240 @@ class Database:
         summary = {scope: {"songs": len(identities[scope]), "charts": len(selected[scope])} for scope in selected}
         return {"selected": selected, "summary": summary,
                 "songs": sum(value["songs"] for value in summary.values()),
-                "charts": sum(value["charts"] for value in summary.values())}
+                "charts": sum(value["charts"] for value in summary.values()),
+                **self.public_selection_receipt(workspace_id)}
+
+    def public_selection_revision(self, workspace_id: int) -> int:
+        row = self._conn.execute("SELECT revision FROM public_selection_clock WHERE workspace_id=?", (workspace_id,)).fetchone()
+        return int(row["revision"]) if row is not None else 0
+
+    def public_selection_receipt(self, workspace_id: int) -> dict[str, Any]:
+        revision = self.public_selection_revision(workspace_id)
+        row = self._conn.execute("SELECT * FROM public_selection_operations WHERE workspace_id=? ORDER BY id DESC LIMIT 1", (workspace_id,)).fetchone()
+        current = self.get_current_exact_generation(workspace_id)
+        generation = int(current["id"]) if current is not None else 0
+        latest = self.get_latest_exact_generation(workspace_id)
+        available = bool(row is not None and int(row["after_revision"]) == revision
+                         and int(row["generation_id"]) == generation
+                         and (latest is None or current is not None)
+                         and int(row["candidate_revision"]) == self.get_workspace_candidate_revision(workspace_id))
+        workspace = self.get_workspace(workspace_id)
+        metadata = _load_json(workspace["metadata_json"], {}) if workspace is not None else {}
+        return {"selection_revision": revision, "undo": {
+            "available": available,
+            "operation_id": int(row["id"]) if available else None,
+            "label": str(row["label"]) if available else "",
+            "revision": revision, "generation_id": generation,
+            "reason": "" if available else str(metadata.get("selection_undo_unavailable") or ""),
+        }}
+
+    def public_selection_history(self, workspace_id: int) -> list[dict[str, Any]]:
+        return [{"operation_id": int(row["id"]), "label": str(row["label"]),
+                 "created_at": row["created_at"]} for row in self._conn.execute(
+                     "SELECT id,label,created_at FROM public_selection_operations WHERE workspace_id=? ORDER BY id DESC LIMIT 10", (workspace_id,))]
+
+    def _public_selection_rows(self, workspace_id: int) -> list[dict[str, Any]]:
+        return [dict(row) for row in self._conn.execute("SELECT * FROM workspace_selections WHERE workspace_id=? ORDER BY id", (workspace_id,))]
+
+    @staticmethod
+    def _public_pick_identity(rows: list[dict[str, Any]]) -> set[tuple]:
+        return {(row["kind"], row["track_id"], row["candidate_id"], row["artist_norm"] or "", row["status"]) for row in rows}
+
+    def _restore_public_selection_rows(self, workspace_id: int, rows: list[dict[str, Any]]) -> None:
+        self._conn.execute("DELETE FROM workspace_selections WHERE workspace_id=?", (workspace_id,))
+        columns = ("id", "workspace_id", "kind", "track_id", "spotify_track_id", "artist_norm", "candidate_id", "score", "explanation", "eligibility", "status", "planned_bytes", "target_relpath", "selected_at", "updated_at", "metadata_json")
+        occupied = {int(row["id"]) for row in self._conn.execute("SELECT id FROM workspace_selections WHERE workspace_id!=?", (workspace_id,))}
+        # Other owners may have acquired deleted row IDs. Reserve the still-free
+        # originals first, then allocate fresh IDs for conflicts; never rewrite
+        # another workspace's selection to preserve an internal row identifier.
+        ordered = sorted(rows, key=lambda row: int(row["id"]) in occupied)
+        self._conn.executemany("INSERT INTO workspace_selections(" + ",".join(columns) + ") VALUES(" + ",".join("?" for _ in columns) + ")",
+                               [tuple((None if int(row["id"]) in occupied else row["id"]) if column == "id" else row[column] for column in columns) for row in ordered])
+
+    @staticmethod
+    def _bounded_public_restore_json(value: Any) -> str | None:
+        parts = []
+        byte_count = 0
+        for part in json.JSONEncoder(separators=(",", ":")).iterencode(value):
+            byte_count += len(part.encode("utf-8"))
+            if byte_count > PUBLIC_RESTORE_POINT_BYTES:
+                return None
+            parts.append(part)
+        return "".join(parts)
+
+    def public_selection_undo_supported(self, workspace_id: int) -> bool:
+        """Evaluate a requested preview, without adding work to routine reads."""
+        return self._bounded_public_restore_json(self._public_selection_rows(workspace_id)) is not None
+
+    @contextmanager
+    def record_public_selection_change(self, workspace_id: int, label: str, generation_id: int | None):
+        """Bounded durable restore points inside an already locked owner snapshot."""
+        if not self._conn.in_transaction or not self._conn.selection_atomic:
+            raise ValueError("selection history requires a locked snapshot")
+        before = self._public_selection_rows(workspace_id)
+        before_revision = self.public_selection_revision(workspace_id)
+        # A large existing set must not trap its owner behind an undo budget.
+        # Bound the saved JSON while allowing the authorized edit to complete.
+        serialized = self._bounded_public_restore_json(before)
+        yield
+        after = self._public_selection_rows(workspace_id)
+        if self._public_pick_identity(before) == self._public_pick_identity(after):
+            # Repeated taps/presets preserve custom metadata and do not consume
+            # the last real restore point. Rebase only a previously valid one.
+            if before != after:
+                self._restore_public_selection_rows(workspace_id, before)
+            self._conn.execute("UPDATE public_selection_operations SET after_revision=? WHERE workspace_id=? AND id=(SELECT MAX(id) FROM public_selection_operations WHERE workspace_id=?) AND after_revision=?",
+                               (self.public_selection_revision(workspace_id), workspace_id, workspace_id, before_revision))
+            return
+        if serialized is None:
+            self._conn.execute("DELETE FROM public_selection_operations WHERE workspace_id=?", (workspace_id,))
+            self._set_public_undo_reason(workspace_id, "This selection change exceeded the restore history size limit; its earlier choices cannot be restored.")
+            return
+        self._conn.execute("INSERT INTO public_selection_operations(workspace_id,label,generation_id,candidate_revision,after_revision,before_json,created_at) VALUES(?,?,?,?,?,?,?)",
+                           (workspace_id, label[:120], int(generation_id or 0), self.get_workspace_candidate_revision(workspace_id), self.public_selection_revision(workspace_id), serialized, time.time()))
+        self._set_public_undo_reason(workspace_id, "")
+        self._bound_public_selection_history(workspace_id)
+
+    def _set_public_undo_reason(self, workspace_id: int, reason: str) -> None:
+        workspace = self.get_workspace(workspace_id)
+        metadata = _load_json(workspace["metadata_json"], {})
+        if str(metadata.get("selection_undo_unavailable") or "") == reason:
+            return
+        if reason:
+            metadata["selection_undo_unavailable"] = reason
+        else:
+            metadata.pop("selection_undo_unavailable", None)
+        self._conn.execute("UPDATE discovery_workspaces SET metadata_json=? WHERE id=?", (_json_text(metadata, {}), workspace_id))
+
+    def _bound_public_selection_history(self, workspace_id: int) -> None:
+        rows = self._conn.execute("SELECT id,length(CAST(before_json AS BLOB)) AS bytes FROM public_selection_operations WHERE workspace_id=? ORDER BY id DESC", (workspace_id,)).fetchall()
+        retained_bytes = 0
+        for index, row in enumerate(rows):
+            retained_bytes += int(row["bytes"])
+            if index >= 10 or retained_bytes > 64 * 1024 * 1024:
+                self._conn.execute("DELETE FROM public_selection_operations WHERE id=?", (row["id"],))
+
+    def _public_expansion_snapshot(self, workspace_id: int) -> dict[str, Any]:
+        # Only workspace projections are saved. Shared chart metadata and the
+        # current artifact ledger remain authoritative at restoration time.
+        candidates = [dict(row) for row in self._conn.execute("SELECT * FROM workspace_candidates WHERE workspace_id=? AND kind='expansion' ORDER BY artist_norm,candidate_id", (workspace_id,))]
+        artists = [dict(row) for row in self._conn.execute("SELECT * FROM workspace_expansion_artists WHERE workspace_id=? ORDER BY artist_norm", (workspace_id,))]
+        for item in candidates + artists:
+            item.pop("id", None)
+            item.pop("workspace_id", None)
+        return {"selections": self._public_selection_rows(workspace_id), "candidates": candidates, "artists": artists}
+
+    def begin_public_expansion_change(self, workspace_id: int, generation_id: int) -> dict[str, Any]:
+        if not self._conn.in_transaction or not self._conn.selection_atomic:
+            raise ValueError("expansion history requires a locked snapshot")
+        snapshot = self._public_expansion_snapshot(workspace_id)
+        encoded = json.dumps(snapshot, separators=(",", ":"))
+        receipt = self.public_selection_receipt(workspace_id)
+        context = {"operation_id": None, "digest": hashlib.sha256(encoded.encode("utf-8")).hexdigest(),
+                   "previous_operation_id": receipt["undo"]["operation_id"],
+                   "before_candidate_revision": self.get_workspace_candidate_revision(workspace_id)}
+        if len(encoded.encode("utf-8")) <= PUBLIC_RESTORE_POINT_BYTES:
+            snapshot["previous_operation_id"] = context["previous_operation_id"]
+            snapshot["before_candidate_revision"] = context["before_candidate_revision"]
+            encoded = json.dumps(snapshot, separators=(",", ":"))
+            if len(encoded.encode("utf-8")) > PUBLIC_RESTORE_POINT_BYTES:
+                return context
+            cur = self._conn.execute("INSERT INTO public_selection_operations(workspace_id,label,generation_id,candidate_revision,after_revision,before_json,created_at) VALUES(?,?,?,?,?,?,?)",
+                                     (workspace_id, "Replace artist expansion", generation_id, context["before_candidate_revision"], -1, encoded, time.time()))
+            context["operation_id"] = int(cur.lastrowid)
+            self._bound_public_selection_history(workspace_id)
+        return context
+
+    def finish_public_expansion_change(self, workspace_id: int, generation_id: int, context: Mapping[str, Any]) -> None:
+        if not self._conn.in_transaction or not self._conn.selection_atomic:
+            raise ValueError("expansion history requires a locked snapshot")
+        current = self.get_current_exact_generation(workspace_id)
+        operation_id = context["operation_id"]
+        if current is None or int(current["id"]) != generation_id:
+            if operation_id is not None:
+                self._conn.execute("DELETE FROM public_selection_operations WHERE id=? AND workspace_id=?", (operation_id, workspace_id))
+            return
+        after = json.dumps(self._public_expansion_snapshot(workspace_id), separators=(",", ":"))
+        if hashlib.sha256(after.encode("utf-8")).hexdigest() == context["digest"]:
+            if operation_id is not None:
+                self._conn.execute("DELETE FROM public_selection_operations WHERE id=? AND workspace_id=?", (operation_id, workspace_id))
+            # A repeated empty or identical expansion must retain a real undo.
+            self._conn.execute("UPDATE public_selection_operations SET after_revision=?,candidate_revision=? WHERE id=? AND workspace_id=? AND generation_id=? AND candidate_revision=?",
+                               (self.public_selection_revision(workspace_id), self.get_workspace_candidate_revision(workspace_id), context["previous_operation_id"], workspace_id, generation_id, context["before_candidate_revision"]))
+            return
+        self._conn.execute("UPDATE discovery_workspaces SET candidate_revision=candidate_revision+1 WHERE id=?", (workspace_id,))
+        self._conn.execute("INSERT INTO public_selection_clock(workspace_id,revision) VALUES(?,1) ON CONFLICT(workspace_id) DO UPDATE SET revision=revision+1", (workspace_id,))
+        if operation_id is None:
+            self._conn.execute("DELETE FROM public_selection_operations WHERE workspace_id=?", (workspace_id,))
+            self._set_public_undo_reason(workspace_id, "This artist expansion exceeded the restore history size limit; its earlier choices cannot be restored.")
+        else:
+            self._conn.execute("UPDATE public_selection_operations SET after_revision=?,candidate_revision=? WHERE id=? AND workspace_id=?",
+                               (self.public_selection_revision(workspace_id), self.get_workspace_candidate_revision(workspace_id), operation_id, workspace_id))
+            self._set_public_undo_reason(workspace_id, "")
+            self._bound_public_selection_history(workspace_id)
+
+    def recover_public_expansion_changes(self) -> None:
+        """Finalize bounded restore points left by an interrupted worker."""
+        for row in list(self._conn.execute("SELECT * FROM public_selection_operations WHERE after_revision=-1 ORDER BY id")):
+            snapshot = json.loads(row["before_json"])
+            baseline = {key: snapshot[key] for key in ("selections", "candidates", "artists")}
+            context = {"operation_id": int(row["id"]),
+                       "digest": hashlib.sha256(json.dumps(baseline, separators=(",", ":")).encode("utf-8")).hexdigest(),
+                       "previous_operation_id": snapshot.get("previous_operation_id"),
+                       "before_candidate_revision": snapshot["before_candidate_revision"]}
+            with self.atomic_workspace_selection():
+                self.finish_public_expansion_change(int(row["workspace_id"]), int(row["generation_id"]), context)
+
+    def _restore_public_expansion_snapshot(self, workspace_id: int, snapshot: Mapping[str, Any]) -> None:
+        self._conn.execute("DELETE FROM workspace_selections WHERE workspace_id=? AND kind='expansion'", (workspace_id,))
+        self._conn.execute("DELETE FROM workspace_candidates WHERE workspace_id=? AND kind='expansion'", (workspace_id,))
+        self._conn.execute("DELETE FROM workspace_expansion_artists WHERE workspace_id=?", (workspace_id,))
+        for table, key, columns in (
+            ("workspace_candidates", "candidates", ("track_id", "candidate_id", "kind", "artist_norm", "task_id", "score", "quality", "decision", "eligibility", "breakdown_json", "metadata_json")),
+            ("workspace_expansion_artists", "artists", ("artist_name", "artist_norm", "track_count", "cap", "selected", "metadata_json")),
+        ):
+            self._conn.executemany("INSERT INTO " + table + "(workspace_id," + ",".join(columns) + ") VALUES(?" + ",?" * len(columns) + ")",
+                                   [(workspace_id, *(item[column] for column in columns)) for item in snapshot[key]])
+        self._conn.execute("UPDATE discovery_workspaces SET candidate_revision=candidate_revision+1 WHERE id=?", (workspace_id,))
+        self._conn.execute("INSERT INTO public_selection_clock(workspace_id,revision) VALUES(?,1) ON CONFLICT(workspace_id) DO UPDATE SET revision=revision+1", (workspace_id,))
+
+    def undo_public_selection(self, workspace_id: int, operation_id: int, revision: int, generation_id: int | None,
+                              *, validate_choice: Callable[[Mapping[str, Any]], bool] | None = None) -> None:
+        if not self._conn.in_transaction or not self._conn.selection_atomic:
+            raise ValueError("selection undo requires a locked snapshot")
+        receipt = self.public_selection_receipt(workspace_id)
+        if revision != receipt["selection_revision"] or not receipt["undo"]["available"] or operation_id != receipt["undo"]["operation_id"]:
+            raise SelectionConflict("The selection changed. Refresh its summary before restoring choices.")
+        row = self._conn.execute("SELECT * FROM public_selection_operations WHERE id=? AND workspace_id=?", (operation_id, workspace_id)).fetchone()
+        if row is None or int(row["generation_id"]) != int(generation_id or 0):
+            raise SelectionConflict("The chart results changed. Choices from an older search cannot be restored.")
+        snapshot = json.loads(row["before_json"])
+        before = snapshot["selections"] if isinstance(snapshot, dict) else snapshot
+        if isinstance(snapshot, dict):
+            for projection in snapshot["candidates"]:
+                candidate = self.get_candidate(int(projection["candidate_id"]))
+                if candidate is None or not self.is_chart_artifact_eligible(candidate.source, candidate.chart_id):
+                    raise SelectionConflict("An earlier artist chart is no longer eligible. Review current chart options.")
+                if validate_choice is not None and not validate_choice(projection):
+                    raise SelectionConflict("An earlier artist chart no longer passes the current compatibility checks.")
+            self._restore_public_expansion_snapshot(workspace_id, snapshot)
+        if validate_choice is not None and any(not validate_choice(item) for item in before):
+            raise SelectionConflict("Some earlier choices no longer pass the current compatibility checks.")
+        # Reapply current membership/hard-gate/artifact checks before restoring
+        # the original customized metadata, order and timestamps.
+        choices = [{"kind": item["kind"], "track_id": item["track_id"], "candidate_id": item["candidate_id"], "artist_norm": item["artist_norm"] or ""} for item in before]
+        try:
+            self.replace_public_selection(workspace_id, ("exact", "expansion"), choices)
+        except ValueError as exc:
+            raise SelectionConflict("Some earlier choices are no longer eligible. Review current chart options.") from exc
+        self._restore_public_selection_rows(workspace_id, before)
+        self._conn.execute("DELETE FROM public_selection_operations WHERE id=? AND workspace_id=?", (operation_id, workspace_id))
+        if isinstance(snapshot, dict):
+            self._conn.execute("UPDATE public_selection_operations SET after_revision=?,candidate_revision=? WHERE id=? AND workspace_id=? AND generation_id=? AND candidate_revision=?",
+                               (self.public_selection_revision(workspace_id), self.get_workspace_candidate_revision(workspace_id), snapshot.get("previous_operation_id"), workspace_id, int(generation_id or 0), snapshot["before_candidate_revision"]))
+        else:
+            self._conn.execute("UPDATE public_selection_operations SET after_revision=? WHERE workspace_id=? AND id=(SELECT MAX(id) FROM public_selection_operations WHERE workspace_id=?) AND generation_id=? AND candidate_revision=?",
+                               (self.public_selection_revision(workspace_id), workspace_id, workspace_id, int(generation_id or 0), self.get_workspace_candidate_revision(workspace_id)))
 
     def public_review_revision(self) -> int:
         return int(self._conn.execute("SELECT revision FROM public_review_clock WHERE id=1").fetchone()["revision"])

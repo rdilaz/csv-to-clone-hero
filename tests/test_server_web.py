@@ -183,11 +183,11 @@ def test_matching_template_javascript_parses():
 def test_public_shell_uses_csp_compatible_external_assets(client):
     response = client.get("/")
     html = response.get_data(as_text=True)
-    assert '<script src="/static/public.js?v=riff-studio-20261008" defer></script>' in html
-    assert '<link rel="stylesheet" href="/static/public.css?v=riff-studio-20261008">' in html
-    assert '<script src="/static/studio.js?v=riff-studio-20261008" defer></script>' in html
-    assert '<script src="/static/riff-scene.js?v=riff-studio-20261008" defer></script>' in html
-    assert '<link rel="stylesheet" href="/static/studio.css?v=riff-studio-20261008">' in html
+    assert '<script src="/static/public.js?v=riff-ux-20261010" defer></script>' in html
+    assert '<link rel="stylesheet" href="/static/public.css?v=riff-ux-20261010">' in html
+    assert '<script src="/static/studio.js?v=riff-ux-20261010" defer></script>' in html
+    assert '<script src="/static/riff-scene.js?v=riff-ux-20261010" defer></script>' in html
+    assert '<link rel="stylesheet" href="/static/studio.css?v=riff-ux-20261010">' in html
     assert "<script>" not in html
     assert " onclick=" not in html
     csp = response.headers["Content-Security-Policy"]
@@ -714,9 +714,12 @@ def test_preflight_refresh_persists_global_authoritative_status(client, app):
             pass
 
     app.extensions["jobs"].source_factory = lambda cfg: [FakeEnchor()]
+    app.extensions["jobs"].shutdown()
     refreshed = client.post("/api/preflight", json={"force": True})
-    assert refreshed.status_code == 200
-    assert refreshed.get_json()["preflight"]["out_of"] == 321
+    assert refreshed.status_code == 202
+    job_id = refreshed.get_json()["job"]["id"]
+    app.extensions["jobs"]._run_job(app.extensions["jobs"].get(job_id))
+    assert client.get(f"/api/jobs/{job_id}").get_json()["job"]["result"]["preflight"]["out_of"] == 321
     cached = client.get("/api/preflight").get_json()["preflight"]
     assert cached["usable"] is True
     assert cached["authoritative"] is True
@@ -733,18 +736,20 @@ def test_fresh_global_preflight_cannot_be_force_overwritten(client, app, config)
     assert calls == []
 
 
-def test_busy_public_preflight_is_503_and_retryable_without_adapter_calls(client, app):
+def test_busy_public_preflight_is_observable_and_retryable_without_adapter_calls(client, app):
     from csv_to_clonehero.database import Database
     from csv_to_clonehero.server.throttle import global_gate
 
     _sign_in(client)
+    app.extensions["jobs"].shutdown()
     calls = []
     app.extensions["jobs"].source_factory = lambda _config: calls.append(True) or []
     with global_gate().acquire(tag="existing-job"):
         response = client.post("/api/preflight", json={})
-    assert response.status_code == 503
-    assert response.headers["Retry-After"] == "1"
-    preflight = response.get_json()["preflight"]
+        assert response.status_code == 202
+        job_id = response.get_json()["job"]["id"]
+        app.extensions["jobs"]._run_job(app.extensions["jobs"].get(job_id))
+    preflight = client.get(f"/api/jobs/{job_id}").get_json()["job"]["result"]["preflight"]
     assert preflight["mode"] == "live_fallback"
     assert preflight["status"] == "busy"
     assert preflight["busy"] and preflight["retryable"] and not preflight["usable"]
@@ -2206,7 +2211,8 @@ def test_public_review_and_selection_use_latest_completed_scan(client, config):
         "candidate_id": current.db_id,
         "action": "select",
     })
-    assert rejected_current.status_code == 400
+    assert rejected_current.status_code == 409
+    assert rejected_current.get_json()["reload"] is True
 
 
 def test_download_requires_selection(client, config):

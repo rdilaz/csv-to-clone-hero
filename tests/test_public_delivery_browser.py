@@ -166,7 +166,9 @@ def test_async_download_failure_reconciles_before_retry(delivery_page):
     page, requests = delivery_page(fixtures)
     page.locator("#continueDownloadButton").click()
     page.locator("#prepareDownloadButton").click()
-    playwright.expect(page.locator("#downloadStatus")).to_contain_text("Chart provider unavailable.")
+    playwright.expect(page.locator("#downloadTitle")).to_have_text("Preparation did not finish")
+    playwright.expect(page.locator("#downloadTechnicalError")).to_have_text("Chart provider unavailable.")
+    playwright.expect(page.locator("#downloadTechnicalError")).to_be_hidden()
     playwright.expect(page.locator("#prepareDownloadButton")).to_be_disabled()
     assert fixtures.download_job["status"] == "failed"
     assert len(_posts(requests, "/api/download")) == 1
@@ -627,15 +629,17 @@ def test_delivery_failed_post_requires_reconciliation_before_explicit_retry(deli
     page.locator("#continueDownloadButton").click()
     _assert_download_counts(page)
     page.locator("#prepareDownloadButton").click()
-    playwright.expect(page.locator("#appError")).to_have_text(
+    playwright.expect(page.locator("#downloadTechnicalError")).to_have_text(
         "Could not create your download right now; try again in a moment."
     )
-    playwright.expect(page.locator("#appError")).to_be_focused()
+    playwright.expect(page.locator("#downloadTechnicalError")).to_be_hidden()
+    playwright.expect(page.locator("#appError")).to_be_hidden()
     assert fixtures.last_export_summary is None
     playwright.expect(page.locator("#stageDownload")).to_be_visible()
-    playwright.expect(page.locator("#downloadSelectionCount")).to_have_text("...")
+    playwright.expect(page.locator("#downloadSelectionCount")).to_have_text("Awaiting confirmation")
     playwright.expect(page.locator("#prepareDownloadButton")).to_be_disabled()
-    playwright.expect(page.locator("#downloadStatus")).to_contain_text("No new delivery is confirmed")
+    playwright.expect(page.locator("#downloadTitle")).to_have_text("Preparation request unconfirmed")
+    playwright.expect(page.locator("#downloadStatus")).to_contain_text("Check status before retrying")
     assert len(_posts(requests)) == 1
 
     fixtures.selected.remove(103)
@@ -673,10 +677,11 @@ def test_delivery_recount_unknown_never_uses_confirm_cache(delivery_page, unknow
     playwright.expect(page.locator("#selectedCount")).to_have_text("3")
     invalidate["value"] = True
     page.locator("#continueDownloadButton").click()
-    playwright.expect(page.locator("#appError")).to_be_visible()
-    playwright.expect(page.locator("#downloadSelectionCount")).to_have_text("...")
+    playwright.expect(page.locator("#appError")).to_be_hidden()
+    playwright.expect(page.locator("#downloadSelectionCount")).to_have_text("Awaiting confirmation")
     playwright.expect(page.locator("#prepareDownloadButton")).to_be_disabled()
-    assert "unavailable" in page.locator("#downloadStatus").inner_text()
+    playwright.expect(page.locator("#downloadTitle")).to_have_text("Preparation status unavailable")
+    playwright.expect(page.locator("#refreshDownloadButton")).to_be_visible()
     assert _posts(requests) == []
     invalidate["value"] = False
     page.locator("#refreshDownloadButton").click()
@@ -1050,7 +1055,7 @@ def test_delivery_ambiguous_expansion_post_gates_choices_until_authoritative_ref
     page.locator("#startExpansionButton").click()
     playwright.expect(page.locator("#retryExpansionButton")).to_be_visible()
     playwright.expect(page.locator("#appError")).to_be_visible()
-    playwright.expect(page.locator("#selectedCount")).to_have_text("...")
+    playwright.expect(page.locator("#selectedCount")).to_have_text("Unknown")
     playwright.expect(page.locator("#exactSelectedCount")).to_have_text("3")
     controls = page.locator(
         "[data-selection], [data-expansion-selection], #selectBestButton, "
@@ -1129,7 +1134,9 @@ def test_delivery_expansion_start_recomputes_after_selection_mutation(delivery_p
     assert selection_posts[0].post_data_json["action"] == "clear"
     expansion_posts = _posts(requests, "/api/expansion")
     assert len(expansion_posts) == 1
-    assert expansion_posts[0].post_data_json == {"artists": ["paramore"]}
+    assert expansion_posts[0].post_data_json == {
+        "artists": ["paramore"], "all_artists": False, "coverage_mode": "recommended",
+    }
 
 
 @pytest.mark.parametrize(
@@ -1152,8 +1159,9 @@ def test_delivery_restored_nonbest_expansion_clear_keeps_focus_visible(delivery_
     replacement = page.locator('[data-candidate="302"][data-expansion-selection="select"]')
     playwright.expect(replacement).to_be_visible()
     playwright.expect(replacement).to_be_focused()
-    playwright.expect(page.locator("#expansionCards details.alternatives")).to_have_attribute("open", "")
-    assert replacement.evaluate("element => element.closest('details').open") is True
+    # A saved alternate is promoted to the primary row on restore. If it is
+    # inside a disclosure, clearing must leave that disclosure open for focus.
+    assert replacement.evaluate("element => !element.closest('details') || element.closest('details').open") is True
     _assert_no_overflow(page)
     assert fixtures.selected == {101, 102, 103}
     assert fixtures.expansion_selected == set()

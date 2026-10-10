@@ -169,7 +169,7 @@ def test_index_serves_source_neutral_workflow(client):
     html = response.get_data(as_text=True)
     for text in (
         "Riff",
-        "music to Clone Hero",
+        "local export to this host",
         "journey.css",
         "journey.js",
         "Restoring your library...",
@@ -1001,6 +1001,12 @@ def test_local_export_reports_one_human_readable_success(config):
         assert status["result"]["published"] == 1
         assert status["result"]["failed"] == 0
         assert status["result"]["ready"] == 1
+        assert status["receipt"]["verified_at_export"] is True
+        assert status["receipt"]["kind"] == "host_folder"
+        assert status["receipt"]["destination"] == str((config.base_dir / "Songs").resolve())
+        assert status["receipt"]["completed_chart_entries"] == 1
+        assert status["receipt"]["game_scan_required"] is True
+        assert status["receipt"]["game_scan_verified"] is False
         db = Database(config.database_path)
         try:
             records = db.list_export_records(workspace_id)
@@ -2753,7 +2759,7 @@ def test_open_folder_prefers_actual_completed_export_destination(client, config,
 
 def test_primary_root_does_not_serve_the_retired_build_surface(client):
     html = client.get("/").get_data(as_text=True)
-    assert "journey.js?v=2.5.3" in html
+    assert "journey.js?v=2.6.0-ux" in html
     assert "done: status.done" not in html
     assert "Calculating build preview" not in html
     assert "LIBRARY READY" not in html

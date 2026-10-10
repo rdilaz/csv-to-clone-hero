@@ -90,6 +90,64 @@ class SignalCheckFixtures:
         self._downloads: dict[str, dict[str, Any]] = {}
         self._download_prefix = f"signal-{uuid4().hex}-"
         self._download_lock = RLock()
+        self.selection_revision = 1
+        self.generation_id = 1
+        self.operations: list[dict[str, Any]] = []
+        self.operation_sequence = 0
+
+    def _snapshot(self):
+        return set(self.selected), set(self.expansion_selected)
+
+    def _commit(self, previous, label):
+        if previous == self._snapshot():
+            return
+        self.selection_revision += 1
+        self.operation_sequence += 1
+        self.operations.append({"operation_id": self.operation_sequence,
+                                "label": label,
+                                "revision": self.selection_revision,
+                                "generation_id": self.generation_id,
+                                "previous": previous})
+
+    def undo(self):
+        operation = self.operations[-1] if self.operations else None
+        available = bool(operation
+                         and operation["revision"] == self.selection_revision
+                         and operation["generation_id"] == self.generation_id)
+        return {"available": available,
+                "operation_id": operation["operation_id"] if available else None,
+                "label": operation["label"] if available else None,
+                "revision": self.selection_revision,
+                "generation_id": self.generation_id}
+
+    def selected_response(self):
+        tracks = self.tracks()
+        library = [{"track_key": track["track_key"], "candidate_id": candidate["candidate_id"]}
+                   for track in tracks for candidate in track["candidates"] if candidate["selected"]]
+        expansion = [{"candidate_id": candidate["candidate_id"], "artist_norm": candidate["artist_norm"],
+                      "song_key": song["song_key"]}
+                     for song in self.expansion_songs() for candidate in song["candidates"] if candidate["selected"]]
+        summary = {"library": {"songs": sum(track["selected"] for track in tracks), "charts": len(library)},
+                   "expansion": {"songs": sum(any(candidate["selected"] for candidate in song["candidates"])
+                                              for song in self.expansion_songs()), "charts": len(expansion)}}
+        return {"ok": True, "summary": summary,
+                "songs": summary["library"]["songs"] + summary["expansion"]["songs"],
+                "charts": len(library) + len(expansion), "selected": {"library": library, "expansion": expansion},
+                "selection_revision": self.selection_revision, "exact_generation_id": self.generation_id,
+                "undo": self.undo()}
+
+    def _eligible_groups(self, scope, policy, include_possible):
+        result = {"library": [], "expansion": []}
+        for kind, groups in (("library", self.tracks()), ("expansion", self.expansion_songs())):
+            if scope not in {kind, "both"}:
+                continue
+            for group in groups:
+                candidates = [candidate for candidate in group["candidates"]
+                              if candidate.get("selectable") and
+                              (include_possible or candidate.get("result_tier") != "POSSIBLE_MATCH")]
+                if candidates:
+                    result[kind].append(candidates if policy == "all_versions" else candidates[:1])
+        return result
 
     def _scope(self) -> dict[str, object]:
         return deepcopy(self.spotify_scope)
@@ -234,6 +292,7 @@ class SignalCheckFixtures:
         }
         if self.async_download:
             journey["download_job"] = deepcopy(self.download_job)
+        journey.update(selection_revision=self.selection_revision, undo=self.undo())
         return journey
 
     @staticmethod
@@ -768,6 +827,9 @@ class SignalCheckFixtures:
             "offset": offset,
             "limit": limit,
             "summary": self.summary(),
+            "selection_revision": self.selection_revision,
+            "exact_generation_id": self.generation_id,
+            "undo": self.undo(),
         }
 
     def respond(
@@ -785,6 +847,54 @@ class SignalCheckFixtures:
 
         if path == "/api/journey" and method == "GET":
             return 200, self.journey()
+        if path == "/api/selection/history" and method == "GET":
+            return 200, {**self.selected_response(), "operations": [
+                {key: value for key, value in operation.items() if key != "previous"}
+                for operation in reversed(self.operations[-10:])
+            ]}
+        if path == "/api/selection/all-preview" and method == "GET":
+            scope = query.get("scope", ["both"])[0]
+            policy = query.get("policy", ["one_per_song"])[0]
+            include_possible = query.get("include_possible", ["false"])[0] == "true"
+            groups = self._eligible_groups(scope, policy, include_possible)
+            summary = {kind: {"songs": len(rows), "charts": sum(map(len, rows))}
+                       for kind, rows in groups.items()}
+            possible_groups = self._eligible_groups(scope, policy, True)
+            possible = [candidate for rows in possible_groups.values() for row in rows for candidate in row
+                        if candidate["result_tier"] == "POSSIBLE_MATCH"]
+            return 200, {"songs": sum(item["songs"] for item in summary.values()),
+                         "charts": sum(item["charts"] for item in summary.values()),
+                         "possible_charts": len(possible),
+                         "possible_songs": sum(any(candidate["result_tier"] == "POSSIBLE_MATCH" for candidate in row)
+                                               for rows in possible_groups.values() for row in rows),
+                         "summary": summary, "scope": scope, "policy": policy, "include_possible": include_possible,
+                         "selection_revision": self.selection_revision,
+                         "exact_generation_id": self.generation_id, "operation": "replace",
+                         "undo_supported": True, "undo": self.undo()}
+        if path == "/api/selection/all" and method == "POST":
+            previous = self._snapshot()
+            groups = self._eligible_groups(body.get("scope", "both"), body.get("policy", "one_per_song"),
+                                           body.get("confirm_possible") is True)
+            if body.get("scope", "both") in {"library", "both"}:
+                self.selected = {candidate["candidate_id"] for row in groups["library"] for candidate in row}
+            if body.get("scope", "both") in {"expansion", "both"}:
+                self.expansion_selected = {candidate["candidate_id"] for row in groups["expansion"] for candidate in row}
+            self._commit(previous, "Select all")
+            response = self.selected_response()
+            response.update(scope=body.get("scope", "both"), policy=body.get("policy", "one_per_song"),
+                            changed=response["charts"])
+            return 200, {"ok": True} if getattr(self, "omit_save_summary", False) else response
+        if path == "/api/selection/undo" and method == "POST":
+            receipt = self.undo()
+            if (not receipt["available"] or body.get("operation_id") != receipt["operation_id"]
+                    or body.get("selection_revision") != self.selection_revision):
+                return 409, {"error": "Your selections changed. Reload before undoing.", "reload": True}
+            operation = self.operations.pop()
+            self.selected, self.expansion_selected = map(set, operation["previous"])
+            self.selection_revision += 1
+            if self.operations and self.operations[-1]["generation_id"] == self.generation_id:
+                self.operations[-1]["revision"] = self.selection_revision
+            return 200, self.selected_response()
         if path == "/api/auth/soundcloud/status" and method == "GET":
             return 200, {"configured": False, "authenticated": False}
         if path == "/api/spotify/scope" and method in {"GET", "POST"}:
@@ -846,6 +956,7 @@ class SignalCheckFixtures:
         if path == "/api/workspace" and method == "GET":
             return 200, self.workspace(query)
         if path == "/api/selection" and method == "POST":
+            previous = self._snapshot()
             if self.fail_next_selection:
                 self.fail_next_selection = False
                 return 503, {"error": "Selection service is temporarily unavailable."}
@@ -872,8 +983,10 @@ class SignalCheckFixtures:
                 selected.discard(candidate_id)
             else:
                 selected.add(candidate_id)
-            return 200, {"ok": True}
+            self._commit(previous, "Change chart selection")
+            return 200, {"ok": True} if getattr(self, "omit_save_summary", False) else self.selected_response()
         if path == "/api/selection/bulk" and method == "POST":
+            previous = self._snapshot()
             action = body.get("action")
             preset = body.get("preset")
             before = set(self.selected)
@@ -894,7 +1007,9 @@ class SignalCheckFixtures:
                 scope = preset
             else:
                 return 400, {"error": "Unknown selection preset."}
-            return 200, {"ok": True, "changed": len(before.symmetric_difference(self.selected)), "minimum_score": 50.0, "scope": scope}
+            self._commit(previous, "Change library selection")
+            return 200, {**self.selected_response(), "changed": len(before.symmetric_difference(self.selected)),
+                         "minimum_score": 50.0, "scope": scope}
         if path == "/api/expansion/artists" and method == "GET":
             return 200, self.expansion_artists()
         if path in {"/api/expansion", "/api/expansion/artists/select"} and method == "POST":

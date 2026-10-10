@@ -225,6 +225,7 @@ def validate_discovery_start(
     user_id: int,
     workspace_key: str,
     current_job_id: int | None = None,
+    availability: dict[str, Any] | None = None,
 ) -> DiscoveryValidation:
     errors: list[str] = []
     user = db.get_user(int(user_id))
@@ -257,7 +258,9 @@ def validate_discovery_start(
         errors.append("The selected playlist scope is too large.")
     elif scope is not None and len(scope.get("track_ids") or []) > config.server.max_scope_tracks:
         errors.append("The selected track scope is too large.")
-    preflight = get_discovery_availability(config, db)
+    # Public request threads pass the worker's current observation. Worker
+    # execution independently performs the full current catalog verification.
+    preflight = dict(availability) if availability is not None else get_discovery_availability(config, db)
     if not preflight.get("usable"):
         errors.append(str(preflight.get("message") or "Check Enchor before starting discovery."))
 
