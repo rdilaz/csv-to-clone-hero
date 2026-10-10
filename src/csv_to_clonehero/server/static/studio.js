@@ -10,7 +10,8 @@
     epoch: 0, contextKey: "", items: [], order: [], cursor: -1,
     total: 0, loaded: false, complete: false, loading: false,
     token: null, request: null, controller: null, seed: null, busy: false,
-    preview: false, playerId: null, undo: null, selectionSerial: 0,
+    preview: false, playerId: null, selectionSerial: 0,
+    operationPreview: null, previewKey: "", previewRequest: 0,
   };
   const status = (message, error = false) => {
     const node = $("#studio-deck-status");
@@ -22,11 +23,11 @@
   const spotifyId = item => /^[a-zA-Z0-9]{22}$/.test(item?.spotify_id || "") ? item.spotify_id : null;
   const formatCount = count => Number(count || 0).toLocaleString();
 
-  function reset(message = "Shuffle or browse your playable songs. Nothing plays until you open the Spotify player.") {
+  function reset(message = "Shuffle or browse your eligible songs. Nothing plays until you open the Spotify player.") {
     state.epoch += 1;
     state.controller?.abort();
     Object.assign(state, {items: [], order: [], cursor: -1, total: 0, loaded: false, complete: false,
-      loading: false, token: null, request: null, controller: null, seed: null, preview: false, playerId: null, undo: null});
+      loading: false, token: null, request: null, controller: null, seed: null, preview: false, playerId: null});
     const player = $("#studio-player-host");
     player?.replaceChildren();
     if (player) player.hidden = true;
@@ -39,19 +40,20 @@
     const allStatus = $("#studio-select-status");
     if (allStatus && context.known && /Loading your chart pool/.test(allStatus.textContent)) allStatus.textContent = "Ready · selections include every page.";
     const blocked = state.busy || context.busy || context.stale;
-    ["#studio-select-all", "#studio-select-scope", "#studio-select-policy"].forEach(selector => {
+    ["#studio-select-scope", "#studio-select-policy", "#studio-include-uncertain"].forEach(selector => {
       const node = $(selector);
       if (node) node.disabled = blocked;
     });
+    $("#studio-select-all").disabled = blocked || !state.operationPreview || state.previewKey !== previewKey();
     ["#studio-next", "#studio-shuffle"].forEach(selector => {
       const node = $(selector);
       if (node) node.disabled = state.loading || state.busy || context.busy;
     });
     const item = current();
     const add = $("#studio-add");
-    if (add) { add.disabled = blocked || !item || item.selected || !item.selectable; add.textContent = item?.selected ? "Added to ZIP" : "Add to ZIP"; }
+    if (add) { add.disabled = blocked || !item || item.selected || !item.selectable; add.textContent = item?.selected ? "Selected" : "Select chart"; }
     const undo = $("#studio-undo");
-    if (undo) undo.disabled = blocked || !state.undo || state.undo.serial !== state.selectionSerial;
+    if (undo) undo.disabled = blocked || !context.undo?.available || context.undo.revision !== context.selection_revision;
     const preview = $("#studio-player-toggle");
     if (preview) {
       preview.disabled = state.loading || state.busy || (item && !spotifyId(item));
@@ -59,12 +61,13 @@
       preview.setAttribute("aria-expanded", String(state.preview));
     }
     panel.setAttribute("aria-busy", String(state.busy || state.loading));
+    requestSelectionPreview();
   }
 
   function render() {
     const item = current();
     const difficulty = item ? bridge.difficulty({difficulty_coverage: item.difficulty_coverage}) : null;
-    $("#studio-now-title").textContent = item ? `${item.title}${difficulty?.suffix || ""}` : "Your next playable song";
+    $("#studio-now-title").textContent = item ? `${item.title}${difficulty?.suffix || ""}` : "Your next eligible song";
     $("#studio-now-artist").textContent = item?.artist || "Shuffle or browse every eligible result";
     const coverage = $("#studio-now-coverage");
     if (coverage) {
@@ -86,6 +89,7 @@
       link.textContent = "Original song on Spotify";
     }
     const deck = $("#studio-deck");
+    $("#studio-queue-position").textContent = item ? `Song ${formatCount(state.cursor + 1)} of ${formatCount(state.total)}${state.seed ? " · Shuffled order" : ""} · 100 load per page` : "Browse all eligible songs; 100 load per page.";
     if (deck) {
       deck.dataset.selected = String(Boolean(item?.selected));
       deck.dataset.scope = item?.scope || "";
@@ -107,7 +111,7 @@
     const item = current();
     const id = spotifyId(item);
     if (!id) {
-      status("No confirmed Spotify recording is available for this chart. You can still add the chart to your ZIP.");
+      status("No confirmed Spotify recording is available for this chart. You can still select the chart.");
       return;
     }
     const host = $("#studio-player-host");
@@ -154,7 +158,7 @@
       const params = new URLSearchParams({scope: selectedScope, limit: String(PAGE_SIZE), offset: String(offset)});
       if (state.token) params.set("generation_token", state.token);
       if (state.seed) { params.set("order", "shuffle"); params.set("seed", state.seed); }
-      status(state.loaded ? "Loading the next songs..." : "Loading playable songs for your listening queue...");
+      status(state.loaded ? "Loading the next songs..." : "Loading eligible songs for your listening queue...");
       const data = await bridge.api(`/api/listening-deck?${params}`, {signal: controller.signal});
       if (epoch !== state.epoch) return;
       const items = validatePage(data, offset);
@@ -199,7 +203,7 @@
       if (state.complete) {
         const eligible = state.items.findIndex(item => !skipped(item));
         if (eligible < 0) {
-          status("Every song in this queue is already added. Turn off Skip added to browse them.");
+          status("Every song in this queue is already selected. Turn off Skip selected songs to browse them.");
           return false;
         }
         // A cycle only restarts after every song in the complete queue was visited.
@@ -233,27 +237,26 @@
       if (epoch !== state.epoch) return;
       render();
       if (reopen && spotifyId(current())) openPlayer();
-      if (advanced) status(`${formatCount(state.cursor + 1)} of ${formatCount(state.total)} in the ${state.seed ? "shuffled " : ""}queue. ${current()?.scope === "expansion" ? "Artist expansion: no confirmed Spotify recording." : "Preview the original song or add its chart to your ZIP."}`);
+      if (advanced) status(`${formatCount(state.cursor + 1)} of ${formatCount(state.total)} in the ${state.seed ? "shuffled " : ""}queue. ${current()?.scope === "expansion" ? "Artist expansion: no confirmed Spotify recording." : "Preview the original song or select its chart."}`);
     } catch (_) { /* loadQueue keeps the actionable message. */ }
   }
 
   async function selectAll() {
+    const preview = state.operationPreview;
+    if (!preview || state.previewKey !== previewKey()) return;
     if (state.busy || !bridge.begin()) return;
     const epoch = state.epoch;
     const selectedScope = scope();
     const policy = $("#studio-select-policy")?.value === "all_versions" ? "all_versions" : "one_per_song";
     try {
-      // This is a single confirmation for the complete operation, across every page.
-      if (!window.confirm(`Add ${policy === "all_versions" ? "every eligible chart version" : "one preferred chart per song"} across all pages of ${selectedScope === "both" ? "your music and artist expansion" : selectedScope === "library" ? "your imported music" : "artist expansion"}? This includes alternate recordings and possible matches that need review. Existing choices outside this scope stay saved. Difficulty levels may be unknown until download inspection; files without playable notes are left out.`)) return;
       state.busy = true;
-      state.undo = null;
       syncControls();
       $("#studio-select-status").textContent = "Adding songs across every page...";
-      const saved = await bridge.api("/api/selection/all", {method: "POST", body: JSON.stringify({scope: selectedScope, policy, confirm_possible: true})});
+      const saved = await bridge.api("/api/selection/all", {method: "POST", body: JSON.stringify({scope: selectedScope, policy, confirm_possible: $("#studio-include-uncertain").checked, selection_revision: preview.selection_revision, exact_generation_id: preview.exact_generation_id})});
       if (epoch !== state.epoch) return;
       const confirmed = bridge.apply(saved) || await bridge.reconcile("All-page choices saved.");
       if (!confirmed) throw new Error("Choices were saved, but the updated totals are not confirmed. Refresh the selection summary before downloading.");
-      const message = `${formatCount(saved.songs)} songs / ${formatCount(saved.charts)} charts in your ZIP tray. All pages included.`;
+      const message = `${formatCount(saved.songs)} songs / ${formatCount(saved.charts)} charts in your selection tray. All pages included.`;
       $("#studio-select-status").textContent = message;
       bridge.announce(message);
       render();
@@ -264,46 +267,86 @@
     } finally { state.busy = false; bridge.finish(); syncControls(); }
   }
 
-  async function changeCurrent(undo = false) {
-    const target = undo ? state.undo?.item : current();
-    if (!target || (!undo && target.selected) || state.busy || !bridge.begin()) return;
+  async function changeCurrent() {
+    const target = current();
+    if (!target || target.selected || state.busy || !bridge.begin()) return;
     const epoch = state.epoch;
     try {
-      if (!undo && target.result_tier === "POSSIBLE_MATCH" && !window.confirm("This chart is a possible match with uncertain song identity. Review its title and artist. Add it to your ZIP?")) return;
+      if (target.result_tier === "POSSIBLE_MATCH" && !window.confirm("This chart is a possible match with uncertain song identity. Review its title and artist. Select this chart?")) return;
       state.busy = true;
       syncControls();
-      const payload = {candidate_id: target.candidate_id, action: undo ? "clear" : "select", confirm_possible: !undo && target.result_tier === "POSSIBLE_MATCH"};
+      const payload = {...bridge.guard(), candidate_id: target.candidate_id, action: "select", confirm_possible: target.result_tier === "POSSIBLE_MATCH"};
       if (target.scope === "expansion") Object.assign(payload, {kind: "expansion", artist_norm: target.artist_norm});
       else payload.track_key = target.track_key;
       const saved = await bridge.api("/api/selection", {method: "POST", body: JSON.stringify(payload)});
       if (epoch !== state.epoch) return;
       const confirmed = bridge.apply(saved) || await bridge.reconcile("Chart choice saved.");
-      if (!confirmed) throw new Error("The updated ZIP tray could not be confirmed. Refresh the selection summary before downloading.");
-      state.undo = undo ? null : {item: {...target}, serial: state.selectionSerial};
-      const message = undo ? `Removed the last addition: ${target.title}.` : `Added ${target.title} to your ZIP tray.`;
+      if (!confirmed) throw new Error("The updated selection tray could not be confirmed. Refresh the selection summary before downloading.");
+      const message = `Added ${target.title} to your selection tray. Undo last selection change restores the previous choices.`;
       status(message);
       bridge.announce(message);
-      if (!undo) {
-        closePlayer();
-        await advanceQueue();
-        if (epoch !== state.epoch) return;
-      }
+      closePlayer();
+      await advanceQueue();
+      if (epoch !== state.epoch) return;
       render();
     } catch (error) {
       if (epoch !== state.epoch) return;
-      state.undo = null;
       const reconciled = await bridge.reconcile("The chart save result is not confirmed.");
       if (!reconciled) bridge.stale("The chart save result is not confirmed.");
       status(error.message || "This chart choice could not be saved.", true);
     } finally { state.busy = false; bridge.finish(); syncControls(); }
   }
 
+  function previewKey() {
+    const context = bridge.context();
+    return [context.workspace, context.generation, context.selection_revision, scope(), $("#studio-select-policy")?.value, $("#studio-include-uncertain")?.checked].join(":");
+  }
+
+  function requestSelectionPreview(force = false) {
+    const context = bridge.context();
+    if (context.stage !== "confirm" || context.busy || context.stale || !context.known) return;
+    const key = previewKey();
+    if (!force && state.previewKey === key) return;
+    state.previewKey = key;
+    state.operationPreview = null;
+    const requestId = ++state.previewRequest;
+    const host = $("#studio-selection-preview");
+    host.textContent = "Checking the full operation across all pages…";
+    $("#studio-select-all").disabled = true;
+    const params = new URLSearchParams({scope: scope(), policy: $("#studio-select-policy").value, include_possible: String($("#studio-include-uncertain").checked)});
+    bridge.api(`/api/selection/all-preview?${params}`, {timeoutMs: 8000}).then(data => {
+      if (requestId !== state.previewRequest || key !== previewKey()) return;
+      if (![data.songs, data.charts, data.possible_charts, data.selection_revision].every(value => Number.isSafeInteger(value) && value >= 0)
+          || data.scope !== scope() || data.policy !== $("#studio-select-policy").value || data.include_possible !== $("#studio-include-uncertain").checked) throw new Error("The operation preview was not confirmed.");
+      state.operationPreview = data;
+      const scopeLabel = data.scope === "both" ? "your imported music and artist expansion" : data.scope === "library" ? "your imported music" : "artist expansion";
+      const restoreNote = data.undo_supported === true ? "Undo restores the previous choices." : data.undo_supported === false ? "The current selection is too large to keep for undo. Applying this change replaces its choices without an undo receipt." : "Undo availability will be confirmed after saving.";
+      host.textContent = `Replace choices in ${scopeLabel} with ${formatCount(data.charts)} chart entries for ${formatCount(data.songs)} songs across all pages. ${data.policy === "one_per_song" ? "One preferred chart per song." : "Every eligible version."} ${data.include_possible ? `${formatCount(data.possible_charts)} possible-match charts included; review their identity.` : "Possible matches excluded."} Choices outside this scope stay saved. ${restoreNote}`;
+      syncControls();
+    }).catch(() => {
+      if (requestId !== state.previewRequest || key !== previewKey()) return;
+      state.operationPreview = null;
+      host.textContent = "Selection preview unavailable. Check the operation before applying it. ";
+      const button = document.createElement("button");
+      button.type = "button"; button.className = "text-button"; button.textContent = "Retry preview";
+      button.addEventListener("click", () => requestSelectionPreview(true));
+      host.append(button);
+      $("#studio-select-all").disabled = true;
+    });
+  }
+
   $("#studio-select-all")?.addEventListener("click", selectAll);
-  $("#studio-select-scope")?.addEventListener("change", () => reset("Scope changed. Shuffle or browse this set of playable songs."));
+  $("#studio-select-scope")?.addEventListener("change", () => reset("Scope changed. Shuffle or browse this set of eligible songs."));
+  $("#studio-select-policy")?.addEventListener("change", () => requestSelectionPreview());
+  $("#studio-include-uncertain")?.addEventListener("change", () => requestSelectionPreview());
   $("#studio-next")?.addEventListener("click", () => nextSong());
   $("#studio-shuffle")?.addEventListener("click", () => nextSong({shuffle: true}));
   $("#studio-add")?.addEventListener("click", () => changeCurrent());
-  $("#studio-undo")?.addEventListener("click", () => changeCurrent(true));
+  $("#studio-undo")?.addEventListener("click", async () => {
+    const restored = await bridge.undo();
+    if (restored) status("The last selection change was undone. Previous customized choices are restored.");
+    render();
+  });
   $("#studio-skip-selected")?.addEventListener("change", () => { render(); });
   $("#studio-player-toggle")?.addEventListener("click", async () => {
     if (state.preview) { closePlayer(); return; }

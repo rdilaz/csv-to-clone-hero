@@ -255,6 +255,7 @@ def test_signal_check_confirm_keeps_multi_chart_selection_truthful(
         _assert_no_overflow(page)
 
         if viewport["width"] <= 1000:
+            page.locator("#studio-select-all").scroll_into_view_if_needed()
             primary_box = page.locator("#studio-select-all").bounding_box()
             initial_rail = page.locator("#selectionRail").bounding_box()
             assert primary_box and initial_rail and 0 <= primary_box["y"] and primary_box["y"] + primary_box["height"] + 7 <= initial_rail["y"]
@@ -271,8 +272,8 @@ def test_signal_check_confirm_keeps_multi_chart_selection_truthful(
                     banner_height = banner_box["height"]
                 else:
                     assert page.locator(".cause-bar").count() == 0
-                # The studio action is visible initially; individual chart
-                # actions remain clear of the tray when browsing the results.
+                # The reviewed action and individual chart controls remain
+                # clear of the tray when browsing their respective sections.
                 assert group_box["y"] < action_box["y"] and action_box["y"] >= 0
             assert "is-in-flow" not in (page.locator("#selectionRail").get_attribute("class") or "")
             assert action_box["y"] + action_box["height"] + 7 <= band_box["y"]
@@ -348,6 +349,9 @@ def test_signal_check_confirm_keeps_multi_chart_selection_truthful(
 def test_signal_check_retries_a_failed_post_mutation_recount(public_server):
     _app, base_url, cookie_name, cookie = public_server
     fixtures = SignalCheckFixtures("confirm")
+    # Exercise an acknowledged save without its authoritative selection DTO,
+    # so the browser must reconcile rather than use the usual fast path.
+    fixtures.omit_save_summary = True
     mutation_saved = {"value": False}
     recount_failed = {"value": False}
     pending_mutation = []
@@ -391,7 +395,7 @@ def test_signal_check_retries_a_failed_post_mutation_recount(public_server):
         playwright.expect(page.locator("#selectionError")).to_contain_text(
             "Chart choice cleared. Riff could not refresh the selection summary."
         )
-        playwright.expect(page.locator("#selectedCount")).to_have_text("...")
+        playwright.expect(page.locator("#selectedCount")).to_have_text("Unknown")
         playwright.expect(page.locator("#exactSelectedCount")).to_have_text("3")
         playwright.expect(page.locator('[data-candidate="102"]')).to_be_disabled()
         playwright.expect(page.locator('[data-candidate="102"]')).to_contain_text("Selected")
@@ -435,14 +439,14 @@ def test_signal_check_keeps_combined_count_unknown_when_expansion_recount_fails(
         page.goto(base_url + "/", wait_until="networkidle")
 
         playwright.expect(page.locator("#exactSelectedCount")).to_have_text("3")
-        playwright.expect(page.locator("#expansionSelectedCount")).to_have_text("...")
-        playwright.expect(page.locator("#selectedCount")).to_have_text("...")
+        playwright.expect(page.locator("#expansionSelectedCount")).to_have_text("Unknown")
+        playwright.expect(page.locator("#selectedCount")).to_have_text("Unknown")
         playwright.expect(page.locator("#selectionMode")).to_have_text(
             "Updating the combined selection total..."
         )
         playwright.expect(page.locator("#continueDownloadButton")).to_be_enabled()
         assert page.locator("#continueDownloadButton").get_attribute("aria-label") == (
-            "Build my ZIP with the currently confirmed chart selections"
+            "Review ZIP with the currently confirmed chart selections"
         )
         browser.close()
 
@@ -472,6 +476,7 @@ def test_signal_check_selection_summary_reflows_at_tablet_widths(
         page.route("**/api/**", fixtures.fulfill)
         page.goto(base_url + "/", wait_until="networkidle")
 
+        page.locator("#studio-select-all").scroll_into_view_if_needed()
         primary = page.locator("#studio-select-all").bounding_box()
         assert primary and 0 <= primary["y"] and primary["y"] + primary["height"] <= viewport["height"]
         page.locator('[data-candidate="101"]').scroll_into_view_if_needed()
@@ -688,7 +693,15 @@ def test_signal_check_reflows_at_320_and_respects_reduced_motion(public_server, 
         page.goto(base_url + "/", wait_until="networkidle")
 
         _assert_no_overflow(page)
+        page.locator("#studio-select-all").scroll_into_view_if_needed()
         _assert_in_viewport(page, "#studio-select-all")
+        assert page.evaluate("""() => ['studio-select-scope', 'studio-select-policy',
+            'studio-include-uncertain', 'studio-selection-preview'].every(id =>
+            Boolean(document.getElementById(id).compareDocumentPosition(
+              document.getElementById('studio-select-all')) & Node.DOCUMENT_POSITION_FOLLOWING))""")
+        action = page.locator("#studio-select-all").bounding_box()
+        rail = page.locator("#selectionRail").bounding_box()
+        assert action and rail and action["height"] >= 44 and action["y"] + action["height"] + 7 <= rail["y"]
         assert page.locator(".journey-steps li").count() == 5
         assert all(
             box and box["x"] >= 0 and box["x"] + box["width"] <= 320
@@ -1089,13 +1102,13 @@ def test_public_authenticated_journey_to_download_ready(
             pytest.fail(f"selection did not settle: calls={api_calls!r}, error={page.locator('#appError').inner_text()!r}")
         assert page.locator("#selectionMode").inner_text() == "Last action: selected recommended charts."
         assert page.get_by_role("button", name="Selected Misery Business chart by Community Charter. Clear this choice.").is_visible()
-        assert page.locator("#continueDownloadButton").inner_text() == "Build my ZIP"
-        page.get_by_role("button", name="Build my ZIP with 1 selected chart").click()
-        assert page.get_by_role("heading", name="Pack the music. Bring the noise.").is_visible()
+        assert page.locator("#continueDownloadButton").inner_text() == "Review ZIP"
+        page.get_by_role("button", name="Review ZIP with 1 selected chart").click()
+        playwright.expect(page.locator("#downloadTitle")).to_have_text("Review your ZIP")
         assert "Songs folder" not in page.locator("#stageDownload").inner_text()
-        page.get_by_role("button", name="Prepare my Riff library").click()
-        page.get_by_role("heading", name="Your setlist. Ready to play.").wait_for()
-        download = page.get_by_role("link", name="Download library")
+        page.get_by_role("button", name="Prepare ZIP").click()
+        page.get_by_role("heading", name="Your ZIP is ready.").wait_for()
+        download = page.get_by_role("link", name="Download ZIP")
         assert download.is_visible()
         assert download.bounding_box()["height"] >= 44
         assert page.get_by_text("Scan Songs.", exact=True).is_visible()
@@ -1337,13 +1350,13 @@ def test_public_expansion_confirm_and_reload_in_browser(public_server):
         playwright.expect(page.locator(".review-card--expansion")).to_contain_text("Guitar intensity rating 4")
         fail_expansion_recount["value"] = True
         page.locator('[data-expansion-selection="select"]').click()
-        playwright.expect(page.locator("#selectedCount")).to_have_text("...")
+        playwright.expect(page.locator("#selectedCount")).to_have_text("Unknown")
         playwright.expect(page.locator("#continueDownloadButton")).to_be_disabled()
         playwright.expect(page.locator("#retrySelectionButton")).to_be_visible()
         playwright.expect(page.locator('[data-expansion-selection="select"]')).to_be_disabled()
         page.locator("#retrySelectionButton").click()
         playwright.expect(page.locator("#selectedCount")).to_have_text("1")
-        assert page.get_by_role("button", name="Build my ZIP with 1 selected chart").is_enabled()
+        assert page.get_by_role("button", name="Review ZIP with 1 selected chart").is_enabled()
         _assert_no_overflow(page)
 
         page.reload(wait_until="networkidle")

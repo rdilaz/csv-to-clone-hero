@@ -43,6 +43,7 @@ from csv_to_clonehero.csv_import import (
     import_playlist_dir,
 )
 from csv_to_clonehero.catalog import load_enchor_catalog
+from csv_to_clonehero.catalog_validation import inspected_difficulty_coverage
 from csv_to_clonehero.database import Database
 from csv_to_clonehero.diagnostics import (
     RunDiagnostics,
@@ -100,12 +101,13 @@ from csv_to_clonehero.sources.base import (
     source_catalog_contains_chart,
 )
 from csv_to_clonehero.normalization import normalize_artist, normalize_title
+from csv_to_clonehero import journey as local_selection
 
 log = logging.getLogger(__name__)
 
 _SPOTIFY_WORKSPACE_KEY = "spotify"
 JOURNEY_SCHEMA_VERSION = 1
-JOURNEY_ASSET_VERSION = "2.5.3"
+JOURNEY_ASSET_VERSION = "2.6.0-ux"
 JOURNEY_MATCHING_FAILURE_CODE = "MATCHING_WORKER_FAILED"
 JOURNEY_MATCHING_START_CONFLICT_CODE = "MATCHING_START_CONFLICT"
 JOURNEY_MATCHING_START_REJECTED_CODE = "MATCHING_START_REJECTED"
@@ -6227,6 +6229,8 @@ def create_app(
         items = [_selection_payload(db, row) for row in rows]
         return {
             "workspace_id": workspace,
+            "selection_revision": local_selection.revision(db, int(workspace)),
+            "undo": local_selection.undo_state(db, int(workspace)),
             "count": len(items),
             "selection_count": len(items),
             "selected_count": len(items),
@@ -6246,7 +6250,8 @@ def create_app(
         minimum_score: float | None = None,
         scope: str = "strong",
         search_text: str = "",
-    ) -> list[int]:
+        choices_only: bool = False,
+    ) -> list[Any]:
         """Select one safe chart per song for an explicit bulk action.
 
         Strong recommendations are the default. Review-tier rows are included
@@ -6320,7 +6325,7 @@ def create_app(
                 kind,
                 catalog_sources=catalog_sources,
             )
-            if not valid:
+            if not valid or not db.is_chart_artifact_eligible(str(data.get("source") or ""), int(data.get("chart_id") or 0)):
                 continue
             key = (
                 data.get("track_id")
@@ -6338,6 +6343,13 @@ def create_app(
                 -int(prior["candidate_id"] or 0),
             ):
                 grouped[key] = row
+        if choices_only:
+            for source in catalog_sources or ():
+                try:
+                    source.close()
+                except Exception:
+                    pass
+            return [_row_dict(row) for row in grouped.values()]
         selected: list[int] = []
         for row in grouped.values():
             data = _row_dict(row)
@@ -6361,6 +6373,119 @@ def create_app(
             except Exception:
                 pass
         return selected
+
+    @app.post("/api/discovery/select-cohort")
+    @app.post("/api/discovery/selection/change")
+    def local_selection_change():
+        """Guarded local edit; cohort replacement never exposes an empty intermediate state."""
+        busy = _busy_response()
+        if busy is not None:
+            return busy
+        payload = request.get_json(silent=True) or {}
+        action = str(payload.get("action") or "cohort").casefold()
+        try:
+            workspace = int(_workspace_id(payload.get("workspace_id")))
+            db = Database(config.database_path)
+            try:
+                local_key = db.get_meta("local_workspace_key")
+                workspace_row = db.get_workspace(workspace)
+                if not local_key or not workspace_row or workspace_row["workspace_key"] != local_key:
+                    return {"error": "This action belongs to the local Riff workspace."}, 403
+                with db.atomic_workspace_selection():
+                    local_selection.guard(db, workspace, payload.get("expected_revision"))
+                    # A matching worker may start between the initial UI check and this write.
+                    if _busy_response() is not None:
+                        raise ValueError("A local operation is active. Check its status before editing choices.")
+                    if db.get_current_exact_generation(workspace) is None:
+                        raise ValueError("Find charts again before changing this selection.")
+                    before = local_selection.choices(db, workspace)
+                    if action == "cohort":
+                        scope = str(payload.get("scope") or "strong").casefold()
+                        if scope not in {"strong", "eligible"}:
+                            raise ValueError("Choose best matches or all eligible recommendations.")
+                        if scope == "eligible" and payload.get("confirm_review") is not True:
+                            raise ValueError("Confirm inclusion of uncertain recommendations before replacing choices.")
+                        selected = _select_recommended_safe(db, workspace, scope=scope, choices_only=True)
+                        db.clear_workspace_selection(workspace, kind="exact")
+                        for row in selected:
+                            db.select_workspace_candidate(workspace, row["track_id"], row["candidate_id"],
+                                kind="exact", score=row.get("score"), explanation=row.get("breakdown_json") or "",
+                                eligibility=row.get("eligibility") or "", require_workspace_candidate=True)
+                        label = "Replace imported-song choices"
+                    elif action in {"select", "clear"}:
+                        track = payload.get("track_id") or payload.get("track_key")
+                        if action == "clear":
+                            db.clear_workspace_selection(workspace, track, kind="exact")
+                            label = "Clear chart choice" if track else "Clear imported-song choices"
+                        else:
+                            row, kind, track, error = _candidate_row_for_request(db, workspace, {**payload, "kind": "exact"})
+                            if row is None or kind != "exact":
+                                raise ValueError(error or "Chart is no longer available.")
+                            valid, error = _validate_candidate_eligibility(db, workspace, row, kind)
+                            data = _row_dict(row)
+                            if not valid or not db.is_chart_artifact_eligible(data["source"], int(data["chart_id"])):
+                                raise ValueError(error or "Chart artifact is unavailable.")
+                            db.clear_workspace_selection(workspace, track, kind="exact")
+                            db.select_workspace_candidate(workspace, track, data["candidate_id"], kind="exact",
+                                score=data.get("score"), explanation=data.get("breakdown_json") or "",
+                                eligibility=data.get("eligibility") or "", require_workspace_candidate=True)
+                            label = "Change chart choice"
+                    else:
+                        raise ValueError("Unsupported local selection action.")
+                    if local_selection.choices(db, workspace) != before:
+                        local_selection.remember(db, workspace, before, label)
+                    result = {"ok": True, **_tray_payload(db, workspace)}
+                return jsonify(result)
+            finally:
+                db.close()
+        except (OSError, ValueError, TypeError) as exc:
+            return {"error": _safe_message(exc)}, 409
+
+    @app.post("/api/discovery/selection/undo")
+    def local_selection_undo():
+        busy = _busy_response()
+        if busy is not None:
+            return busy
+        payload = request.get_json(silent=True) or {}
+        try:
+            workspace = int(_workspace_id(payload.get("workspace_id")))
+            db = Database(config.database_path)
+            try:
+                row = db.get_workspace(workspace)
+                if not row or row["workspace_key"] != db.get_meta("local_workspace_key"):
+                    return {"error": "This action belongs to the local Riff workspace."}, 403
+                with db.atomic_workspace_selection():
+                    local_selection.guard(db, workspace, payload.get("expected_revision"))
+                    record = local_selection.undo_record(db, workspace)
+                    if not record or record["operation_id"] != payload.get("operation_id"):
+                        raise ValueError("This undo is no longer current. Refresh your chart choices.")
+                    if _busy_response() is not None:
+                        raise ValueError("A local operation is active. Check its status before restoring choices.")
+                    # Revalidate every exact customized version before replacing anything.
+                    for choice in record["before"]:
+                        candidate, kind, _track, error = _candidate_row_for_request(db, workspace, choice)
+                        data = _row_dict(candidate) if candidate is not None else {}
+                        force = str(choice.get("eligibility") or "") == "ELIGIBLE_REVIEW"
+                        valid, error = _validate_candidate_eligibility(db, workspace, candidate, kind, force=force) if candidate is not None else (False, error)
+                        if not valid or not db.is_chart_artifact_eligible(data["source"], int(data["chart_id"])):
+                            raise ValueError(error or "A previous chart choice is no longer eligible.")
+                    db.clear_workspace_selection(workspace)
+                    for choice in record["before"]:
+                        db.select_workspace_candidate(workspace, choice.get("track_id"), choice["candidate_id"],
+                            kind=choice["kind"], artist_norm=choice.get("artist_norm") or "",
+                            score=choice.get("score"), explanation=choice.get("explanation") or "",
+                            eligibility=choice.get("eligibility") or "", status=choice.get("status") or "selected",
+                            planned_bytes=choice.get("planned_bytes") or 0, target_relpath=choice.get("target_relpath") or "",
+                            metadata=_json_object(choice.get("metadata_json"), {}),
+                            force=str(choice.get("eligibility") or "") == "ELIGIBLE_REVIEW",
+                            require_workspace_candidate=True)
+                    local_selection.clear_undo(db, workspace)
+                    result = {"ok": True, "restored": True, **_tray_payload(db, workspace)}
+                return jsonify(result)
+            finally:
+                db.close()
+        except (OSError, ValueError, TypeError) as exc:
+            return {"error": _safe_message(exc)}, 409
 
     @app.get("/api/spotify/selections")
     @app.get("/api/spotify/selection/tray")
@@ -6619,7 +6744,7 @@ def create_app(
     @app.post("/api/spotify/path/pick")
     def native_folder_picker():
         if not _loopback_request():
-            return {"error": "folder picking runs on the server. Use Download ZIP to save on this device."}, 403
+            return {"error": "Folder picking opens on the Riff host and requires a loopback connection. Use the linked host folder or open Riff on that host."}, 403
         if os.name != "nt":
             return {"error": "native folder picking is only supported on Windows"}, 501
         selected = ""
@@ -7600,6 +7725,17 @@ def create_app(
                         "resume_available": history["resume_available"],
                     })
         payload["operation"] = _export_operation(payload)
+        result = payload.get("result") or {}
+        receipt_id = result.get("export_id") or payload.get("export_id")
+        if (payload.get("kind") == "folder" and receipt_id and payload.get("destination")
+                and payload.get("status") in {"complete", "success", "partial", "cancelled", "interrupted", "failed"}):
+            payload["receipt"] = {
+                "export_id": receipt_id, "kind": "host_folder", "destination": payload["destination"],
+                "status": payload["status"], "verified_at_export": True,
+                "completed_chart_entries": result.get("ready"), "chart_entries_added": result.get("added"),
+                "already_available": result.get("already_present"),
+                "game_scan_required": True, "game_scan_verified": False,
+            }
         return jsonify(payload)
 
     @app.post("/api/spotify/export/download")
@@ -8727,6 +8863,15 @@ def create_app(
             "app_surface": "journey",
             "application_surface": "journey",
             "revision": revision,
+            "capabilities": {
+                "surface": "local", "delivery": "host_folder", "host_name": platform.node() or "Riff host",
+                "host_os": platform.system(), "configured_destination": str(config.library_root),
+                "native_folder_picker": os.name == "nt" and _loopback_request(),
+                "manual_destination": _loopback_request(),
+                "folder_picker_reason": "" if os.name == "nt" and _loopback_request() else
+                    "Native folder picking requires Windows and a loopback connection on the Riff host.",
+                "game_scan_required": True,
+            },
             "screen": screen,
             "workspace_id": int(workspace),
             "sources": sources,
@@ -9600,6 +9745,7 @@ def create_app(
             ]
             for row in detail_rows:
                 candidate = _candidate_payload(row)
+                candidate["difficulty_coverage"] = inspected_difficulty_coverage(db, db.candidate_from_workspace_row(row))
                 manual = manual_decisions.get(
                     (
                         track.track_key,

@@ -194,8 +194,8 @@ def test_public_exact_and_expansion_share_inspected_levels_and_prefer_multi_diff
         "preset": "one_per_song", "confirm_possible": True,
     })
     assert expanded.status_code == 200, expanded.get_json()
-    assert expanded.get_json()["songs"] == 2
-    assert expanded.get_json()["charts"] == 2
+    assert expanded.get_json()["summary"]["expansion"] == {"songs": 2, "charts": 2}
+    assert expanded.get_json()["songs"] == expanded.get_json()["charts"] == 3
     db = Database(config.database_path)
     try:
         exact_ids = {row["candidate_id"] for row in db.list_workspace_selections(workspace, kind="exact")}

@@ -20,6 +20,7 @@
     selections: null,
     selectionError: "",
     cohortPreference: "",
+    includeReview: false,
     confirmationVisible: false,
     pendingRow: "",
     reviewRevision: 0,
@@ -31,6 +32,9 @@
     preflightNotice: "",
     exportStatus: null,
     exportError: "",
+    exportTechnicalError: "",
+    exportLastChecked: null,
+    exportReconnectAttempts: 0,
     exportPollTimer: null,
     exportController: null,
     exportRevision: 0,
@@ -366,9 +370,19 @@
       const chartTitle = candidate.candidate_title || candidate.title || candidate.name || "Recommended chart";
       const charter = String(candidate.charter || "").trim();
       const concerns = reviewConcerns(candidate);
+      const coverage = candidate.difficulty_coverage || {};
+      const levels = Array.isArray(coverage.guitar_difficulties) ? coverage.guitar_difficulties : [];
+      const difficulty = coverage.evidence === "inspected_notes" && levels.length
+        ? "Guitar: " + levels.map(function (level) { return level.charAt(0).toUpperCase() + level.slice(1); }).join(" / ") + " (verified notes)"
+        : "Difficulty levels unknown";
+      const alternatives = Array.isArray(card.candidates) ? card.candidates.filter(function (version) { return String(version.candidate_id) !== String(candidate.candidate_id); }) : [];
+      const versions = alternatives.length ? '<details class="chart-alternatives"><summary>Other chart versions (' + number(alternatives.length) + ')</summary>' + alternatives.map(function (version) {
+        const eligible = ["strong", "needs_review"].includes(version.review_state);
+        return '<div><strong>' + escapeHtml(version.candidate_title || version.title || "Chart version") + '</strong><p>' + escapeHtml(reviewConcerns(version).join(" ") || "Recording metadata supplied by the chart source.") + '</p><button class="button secondary" data-action="select-version" data-track-key="' + escapeHtml(card.track_key) + '" data-candidate-id="' + escapeHtml(version.candidate_id) + '"' + (!eligible || disabled ? ' disabled' : '') + '>Use this version</button></div>';
+      }).join("") + '</details>' : '';
       const source = sourceLabel(candidate.source);
       const accessible = "Use " + String(card.title || "this song") + " by " + String(card.artist || "unknown artist");
-      return '<div class="chart-row' + (selected ? " is-row-selected" : "") + '" data-track-key="' + escapeHtml(card.track_key) + '" aria-busy="' + (pending ? "true" : "false") + '"><label class="row-check"><input type="checkbox" data-row-selection data-track-key="' + escapeHtml(card.track_key) + '" aria-label="' + escapeHtml(accessible) + '"' + (selected ? " checked" : "") + (disabled ? ' disabled aria-disabled="true"' : '') + '><span class="custom-check" aria-hidden="true">' + icons.check + '</span></label><span class="chart-art" aria-hidden="true">' + escapeHtml(source.charAt(0)) + '</span><div class="chart-song"><strong>' + escapeHtml(card.title) + '</strong><small>' + escapeHtml(card.artist) + '</small></div><div class="chart-tags"><span class="source-tag">' + escapeHtml(source) + '</span><span class="tier-tag ' + (tierState === "strong" ? "tier-best" : "tier-available") + '">' + tier + '</span></div><div class="chart-version"><span>' + escapeHtml(chartTitle) + '</span>' + (charter ? '<small>Chart by ' + escapeHtml(charter) + '</small>' : '') + concernPopover(concerns, index) + (pending ? '<strong class="row-pending" role="status">Saving...</strong>' : '') + '</div></div>';
+      return '<div class="chart-row' + (selected ? " is-row-selected" : "") + '" data-track-key="' + escapeHtml(card.track_key) + '" aria-busy="' + (pending ? "true" : "false") + '"><label class="row-check"><input type="checkbox" data-row-selection data-track-key="' + escapeHtml(card.track_key) + '" aria-label="' + escapeHtml(accessible) + '"' + (selected ? " checked" : "") + (disabled ? ' disabled aria-disabled="true"' : '') + '><span class="custom-check" aria-hidden="true">' + icons.check + '</span></label><span class="chart-art" aria-hidden="true">' + escapeHtml(source.charAt(0)) + '</span><div class="chart-song"><strong>' + escapeHtml(card.title) + '</strong><small>' + escapeHtml(card.artist) + '</small></div><div class="chart-tags"><span class="source-tag">' + escapeHtml(source) + '</span><span class="tier-tag ' + (tierState === "strong" ? "tier-best" : "tier-available") + '">' + tier + '</span></div><div class="chart-version"><span>' + escapeHtml(chartTitle) + '</span>' + (charter ? '<small>Chart by ' + escapeHtml(charter) + '</small>' : '') + '<small class="chart-difficulty">' + escapeHtml(difficulty) + '</small>' + concernPopover(concerns, index) + versions + (pending ? '<strong class="row-pending" role="status">Saving...</strong>' : '') + '</div></div>';
     }).join("");
   }
 
@@ -390,7 +404,7 @@
     else if (!rows) list = '<p class="empty-filter">No charts match that search or filter.</p>';
     const status = model.review.loading ? "Updating charts..." : "Showing " + number(shown) + " of " + number(total);
     const more = page.has_more ? '<button class="load-more" data-action="load-more-review"' + (model.review.loading ? " disabled" : "") + '>Load more charts</button>' : "";
-    return '<section class="confirmation-list" aria-labelledby="confirmation-heading" aria-busy="' + (model.review.loading ? "true" : "false") + '"><div class="list-head"><div><p class="overline">A quick check</p><h2 id="confirmation-heading">A few representative charts</h2></div><span class="list-note">Optional adjustment</span></div><div class="list-toolbar"><label class="search-field">' + icons.search + '<span class="sr-only">Search charts</span><input id="chart-search" type="search" placeholder="Search songs" value="' + escapeHtml(model.review.search) + '" autocomplete="off"></label><div class="filter-group" aria-label="Filter chart choices">' + filters + '</div></div>' + (model.review.error ? '<p class="confirmation-error" role="alert">' + escapeHtml(model.review.error) + '</p>' : '') + '<div class="list-status" role="status">' + status + '</div><div class="chart-list">' + list + '</div><div class="list-footer"><span>' + (total ? number(shown) + " of " + number(total) + " charts" : "") + '</span>' + more + '</div></section>';
+    return '<section class="confirmation-list" aria-labelledby="confirmation-heading" aria-busy="' + (model.review.loading ? "true" : "false") + '"><div class="list-head"><div><p class="overline">A quick check</p><h2 id="confirmation-heading">Review songs and chart versions</h2></div><span class="list-note">Optional adjustment</span></div><div class="list-toolbar"><label class="search-field">' + icons.search + '<span class="sr-only">Search charts</span><input id="chart-search" type="search" placeholder="Search songs" value="' + escapeHtml(model.review.search) + '" autocomplete="off"></label><div class="filter-group" aria-label="Filter chart choices">' + filters + '</div></div>' + (model.review.error ? '<p class="confirmation-error" role="alert">' + escapeHtml(model.review.error) + '</p>' : '') + '<div class="list-status" role="status">' + status + '</div><div class="chart-list">' + list + '</div><div class="list-footer"><span>' + (total ? number(shown) + " of " + number(total) + " charts" : "") + '</span>' + more + '</div></section>';
   }
 
   function chartsFound(snapshot) {
@@ -401,14 +415,24 @@
     const pending = model.pendingAction === "cohort";
     const enabled = Boolean(snapshot.matching.authoritative) && !model.pendingRow;
     const mutationPending = Boolean(model.pendingAction) || Boolean(model.pendingRow);
+    const undo = model.selections && model.selections.undo;
+    const selectionSettings = '<div class="selection-settings"><strong>One preferred chart per song</strong><p>Each option replaces ' + (selectionKnown ? 'your ' + number(selection.count) + ' saved imported-song choices' : 'imported-song choices') + '. Artist discoveries remain separate. Real playable notes are verified during export.</p><p>Undo keeps the last selection change for 30 minutes while these chart results remain current.</p><label><input id="include-review-choices" type="checkbox"' + (model.includeReview ? ' checked' : '') + (mutationPending ? ' disabled' : '') + '> Include uncertain recommendations in the all-recommendations option</label></div>';
+    const restoration = '<div class="selection-restoration">' + (undo && undo.available ? '<button class="button secondary" data-action="undo-selection"' + (mutationPending ? ' disabled' : '') + '>Undo last selection change</button>' : '') + (selectionKnown && selection.count ? '<button class="text-link" data-action="clear-selection"' + (mutationPending ? ' disabled' : '') + '>Clear imported-song choices</button>' : '') + '</div>';
     let status = '<span class="empty-status-mark" aria-hidden="true"></span><span>Nothing selected yet</span>';
     if (!selectionKnown) status = '<span class="empty-status-mark" aria-hidden="true"></span><span>Selection unavailable</span>';
     else if (selection.count > 0) status = '<span class="status-check">' + icons.check + '</span><strong>' + number(selection.count) + ' selected</strong>';
     const details = '<details class="details"><summary>Details</summary><p>' + number(result.no_suitable) + ' no suitable, ' + number(result.not_playable) + ' not playable, and ' + number(result.no_candidate) + ' had no candidate.</p></details>';
     const continuation = selectionKnown && selection.count > 0
-      ? '<button class="button primary" data-test="continue-download" data-action="continue-download"' + (mutationPending ? ' disabled aria-disabled="true"' : '') + '>Continue with ' + number(selection.count) + ' charts ' + icons.arrow + '</button>'
+      ? '<button class="button primary" data-test="continue-download" data-action="continue-download"' + (mutationPending ? ' disabled aria-disabled="true"' : '') + '>Review export for ' + number(selection.count) + ' charts ' + icons.arrow + '</button>'
       : '<span class="footer-hint">Choose at least one chart to continue</span>';
-    return shell('<section class="found-stage stage-section" data-test="charts-found"><header class="found-head"><div><p class="overline">Confirm charts</p><h1>We found charts for <span>' + number(result.recommendations) + '</span> of your songs.</h1></div><div class="selection-status' + (selection.count > 0 ? " has-selection" : "") + '">' + status + '</div></header><div class="cohort-grid">' + cohortCard("best", result.best_matches, "Best matches", "Most reliable. Artist, title, version, and playability all look right.", "Use " + number(result.best_matches) + " best matches", activeCohort === "best", pending, enabled) + cohortCard("all", result.recommendations, "recommendations", "Includes " + number(result.best_available) + " Best available suggestions. Some may be live, remastered, alternate, or otherwise imperfect versions.", "Use all " + number(result.recommendations) + " recommendations", activeCohort === "all", pending, enabled) + '</div>' + (model.selectionError ? '<p class="cohort-error" role="alert">' + escapeHtml(model.selectionError) + '</p>' : '') + (model.confirmationVisible ? confirmationList() : "") + '<footer class="found-footer"><div class="found-gaps"><span><strong>' + number(result.no_suitable) + '</strong> no suitable</span><span><strong>' + number(result.not_playable) + '</strong> not playable</span><span><strong>' + number(result.no_candidate) + '</strong> no candidate</span></div><div class="found-footer-actions">' + details + continuation + '</div></footer></section>', "Confirm charts");
+    return shell('<section class="found-stage stage-section" data-test="charts-found"><header class="found-head"><div><p class="overline">Review chart choices</p><h1>We found charts for <span>' + number(result.recommendations) + '</span> of your songs.</h1></div><div class="selection-status' + (selection.count > 0 ? " has-selection" : "") + '">' + status + '</div></header>' + selectionSettings + '<div class="cohort-grid">' + cohortCard("best", result.best_matches, "Best matches", "Artist, title and recording metadata are the strongest matches. File validation happens during export.", "Use " + number(result.best_matches) + " best matches", activeCohort === "best", pending, enabled) + cohortCard("all", result.recommendations, "recommendations", "Includes " + number(result.best_available) + " uncertain suggestions. Check recording differences before including these charts.", "Use all " + number(result.recommendations) + " recommendations", activeCohort === "all", pending, enabled && model.includeReview) + '</div>' + restoration + (model.selectionError ? '<p class="cohort-error" role="alert">' + escapeHtml(model.selectionError) + '</p>' : '') + (model.confirmationVisible ? confirmationList() : "") + '<footer class="found-footer"><div class="found-gaps"><span><strong>' + number(result.no_suitable) + '</strong> no suitable</span><span><strong>' + number(result.not_playable) + '</strong> not playable</span><span><strong>' + number(result.no_candidate) + '</strong> no candidate</span></div><div class="found-footer-actions">' + details + continuation + '</div></footer></section>', "Review chart choices");
+  }
+
+  function hostDestinationControls() {
+    const capabilities = model.snapshot && model.snapshot.capabilities || {};
+    const host = capabilities.host_name || "the Riff host";
+    const destination = model.preflightDestination || capabilities.configured_destination || "";
+    return '<aside class="host-capability"><strong>Local export to ' + escapeHtml(host) + '</strong><p>Charts are written to a folder on this host. Clone Hero or YARG must scan that folder afterward.</p>' + (!capabilities.native_folder_picker ? '<p>' + escapeHtml(capabilities.folder_picker_reason || "Folder picker capability is unavailable.") + '</p>' : '<p>The native picker opens on this Windows host.</p>') + (capabilities.manual_destination ? '<label for="host-folder-path">Songs folder on this host</label><div class="host-path-controls"><input id="host-folder-path" type="text" value="' + escapeHtml(destination) + '" autocomplete="off"><button class="button secondary" data-action="validate-host-folder"' + (model.pendingAction ? ' disabled' : '') + '>Check this folder</button></div>' : '<p>Use the linked host folder, or open Riff on the host to change the destination.</p>') + '</aside>';
   }
 
   function preflightCount(preflight, key, fallback) {
@@ -480,13 +504,14 @@
     const choosing = model.pendingAction === "folder";
     const starting = model.pendingAction === "export-start";
     const busy = Boolean(model.pendingAction);
+    const pickerUnavailable = !(model.snapshot.capabilities && model.snapshot.capabilities.native_folder_picker);
     const start = persistedCount > 0
-      ? '<button class="button primary" data-action="start-export"' + (busy ? ' disabled aria-disabled="true"' : '') + '>' + (starting ? "Starting download..." : "Download library " + icons.download) + '</button>'
+      ? '<button class="button primary" data-action="start-export"' + (busy ? ' disabled aria-disabled="true"' : '') + '>' + (starting ? "Starting export..." : "Write charts to folder " + icons.download) + '</button>'
       : "";
     if (ready) {
-      return shell('<section class="ready-download-stage stage-section" data-test="download-ready"><div class="download-ready-copy"><p class="overline">Download</p><h1>Ready to add <span>' + number(selected) + '</span> ' + (selected === 1 ? "song" : "songs") + '</h1><p class="lead-copy">Your chart choices and destination passed every current check.</p><dl class="download-facts">' + facts + '</dl>' + notice + issueList + '<div class="download-ready-status"><span class="enough-mark">' + icons.check + '</span><span><strong>Ready for download</strong><small>No chart files have been downloaded yet.</small></span></div><div class="download-actions">' + start + '<button class="button secondary" data-action="change-folder"' + (busy ? ' disabled aria-disabled="true"' : '') + '>' + (choosing ? "Choosing folder..." : "Change folder") + '</button><button class="text-link quiet-back" data-action="back-to-charts"' + (busy ? ' disabled aria-disabled="true"' : '') + '>Change chart choices ' + icons.arrow + '</button></div></div>' + folderVisual(preflight, "ready") + '</section>', "Download");
+      return shell('<section class="ready-download-stage stage-section" data-test="download-ready"><div class="download-ready-copy"><p class="overline">Download</p><h1>Review export of <span>' + number(selected) + '</span> ' + (selected === 1 ? "chart entry" : "chart entries") + '</h1><p class="lead-copy">Selection, destination and space were checked. Playable chart files are verified during export.</p><dl class="download-facts">' + facts + '</dl>' + hostDestinationControls() + notice + issueList + '<div class="download-ready-status"><span class="enough-mark">' + icons.check + '</span><span><strong>Ready to write charts</strong><small>No new chart files have been written yet.</small></span></div><div class="download-actions">' + start + '<button class="button secondary" data-action="change-folder"' + (busy || pickerUnavailable ? ' disabled aria-disabled="true"' : '') + '>' + (choosing ? "Choosing folder..." : "Change folder") + '</button><button class="text-link quiet-back" data-action="back-to-charts"' + (busy ? ' disabled aria-disabled="true"' : '') + '>Change chart choices ' + icons.arrow + '</button></div></div>' + folderVisual(preflight, "ready") + '</section>', "Download");
     }
-    return shell('<section class="ready-download-stage stage-section" data-test="download-preflight-error"><div class="download-ready-copy"><p class="overline">Download</p><h1>Your library needs one more check</h1><p class="lead-copy">No chart files were downloaded. Your selected charts are still saved.</p><dl class="download-facts">' + facts + '</dl>' + notice + issueList + '<div class="download-actions"><button class="button secondary" data-action="retry-preflight"' + (choosing ? ' disabled aria-disabled="true"' : '') + '>Retry preflight</button><button class="button quiet" data-action="change-folder"' + (choosing ? ' disabled aria-disabled="true"' : '') + '>' + (choosing ? "Choosing folder..." : "Change folder") + '</button><button class="text-link quiet-back" data-action="back-to-charts"' + (choosing ? ' disabled aria-disabled="true"' : '') + '>Change chart choices ' + icons.arrow + '</button></div></div>' + folderVisual(preflight, "warning") + '</section>', "Download");
+    return shell('<section class="ready-download-stage stage-section" data-test="download-preflight-error"><div class="download-ready-copy"><p class="overline">Download</p><h1>Your library needs one more check</h1><p class="lead-copy">No chart files were downloaded. Your selected charts are still saved.</p><dl class="download-facts">' + facts + '</dl>' + hostDestinationControls() + notice + issueList + '<div class="download-actions"><button class="button secondary" data-action="retry-preflight"' + (choosing ? ' disabled aria-disabled="true"' : '') + '>Retry preflight</button><button class="button quiet" data-action="change-folder"' + (choosing || pickerUnavailable ? ' disabled aria-disabled="true"' : '') + '>' + (choosing ? "Choosing folder..." : "Change folder") + '</button><button class="text-link quiet-back" data-action="back-to-charts"' + (choosing ? ' disabled aria-disabled="true"' : '') + '>Change chart choices ' + icons.arrow + '</button></div></div>' + folderVisual(preflight, "warning") + '</section>', "Download");
   }
 
   function knownNumber() {
@@ -616,6 +641,7 @@
   }
 
   function exportGoalComplete(status) {
+    if (!(status && status.receipt && status.receipt.verified_at_export && status.receipt.kind === "host_folder")) return false;
     const state = exportState(status);
     if (state === "complete") return true;
     if (state !== "partial") return false;
@@ -633,6 +659,10 @@
 
   function downloadRunning() {
     const status = model.exportStatus || {};
+    if (model.exportError) {
+      const checked = model.exportLastChecked ? new Date(model.exportLastChecked).toLocaleTimeString() : "Unavailable";
+      return shell('<section class="export-recovery stage-section" data-test="export-status-unavailable"><p class="overline">Local export</p><h1>Export status unavailable</h1><p class="lead-copy">The outcome is unknown. Work may still continue on the Riff host. Check its status before starting another export.</p><p>Last successful check: ' + escapeHtml(checked) + '. Your chart choices remain saved.</p><button class="button primary" data-action="check-export-status">Check export status</button><details class="details"><summary>Technical details</summary><p>' + escapeHtml(model.exportTechnicalError) + '</p></details></section>', "Export status unavailable");
+    }
     const view = exportRunningView(status);
     const countValue = view.determinate ? number(view.ready) : "";
     const countCopy = view.determinate ? " / " + number(view.total) + " ready" : "Preparing selected charts";
@@ -645,7 +675,7 @@
     const stop = '<button class="button quiet stop-safe" data-action="cancel-export"' + (view.stopDisabled ? ' disabled aria-disabled="true"' : '') + '>' + (view.stopDisabled ? "Stopping safely..." : "Stop safely") + '</button>';
     return shell(
       '<section class="building-stage stage-section" data-test="export-' + (view.cancelling ? "cancelling" : "running") + '">' +
-      '<header class="building-head"><div><p class="overline">Download</p><h1>Building your Clone Hero library</h1><p class="building-count" role="status" aria-live="polite" aria-atomic="true"><strong data-export-ready' + (view.determinate ? "" : " hidden") + '>' + countValue + '</strong><span data-export-count-copy>' + countCopy + '</span></p></div>' +
+      '<header class="building-head"><div><p class="overline">Download</p><h1>Writing charts to this host</h1><p class="building-count" role="status" aria-live="polite" aria-atomic="true"><strong data-export-ready' + (view.determinate ? "" : " hidden") + '>' + countValue + '</strong><span data-export-count-copy>' + countCopy + '</span></p></div>' +
       '<div class="building-percent' + (view.determinate ? "" : " is-preparing") + '" data-export-percent-wrap><strong data-export-percent>' + (view.determinate ? number(view.percent) + "%" : "Preparing") + '</strong><span data-export-percent-label>' + (view.determinate ? "ready" : "charts") + '</span></div></header>' +
       '<div class="building-progress' + (view.determinate ? "" : " is-indeterminate") + '" data-export-progress role="progressbar"' + progressAttributes + '><span data-export-progress-fill' + (view.determinate ? ' style="width:' + view.percent + '%"' : "") + '></span></div>' +
       '<div class="flow-visual" aria-hidden="true"><div class="flow-orbit flow-orbit-one"></div><div class="flow-orbit flow-orbit-two"></div><span class="flow-node flow-node-one"></span><span class="flow-node flow-node-two"></span><span class="flow-node flow-node-three"></span><div class="flow-line"></div><div class="songs-folder-target"><span>' + icons.folder + '</span><strong>Songs</strong><small>library</small></div></div>' +
@@ -750,20 +780,25 @@
     const destination = String(status.destination || status.result && status.result.destination || model.preflightDestination || "");
     const selected = counts.selected == null ? exactSelectionItems().length : counts.selected;
     const notReady = Math.max(0, selected - counts.ready);
-    if (state === "partial" && notReady === 0) state = "complete";
+    const receipt = status.receipt;
+    if (state === "partial" && notReady === 0 && receipt && receipt.verified_at_export) state = "complete";
     if (state === "failed" && counts.ready > 0 && notReady > 0) state = "partial";
     const destinationDetail = destination ? '<p class="done-destination"><span>Destination</span><strong>' + escapeHtml(destination) + '</strong></p>' : "";
     const changeChoices = '<button class="text-link" data-action="back-to-charts">Change chart choices ' + icons.arrow + '</button>';
     let visual = icons.check;
-    let heading = '<span>' + number(counts.ready) + '</span> ' + (counts.ready === 1 ? "song is" : "songs are") + ' ready to play';
-    let body = '<p class="done-instruction">In Clone Hero or YARG, scan your Songs folder.</p>';
+    let heading = '<span>' + number(counts.ready) + '</span> ' + (counts.ready === 1 ? 'verified chart entry available' : 'verified chart entries available');
+    let body = '<p class="done-instruction">Export to the Riff host finished. Next: run Scan Songs in Clone Hero or YARG. Riff has not verified the game scan.</p>';
     let actions = changeChoices;
     let className = "is-complete";
     let testName = "export-complete";
 
+    if ((state === "complete" || counts.ready > 0) && !(receipt && receipt.verified_at_export && receipt.kind === "host_folder")) {
+      return shell('<section class="export-recovery stage-section" data-test="export-receipt-unavailable"><p class="overline">Local export</p><h1>Export receipt unavailable</h1><p class="lead-copy">The status says complete, but no verified folder receipt is available. Check status before relying on this result.</p><button class="button primary" data-action="check-export-status">Check export status</button></section>', "Check export receipt");
+    }
+
     if (state === "partial") {
       visual = number(notReady);
-      heading = '<span>' + number(counts.ready) + '</span> ' + (counts.ready === 1 ? "song is" : "songs are") + ' ready';
+      heading = '<span>' + number(counts.ready) + '</span> ' + (counts.ready === 1 ? "verified chart entry" : "verified chart entries") + ' available';
       body = '<p class="done-issue"><strong>' + number(notReady) + '</strong> couldn’t be added</p><p class="done-instruction">Completed charts are safe. Retry only the remaining work.</p>';
       actions = '<button class="button secondary" data-action="retry-export">Retry remaining</button>' + changeChoices;
       className = "is-partial";
@@ -777,7 +812,7 @@
       testName = "export-" + state;
     } else if (state === "failed") {
       visual = "!";
-      heading = counts.ready > 0 ? '<span>' + number(counts.ready) + '</span> ' + (counts.ready === 1 ? "song is" : "songs are") + ' ready, but finishing failed' : 'Build failed';
+      heading = counts.ready > 0 ? '<span>' + number(counts.ready) + '</span> ' + (counts.ready === 1 ? "verified chart entry" : "verified chart entries") + ' available, but finishing failed' : 'Build failed';
       body = '<p class="done-instruction">' + escapeHtml(terminalIssue(status)) + '</p>' + (counts.ready > 0 ? '<p class="done-issue">Completed chart files remain in your Songs folder.</p>' : '<p class="done-issue"><strong>' + number(selected) + '</strong> ' + (selected === 1 ? "chart" : "charts") + ' selected</p>');
       actions = '<button class="button secondary" data-action="retry-export">Try again</button>' + changeChoices;
       className = "is-failed";
@@ -841,7 +876,7 @@
     else content = snapshot.music.canonical_count ? musicReady(snapshot) : sourcesEmpty(snapshot);
     const terminalDone = lifecycle && exportGoalComplete(model.exportStatus);
     const stage = snapshot.matching && snapshot.matching.state === "charts_found" ? (terminalDone ? "Done" : model.downloadView ? "Download" : "Confirm charts") : snapshot.matching && snapshot.matching.state !== "music_ready" ? "Find charts" : snapshot.operation.state === "importing" ? "Add music" : snapshot.music.canonical_count ? "Music ready" : "Add music";
-    app.innerHTML = '<header class="topbar"><div class="brand"><span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span><span class="brand-name">Riff</span><span class="brand-divider" aria-hidden="true"></span><span class="brand-context">music to Clone Hero</span></div><div class="stage-label"><span class="stage-pip" aria-hidden="true"></span><span id="stage-label">' + stage + '</span></div></header>' + content.slice(content.indexOf("<main"));
+    app.innerHTML = '<header class="topbar"><div class="brand"><span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span><span class="brand-name">Riff</span><span class="brand-divider" aria-hidden="true"></span><span class="brand-context">local export to this host</span></div><div class="stage-label"><span class="stage-pip" aria-hidden="true"></span><span id="stage-label">' + stage + '</span></div></header>' + content.slice(content.indexOf("<main"));
     app.setAttribute("aria-busy", matchingActive(snapshot) || ["preflight", "folder", "export-start", "cancel"].includes(model.pendingAction) || lifecycle && ["building", "cancelling"].includes(exportState(model.exportStatus)) ? "true" : "false");
     if (model.overlay) {
       app.insertAdjacentHTML("beforeend", sourceSheet(snapshot.sources[model.overlay]));
@@ -1018,12 +1053,12 @@
     model.exportRevision += 1;
   }
 
-  function scheduleExportPoll() {
+  function scheduleExportPoll(delay) {
     if (model.exportPollTimer !== null) window.clearTimeout(model.exportPollTimer);
     model.exportPollTimer = window.setTimeout(function () {
       model.exportPollTimer = null;
       loadExportStatus({ render: true });
-    }, 850);
+    }, delay || 1500);
   }
 
   async function loadExportStatus(options) {
@@ -1040,6 +1075,9 @@
         { signal: controller.signal }
       );
       if (revision !== model.exportRevision) return null;
+      const recovering = Boolean(model.exportError);
+      model.exportReconnectAttempts = 0;
+      model.exportLastChecked = Date.now();
       const state = exportState(status);
       if (state !== "idle") {
         model.exportStatus = status;
@@ -1050,7 +1088,7 @@
         model.exportStatus = null;
       }
       if (settings.render !== false) {
-        const updated = state === previousState && ["building", "cancelling"].includes(state)
+        const updated = !recovering && state === previousState && ["building", "cancelling"].includes(state)
           ? updateDownloadRunning() : false;
         if (!updated) render(false);
       }
@@ -1059,9 +1097,11 @@
     } catch (error) {
       if (error.name === "AbortError" || revision !== model.exportRevision) return null;
       if (model.exportStatus && ["building", "cancelling"].includes(exportState(model.exportStatus))) {
-        model.exportError = "Live progress could not be refreshed. Retrying automatically.";
-        if (settings.render !== false && !updateDownloadRunning()) render(false);
-        scheduleExportPoll();
+        model.exportError = "Export status could not be refreshed; its outcome is unknown.";
+        model.exportTechnicalError = error.message;
+        if (settings.render !== false) render(false);
+        model.exportReconnectAttempts += 1;
+        if (model.exportReconnectAttempts < 3) scheduleExportPoll(1500 * Math.pow(2, model.exportReconnectAttempts));
       }
       return null;
     } finally {
@@ -1211,7 +1251,8 @@
     const scope = cohort === "all" ? "eligible" : cohort === "best" ? "strong" : "";
     if (!scope) return;
     const workspace = model.snapshot.workspace_id;
-    const endpoint = "/api/discovery/select-all";
+    const endpoint = "/api/discovery/select-cohort";
+    if (scope === "eligible" && !model.includeReview) return;
     const headers = { "Content-Type": "application/json" };
     model.pendingAction = "cohort";
     model.selectionError = "";
@@ -1219,13 +1260,8 @@
     try {
       model.selections = await api(endpoint, {
         method: "POST", headers: headers,
-        body: JSON.stringify({ workspace_id: workspace, kind: "exact", action: "clear" })
-      });
-      model.cohortPreference = "";
-      render(false);
-      model.selections = await api(endpoint, {
-        method: "POST", headers: headers,
-        body: JSON.stringify({ workspace_id: workspace, kind: "exact", scope: scope })
+        body: JSON.stringify({ workspace_id: workspace, scope: scope, confirm_review: model.includeReview,
+          expected_revision: model.selections && model.selections.selection_revision })
       });
       model.cohortPreference = cohort;
       model.confirmationVisible = true;
@@ -1261,10 +1297,10 @@
     if (checkbox) checkbox.focus();
   }
 
-  async function updateRowSelection(trackKey, selected) {
+  async function updateRowSelection(trackKey, selected, versionId) {
     if (!trackKey || model.pendingRow || model.pendingAction || !model.snapshot || !model.snapshot.matching.authoritative) return;
     const card = model.review.tracks.find(function (item) { return String(item.track_key || "") === String(trackKey); });
-    const candidate = card ? recommendationCandidate(card) : null;
+    const candidate = card ? versionId ? card.candidates.find(function (version) { return String(version.candidate_id) === String(versionId); }) : recommendationCandidate(card) : null;
     if (selected && (!candidate || candidate.candidate_id == null)) {
       model.review.error = "That recommendation is no longer available. Refresh the chart list and try again.";
       render(false);
@@ -1277,12 +1313,13 @@
       track_id: trackKey,
       action: selected ? "select" : "clear"
     };
+    payload.expected_revision = model.selections && model.selections.selection_revision;
     if (selected) payload.candidate_id = candidate.candidate_id;
     model.pendingRow = String(trackKey);
     model.review.error = "";
     render(false);
     try {
-      model.selections = await api("/api/discovery/select", {
+      model.selections = await api("/api/discovery/selection/change", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload)
@@ -1300,7 +1337,7 @@
       try {
         model.selections = await api("/api/discovery/selections?workspace_id=" + encodeURIComponent(workspace));
         await loadReview(true, { renderStart: false, renderEnd: false });
-        model.review.error = "We could not update that chart. Your saved choice was restored. Try again.";
+        model.review.error = "We could not confirm that change. Your current saved choices are shown. Check them before trying again.";
       } catch (_refreshError) {
         model.review.error = "We could not update or verify that chart. Reload this page before trying again.";
       }
@@ -1310,6 +1347,31 @@
       render(false);
       focusReviewRow(trackKey);
     }
+  }
+
+  async function changeSelectionTray(action) {
+    if (model.pendingAction || model.pendingRow || !model.selections) return;
+    const workspace = model.snapshot.workspace_id;
+    const undo = action === "undo-selection";
+    const record = model.selections.undo;
+    if (undo && !(record && record.available)) return;
+    model.pendingAction = "selection";
+    render(false);
+    try {
+      model.selections = await api(undo ? "/api/discovery/selection/undo" : "/api/discovery/selection/change", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ workspace_id: workspace, action: "clear",
+          expected_revision: model.selections.selection_revision, operation_id: record && record.operation_id })
+      });
+      model.cohortPreference = "";
+      await loadReview(true);
+      announce(undo ? "Previous chart choices restored." : "Imported-song choices cleared." + (model.selections.undo && model.selections.undo.available ? " Undo is available for the last change." : ""));
+    } catch (error) {
+      model.selectionError = "The change could not be confirmed. Refresh saved choices before trying again.";
+      try { model.selections = await api("/api/discovery/selections?workspace_id=" + workspace); }
+      catch (_) { model.selections = null; }
+      announce(model.selectionError);
+    } finally { model.pendingAction = ""; render(false); }
   }
 
   async function runPreflight(destination) {
@@ -1361,6 +1423,7 @@
 
   async function changeFolder() {
     if (model.pendingAction || model.pendingRow || !model.downloadView) return;
+    if (!model.snapshot.capabilities || !model.snapshot.capabilities.native_folder_picker) return;
     model.pendingAction = "folder";
     model.preflightNotice = "";
     render(false);
@@ -1524,6 +1587,12 @@
     else if (action === "view-imported") { model.overlay = null; render(false); document.getElementById("main-content").focus(); }
     else if (action === "find-charts" || action === "retry-matching") { startMatching(); }
     else if (action === "select-cohort") { selectCohort(target.dataset.cohort); }
+    else if (action === "select-version") { updateRowSelection(target.dataset.trackKey, true, target.dataset.candidateId); }
+    else if (action === "undo-selection" || action === "clear-selection") { changeSelectionTray(action); }
+    else if (action === "validate-host-folder") {
+      const input = document.getElementById("host-folder-path");
+      if (input && input.value.trim()) runPreflight(input.value.trim());
+    }
     else if (action === "set-review-filter") {
       model.review.filter = target.dataset.reviewFilter || "all";
       loadReview(true);
@@ -1541,6 +1610,7 @@
     }
     else if (action === "continue-download") { runPreflight(); }
     else if (action === "retry-preflight") { runPreflight(model.preflightDestination || undefined); }
+    else if (action === "check-export-status") { model.exportReconnectAttempts = 0; loadExportStatus({ render: true }); }
     else if (action === "change-folder") { changeFolder(); }
     else if (action === "start-export") { startExport(); }
     else if (action === "cancel-export") { cancelExport(); }
@@ -1563,6 +1633,12 @@
   });
 
   app.addEventListener("change", function (event) {
+    if (event.target.id === "include-review-choices") {
+      model.includeReview = event.target.checked;
+      render(false);
+      document.getElementById("include-review-choices")?.focus();
+      return;
+    }
     const checkbox = event.target.closest("[data-row-selection]");
     if (!checkbox || !app.contains(checkbox)) return;
     updateRowSelection(checkbox.dataset.trackKey, checkbox.checked);

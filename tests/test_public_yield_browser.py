@@ -96,12 +96,14 @@ class YieldFixtures(SignalCheckFixtures):
             return 202, {"job": self.expansion_job()}
         if path == "/api/expansion/selection/bulk" and method == "POST":
             self.request_log.append((method, path, body))
-            if body != {"preset": "one_per_song", "confirm_possible": True}:
-                return 400, {"error": "Explicit expansion-review confirmation is required."}
+            if body.get("preset") != "one_per_song" or body.get("confirm_possible") is not False:
+                return 400, {"error": "Possible matches must be excluded from this reviewed preset."}
             # Model the separately tested server preset: one candidate per song,
             # known multiple guitar levels first; exact choices are untouched.
+            previous = self._snapshot()
             self.expansion_selected = {302, 401}
-            return 200, {"ok": True, "songs": 2, "charts": 2, "changed": 2, "scope": "expansion"}
+            self._commit(previous, "Replace additional-song choices")
+            return 200, {**self.selected_response(), "changed": 2, "scope": "expansion"}
         return super().respond(method, request_url, post_data)
 
 
@@ -119,6 +121,7 @@ def test_expert_only_is_labeled_and_selectable_in_exact_and_expansion_choices(de
     assert "Expert only" in row.locator('[data-candidate="101"]').get_attribute("aria-label")
     assert "Inspected note tracks · Guitar: Expert; Bass: Expert" in row.inner_text()
     if width == 390:
+        page.locator("#studio-select-all").scroll_into_view_if_needed()
         primary = page.locator("#studio-select-all").bounding_box()
         initial_rail = page.locator("#selectionRail").bounding_box()
         assert primary and initial_rail and 0 <= primary["y"] and primary["y"] + primary["height"] + 7 <= initial_rail["y"]
@@ -270,9 +273,12 @@ def test_bulk_expansion_choice_needs_confirmation_and_keeps_exact_choices(delive
     assert fixtures.expansion_selected == {302, 401}
     assert len(_posts(requests, "/api/expansion/selection/bulk")) == 1
     assert not _posts(requests, "/api/selection/bulk")
-    assert "Replace your additional-song choices" in dialogs[0]
-    assert "marked for review" in dialogs[0] and "Unknown difficulty levels" in dialogs[0]
-    assert "imported-song choices stay unchanged" in dialogs[0]
+    assert "Replace additional-song choices" in dialogs[0]
+    assert "Possible matches are excluded" in dialogs[0]
+    assert "Undo restores the previous choices" in dialogs[0]
+    payload = _posts(requests, "/api/expansion/selection/bulk")[0].post_data_json
+    assert payload == {"preset": "one_per_song", "confirm_possible": False,
+                       "selection_revision": 1, "exact_generation_id": 1}
 
 
 def test_saved_bulk_choices_with_failed_recount_block_download_until_reconciled(delivery_page):
@@ -281,7 +287,7 @@ def test_saved_bulk_choices_with_failed_recount_block_download_until_reconciled(
     page, _requests = delivery_page(fixtures)
     page.once("dialog", lambda dialog: dialog.accept())
     page.locator("#selectExpansionSongsButton").click()
-    playwright.expect(page.locator("#selectedCount")).to_have_text("...")
+    playwright.expect(page.locator("#selectedCount")).to_have_text("Unknown")
     playwright.expect(page.locator("#continueDownloadButton")).to_be_disabled()
     playwright.expect(page.locator("#selectExpansionSongsButton")).to_be_disabled()
     playwright.expect(page.locator("#retrySelectionButton")).to_be_visible()

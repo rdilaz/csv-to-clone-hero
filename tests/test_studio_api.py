@@ -94,7 +94,7 @@ def test_listening_deck_spans_all_pages_no_guessed_expansion_ids_and_no_provider
 
 
 @pytest.mark.parametrize("payload", [
-    {"scope": "both"}, {"scope": "expansion", "confirm_possible": "true"},
+    {"scope": "expansion", "confirm_possible": "true"},
     {"scope": []}, {"policy": "all"}, ["bad"],
 ])
 def test_selection_rejects_ambiguous_input(client, config, payload):
@@ -156,7 +156,7 @@ def test_selection_transaction_rolls_back_both_scopes_on_write_failure(client, c
 
 def test_studio_capabilities_and_embed_policy_are_public(client):
     health = client.get("/healthz")
-    assert health.get_json()["ui_release"] == "riff-studio-20261008"
+    assert health.get_json()["ui_release"] == "riff-ux-20261010"
     assert health.get_json()["capabilities"]["select_all"]
     policy = health.headers["Content-Security-Policy"]
     assert "frame-src 'self' https://open.spotify.com;" in policy

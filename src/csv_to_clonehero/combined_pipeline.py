@@ -435,6 +435,14 @@ def discover_combined(
             # Direct callers may supply a not-yet-persisted snapshot. Never let
             # the workspace's older canonical fingerprint validate new inputs.
             library_fingerprint = ""
+    # The first cold validation path can synchronously load the full catalog.
+    # Publish observable feedback before either loader/fast-path validation runs.
+    if on_progress is not None:
+        on_progress({
+            "phase": "catalog_prepare", "message": "Preparing and checking the local chart catalog",
+            "total_tracks": len(normalized), "processed_tracks": 0,
+            "catalog_chart_count": None, "scoring_tasks_completed": 0,
+        })
     if catalog is not None and catalog.available and library_fingerprint:
         set_stage("completed_scan_validation")
         cached_result = completed_scan_fast_path(
@@ -517,7 +525,7 @@ def discover_combined(
             })
 
     emit(
-        phase="catalog_prepare", message="Preparing local Enchor search index",
+        phase="matching_prepare", message="Preparing chart matching",
         catalog_chart_count=result.catalog_chart_count, processed_tracks=0,
         scoring_tasks_completed=0,
     )

@@ -18,6 +18,7 @@ the worker advances one job at a time.
 from __future__ import annotations
 
 import logging
+import hashlib
 import threading
 import time
 from collections.abc import Callable, Mapping
@@ -155,6 +156,8 @@ class JobManager:
         self._thread: threading.Thread | None = None
         self._handles: dict[int, JobResult] = {}
         self._cancel_events: dict[int, threading.Event] = {}
+        self._availability_lock = threading.Lock()
+        self._availability_cache: tuple[tuple, dict[str, Any]] | None = None
         self._recover_orphaned_jobs()
         if auto_start:
             self.start()
@@ -165,6 +168,7 @@ class JobManager:
         try:
             recovered = db.recover_running_jobs()
             recovered_discovery = db.recover_interrupted_discovery()
+            db.recover_public_expansion_changes()
         finally:
             db.close()
         if recovered:
@@ -195,6 +199,53 @@ class JobManager:
             self._thread.join(timeout=timeout)
 
     # ---- public API --------------------------------------------------------
+    def _availability_key(self, db: Database) -> tuple:
+        from csv_to_clonehero.catalog import MAX_CATALOG_HEADER_BYTES
+
+        path = self.config.catalog_path
+        try:
+            stat = path.stat()
+            identity = (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
+            # A bounded header read catches atomic/content replacements even
+            # when an operator preserves the file's size and modification time.
+            with path.open("rb") as stream:
+                header = stream.readline(MAX_CATALOG_HEADER_BYTES + 1)
+            header_identity = hashlib.sha256(header).hexdigest()
+        except OSError:
+            identity = None
+            header_identity = None
+        return (str(path), identity, header_identity, db.chart_validation_fingerprint())
+
+    def discovery_availability(self, db: Database) -> dict[str, Any]:
+        """A request reads readiness; only the worker parses a cold catalog."""
+        from csv_to_clonehero.server.safeguards import get_enchor_preflight
+
+        key = self._availability_key(db)
+        with self._availability_lock:
+            cached = self._availability_cache
+        if cached is not None and cached[0] == key:
+            result = dict(cached[1])
+            if result.get("mode") == "catalog" or float(result.get("expires_at") or 0) > time.time():
+                return result
+        if key[1] is None:
+            result = get_enchor_preflight(db)
+            result.update(mode="live_fallback", catalog_available=False,
+                          catalog_diagnostic="The local chart catalog is unavailable.")
+            return result
+        return {"available": False, "fresh": False, "usable": False,
+                "status": "check_required", "busy": False, "retryable": True,
+                "retry_after_seconds": 0, "source": "enchor",
+                "message": "Check chart readiness before finding charts."}
+
+    def _save_discovery_availability(self, db: Database, result: dict[str, Any], key: tuple) -> dict[str, Any]:
+        if key != self._availability_key(db):
+            return {"available": False, "fresh": False, "usable": False,
+                    "status": "stale", "busy": False, "retryable": True,
+                    "message": "The chart catalog changed during its check. Check readiness again."}
+        with self._availability_lock:
+            self._availability_cache = (key, dict(result))
+        return result
+
     def enqueue(
         self,
         user_id: int,
@@ -297,6 +348,9 @@ class JobManager:
             if self._cancelled(job.id):
                 self._mark(job.id, status="cancelled", phase="cancelled", message="Job cancelled")
                 return
+            if job.kind == "preflight":
+                self._run_preflight(job)
+                return
             if job.kind == "discovery":
                 from csv_to_clonehero.server.safeguards import (
                     get_discovery_availability,
@@ -305,8 +359,14 @@ class JobManager:
 
                 db = Database(self.config.database_path)
                 try:
+                    self._mark(job.id, status="running", phase="checking_catalog",
+                               message="Checking chart readiness")
+                    key = self._availability_key(db)
                     if not get_discovery_availability(self.config, db).get("fresh"):
-                        refresh_enchor_preflight(self.config, db, self.source_factory)
+                        result = refresh_enchor_preflight(self.config, db, self.source_factory)
+                    else:
+                        result = get_discovery_availability(self.config, db)
+                    self._save_discovery_availability(db, result, key)
                 finally:
                     db.close()
             if self._cancelled(job.id):
@@ -350,6 +410,28 @@ class JobManager:
             self._run_download(job)
         else:
             raise ValueError(f"unknown job kind: {job.kind}")
+
+    def _run_preflight(self, job: JobResult) -> None:
+        """Catalog verification/provider probes share the existing FIFO worker."""
+        from csv_to_clonehero.server.safeguards import refresh_enchor_preflight
+
+        self._mark(job.id, status="running", phase="checking_catalog", message="Checking chart catalog readiness")
+        db = Database(self.config.database_path)
+        try:
+            user = db.get_user(job.user_id)
+            if user is None or job.workspace_key != Database.workspace_key_for_user(str(user["spotify_user_id"])):
+                raise RuntimeError("This chart-readiness check is no longer available.")
+            key = self._availability_key(db)
+            result = refresh_enchor_preflight(self.config, db, self.source_factory)
+            result = self._save_discovery_availability(db, result, key)
+            if self._cancelled(job.id):
+                self._mark(job.id, status="cancelled", phase="cancelled", message="Chart-readiness check cancelled")
+                return
+            self._mark(job.id, status="complete", phase="complete",
+                       message="Charts ready" if result.get("usable") else "Chart-readiness check finished",
+                       result={"preflight": result})
+        finally:
+            db.close()
 
     def _run_download(self, job: JobResult) -> None:
         """Prepare one user-owned ZIP off the request thread.
@@ -480,6 +562,8 @@ class JobManager:
             progress={**job.progress, "completed_artists": 0, "total_artists": len(artists)},
         )
         db = Database(self.config.database_path)
+        restore_context = None
+        restore_workspace = None
         try:
             workspace = db.get_workspace(job.workspace_key)
             if workspace is None:
@@ -508,6 +592,12 @@ class JobManager:
             )
             if not catalog.available:
                 raise RuntimeError(catalog.diagnostic or "The local chart catalog is unavailable.")
+            restore_workspace = int(workspace["id"])
+            with db.atomic_workspace_selection():
+                expected_revision = job.progress.get("selection_revision")
+                if expected_revision is not None and int(expected_revision) != db.public_selection_revision(restore_workspace):
+                    raise RuntimeError("The choices changed before artist expansion started; review them and try again.")
+                restore_context = db.begin_public_expansion_change(restore_workspace, expected_generation)
 
             def on_progress(payload: Mapping[str, Any]) -> None:
                 if self._cancelled(job.id):
@@ -552,6 +642,10 @@ class JobManager:
                 "catalog_snapshot_id": result.catalog_snapshot_id,
                 "network_requests": 0,
             }
+            with db.atomic_workspace_selection():
+                db.finish_public_expansion_change(restore_workspace, expected_generation, restore_context)
+            restore_context = None
+            payload.update(db.public_selection_receipt(restore_workspace))
             self._mark(
                 job.id,
                 status="cancelled" if cancelled else "complete",
@@ -561,6 +655,11 @@ class JobManager:
                 result=payload,
             )
         finally:
+            if restore_context is not None:
+                # A failed/cancelled replacement may already have changed some
+                # artists. Its owned restore point survives the terminal job.
+                with db.atomic_workspace_selection():
+                    db.finish_public_expansion_change(restore_workspace, expected_generation, restore_context)
             db.close()
 
     def _run_discovery(self, job: JobResult) -> None:

@@ -13,6 +13,7 @@
     jobRequest: 0,
     pollTimer: null,
     progressAnnouncement: "",
+    preflightRequest: 0,
     activityOffset: 0,
     activityTotal: 0,
     activityRequest: 0,
@@ -52,6 +53,9 @@
     selectionBusy: false,
     selectionStale: false,
     selectionTotalKnown: false,
+    selectionRevision: null,
+    selectionUndo: null,
+    selectionHistoryRequest: 0,
     openDisclosures: new Set(),
     closedDisclosures: new Set(),
     disclosurePreferences: {},
@@ -66,6 +70,8 @@
     downloadPollRequest: 0,
     downloadPolling: false,
     downloadCancelBusy: false,
+    downloadRecovery: false,
+    downloadReconnectAttempts: 0,
     expiryTimer: null,
     pollBackoff: {},
     inFlightPolls: new Set(),
@@ -75,7 +81,7 @@
     const headers = new Headers(options.headers || {});
     if (options.body && !(options.body instanceof FormData)) headers.set("Content-Type", "application/json");
     headers.set("X-Riff-Request", "1");
-    const {timeoutMs, ...requestOptions} = options;
+    const {timeoutMs, timeoutMessage, ...requestOptions} = options;
     const controller = timeoutMs ? new AbortController() : null;
     const timer = controller ? window.setTimeout(() => controller.abort(), timeoutMs) : null;
     let response;
@@ -87,7 +93,7 @@
         return {};
       });
     } catch (error) {
-      if (controller?.signal.aborted) throw new Error("The chart service took too long to respond. Your music choices are kept. Try again.");
+      if (controller?.signal.aborted) throw new Error(timeoutMessage || "The chart service took too long to respond. Your music choices are kept. Try again.");
       throw error;
     } finally {
       if (timer !== null) window.clearTimeout(timer);
@@ -292,6 +298,7 @@
     try {
       const journey = await api("/api/journey");
       state.journey = journey;
+      captureSelectionHistory(journey);
       try {
         state.deliveryRecord = JSON.parse(sessionStorage.getItem(`riff:delivery:${journey.workspace_id}`) || "{}");
         state.disclosurePreferences = JSON.parse(sessionStorage.getItem(`riff:disclosures:${journey.workspace_id}`) || "{}");
@@ -306,6 +313,15 @@
         });
       } catch (_) { /* Storage is optional; server selections remain authoritative. */ }
       renderSources(journey);
+      if (["queued", "running"].includes(journey.preflight_job?.status) && !["queued", "running"].includes(journey.download_job?.status)) {
+        resetFindUi();
+        showStage("find", false);
+        try {
+          await awaitPreflightJob(journey.preflight_job);
+          showSearchRecovery("The chart-library check finished. Choose Try search again to start matching your saved music.", Boolean(journey.review?.total > 0));
+        } catch (error) { showSearchRecovery(error.message, Boolean(journey.review?.total > 0)); }
+        return;
+      }
       if (["queued", "running"].includes(journey.job?.status) && journey.job?.kind === "expansion") {
         await openConfirm(false);
         if (!state.expansionPolling) attachExpansionJob(journey.job.id);
@@ -727,6 +743,8 @@
     $("#savedSearchResultsNote").hidden = !hasSavedResults;
     $("#cancelJobButton").hidden = true;
     $("#retryJobButton").hidden = true;
+    $("#retrySearchButton").hidden = false;
+    $("#searchTechnicalDetails").hidden = true;
     showStage("find", true);
     announce(message);
   }
@@ -747,12 +765,38 @@
   }
 
   async function ensurePreflight() {
-    let response = await api("/api/preflight", {timeoutMs: 15000});
-    if (!response.preflight?.usable) response = await api("/api/preflight", {method: "POST", body: "{}", timeoutMs: 45000});
+    let response = await api("/api/preflight", {timeoutMs: 10000});
+    if (!response.preflight?.usable && !["queued", "running"].includes(response.job?.status)) response = await api("/api/preflight", {method: "POST", body: "{}", timeoutMs: 10000});
+    if (response.job && !response.preflight?.usable) response = await awaitPreflightJob(response.job);
     if (!response.preflight?.usable) throw new Error(response.preflight?.message || "The community chart library is unavailable right now.");
     $("#progressMessage").textContent = response.preflight?.mode === "catalog"
       ? "Chart library ready. Starting your search..."
       : "Community chart service ready. Starting your search...";
+  }
+
+  async function awaitPreflightJob(job) {
+    if (!Number.isSafeInteger(job?.id) || job.id < 1 || job.kind !== "preflight") throw new Error("The chart-library check could not be confirmed. Try search again to check its status.");
+    const requestId = ++state.preflightRequest;
+    const started = Date.now();
+    let current = job;
+    while (["queued", "running"].includes(current.status)) {
+      if (requestId !== state.preflightRequest || $("#stageFind").hidden) throw new Error("The chart-library check is no longer active on this page.");
+      $("#progressMessage").textContent = current.status === "queued" ? "The chart-library check is queued." : current.message || "Preparing the community chart catalog…";
+      $("#progressPercent").textContent = "Checking…";
+      $("#progressCount").textContent = "Chart-library readiness is being checked; song matching has not started.";
+      $("#progressEta").textContent = "Not yet available";
+      $("#searchLeaveNote").textContent = "Your music choices are saved. The readiness check can continue on the server. Return and choose Try search again to start matching.";
+      if (Date.now() - started > 120000) throw new Error("The chart-library check is still taking time. It may continue on the server. Try search again to reconnect before matching.");
+      await new Promise(resolve => window.setTimeout(resolve, nextPollDelay("preflight", current)));
+      const response = await api(`/api/jobs/${job.id}`, {timeoutMs: 8000, timeoutMessage: "The chart-library check status is unavailable. Try search again to reconnect."});
+      if (requestId !== state.preflightRequest) throw new Error("The chart-library check changed.");
+      current = response.job;
+      if (!current || current.id !== job.id || current.kind !== "preflight") throw new Error("The server returned an unexpected chart-library check.");
+    }
+    if (current.status !== "complete") throw new Error(current.error || "The chart-library check did not finish. Try again; your music choices are saved.");
+    const response = await api("/api/preflight", {timeoutMs: 10000});
+    if (!response.preflight?.usable) throw new Error(response.preflight?.message || "The community chart library is unavailable right now.");
+    return response;
   }
 
   async function startDiscovery() {
@@ -780,6 +824,8 @@
       state.selectionStale = false;
       state.selected = 0;
       state.selectionMode = "none";
+      state.selectionUndo = null;
+      state.selectionRevision = null;
       state.openDisclosures.clear();
       state.closedDisclosures.clear();
       const reviewHost = $("#reviewCards");
@@ -811,6 +857,7 @@
   function resetFindUi() {
     document.body.dataset.riffSearchState = "checking";
     $("#searchRecovery").hidden = true;
+    $("#retryJobButton").hidden = true;
     $("#findTitle").textContent = "Finding your charts";
     $("#cancelJobButton").hidden = true;
     $("#retryJobButton").hidden = true;
@@ -834,6 +881,7 @@
   function attachJob(jobId) {
     const expectedJobId = Number(jobId);
     state.jobId = expectedJobId;
+    $("#searchLeaveNote").innerHTML = "<strong>Safe to leave.</strong> Once the search starts, progress is saved to your account. You can close this page and come back.";
     document.body.dataset.riffSearchState = "running";
     $("#searchRecovery").hidden = true;
     $("#findTitle").textContent = "Finding your charts";
@@ -989,7 +1037,7 @@
     let delay = 1500;
     $("#retryJobButton").hidden = true;
     try {
-      const {job} = await api(`/api/jobs/${expectedJobId}`);
+      const {job} = await api(`/api/jobs/${expectedJobId}`, {timeoutMs: 8000, timeoutMessage: "The search status request timed out."});
       if (expectedJobId !== state.jobId || requestId !== state.jobRequest) return;
       delay = nextPollDelay("find", job);
       renderProgress(job);
@@ -1012,8 +1060,11 @@
       if (expectedJobId !== state.jobId || requestId !== state.jobRequest) return;
       window.clearTimeout(state.pollTimer);
       state.pollTimer = null;
-      showError(error.message);
+      showSearchRecovery("Search status is unavailable. Matching may still be running on the server. Check status before starting another search.", Boolean(state.journey?.review?.total > 0));
+      $("#retrySearchButton").hidden = true;
       $("#retryJobButton").hidden = false;
+      $("#searchTechnicalDetails").hidden = false;
+      $("#searchTechnicalError").textContent = error.message;
       return;
     } finally {
       state.inFlightPolls.delete(pollKey);
@@ -1041,10 +1092,10 @@
       provider_import: "Loading your selected music...",
       combine: "Merging duplicate songs...",
       catalog_prepare: "Preparing the community chart catalog...",
-      finding_charts: "Comparing songs with playable community charts...",
+      finding_charts: "Comparing songs with eligible community charts...",
       spotify_sync: "Loading your selected music...",
       source_search: "Checking the community chart library...",
-      scoring: "Comparing songs with playable community charts...",
+      scoring: "Comparing songs with eligible community charts...",
     };
     const phaseMessage = phases[job.status === "queued" ? "queued" : job.phase] || job.message || "Finding charts...";
     $("#progressMessage").textContent = phaseMessage;
@@ -1107,7 +1158,10 @@
       state.expansionSelected = 0;
       state.expansionSelectionKnown = true;
     }
-    await Promise.all([loadReview(), loadExpansion(), loadCatalogCoverage()]);
+    window.clearTimeout(state.downloadPollTimer);
+    state.downloadPollRequest += 1;
+    clearError();
+    await Promise.all([loadReview(), loadExpansion(), loadCatalogCoverage(), loadSelectionHistory()]);
     syncSelectionBand();
   }
 
@@ -1212,6 +1266,7 @@
     try {
       const data = await api(`/api/workspace?${reviewParams()}`, {signal: reviewAbort.signal});
       if (requestId !== state.reviewRequest) return false;
+      captureSelectionHistory(data);
       state.reviewTotal = Number(data.total || 0);
       const exactSelected = availableNumber(data.summary, ["selected_charts", "selection_count"]);
       const selectedSongs = availableNumber(data.summary, ["selected_tracks", "selected"]);
@@ -1240,7 +1295,7 @@
         if (wasStale) clearSelectionFeedback();
       }
       refreshSelectionUi();
-      $("#reviewSummary").textContent = `${state.reviewTotal.toLocaleString()} ${state.reviewTotal === 1 ? "song" : "songs"} in this view; ${additional.toLocaleString()} additional playable charts across your imported music.`;
+      $("#reviewSummary").textContent = `${state.reviewTotal.toLocaleString()} ${state.reviewTotal === 1 ? "song" : "songs"} in this view; ${additional.toLocaleString()} additional eligible charts across your imported music.`;
       state.reviewTracks = data.tracks || [];
       const markup = state.reviewTracks.map((track, index) => reviewCard(track, state.reviewOffset + index)).join("") || `<div class="empty-state">No imported songs match this view.</div>`;
       if (host._riffMarkup !== markup || !host.firstElementChild) {
@@ -1276,21 +1331,21 @@
     const expansionConfirmed = state.expansionSelectionKnown ? state.expansionSelected : 0;
     state.selected = exactConfirmed + expansionConfirmed;
     state.selectionTotalKnown = state.exactSelectionKnown && state.expansionSelectionKnown && !state.selectionStale;
-    $("#selectedCount").textContent = state.selectionTotalKnown ? state.selected.toLocaleString() : "...";
-    $("#exactSelectedCount").textContent = state.exactSelectionKnown ? state.exactSelected.toLocaleString() : "...";
-    $("#librarySelectedChartCount").textContent = state.exactSelectionKnown && !state.selectionStale ? state.exactSelected.toLocaleString() : "...";
-    $("#selectedSongCount").textContent = state.exactSelectedSongsKnown ? state.exactSelectedSongs.toLocaleString() : "...";
+    $("#selectedCount").textContent = state.selectionTotalKnown ? state.selected.toLocaleString() : "Unknown";
+    $("#exactSelectedCount").textContent = state.exactSelectionKnown ? state.exactSelected.toLocaleString() : "Unknown";
+    $("#librarySelectedChartCount").textContent = state.exactSelectionKnown && !state.selectionStale ? state.exactSelected.toLocaleString() : "Unknown";
+    $("#selectedSongCount").textContent = state.exactSelectedSongsKnown ? state.exactSelectedSongs.toLocaleString() : "Unknown";
     $("#exactSelectedLabel").textContent = state.exactSelectionKnown && state.exactSelected === 1 ? "chart" : "charts";
     $("#selectedSongLabel").textContent = state.exactSelectedSongsKnown && state.exactSelectedSongs === 1 ? "song" : "songs";
-    $("#expansionSelectedCount").textContent = state.expansionSelectionKnown ? state.expansionSelected.toLocaleString() : "...";
+    $("#expansionSelectedCount").textContent = state.expansionSelectionKnown ? state.expansionSelected.toLocaleString() : "Unknown";
     const hasConfirmedSelection = exactConfirmed > 0 || expansionConfirmed > 0;
     $("#continueDownloadButton").disabled = !hasConfirmedSelection || state.selectionBusy || state.selectionStale || state.expansionBusy;
-    $("#continueDownloadButton").textContent = "Build my ZIP";
+    $("#continueDownloadButton").textContent = "Review ZIP";
     $("#continueDownloadButton").setAttribute(
       "aria-label",
       state.selectionTotalKnown && state.selected
-        ? `Build my ZIP with ${state.selected.toLocaleString()} selected ${state.selected === 1 ? "chart" : "charts"}`
-        : hasConfirmedSelection ? "Build my ZIP with the currently confirmed chart selections" : "Build my ZIP with selected charts"
+        ? `Review ZIP with ${state.selected.toLocaleString()} selected ${state.selected === 1 ? "chart" : "charts"}`
+        : hasConfirmedSelection ? "Review ZIP with the currently confirmed chart selections" : "Review ZIP with selected charts"
     );
     const modeLabels = {
       best_matches: "Last action: selected recommended charts.",
@@ -1305,6 +1360,7 @@
     syncSelectionBand();
     syncExpansionStart();
     syncExpansionBulk();
+    syncSelectionUndo();
     document.dispatchEvent(new CustomEvent("riff:selection-state", {detail: selectionSnapshot()}));
   }
 
@@ -1348,7 +1404,7 @@
     const details = $(".selection-options");
     if (!details) return;
     const viewport = window.matchMedia("(max-width: 1000px)").matches ? "mobile" : "desktop";
-    if (document.body.dataset.riffUi === "riff-studio-20261008") {
+    if (document.body.dataset.riffUi === "riff-ux-20261010") {
       if (!details.dataset.viewport) details.open = false;
       details.dataset.viewport = viewport;
       return;
@@ -1594,18 +1650,18 @@
     const focusKey = button.dataset.focusKey;
     const action = button.dataset.selection === "clear" ? "Chart choice cleared." : "Chart selected.";
     try {
-      const saved = await api("/api/selection", {method: "POST", body: JSON.stringify({track_key: button.dataset.track, candidate_id: Number(button.dataset.candidate), action: button.dataset.selection, confirm_possible: possible})});
+      const saved = await api("/api/selection", {method: "POST", body: JSON.stringify({...selectionGuard(), track_key: button.dataset.track, candidate_id: Number(button.dataset.candidate), action: button.dataset.selection, confirm_possible: possible})});
       state.selectionMode = "custom";
       if (button.dataset.selection === "select" && button.dataset.disclosureParent) {
         state.closedDisclosures.delete(button.dataset.disclosureParent);
         state.openDisclosures.add(button.dataset.disclosureParent);
       }
-      const applied = applySelectionResponse(saved);
+      const applied = applySelectionResponse(saved, {refreshSelected: false});
       if (applied) {
         $("#selectionMessage").textContent = `${action} ${chartCount(state.selected)} selected.`;
         announce($("#selectionMessage").textContent);
       }
-      const refreshed = applied || await loadReview({focusKey, announcement: action, reconciliation: true});
+      const refreshed = (applied && state.reviewFilter !== "selected") || await loadReview({focusKey, announcement: action, reconciliation: true});
       if (!refreshed) {
         setButtonBusy(button, false);
         markSelectionStale(action);
@@ -1634,7 +1690,8 @@
     setButtonBusy(button, true, "Saving choices...");
     try {
       const payload = scope === "clear" ? {action: "clear"} : {action: "select", preset: scope};
-      await api("/api/selection/bulk", {method: "POST", body: JSON.stringify(payload)});
+      const saved = await api("/api/selection/bulk", {method: "POST", body: JSON.stringify({...selectionGuard(), ...payload})});
+      captureSelectionHistory(saved);
       state.selectionMode = scope === "clear" ? "none" : scope;
       state.reviewOffset = 0;
       const labels = {best_matches: "Recommended charts selected.", all_safe_charts: "Same-recording charts selected.", maximum_playable: "Alternate recordings included.", clear: "Choices from your music cleared."};
@@ -1753,6 +1810,7 @@
         choices.onchange();
       }
       const pageCards = resultData.songs || [];
+      captureSelectionHistory(resultData);
       state.expansionCards = append
         ? [...state.expansionCards, ...pageCards].filter((item, index, values) => values.findIndex(other => other.song_key === item.song_key) === index)
         : pageCards;
@@ -1851,6 +1909,7 @@
     setButtonBusy(button, true, "Saving...");
     try {
       const saved = await api("/api/selection", {method: "POST", body: JSON.stringify({
+        ...selectionGuard(),
         kind: "expansion",
         artist_norm: button.dataset.artist,
         candidate_id: Number(button.dataset.candidate),
@@ -2000,7 +2059,7 @@
   async function selectExpansionSongs() {
     const button = $("#selectExpansionSongsButton");
     if (!button || button.disabled || state.selectionBusy || state.expansionBusy || state.selectionStale) return;
-    if (!window.confirm("Replace your additional-song choices with one playable chart per expansion song? This includes compatible charts marked for review. Unknown difficulty levels will be checked during ZIP preparation. Your imported-song choices stay unchanged.")) return;
+    if (!window.confirm("Replace additional-song choices with one eligible chart per song? Possible matches are excluded. Undo restores the previous choices.")) return;
     state.selectionBusy = true;
     state.reviewRequest += 1;
     state.expansionRequest += 1;
@@ -2009,7 +2068,8 @@
     refreshSelectionUi();
     setButtonBusy(button, true, "Saving choices...");
     try {
-      await api("/api/expansion/selection/bulk", {method: "POST", body: JSON.stringify({preset: "one_per_song", confirm_possible: true})});
+      const saved = await api("/api/expansion/selection/bulk", {method: "POST", body: JSON.stringify({...selectionGuard(), preset: "one_per_song", confirm_possible: false})});
+      captureSelectionHistory(saved);
       const [reviewed, expanded] = await Promise.all([
         loadReview({reconciliation: true}),
         loadExpansion(false, {reconciliation: true}),
@@ -2044,6 +2104,7 @@
     state.expansionPolling = true;
     setExpansionBusy(true);
     $("#retryExpansionButton").hidden = true;
+    $("#expansionTechnicalDetails").hidden = true;
     void pollExpansionJob(expectedJobId, ++state.expansionPollRequest);
   }
 
@@ -2059,7 +2120,7 @@
     let delay = 1500;
     const status = $("#expansionStatus");
     try {
-      const {job} = await api(`/api/jobs/${expectedJobId}`);
+      const {job} = await api(`/api/jobs/${expectedJobId}`, {timeoutMs: 8000, timeoutMessage: "The expansion status request timed out."});
       if (!state.expansionPolling || expectedJobId !== state.expansionJobId || requestId !== state.expansionPollRequest) return;
       delay = nextPollDelay("expansion", job);
       const done = Number(job.progress?.completed_artists || 0);
@@ -2085,7 +2146,9 @@
       state.expansionPolling = false;
       status.textContent = "Expansion status could not be refreshed. Its outcome is unknown; refresh status before continuing.";
       $("#retryExpansionButton").hidden = false;
-      showError(error.message);
+      $("#expansionTechnicalDetails").hidden = false;
+      $("#expansionTechnicalError").textContent = error.message;
+      announce(status.textContent);
       return;
     } finally {
       state.inFlightPolls.delete(pollKey);
@@ -2107,6 +2170,74 @@
     return `${value.toLocaleString()} ${value === 1 ? "chart" : "charts"}`;
   }
 
+  function captureSelectionHistory(data) {
+    const revision = data?.selection_revision;
+    if (!Number.isSafeInteger(revision) || revision < 0 || (state.selectionRevision !== null && revision < state.selectionRevision)) return;
+    state.selectionRevision = revision;
+    if (data.undo && typeof data.undo.available === "boolean") state.selectionUndo = data.undo;
+    syncSelectionUndo();
+  }
+
+  function selectionGuard() {
+    return {
+      ...(state.selectionRevision === null ? {} : {selection_revision: state.selectionRevision}),
+      ...($("#expansionChoices")?.dataset.generation ? {exact_generation_id: Number($("#expansionChoices").dataset.generation)} : {}),
+    };
+  }
+
+  function syncSelectionUndo() {
+    const undo = state.selectionUndo;
+    const available = Boolean(undo?.available && undo.revision === state.selectionRevision);
+    const blocked = !available || state.selectionBusy || state.selectionStale || state.expansionBusy || state.deliveryBusy;
+    for (const id of ["#selectionUndoButton", "#studio-undo"]) {
+      const button = $(id);
+      if (button) { button.disabled = blocked; button.setAttribute("aria-label", available ? `Undo: ${undo.label || "last selection change"}` : "Undo last selection change"); }
+    }
+    const status = $("#selectionUndoStatus");
+    if (status) status.textContent = available ? `Can undo: ${undo.label || "last selection change"}. Customized choices will be restored.` : undo?.reason || "No confirmed selection change to undo.";
+  }
+
+  async function loadSelectionHistory() {
+    const workspace = state.journey?.workspace_id;
+    const requestId = ++state.selectionHistoryRequest;
+    try {
+      const data = await api("/api/selection/history", {timeoutMs: 8000});
+      if (requestId !== state.selectionHistoryRequest || workspace !== state.journey?.workspace_id) return false;
+      captureSelectionHistory(data);
+      return true;
+    } catch (_) {
+      if (requestId === state.selectionHistoryRequest) { state.selectionUndo = null; syncSelectionUndo(); }
+      return false;
+    }
+  }
+
+  async function undoSelectionChange() {
+    const undo = state.selectionUndo;
+    if (!undo?.available || undo.revision !== state.selectionRevision || !beginStudioMutation()) return false;
+    const button = $("#selectionUndoButton");
+    setButtonBusy(button, true, "Restoring choices…");
+    try {
+      const saved = await api("/api/selection/undo", {method: "POST", body: JSON.stringify({operation_id: undo.operation_id, selection_revision: state.selectionRevision})});
+      let confirmed = applySelectionResponse(saved);
+      if (undo.label === "Replace artist expansion") {
+        document.dispatchEvent(new CustomEvent("riff:studio-reset"));
+        confirmed = await reconcileStudioSelection("The restored artist chart options are not yet confirmed.");
+      } else if (!confirmed) confirmed = await reconcileStudioSelection("The undo result is not yet confirmed.");
+      if (!confirmed) return false;
+      const message = `Undone: ${undo.label || "last selection change"}. Previous chart choices restored.`;
+      $("#selectionMessage").textContent = message;
+      announce(message);
+      return true;
+    } catch (error) {
+      await reconcileStudioSelection("The undo outcome is unknown. Refresh before another change.");
+      showSelectionError(error.status === 409 ? "These choices changed after the undo receipt. The current selection was refreshed; review it before another action." : "Undo could not be confirmed. The current selection was checked; no automatic undo retry was sent.");
+      return false;
+    } finally {
+      setButtonBusy(button, false);
+      finishStudioMutation();
+    }
+  }
+
   function selectionSnapshot() {
     return {
       workspace: state.journey?.workspace_id ?? null,
@@ -2116,6 +2247,8 @@
       stale: state.selectionStale,
       known: state.selectionTotalKnown,
       charts: state.selected,
+      selection_revision: state.selectionRevision,
+      undo: state.selectionUndo,
     };
   }
 
@@ -2125,7 +2258,8 @@
     }));
   }
 
-  function applySelectionResponse(data) {
+  function applySelectionResponse(data, {refreshSelected = true} = {}) {
+    captureSelectionHistory(data);
     const library = data?.summary?.library;
     const expansion = data?.summary?.expansion;
     const counts = [library?.songs, library?.charts, expansion?.songs, expansion?.charts];
@@ -2162,7 +2296,7 @@
     bindExpansionActions();
     refreshSelectionUi();
     document.dispatchEvent(new CustomEvent("riff:selection-committed", {detail: data}));
-    if (state.reviewFilter === "selected") void loadReview();
+    if (refreshSelected && state.reviewFilter === "selected") void loadReview();
     return true;
   }
 
@@ -2194,6 +2328,7 @@
       return false;
     }
     clearSelectionStale();
+    await loadSelectionHistory();
     refreshSelectionUi();
     return true;
   }
@@ -2207,6 +2342,28 @@
     return Boolean(download?.token && typeof archiveId === "string" && archiveId && download.archive_id === archiveId);
   }
 
+  function setDeliveryState(title, message, {unavailable = false, technical = null} = {}) {
+    state.downloadRecovery = unavailable;
+    $("#downloadTitle").textContent = title;
+    $("#downloadStatus").textContent = message;
+    $("#downloadPreparationPanel").classList.toggle("is-unavailable", unavailable);
+    $("#downloadTechnicalDetails").hidden = !technical;
+    $("#downloadTechnicalError").textContent = technical || "";
+    if (unavailable) announce(`${title}. ${message}`);
+  }
+
+  function recordDownloadJob(job) {
+    rememberDelivery({lastJob: {id: job.id, status: job.status, phase: job.phase || null, message: job.message || null, checkedAt: Date.now()}});
+    renderDownloadLastCheck();
+  }
+
+  function renderDownloadLastCheck(stale = false) {
+    const job = state.deliveryRecord.lastJob;
+    $("#downloadLastCheck").textContent = job
+      ? `${stale ? "Last confirmed; current outcome unknown" : "Last checked"}: ${new Date(job.checkedAt).toLocaleTimeString()} · Preparation ${job.id} · ${job.phase || job.status}${job.message ? ` · ${job.message}` : ""}`
+      : "No preparation status has been confirmed yet.";
+  }
+
   function stopDownloadPolling() {
     window.clearTimeout(state.downloadPollTimer);
     state.downloadPollTimer = null;
@@ -2216,7 +2373,7 @@
     syncDeliveryControls();
   }
 
-  function attachDownloadJob(jobId) {
+  function attachDownloadJob(jobId, reconnecting = false) {
     const expectedJobId = Number(jobId);
     if (!Number.isSafeInteger(expectedJobId) || expectedJobId < 1) throw new Error("The server did not return a valid preparation job. Refresh its status before retrying.");
     if (state.downloadPolling && state.downloadJobId === expectedJobId) return;
@@ -2224,8 +2381,11 @@
     state.downloadJobId = expectedJobId;
     state.downloadPolling = true;
     state.deliveryBusy = true;
+    if (!reconnecting) state.downloadReconnectAttempts = 0;
     $("#prepareDownloadButton").textContent = "Preparing your ZIP...";
-    $("#downloadStatus").textContent = "Preparation is queued or running on the server. You can leave this page and return; your saved choices remain in your workspace.";
+    setDeliveryState(reconnecting ? "Checking preparation status" : "Preparing your ZIP", reconnecting
+      ? `Reconnecting to preparation ${expectedJobId} (${state.downloadReconnectAttempts} of 3 automatic checks). No new ZIP request is being sent.`
+      : "Preparation is queued or running on the server. You can leave this page and return; your saved choices remain in your workspace.");
     syncDeliveryControls();
     void pollDownloadJob(expectedJobId, ++state.downloadPollRequest);
   }
@@ -2241,12 +2401,15 @@
     if (state.inFlightPolls.has(pollKey)) return;
     state.inFlightPolls.add(pollKey);
     try {
-      const {job} = await api(`/api/jobs/${expectedJobId}`);
+      const {job} = await api(`/api/jobs/${expectedJobId}`, {timeoutMs: 8000, timeoutMessage: "The preparation status request timed out."});
       if (!current()) return;
       if (!job || Number(job.id) !== expectedJobId || job.kind !== "download") {
         throw new Error("The server returned an unexpected preparation job. Refresh its status before retrying.");
       }
       if (["queued", "running"].includes(job.status)) {
+        state.downloadReconnectAttempts = 0;
+        recordDownloadJob(job);
+        $("#downloadTitle").textContent = job.status === "queued" ? "Your ZIP is queued" : job.phase === "package" ? "Packaging your ZIP" : "Preparing your ZIP";
         $("#downloadStatus").textContent = job?.status === "queued"
           ? "Your ZIP is queued on the server. You can leave and return to check its status."
           : `${job?.message || "Riff is validating and packaging your selected charts."} You can leave and return to check its status.`;
@@ -2256,34 +2419,32 @@
       if (!["complete", "partial", "failed", "cancelled", "interrupted"].includes(job.status)) {
         throw new Error("The server returned an unknown preparation status. Refresh its status before retrying.");
       }
+      recordDownloadJob(job);
       if (!["complete", "partial"].includes(job.status)) {
         stopDownloadPolling();
         rememberDelivery({pending: false});
         state.selectionTotalKnown = false;
-        $("#prepareDownloadButton").textContent = "Refresh choices to retry";
-        $("#downloadStatus").textContent = job.status === "cancelled"
+        setDeliveryState(job.status === "cancelled" ? "Preparation cancelled" : "Preparation did not finish", job.status === "cancelled"
           ? "Preparation cancelled. Your saved choices remain; refresh them before preparing again."
-          : job.error || "ZIP preparation did not finish. Refresh your saved choices before retrying.";
+          : "Your saved choices remain. Check the current choices before preparing again.", {unavailable: true, technical: job.error});
         $("#refreshDownloadButton").hidden = false;
-        if (job.status !== "cancelled") showError($("#downloadStatus").textContent);
         syncDeliveryControls();
         return;
       }
-      const journey = await api("/api/journey");
+      const journey = await api("/api/journey", {timeoutMs: 8000, timeoutMessage: "The preparation receipt request timed out."});
       if (!current()) return;
       state.journey = journey;
       if (!downloadMatchesJob(journey.download, job)) {
         stopDownloadPolling();
         rememberDelivery({pending: false});
         state.selectionTotalKnown = false;
-        $("#prepareDownloadButton").textContent = "Refresh choices to retry";
-        $("#downloadStatus").textContent = "Preparation finished, but its single-use ZIP link is unavailable. The server may have restarted or the link expired. Refresh your choices before preparing again.";
+        setDeliveryState("ZIP link unavailable", "Preparation finished, but its single-use ZIP link is unavailable. Check your saved choices before preparing again.", {unavailable: true});
         $("#refreshDownloadButton").hidden = false;
-        showError($("#downloadStatus").textContent);
         syncDeliveryControls();
         return;
       }
       const selection = state.deliveryRecord.pendingSelection || null;
+      state.downloadReconnectAttempts = 0;
       rememberDelivery({pending: false, pendingSelection: null, receipt: {token: journey.download.token, summary: job.result?.summary || null, selection, requested: false}});
       stopDownloadPolling();
       if (!$("#stageDownload").hidden) renderDone(journey.download, job.result?.summary || null);
@@ -2291,10 +2452,16 @@
       if (!current()) return;
       stopDownloadPolling();
       state.selectionTotalKnown = false;
-      $("#prepareDownloadButton").textContent = "Refresh choices to retry";
-      $("#downloadStatus").textContent = "Preparation status could not be refreshed. Its outcome is unknown; use Refresh status before retrying.";
+      setDeliveryState("Preparation status unavailable", "The current outcome is unknown. Preparation may still be running on the server. Check its status before retrying.", {unavailable: true, technical: error.message});
+      renderDownloadLastCheck(true);
       $("#refreshDownloadButton").hidden = false;
-      showError(error.message);
+      state.downloadReconnectAttempts += 1;
+      if (state.downloadReconnectAttempts <= 3 && (!error.status || error.status >= 500)) {
+        const attempt = state.downloadReconnectAttempts;
+        state.downloadPollTimer = window.setTimeout(() => {
+          if (state.downloadPollRequest === requestId && state.deliveryRecord.pending && !$("#stageDownload").hidden) attachDownloadJob(expectedJobId, true);
+        }, 2000 * attempt);
+      }
       syncDeliveryControls();
     } finally {
       state.inFlightPolls.delete(pollKey);
@@ -2313,6 +2480,8 @@
   function syncDeliveryControls() {
     const blocked = state.deliveryBusy || state.deliveryLoading;
     $("#prepareDownloadButton").disabled = blocked || !state.selectionTotalKnown || state.selected < 1;
+    $("#prepareDownloadButton").hidden = state.downloadRecovery;
+    $("#refreshDownloadButton").classList.toggle("button--secondary", !state.downloadRecovery);
     $("#cancelDownloadButton").hidden = !state.downloadPolling;
     $("#cancelDownloadButton").disabled = !state.downloadPolling || state.downloadCancelBusy;
     $("#backToChartsButton").disabled = blocked;
@@ -2321,11 +2490,21 @@
     $("#deliverySelectionMore").disabled = blocked;
     $("#downloadBusyIndicator").hidden = !state.deliveryBusy;
     $("#prepareDownloadButton").setAttribute("aria-busy", String(state.deliveryBusy));
-    $("#downloadSelectionCount").textContent = state.selectionTotalKnown ? state.selected.toLocaleString() : "...";
-    $("#downloadExactSummary").textContent = state.exactSelectionKnown
+    const last = state.deliveryRecord.lastSelection;
+    $("#downloadSelectionCount").textContent = state.selectionTotalKnown ? state.selected.toLocaleString() : "Awaiting confirmation";
+    $("#downloadSelectionFreshness").textContent = state.selectionTotalKnown
+      ? "Current saved chart entries; final packaged file count follows validation."
+      : last ? `Last confirmed selection: ${chartCount(last.total)} at ${new Date(last.checkedAt).toLocaleTimeString()}. Current total is unknown.`
+        : "Current total is unknown. No confirmed count is available.";
+    $("#downloadSelectionCount").classList.toggle("is-unknown", !state.selectionTotalKnown);
+    $("#downloadExactSummary").textContent = !state.selectionTotalKnown && last
+      ? `Last confirmed: ${chartCount(last.exact)}${last.songs !== null ? ` for ${last.songs.toLocaleString()} imported songs` : ""}`
+      : state.exactSelectionKnown
       ? `${chartCount(state.exactSelected)} for ${state.exactSelectedSongsKnown ? `${state.exactSelectedSongs.toLocaleString()} imported ${state.exactSelectedSongs === 1 ? "song" : "songs"}` : "an unavailable imported-song count"}`
       : "Selected chart count unavailable. Refresh before preparing.";
-    $("#downloadExpansionSummary").textContent = state.expansionSelectionKnown
+    $("#downloadExpansionSummary").textContent = !state.selectionTotalKnown && last
+      ? `Last confirmed: ${chartCount(last.expansion)} beyond your music`
+      : state.expansionSelectionKnown
       ? `${chartCount(state.expansionSelected)} beyond your music`
       : "Additional chart count unavailable. It is not assumed to be zero.";
   }
@@ -2413,22 +2592,26 @@
     const focusedControl = focus === false && $("#stageDownload").contains(document.activeElement)
       ? document.activeElement : null;
     const requestId = ++state.deliveryRequest;
+    window.clearTimeout(state.downloadPollTimer);
+    state.downloadPollRequest += 1;
     state.deliveryLoading = true;
     state.selectionTotalKnown = false;
     clearError();
     showStage("download", focus !== false);
-    $("#downloadStatus").textContent = state.deliveryRecord.pending
+    setDeliveryState("Checking preparation status", state.deliveryRecord.pending
       ? "Checking the server's ZIP preparation status."
-      : "Checking the current saved chart selections...";
+      : "Checking the current saved chart selections...");
+    renderDownloadLastCheck(true);
     $("#refreshDownloadButton").hidden = true;
     $("#previousDownloadButton").hidden = true;
     syncDeliveryControls();
     try {
-      const journey = await api("/api/journey");
+      const journey = await api("/api/journey", {timeoutMs: 10000, timeoutMessage: "The preparation status check timed out."});
       if (requestId !== state.deliveryRequest) return;
       state.journey = journey;
       state.availableDownload = journey.download || null;
       const downloadJob = journey.download_job;
+      if (downloadJob?.id) recordDownloadJob(downloadJob);
       if (["queued", "running"].includes(downloadJob?.status)) {
         rememberDelivery({pending: true});
         attachDownloadJob(downloadJob.id);
@@ -2455,8 +2638,8 @@
         throw new Error("A search or artist expansion is still active. Return to chart choices and wait for it to finish before preparing a ZIP.");
       }
       const [exact, expansion] = await Promise.all([
-        api("/api/workspace?selected=true&limit=25&offset=0"),
-        $("#expansionPanel") ? api("/api/expansion/results?limit=25&offset=0") : Promise.resolve({songs: [], total: 0, summary: {selected: 0}}),
+        api("/api/workspace?selected=true&limit=25&offset=0", {timeoutMs: 10000}),
+        $("#expansionPanel") ? api("/api/expansion/results?limit=25&offset=0", {timeoutMs: 10000}) : Promise.resolve({songs: [], total: 0, summary: {selected: 0}}),
       ]);
       if (requestId !== state.deliveryRequest) return;
       const exactCount = availableNumber(exact.summary, ["selected_charts", "selection_count"]);
@@ -2471,6 +2654,9 @@
       refreshSelectionUi();
       renderDeliveryPage(exact, expansion);
       if (!state.selectionTotalKnown) throw new Error("The combined selection count is unavailable. Refresh before preparing; no unknown count is assumed to be zero.");
+      rememberDelivery({lastSelection: {...deliverySnapshot(), checkedAt: Date.now()}});
+      state.downloadRecovery = false;
+      $("#downloadTitle").textContent = completedUnavailable ? "Prepare a new ZIP" : "Review your ZIP";
       $("#downloadStatus").textContent = completedUnavailable
         ? "Preparation finished, but its single-use ZIP link is unavailable. The server may have restarted or the link expired. You can prepare again from your saved choices."
         : ["failed", "cancelled", "interrupted"].includes(downloadJob?.status)
@@ -2480,17 +2666,15 @@
         : state.selected > 0
           ? "Ready to prepare. Riff will recheck your saved choices and validate each artifact."
           : "No eligible selected charts remain. Return to chart choices to review unavailable charts or select alternatives.";
-      $("#prepareDownloadButton").textContent = state.deliveryRecord.pending ? "Retry preparation" : "Prepare my Riff library";
+      $("#prepareDownloadButton").textContent = state.deliveryRecord.pending ? "Retry preparation" : "Prepare ZIP";
       $("#refreshDownloadButton").hidden = false;
       $("#previousDownloadButton").hidden = !journey.download?.token;
     } catch (error) {
       if (requestId !== state.deliveryRequest) return;
       state.selectionTotalKnown = false;
-      state.exactSelectionKnown = false;
-      state.expansionSelectionKnown = false;
-      $("#downloadStatus").textContent = error.message;
+      setDeliveryState("Preparation status unavailable", "The current selection and preparation outcome could not be confirmed. Your saved choices remain on the server. Check status before retrying.", {unavailable: true, technical: error.message});
+      renderDownloadLastCheck(true);
       $("#refreshDownloadButton").hidden = false;
-      showError(error.message);
     } finally {
       if (requestId === state.deliveryRequest) {
         state.deliveryLoading = false;
@@ -2508,13 +2692,14 @@
     const selection = deliverySnapshot();
     let queued = false;
     state.deliveryBusy = true;
+    rememberDelivery({lastSelection: {...selection, checkedAt: Date.now()}});
     rememberDelivery({pending: true, pendingSelection: selection, previousToken: state.availableDownload?.token || null, previousCreatedAt: availableNumber(state.availableDownload, ["created_at"])});
     clearError();
     $("#prepareDownloadButton").textContent = "Validating and packaging...";
-    $("#downloadStatus").textContent = `Starting preparation for your ${chartCount(selection.total)} from saved choices. Riff will validate and package the artifacts on the server.`;
+    setDeliveryState("Starting ZIP preparation", `Starting preparation for your ${chartCount(selection.total)} from saved choices. Riff will validate and package the artifacts on the server.`);
     syncDeliveryControls();
     try {
-      const result = await api("/api/download", {method: "POST", body: "{}"});
+      const result = await api("/api/download", {method: "POST", body: "{}", timeoutMs: 15000, timeoutMessage: "The preparation request response was not confirmed."});
       if (requestId !== state.deliveryRequest) return;
       if (result.job?.id) {
         queued = true;
@@ -2527,12 +2712,9 @@
     } catch (error) {
       if (requestId !== state.deliveryRequest) return;
       state.selectionTotalKnown = false;
-      state.exactSelectionKnown = false;
-      state.expansionSelectionKnown = false;
-      $("#downloadStatus").textContent = "No new delivery is confirmed. Refresh preparation status to check for a completed ZIP and reconcile current eligible choices before retrying. A retry prepares a new archive, not just failed files.";
+      setDeliveryState("Preparation request unconfirmed", "The response was lost or could not be confirmed. Preparation may already be running. Check status before retrying; no automatic preparation request will be sent.", {unavailable: true, technical: error.message});
       $("#refreshDownloadButton").hidden = false;
       $("#previousDownloadButton").hidden = !state.availableDownload?.token;
-      showError(error.message);
     } finally {
       if (requestId === state.deliveryRequest) {
         if (!queued) {
@@ -2556,7 +2738,7 @@
     const expires = availableNumber(download, ["expires_at"]);
     const available = Boolean(download?.token && (expires === null || expires * 1000 > Date.now()) && summary?.success !== false && published !== 0);
     const hasIssues = (failed !== null && failed > 0) || (remaining !== null && remaining > 0) || Boolean(summary?.errors?.length) || (selection && selected !== null && selection.total !== selected);
-    $("#doneTitle").textContent = !available ? "This download is not available." : hasIssues ? "Your ZIP is ready, with exceptions." : published === null ? "Your ZIP is available." : "Your setlist. Ready to play.";
+    $("#doneTitle").textContent = !available ? "This download is not available." : hasIssues ? "Your ZIP is ready, with exceptions." : published === null ? "Your ZIP is available." : "Your ZIP is ready.";
     $("#doneSummary").textContent = !available
       ? "No usable delivery link is confirmed. It may have been used, expired, or lost after a server restart. Review your choices or prepare a new download; Riff cannot verify a saved copy on this device."
       : published !== null
@@ -2584,6 +2766,7 @@
     bindDisclosureState($("#doneWarnings"));
     const link = $("#downloadLibraryLink");
     const requested = Boolean(receipt?.requested && receipt?.token && receipt.token === download?.token);
+    if (available && requested) $("#doneTitle").textContent = "Download requested.";
     link.hidden = !available;
     link.setAttribute("aria-disabled", String(requested || !available));
     if (available && !requested) link.href = download.url || `/api/download/${download.token}`;
@@ -2627,6 +2810,7 @@
     // Leave the native navigation intact. Fetching or probing would consume the token.
     window.setTimeout(() => { link.removeAttribute("href"); }, 0);
     $("#downloadHandoff").textContent = "Download requested. Check your browser's Downloads list. Riff cannot confirm saving, and a consumed link cannot be reused.";
+    $("#doneTitle").textContent = "Download requested.";
     $("#refreshLinkButton").hidden = false;
     announce($("#downloadHandoff").textContent);
   }
@@ -2726,6 +2910,7 @@
     $("#selectMaximumButton")?.addEventListener("click", () => bulkSelect("maximum_playable"));
     $("#clearSelectionButton")?.addEventListener("click", () => bulkSelect("clear"));
     $("#retrySelectionButton")?.addEventListener("click", retrySelectionSummary);
+    $("#selectionUndoButton")?.addEventListener("click", undoSelectionChange);
     $("#reviewSearch")?.addEventListener("input", debounce(event => { state.reviewSearch = event.target.value.trim(); state.reviewOffset = 0; loadReview(); }));
     $$('[data-review-filter]').forEach(button => button.addEventListener("click", () => {
       state.reviewFilter = button.dataset.reviewFilter;
@@ -2764,6 +2949,7 @@
     api, context: selectionSnapshot, begin: beginStudioMutation, finish: finishStudioMutation,
     apply: applySelectionResponse, reconcile: reconcileStudioSelection,
     stale: markSelectionStale, announce, difficulty: difficultyPresentation,
+    guard: selectionGuard, undo: undoSelectionChange,
   });
   $("#logoutButton")?.addEventListener("click", logout);
   if (authenticated && app) bindAuthenticated(); else bindGuest();

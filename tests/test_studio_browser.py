@@ -51,13 +51,7 @@ class StudioFixtures(YieldFixtures):
         return tracks
 
     def selected_response(self):
-        tracks = self.tracks()
-        library = [{"track_key": track["track_key"], "candidate_id": candidate["candidate_id"]} for track in tracks for candidate in track["candidates"] if candidate["selected"]]
-        expansion = [{"candidate_id": candidate["candidate_id"], "artist_norm": candidate["artist_norm"], "song_key": song["song_key"]} for song in self.expansion_songs() for candidate in song["candidates"] if candidate["selected"]]
-        library_songs = sum(track["selected"] for track in tracks)
-        expansion_songs = sum(any(candidate["selected"] for candidate in song["candidates"]) for song in self.expansion_songs())
-        return {"ok": True, "summary": {"library": {"songs": library_songs, "charts": len(library)}, "expansion": {"songs": expansion_songs, "charts": len(expansion)}},
-            "songs": library_songs + expansion_songs, "charts": len(library) + len(expansion), "selected": {"library": library, "expansion": expansion}}
+        return super().selected_response()
 
     def deck(self, query):
         selected_scope = query.get("scope", ["both"])[0]
@@ -94,17 +88,6 @@ class StudioFixtures(YieldFixtures):
             if self.change_generation_on_page and int(query.get("offset", ["0"])[0]) > 0:
                 return 409, {"error": "Your chart results changed. Start browsing again."}
             return 200, self.deck(query)
-        if path == "/api/selection/all" and method == "POST":
-            self.request_log.append((method, path, body))
-            if not body.get("confirm_possible"):
-                return 400, {"error": "Explicit review confirmation required"}
-            if body["scope"] in {"library", "both"}:
-                self.selected = {candidate["candidate_id"] for track in self.tracks() for candidate in (track["candidates"] if body["policy"] == "all_versions" else track["candidates"][:1])}
-            if body["scope"] in {"expansion", "both"}:
-                self.expansion_selected = {candidate["candidate_id"] for song in self.expansion_songs() for candidate in (song["candidates"] if body["policy"] == "all_versions" else song["candidates"][:1])}
-            response = self.selected_response()
-            response.update(scope=body["scope"], policy=body["policy"], changed=response["charts"])
-            return 200, {"ok": True} if self.omit_save_summary else response
         if self.fail_recount and self.selected and path in {"/api/workspace", "/api/expansion/results"}:
             self.request_log.append((method, path, {}))
             return 503, {"error": "Synthetic summary unavailable"}
@@ -138,19 +121,19 @@ def test_all_page_one_song_selection_is_one_post_with_authoritative_totals(deliv
     _capture(page, f"studio-all-selected-{width}.png")
 
 
-def test_all_versions_and_scope_are_explicit_and_declining_does_not_save(delivery_page):
+def test_all_versions_and_scope_have_a_preview_before_one_explicit_save(delivery_page):
     fixtures = StudioFixtures(count=120, versions=2)
     page, requests = delivery_page(fixtures)
     page.locator("#studio-select-scope").select_option("library")
     page.locator("#studio-select-policy").select_option("all_versions")
-    page.once("dialog", lambda dialog: dialog.dismiss())
-    page.locator("#studio-select-all").click()
+    playwright.expect(page.locator("#studio-selection-preview")).to_contain_text("240")
+    assert not page.locator("#studio-include-uncertain").is_checked()
     assert not _requests(requests, "/api/selection/all", "POST")
-    page.once("dialog", lambda dialog: dialog.accept())
     page.locator("#studio-select-all").click()
     playwright.expect(page.locator("#selectedCount")).to_have_text("240")
     payload = _requests(requests, "/api/selection/all", "POST")[0].post_data_json
-    assert payload == {"scope": "library", "policy": "all_versions", "confirm_possible": True}
+    assert payload == {"scope": "library", "policy": "all_versions", "confirm_possible": False,
+                       "selection_revision": 1, "exact_generation_id": 1}
 
 
 def test_add_advances_skip_added_and_undo_preserves_previous_choices_without_refetch(delivery_page):
@@ -167,7 +150,8 @@ def test_add_advances_skip_added_and_undo_preserves_previous_choices_without_ref
     page.locator("#studio-undo").click()
     playwright.expect(page.locator("#selectedCount")).to_have_text("1")
     assert fixtures.selected == {1000}
-    assert len(_requests(requests, "/api/selection", "POST")) == 2
+    assert len(_requests(requests, "/api/selection", "POST")) == 1
+    assert len(_requests(requests, "/api/selection/undo", "POST")) == 1
     assert len(_requests(requests, "/api/workspace")) == baseline
 
 
