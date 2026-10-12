@@ -193,6 +193,14 @@ an older image after a schema change.
   records a report and archive timestamp, never the token or file path. A
   container restart can leave a completed job without a usable link; the user
   must prepare a new ZIP from saved choices in that case.
+- Public ZIP preparation prefers the official no-video package for charts
+  whose metadata declares a background video, as supported by
+  [Bridge's download adapter](https://github.com/Geomitron/Bridge/blob/master/src-electron/ipc/download/ChartDownload.ts).
+  Local downloads retain their existing video-inclusive default. If the
+  optional variant returns HTTP 404 or 410, the adapter tries the canonical
+  package once; other failures do not trigger a fallback. Chart MD5 identity
+  stays unchanged, and validation records the actual downloaded SHA-256 and
+  byte count. The actual export budget and disk-reserve checks still apply.
 - User refresh tokens are encrypted at rest. Logs and diagnostics must not
   contain tokens, cookies, or OAuth authorization values.
 
