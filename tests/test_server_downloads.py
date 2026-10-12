@@ -43,6 +43,32 @@ def test_sign_and_resolve(downloads):
     assert resolved["workspace_id"] == 99
 
 
+@pytest.mark.parametrize("clock_step", [0, -1])
+def test_archive_identity_and_retention_do_not_depend_on_wall_clock(downloads, monkeypatch, clock_step):
+    from types import SimpleNamespace
+    import csv_to_clonehero.server.downloads as download_module
+
+    now = [1000.0]
+    monkeypatch.setattr(download_module, "time", SimpleNamespace(time=lambda: now[0]))
+    archives = []
+    for index in range(4):
+        now[0] = 1000.0 + index * clock_step
+        path = downloads.root / f"clock-{index}.zip"
+        path.write_bytes(b"synthetic archive")
+        archives.append(downloads.create(7, 99, path))
+
+    assert len({archive["archive_id"] for archive in archives}) == 4
+    assert downloads.latest_for_user_workspace(7, 99)["archive_id"] == archives[-1]["archive_id"]
+    assert downloads.latest_for_user_workspace(8, 99) is None
+    assert downloads.resolve(archives[0]["token"]) is None
+    assert downloads.resolve(archives[-1]["token"]) is not None
+    assert downloads.resolve(archives[-1]["archive_id"]) is None
+
+    downloads.revoke(archives[-1]["token"])
+
+    assert downloads.latest_for_user_workspace(7, 99)["archive_id"] == archives[-2]["archive_id"]
+
+
 def test_resolve_rejects_tampered_token(downloads):
     archive = downloads.root / "b.zip"
     archive.write_bytes(b"data")
@@ -336,6 +362,148 @@ def test_build_archive_collapses_duplicate_artifact_identity(config):
         db.close()
 
 
+def test_public_archive_distinguishes_represented_selections_from_identical_bytes(config):
+    from csv_to_clonehero.database import Database
+    from tests.conftest import FakeSource, make_chart, make_track, valid_sng_bytes
+
+    content = valid_sng_bytes("Song")
+    charts = [make_chart("Song", "Artist", chart_id=300 + index) for index in range(2)]
+    source = FakeSource(files={chart.md5: content for chart in charts})
+    # Distinct Enchor-style artifact references are not checksums of served bytes.
+    source.download_hash_verified = False
+    config.export.download_workers = 1
+    db = Database(config.database_path)
+    try:
+        workspace = db.create_workspace(workspace_key="public-identical-bytes")
+        track = db.upsert_spotify_tracks([make_track("Song", "Artist", "identical-bytes")])[0]
+        db.replace_workspace_library_tracks(workspace, [track])
+        for chart in charts:
+            db.upsert_workspace_candidate(
+                workspace, track.track_key, chart, score=99,
+                eligibility="RECOMMENDED", decision="AUTO_ACCEPT",
+            )
+            db.select_workspace_candidate(workspace, track.track_key, chart)
+        assert len(db.list_workspace_selections(workspace)) == 2
+        assert len(_validated_selections(db, workspace, config=config)) == 2
+
+        archive, summary = build_archive(
+            config, db, workspace, [source], config.state_path / "downloads"
+        )
+
+        assert summary == {
+            "success": True, "published": 1, "failed": 0, "invalid": 0,
+            "download_failures": 0, "already_present": 0, "ready": 2,
+            "selected": 2, "remaining": 0, "status": "success",
+            "bytes": archive.stat().st_size, "errors": [],
+        }
+        assert source.downloads == [chart.md5 for chart in charts]
+        with zipfile.ZipFile(archive) as built:
+            songs = [name for name in built.namelist() if name.endswith(".sng")]
+            assert len(songs) == summary["published"]
+            assert built.read(songs[0]) == content
+        assert len(db.list_workspace_selections(workspace)) == 2
+        assert not config.artifact_cache_path.exists()
+    finally:
+        db.close()
+
+
+def test_public_archive_partial_success_revalidates_ledger_before_retry(config):
+    from csv_to_clonehero.database import Database
+    from csv_to_clonehero.sources.base import SourceError
+    from tests.conftest import FakeSource, make_chart, make_track, valid_sng_bytes
+
+    class RetrySource(FakeSource):
+        download_hash_verified = False
+
+        def __init__(self, files):
+            super().__init__(files=files)
+            self.attempts = []
+            self.failures = {312: "temporary download failure", 313: "HTTP 404"}
+
+        def download_chart(self, candidate, destination):
+            self.attempts.append(candidate.chart_id)
+            if candidate.chart_id in self.failures:
+                raise SourceError(self.failures[candidate.chart_id])
+            return super().download_chart(candidate, destination)
+
+    titles = ["Good", "Invalid", "Transient", "Unavailable"]
+    charts = [make_chart(title, "Artist", chart_id=310 + index) for index, title in enumerate(titles)]
+    source = RetrySource({chart.md5: valid_sng_bytes(chart.name) for chart in charts})
+    source.files[charts[1].md5] = b"not a playable chart package"
+    config.export.download_workers = 1
+    config.export.artifact_retries = 0
+    config.export.retry_backoff_seconds = 0
+    db = Database(config.database_path)
+    try:
+        workspace = db.create_workspace(workspace_key="public-partial-retry")
+        tracks = db.upsert_spotify_tracks([
+            make_track(title, "Artist", f"partial-{index}")
+            for index, title in enumerate(titles)
+        ])
+        db.replace_workspace_library_tracks(workspace, tracks)
+        for track, chart in zip(tracks, charts):
+            db.upsert_workspace_candidate(
+                workspace, track.track_key, chart, score=99,
+                eligibility="RECOMMENDED", decision="AUTO_ACCEPT",
+            )
+            db.select_workspace_candidate(workspace, track.track_key, chart)
+        selections = [dict(row) for row in db.list_workspace_selections(workspace)]
+
+        archive, summary = build_archive(
+            config, db, workspace, [source], config.state_path / "downloads"
+        )
+
+        assert summary["success"] is True
+        assert summary["status"] == "success"
+        assert summary["selected"] == 4
+        assert summary["ready"] == summary["published"] == 1
+        assert summary["failed"] == 3
+        assert summary["invalid"] == 1
+        assert summary["download_failures"] == 2
+        assert summary["remaining"] == summary["already_present"] == 0
+        assert summary["bytes"] == archive.stat().st_size
+        assert len(summary["errors"]) == 3
+        assert any("temporary download failure" in error for error in summary["errors"])
+        assert any("HTTP 404" in error for error in summary["errors"])
+        assert source.attempts == [chart.chart_id for chart in charts]
+        with zipfile.ZipFile(archive) as built:
+            assert sum(name.endswith(".sng") for name in built.namelist()) == 1
+        observations = [db.get_chart_artifact_validation(chart.source, chart.chart_id) for chart in charts]
+        assert [row["state"] for row in observations] == [
+            "VERIFIED", "REJECTED", "UNVERIFIED", "UNAVAILABLE",
+        ]
+        assert [row["reason_code"] for row in observations[1:]] == [
+            "ARTIFACT_VALIDATION_FAILED", "TRANSIENT_DOWNLOAD_FAILURE", "SOURCE_UNAVAILABLE",
+        ]
+
+        source.failures.clear()
+        source.files[charts[1].md5] = valid_sng_bytes("Invalid")
+        assert {row["candidate_id"] for row in _validated_selections(db, workspace, config=config)} == {
+            charts[0].db_id, charts[2].db_id,
+        }
+        retry_archive, retry = build_archive(
+            config, db, workspace, [source], config.state_path / "downloads"
+        )
+
+        assert retry == {
+            "success": True, "published": 2, "failed": 0, "invalid": 0,
+            "download_failures": 0, "already_present": 0, "ready": 2,
+            "selected": 2, "remaining": 0, "status": "success",
+            "bytes": retry_archive.stat().st_size, "errors": [],
+        }
+        assert source.attempts == [310, 311, 312, 313, 310, 312]
+        assert [db.get_chart_artifact_validation(chart.source, chart.chart_id)["state"] for chart in charts] == [
+            "VERIFIED", "REJECTED", "VERIFIED", "UNAVAILABLE",
+        ]
+        with zipfile.ZipFile(retry_archive) as built:
+            assert sum(name.endswith(".sng") for name in built.namelist()) == 2
+        assert [dict(row) for row in db.list_workspace_selections(workspace)] == selections
+        assert not config.artifact_cache_path.exists()
+        assert all(path.suffix == ".zip" for path in retry_archive.parent.iterdir())
+    finally:
+        db.close()
+
+
 def test_build_archive_rejects_stale_wrong_identity_selection(config):
     from csv_to_clonehero.database import Database
     from tests.conftest import FakeSource, make_chart, make_track, valid_sng_bytes
@@ -403,3 +571,57 @@ def db_workspace(config):
     db = Database(config.database_path)
     yield db, 1  # workspace id 1 has no selections yet
     db.close()
+
+
+@pytest.mark.parametrize("reserve, from_environment", [
+    (0, False), (-1, False), (2048, False), (2048, True),
+])
+def test_public_archive_honors_configured_disk_reserve(config, monkeypatch, reserve, from_environment):
+    from csv_to_clonehero.database import Database
+    from tests.conftest import FakeSource, make_chart, make_track, valid_sng_bytes
+
+    content = valid_sng_bytes("Reserve Song")
+    digest = hashlib.md5(content).hexdigest()
+    if from_environment:
+        from csv_to_clonehero.config import load_config
+
+        path = config.base_dir / "config.yaml"
+        path.write_text("export:\n  minimum_free_bytes: 0\n", encoding="utf-8")
+        monkeypatch.setenv("EXPORT_MINIMUM_FREE_BYTES", str(reserve))
+        config = load_config(path)
+    else:
+        config.export.minimum_free_bytes = reserve
+    monkeypatch.setattr(
+        "csv_to_clonehero.exporter._default_disk_usage",
+        lambda _path: (100_000, 90_000, len(content) + 1024),
+    )
+    db = Database(config.database_path)
+    try:
+        workspace = db.create_workspace(workspace_key="disk-reserve")
+        track = db.upsert_spotify_tracks([make_track("Reserve Song", "Artist", "reserve")])[0]
+        db.replace_workspace_library_tracks(workspace, [track])
+        chart = make_chart("Reserve Song", "Artist", chart_id=601, md5=digest)
+        db.upsert_workspace_candidate(
+            workspace, track.track_key, chart, score=99,
+            eligibility="RECOMMENDED", decision="AUTO_ACCEPT", kind="exact",
+        )
+        db.select_workspace_candidate(workspace, track.track_key, chart, kind="exact")
+        selections = [dict(row) for row in db.list_workspace_selections(workspace)]
+        source = FakeSource(files={digest: content})
+        staging = config.state_path / "downloads"
+        if reserve > 0:
+            with pytest.raises(DownloadError, match="free|required"):
+                build_archive(config, db, workspace, [source], staging)
+            assert source.downloads == []
+            assert list(staging.iterdir()) == []
+            observation = db.get_chart_artifact_validation(chart.source, chart.chart_id)
+            assert observation is None or observation["state"] not in {"REJECTED", "UNAVAILABLE"}
+        else:
+            archive, summary = build_archive(config, db, workspace, [source], staging)
+            assert archive.is_file()
+            assert summary["success"] is True
+            assert source.downloads == [digest]
+            assert not list(staging.glob(".assembly-*"))
+        assert [dict(row) for row in db.list_workspace_selections(workspace)] == selections
+    finally:
+        db.close()

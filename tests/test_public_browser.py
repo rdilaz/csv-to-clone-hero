@@ -14,6 +14,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.public_signal_fixtures import SignalCheckFixtures
+
 
 pytestmark = pytest.mark.browser
 playwright = pytest.importorskip("playwright.sync_api")
@@ -59,9 +61,23 @@ def public_server(tmp_path, monkeypatch):
 
 
 def _assert_no_overflow(page):
-    assert page.evaluate(
-        "document.documentElement.scrollWidth <= document.documentElement.clientWidth"
-    )
+    result = page.evaluate("""() => ({
+      fits: document.documentElement.scrollWidth <= document.documentElement.clientWidth,
+      scrollWidth: document.documentElement.scrollWidth,
+      clientWidth: document.documentElement.clientWidth,
+      offenders: [...document.querySelectorAll('body *')]
+        .filter(element => {
+          const box = element.getBoundingClientRect();
+          return box.left < -0.5 || box.right > document.documentElement.clientWidth + 0.5;
+        })
+        .slice(0, 20)
+        .map(element => ({tag: element.tagName, id: element.id, className: element.className, box: element.getBoundingClientRect().toJSON()})),
+      internalOverflow: [...document.querySelectorAll('body *')]
+        .filter(element => element.scrollWidth > element.clientWidth + 1)
+        .slice(0, 20)
+        .map(element => ({tag: element.tagName, id: element.id, className: element.className, scrollWidth: element.scrollWidth, clientWidth: element.clientWidth})),
+    })""")
+    assert result["fits"], json.dumps(result, sort_keys=True)
 
 
 def _assert_in_viewport(page, selector):
@@ -71,17 +87,51 @@ def _assert_in_viewport(page, selector):
     assert box["y"] + box["height"] <= page.evaluate("window.innerHeight")
 
 
+def _assert_control_reachable_above_player(page, selector):
+    control = page.locator(selector)
+    control.scroll_into_view_if_needed()
+    _assert_in_viewport(page, selector)
+    box = control.bounding_box()
+    assert box is not None and box["height"] >= 44
+    dock = page.locator("#catalogPlayerDock").bounding_box()
+    assert dock is not None and box["y"] + box["height"] <= dock["y"]
+    assert control.evaluate("""element => {
+      const box = element.getBoundingClientRect();
+      const hit = document.elementFromPoint(box.x + box.width / 2, box.y + box.height / 2);
+      return Boolean(hit && (hit === element || element.contains(hit)));
+    }"""), f"{selector} is covered at its center"
+    return box
+
+
+def _empty_catalog_receipt(revision, generation_id=1):
+    """This fixture owns no catalog choices; provide the current API guards."""
+    return {
+        "catalog_summary": {"songs": 0, "charts": 0},
+        "selection_revision": revision,
+        "exact_generation_id": generation_id,
+        "undo": {"available": False, "operation_id": None, "label": "",
+                 "revision": revision, "generation_id": generation_id, "reason": ""},
+    }
+
+
 def _capture(page, name):
     root = os.environ.get("RIFF_BROWSER_EVIDENCE_DIR", "").strip()
     if not root:
         return
     destination = Path(root)
     destination.mkdir(parents=True, exist_ok=True)
-    page.screenshot(path=str(destination / name), full_page=True)
+    page.emulate_media(reduced_motion="reduce")
+    page.evaluate("document.fonts.ready")
+    page.screenshot(path=str(destination / name), full_page=False)
 
 
-def test_public_landing_mobile_and_desktop(public_server):
+@pytest.mark.parametrize("support_enabled", [False, True])
+def test_public_landing_mobile_and_desktop(public_server, support_enabled):
     _app, base_url, _cookie_name, _cookie = public_server
+    support_config = _app.extensions["config"].monetization
+    support_config.gofundme_enabled = support_enabled
+    support_config.gofundme_banner = support_enabled
+    support_config.gofundme_url = "https://example.test/community-support"
     with playwright.sync_playwright() as runtime:
         try:
             browser = runtime.chromium.launch(headless=True)
@@ -93,22 +143,22 @@ def test_public_landing_mobile_and_desktop(public_server):
                 errors = []
                 page.on("console", lambda message: errors.append(message.text) if message.type == "error" else None)
                 page.goto(base_url + "/", wait_until="networkidle")
-                assert page.get_by_role("heading", name="Turn the music you love into a Clone Hero library.").is_visible()
-                login = page.get_by_role("link", name="Continue with Spotify")
+                assert page.get_by_role("heading", name="Find your next favorite riff.").is_visible()
+                login = page.get_by_role("link", name="Connect Spotify")
                 assert login.is_visible()
                 assert login.bounding_box()["height"] >= 44
                 support = page.get_by_role(
                     "link", name="Support the creator of Clone Hero on GoFundMe"
                 )
-                assert support.is_visible()
-                assert support.get_attribute("href") == (
-                    "https://www.gofundme.com/f/"
-                    "cancer-deudas-y-a-punto-de-perder-nuestro-hogar-apoyanos"
-                )
-                assert support.get_attribute("target") == "_blank"
-                assert support.get_attribute("rel") == "noopener noreferrer"
-                support.focus()
-                assert support.evaluate("element => document.activeElement === element")
+                if support_enabled:
+                    assert support.is_visible()
+                    assert support.get_attribute("href") == "https://example.test/community-support"
+                    assert support.get_attribute("target") == "_blank"
+                    assert support.get_attribute("rel") == "noopener noreferrer"
+                    support.focus()
+                    assert support.evaluate("element => document.activeElement === element")
+                else:
+                    assert support.count() == 0
                 assert page.get_by_text("Your music", exact=True).is_visible()
                 assert page.get_by_text("Community charts", exact=True).is_visible()
                 _assert_no_overflow(page)
@@ -170,18 +220,529 @@ def test_running_find_eta_restores_without_overflow(public_server, viewport):
         page.route("**/api/**", route_api)
         page.goto(base_url + "/", wait_until="networkidle")
 
-        playwright.expect(page.get_by_text("1 of 100 songs complete", exact=True)).to_be_visible()
+        playwright.expect(page.get_by_text("1 of 100 songs checked", exact=True)).to_be_visible()
         assert page.locator("#progressEta").inner_text() == "Estimating..."
-        playwright.expect(page.get_by_text("10 of 100 songs complete", exact=True)).to_be_visible(timeout=3000)
+        playwright.expect(page.get_by_text("10 of 100 songs checked", exact=True)).to_be_visible(timeout=3000)
         assert page.locator("#progressEta").inner_text() == "About 2-4 minutes"
         _assert_in_viewport(page, "#progressEta")
         _assert_no_overflow(page)
 
+        _capture(page, f"find-{viewport['width']}x{viewport['height']}.png")
         page.reload(wait_until="networkidle")
-        playwright.expect(page.get_by_text("10 of 100 songs complete", exact=True)).to_be_visible()
+        playwright.expect(page.get_by_text("10 of 100 songs checked", exact=True)).to_be_visible()
         assert page.locator("#progressEta").inner_text() == "About 2-4 minutes"
         _assert_in_viewport(page, "#progressEta")
         _assert_no_overflow(page)
+        browser.close()
+
+
+@pytest.mark.parametrize(
+    "viewport",
+    [{"width": 390, "height": 844}, {"width": 1440, "height": 900}],
+)
+@pytest.mark.parametrize("support_enabled", [False, True])
+def test_signal_check_confirm_keeps_multi_chart_selection_truthful(
+    public_server, viewport, support_enabled
+):
+    _app, base_url, cookie_name, cookie = public_server
+    support = _app.extensions["config"].monetization
+    support.gofundme_enabled = support_enabled
+    support.gofundme_banner = support_enabled
+    support.gofundme_url = "https://example.test/community-support"
+    fixtures = SignalCheckFixtures("confirm")
+
+    with playwright.sync_playwright() as runtime:
+        try:
+            browser = runtime.chromium.launch(headless=True)
+        except Exception as exc:
+            pytest.skip(f"Chromium is not installed: {exc}")
+        context = browser.new_context(viewport=viewport, has_touch=viewport["width"] < 720)
+        context.add_cookies([{"name": cookie_name, "value": cookie, "url": base_url}])
+        page = context.new_page()
+        page.route("**/api/**", fixtures.fulfill)
+        page.goto(base_url + "/", wait_until="networkidle")
+
+        playwright.expect(page.get_by_role("heading", name="Build your setlist.")).to_be_visible()
+        playwright.expect(page.locator("#selectedCount")).to_have_text("3")
+        playwright.expect(page.locator("#exactSelectedCount")).to_have_text("3")
+        playwright.expect(page.locator("#selectedSongCount")).to_have_text("1")
+        playwright.expect(page.locator("#expansionSelectedCount")).to_have_text("0")
+        playwright.expect(page.locator('[data-candidate="101"][data-selection="clear"]')).to_be_visible()
+        assert page.locator('[data-candidate="101"]').get_attribute("aria-pressed") is None
+        assert page.get_by_role(
+            "button",
+            name="Selected Misery Business chart by Atlas Charts. Clear this choice.",
+        ).is_visible()
+        same_recording = page.locator('details[data-disclosure-key$="SAME_RECORDING_CHART_VARIANT"]')
+        alternate = page.locator('details[data-disclosure-key$="ALTERNATE_RECORDING"]')
+        assert same_recording.get_attribute("open") is not None
+        assert alternate.get_attribute("open") is not None
+        assert page.get_by_text("Guitar intensity rating 0", exact=True).is_visible()
+        assert page.get_by_text("Different live recording.", exact=True).is_visible()
+        _assert_no_overflow(page)
+
+        # The persistent player owns the fixed bottom area. The selection
+        # summary stays in document flow, with every chart action reachable.
+        rail = page.locator("#selectionRail")
+        assert "is-in-flow" in (rail.get_attribute("class") or "")
+        assert rail.evaluate("element => getComputedStyle(element).position") == "relative"
+        _assert_control_reachable_above_player(page, "#studio-select-all")
+        action_box = _assert_control_reachable_above_player(page, '[data-candidate="101"]')
+        group_box = page.locator(".song-group").first.bounding_box()
+        assert group_box is not None and group_box["y"] < action_box["y"]
+        if viewport["width"] == 390:
+            if support_enabled:
+                banner_box = page.locator(".cause-bar").bounding_box()
+                assert banner_box is not None and banner_box["height"] <= 44
+            else:
+                assert page.locator(".cause-bar").count() == 0
+        _assert_control_reachable_above_player(page, "#continueDownloadButton")
+        _capture(page, f"confirm-{viewport['width']}x{viewport['height']}.png")
+
+        sibling = page.locator('[data-candidate="102"]')
+        page.locator('details[data-disclosure-key$=":102:concerns"] > summary').click()
+        sibling.focus()
+        sibling.click()
+        playwright.expect(page.locator("#selectedCount")).to_have_text("2")
+        replacement = page.locator('[data-candidate="102"][data-selection="select"]')
+        playwright.expect(replacement).to_be_focused()
+        assert page.locator('[data-candidate="101"][data-selection="clear"]').count() == 1
+        assert page.locator('[data-candidate="103"][data-selection="clear"]').count() == 1
+        assert same_recording.get_attribute("open") is not None
+        assert page.locator('details[data-disclosure-key$=":102:concerns"]').get_attribute("open") is not None
+
+        page.reload(wait_until="networkidle")
+        playwright.expect(page.locator("#selectedCount")).to_have_text("2")
+        assert page.locator('[data-candidate="101"][data-selection="clear"]').count() == 1
+        assert page.locator('[data-candidate="103"][data-selection="clear"]').count() == 1
+        page.locator('details[data-disclosure-key$="SAME_RECORDING_CHART_VARIANT"] > summary').click()
+        page.locator('[data-candidate="102"][data-selection="select"]').click()
+        playwright.expect(page.locator("#selectedCount")).to_have_text("3")
+
+        page.get_by_role("button", name="Possible matches").click()
+        possible = page.locator('[data-candidate="201"][data-selection="select"]')
+        playwright.expect(possible).to_be_visible()
+        assert page.get_by_text("Guitar intensity rating not provided", exact=True).is_visible()
+        posts_before = len([
+            body for method, path, body in fixtures.request_log
+            if method == "POST" and path == "/api/selection" and body.get("candidate_id") == 201
+        ])
+        page.once("dialog", lambda dialog: dialog.dismiss())
+        possible.click()
+        posts_after_cancel = len([
+            body for method, path, body in fixtures.request_log
+            if method == "POST" and path == "/api/selection" and body.get("candidate_id") == 201
+        ])
+        assert posts_after_cancel == posts_before
+
+        page.once("dialog", lambda dialog: dialog.accept())
+        possible.click()
+        playwright.expect(page.locator("#selectedCount")).to_have_text("4")
+        possible_post = [
+            body for method, path, body in fixtures.request_log
+            if method == "POST" and path == "/api/selection" and body.get("candidate_id") == 201
+        ][-1]
+        assert possible_post["confirm_possible"] is True
+
+        fixtures.fail_next_selection = True
+        page.locator('[data-review-filter="selected"]').click()
+        page.locator('[data-candidate="201"][data-selection="clear"]').click()
+        playwright.expect(page.locator("#selectionError")).to_have_text(
+            "Selection service is temporarily unavailable."
+        )
+        playwright.expect(page.locator("#selectedCount")).to_have_text("4")
+        assert page.locator('[data-candidate="201"][data-selection="clear"]').count() == 1
+        page.locator('[data-candidate="201"][data-selection="clear"]').click()
+        playwright.expect(page.locator("#selectedCount")).to_have_text("3")
+        playwright.expect(page.locator("#reviewSearch")).to_be_focused()
+        _assert_no_overflow(page)
+        assert fixtures.unexpected_requests == []
+        browser.close()
+
+
+def test_signal_check_retries_a_failed_post_mutation_recount(public_server):
+    _app, base_url, cookie_name, cookie = public_server
+    fixtures = SignalCheckFixtures("confirm")
+    # Exercise an acknowledged save without its authoritative selection DTO,
+    # so the browser must reconcile rather than use the usual fast path.
+    fixtures.omit_save_summary = True
+    mutation_saved = {"value": False}
+    recount_failed = {"value": False}
+    pending_mutation = []
+
+    def route_api(route):
+        path = route.request.url.split(base_url, 1)[-1]
+        if route.request.method == "POST" and path == "/api/selection":
+            pending_mutation.append(route)
+            return
+        if path.startswith("/api/workspace?") and mutation_saved["value"] and not recount_failed["value"]:
+            recount_failed["value"] = True
+            route.fulfill(
+                status=503,
+                content_type="application/json",
+                body=json.dumps({"error": "Selection summary is temporarily unavailable."}),
+            )
+            return
+        fixtures.fulfill(route)
+
+    with playwright.sync_playwright() as runtime:
+        try:
+            browser = runtime.chromium.launch(headless=True)
+        except Exception as exc:
+            pytest.skip(f"Chromium is not installed: {exc}")
+        context = browser.new_context(viewport={"width": 1440, "height": 900})
+        context.add_cookies([{"name": cookie_name, "value": cookie, "url": base_url}])
+        page = context.new_page()
+        page.route("**/api/**", route_api)
+        page.goto(base_url + "/", wait_until="networkidle")
+
+        page.locator('[data-candidate="102"][data-selection="clear"]').click()
+        page.wait_for_timeout(50)
+        assert pending_mutation
+        playwright.expect(page.locator("#continueDownloadButton")).to_be_disabled()
+        assert all(
+            page.locator('[data-selection]').nth(index).is_disabled()
+            for index in range(page.locator('[data-selection]').count())
+        )
+        mutation_saved["value"] = True
+        fixtures.fulfill(pending_mutation.pop())
+        playwright.expect(page.locator("#selectionError")).to_contain_text(
+            "Chart choice cleared. Riff could not refresh the selection summary."
+        )
+        playwright.expect(page.locator("#selectedCount")).to_have_text("Unknown")
+        playwright.expect(page.locator("#exactSelectedCount")).to_have_text("3")
+        playwright.expect(page.locator('[data-candidate="102"]')).to_be_disabled()
+        playwright.expect(page.locator('[data-candidate="102"]')).to_contain_text("Selected")
+        playwright.expect(page.locator("#continueDownloadButton")).to_be_disabled()
+        retry = page.locator("#retrySelectionButton")
+        playwright.expect(retry).to_be_visible()
+
+        retry.click()
+        playwright.expect(page.locator("#selectedCount")).to_have_text("2")
+        playwright.expect(page.locator('[data-candidate="102"][data-selection="select"]')).to_be_enabled()
+        assert retry.is_hidden()
+        assert fixtures.unexpected_requests == []
+        browser.close()
+
+
+def test_signal_check_keeps_combined_count_unknown_when_expansion_recount_fails(
+    public_server,
+):
+    _app, base_url, cookie_name, cookie = public_server
+    fixtures = SignalCheckFixtures("confirm")
+
+    def route_api(route):
+        if "/api/expansion/results" in route.request.url:
+            route.fulfill(
+                status=503,
+                content_type="application/json",
+                body=json.dumps({"error": "Expansion summary is temporarily unavailable."}),
+            )
+            return
+        fixtures.fulfill(route)
+
+    with playwright.sync_playwright() as runtime:
+        try:
+            browser = runtime.chromium.launch(headless=True)
+        except Exception as exc:
+            pytest.skip(f"Chromium is not installed: {exc}")
+        context = browser.new_context(viewport={"width": 1440, "height": 900})
+        context.add_cookies([{"name": cookie_name, "value": cookie, "url": base_url}])
+        page = context.new_page()
+        page.route("**/api/**", route_api)
+        page.goto(base_url + "/", wait_until="networkidle")
+
+        playwright.expect(page.locator("#exactSelectedCount")).to_have_text("3")
+        playwright.expect(page.locator("#expansionSelectedCount")).to_have_text("Unknown")
+        playwright.expect(page.locator("#selectedCount")).to_have_text("Unknown")
+        playwright.expect(page.locator("#selectionMode")).to_have_text(
+            "Updating the combined selection total..."
+        )
+        playwright.expect(page.locator("#continueDownloadButton")).to_be_enabled()
+        assert page.locator("#continueDownloadButton").get_attribute("aria-label") == (
+            "Review ZIP with the currently confirmed chart selections"
+        )
+        browser.close()
+
+
+@pytest.mark.parametrize(
+    "viewport",
+    [
+        {"width": 768, "height": 1024},
+        {"width": 960, "height": 900},
+        {"width": 1024, "height": 900},
+    ],
+)
+def test_signal_check_selection_summary_reflows_at_tablet_widths(
+    public_server, viewport
+):
+    _app, base_url, cookie_name, cookie = public_server
+    fixtures = SignalCheckFixtures("confirm")
+
+    with playwright.sync_playwright() as runtime:
+        try:
+            browser = runtime.chromium.launch(headless=True)
+        except Exception as exc:
+            pytest.skip(f"Chromium is not installed: {exc}")
+        context = browser.new_context(viewport=viewport)
+        context.add_cookies([{"name": cookie_name, "value": cookie, "url": base_url}])
+        page = context.new_page()
+        page.route("**/api/**", fixtures.fulfill)
+        page.goto(base_url + "/", wait_until="networkidle")
+
+        _assert_control_reachable_above_player(page, "#studio-select-all")
+        _assert_control_reachable_above_player(page, '[data-candidate="101"]')
+        rail = page.locator("#selectionRail")
+        source_box = page.locator(".song-group > .candidate-row .candidate-source").first.bounding_box()
+        assert source_box is not None
+        assert "is-in-flow" in (rail.get_attribute("class") or "")
+        assert rail.evaluate("element => getComputedStyle(element).position") == "relative"
+        _assert_control_reachable_above_player(page, "#continueDownloadButton")
+        _assert_no_overflow(page)
+        if viewport["width"] in {768, 1024}:
+            page.evaluate("document.documentElement.style.fontSize = '200%'; window.dispatchEvent(new Event('resize'))")
+            page.wait_for_timeout(50)
+            _assert_no_overflow(page)
+            _assert_control_reachable_above_player(page, "#continueDownloadButton")
+        browser.close()
+
+
+def test_signal_check_add_refresh_failure_keeps_cached_choices(public_server):
+    _app, base_url, cookie_name, cookie = public_server
+    fixtures = SignalCheckFixtures("add")
+    fail_refresh = {"value": False}
+
+    def route_api(route):
+        if route.request.method == "GET" and "/api/spotify/scope" in route.request.url and fail_refresh["value"]:
+            route.fulfill(
+                status=502,
+                content_type="application/json",
+                body=json.dumps({"error": "Spotify refresh is temporarily unavailable."}),
+            )
+            return
+        fixtures.fulfill(route)
+
+    with playwright.sync_playwright() as runtime:
+        try:
+            browser = runtime.chromium.launch(headless=True)
+        except Exception as exc:
+            pytest.skip(f"Chromium is not installed: {exc}")
+        context = browser.new_context(viewport={"width": 390, "height": 844}, has_touch=True)
+        context.add_cookies([{"name": cookie_name, "value": cookie, "url": base_url}])
+        page = context.new_page()
+        page.route("**/api/**", route_api)
+        page.goto(base_url + "/", wait_until="networkidle")
+
+        page.get_by_label("Heavy rotation").check()
+        fail_refresh["value"] = True
+        page.get_by_role("button", name="Refresh Spotify").click()
+        playwright.expect(page.locator("#appError")).to_have_text(
+            "Spotify refresh is temporarily unavailable."
+        )
+        playwright.expect(page.locator("#appError")).to_be_focused()
+        assert page.get_by_label("Heavy rotation").is_checked()
+        assert page.get_by_label("Road trip").is_checked()
+        assert page.locator("#spotifyFreshness").inner_text() == (
+            "Spotify could not be refreshed. Saved choices are still shown."
+        )
+        _assert_no_overflow(page)
+        browser.close()
+
+
+def test_signal_check_unknown_progress_never_invents_percentage(public_server):
+    _app, base_url, cookie_name, cookie = public_server
+    fixtures = SignalCheckFixtures("find")
+
+    def route_api(route):
+        if route.request.method == "GET" and route.request.url.endswith("/api/jobs/41"):
+            route.fulfill(
+                status=200,
+                content_type="application/json",
+                body=json.dumps({"job": {
+                    "id": 41,
+                    "kind": "discovery",
+                    "status": "running",
+                    "phase": "catalog_prepare",
+                    "message": "Preparing the chart catalog",
+                    "progress": {"current_song": None},
+                }}),
+            )
+            return
+        fixtures.fulfill(route)
+
+    with playwright.sync_playwright() as runtime:
+        try:
+            browser = runtime.chromium.launch(headless=True)
+        except Exception as exc:
+            pytest.skip(f"Chromium is not installed: {exc}")
+        context = browser.new_context(viewport={"width": 390, "height": 844})
+        context.add_cookies([{"name": cookie_name, "value": cookie, "url": base_url}])
+        page = context.new_page()
+        page.route("**/api/**", route_api)
+        page.goto(base_url + "/", wait_until="networkidle")
+
+        playwright.expect(page.locator("#progressPercent")).to_have_text("Working...")
+        assert page.locator("#progressDisc").get_attribute("aria-valuenow") is None
+        assert "is-indeterminate" in (page.locator("#progressDisc").get_attribute("class") or "")
+        playwright.expect(page.locator("#progressCount")).to_have_text("Preparing your music")
+        _assert_no_overflow(page)
+        browser.close()
+
+
+def test_signal_check_forced_colors_keeps_progress_meter_distinct(public_server):
+    _app, base_url, cookie_name, cookie = public_server
+    fixtures = SignalCheckFixtures("find")
+
+    with playwright.sync_playwright() as runtime:
+        try:
+            browser = runtime.chromium.launch(headless=True)
+        except Exception as exc:
+            pytest.skip(f"Chromium is not installed: {exc}")
+        context = browser.new_context(
+            viewport={"width": 390, "height": 844}, forced_colors="active"
+        )
+        context.add_cookies([{"name": cookie_name, "value": cookie, "url": base_url}])
+        page = context.new_page()
+        page.route("**/api/**", fixtures.fulfill)
+        page.goto(base_url + "/", wait_until="networkidle")
+
+        styles = page.locator("#progressDisc").evaluate("""element => {
+          const track = getComputedStyle(element);
+          const fill = getComputedStyle(element.firstElementChild);
+          return {
+            borderStyle: track.borderTopStyle,
+            borderWidth: track.borderTopWidth,
+            track: track.backgroundColor,
+            fill: fill.backgroundColor,
+          };
+        }""")
+        assert styles["borderStyle"] == "solid"
+        assert styles["borderWidth"] != "0px"
+        assert styles["track"] != styles["fill"]
+        browser.close()
+
+
+def test_signal_check_ignores_out_of_order_review_reads(public_server):
+    _app, base_url, cookie_name, cookie = public_server
+    fixtures = SignalCheckFixtures("confirm")
+    pending = []
+    workspace_reads = {"count": 0}
+
+    def route_api(route):
+        if route.request.method == "GET" and "/api/workspace?" in route.request.url:
+            workspace_reads["count"] += 1
+            if workspace_reads["count"] > 1:
+                pending.append(route)
+                return
+        fixtures.fulfill(route)
+
+    with playwright.sync_playwright() as runtime:
+        try:
+            browser = runtime.chromium.launch(headless=True)
+        except Exception as exc:
+            pytest.skip(f"Chromium is not installed: {exc}")
+        context = browser.new_context(viewport={"width": 1440, "height": 900})
+        context.add_cookies([{"name": cookie_name, "value": cookie, "url": base_url}])
+        page = context.new_page()
+        page.route("**/api/**", route_api)
+        page.goto(base_url + "/", wait_until="networkidle")
+
+        search = page.locator("#reviewSearch")
+        search.fill("radiohead")
+        page.wait_for_timeout(350)
+        assert len(pending) == 1
+        search.fill("paramore")
+        page.wait_for_timeout(350)
+        assert len(pending) == 2
+
+        newest = pending.pop()
+        fixtures.fulfill(newest)
+        playwright.expect(page.locator(".song-group__identity h3")).to_have_text("Misery Business")
+        assert page.get_by_role("heading", name="Weird Fishes / Arpeggi").count() == 0
+
+        oldest = pending.pop()
+        fixtures.fulfill(oldest)
+        page.wait_for_timeout(100)
+        assert page.locator(".song-group__identity h3").inner_text() == "Misery Business"
+        assert page.get_by_role("heading", name="Weird Fishes / Arpeggi").count() == 0
+        _assert_no_overflow(page)
+        browser.close()
+
+
+@pytest.mark.parametrize("support_enabled", [False, True])
+def test_signal_check_reflows_at_320_and_respects_reduced_motion(public_server, support_enabled):
+    _app, base_url, cookie_name, cookie = public_server
+    support = _app.extensions["config"].monetization
+    support.gofundme_enabled = support_enabled
+    support.gofundme_banner = support_enabled
+    support.gofundme_url = "https://example.test/community-support"
+    fixtures = SignalCheckFixtures("confirm")
+
+    with playwright.sync_playwright() as runtime:
+        try:
+            browser = runtime.chromium.launch(headless=True)
+        except Exception as exc:
+            pytest.skip(f"Chromium is not installed: {exc}")
+        context = browser.new_context(
+            viewport={"width": 320, "height": 800},
+            has_touch=True,
+            reduced_motion="reduce",
+        )
+        context.add_cookies([{"name": cookie_name, "value": cookie, "url": base_url}])
+        page = context.new_page()
+        page.route("**/api/**", fixtures.fulfill)
+        page.goto(base_url + "/", wait_until="networkidle")
+
+        _assert_no_overflow(page)
+        _assert_control_reachable_above_player(page, "#studio-select-all")
+        assert page.evaluate("""() => ['studio-select-scope', 'studio-select-policy',
+            'studio-include-uncertain', 'studio-selection-preview'].every(id =>
+            Boolean(document.getElementById(id).compareDocumentPosition(
+              document.getElementById('studio-select-all')) & Node.DOCUMENT_POSITION_FOLLOWING))""")
+        action = page.locator("#studio-select-all").bounding_box()
+        rail = page.locator("#selectionRail").bounding_box()
+        assert action and rail and action["height"] >= 44 and action["y"] + action["height"] + 7 <= rail["y"]
+        assert page.locator(".journey-steps li").count() == 5
+        assert all(
+            box and box["x"] >= 0 and box["x"] + box["width"] <= 320
+            for box in [page.locator(".journey-steps li").nth(index).bounding_box() for index in range(5)]
+        )
+        assert page.locator(".selection-options").get_attribute("open") is None
+        selectors = [".brand", ".selection-options > summary", ".concern-details > summary"]
+        if support_enabled:
+            selectors.append(".cause-bar__link")
+        else:
+            assert page.locator(".cause-bar__link").count() == 0
+        for selector in selectors:
+            box = page.locator(selector).first.bounding_box()
+            assert box is not None and box["height"] >= 44
+        identity_style = page.locator(".candidate-identity h4").first.evaluate(
+            "element => ({family: getComputedStyle(element).fontFamily, size: parseFloat(getComputedStyle(element).fontSize)})"
+        )
+        evidence_size = page.locator(".candidate-evidence small").first.evaluate(
+            "element => parseFloat(getComputedStyle(element).fontSize)"
+        )
+        assert "IBM Plex Sans Riff" in identity_style["family"]
+        assert identity_style["size"] >= 16
+        assert evidence_size >= 14
+        page.locator(".selection-options > summary").focus()
+        focus_style = page.locator(".selection-options > summary").evaluate(
+            "element => ({outline: getComputedStyle(element).outlineColor, shadow: getComputedStyle(element).boxShadow})"
+        )
+        assert focus_style["shadow"] != "none"
+        _assert_control_reachable_above_player(page, '[data-candidate="101"]')
+        rail = page.locator("#selectionRail")
+        assert "is-in-flow" in (rail.get_attribute("class") or "")
+        assert rail.evaluate("element => getComputedStyle(element).position") == "relative"
+        _assert_control_reachable_above_player(page, "#continueDownloadButton")
+        animation_duration = page.locator(".loading-line span").evaluate(
+            "element => getComputedStyle(element).animationDuration"
+        )
+        assert animation_duration in {"0s", "1e-05s", "0.001ms", "0.01ms"}
+        page.evaluate("document.documentElement.style.fontSize = '200%'; window.dispatchEvent(new Event('resize'))")
+        page.wait_for_timeout(50)
+        _assert_no_overflow(page)
+        _assert_control_reachable_above_player(page, "#continueDownloadButton")
         browser.close()
 
 
@@ -194,6 +755,7 @@ def test_public_authenticated_journey_to_download_ready(
 ):
     _app, base_url, cookie_name, cookie = public_server
     selected = {"value": False}
+    selection_revision = {"value": 1}
     scope_saved = {"value": False}
     job_polls = {"count": 0}
     api_calls = []
@@ -212,6 +774,7 @@ def test_public_authenticated_journey_to_download_ready(
             else {"known": True, "include_liked": False, "playlist_ids": ["playlist-1"]}
         )
         return {
+            **_empty_catalog_receipt(selection_revision["value"], 1 if complete else 0),
             "workspace_id": 1,
             "workspace_status": "complete" if complete else "created",
             "workspace": {"id": 1, "status": "complete" if complete else "created", "phase": "complete" if complete else "source_setup", "updated_at": time.time()},
@@ -296,6 +859,7 @@ def test_public_authenticated_journey_to_download_ready(
             },
         }
         return {
+            **_empty_catalog_receipt(selection_revision["value"]),
             "workspace": 1,
             "minimum_score": 50,
             "tracks": [{
@@ -358,13 +922,29 @@ def test_public_authenticated_journey_to_download_ready(
             status = 200
         elif path.startswith("/api/workspace?"):
             payload, status = workspace_payload(), 200
+        elif path == "/api/expansion/artists":
+            payload, status = {"available": False, "reason": "Expansion is not enabled for this fixture.", "artists": [], "job": None}, 200
+        elif path.startswith("/api/expansion/results"):
+            payload, status = {"songs": [], "total": 0, "offset": 0, "limit": 25, "has_more": False, "summary": {"selected": 0}}, 200
+        elif path == "/api/selection/history":
+            payload, status = {**_empty_catalog_receipt(selection_revision["value"]), "operations": []}, 200
+        elif path.startswith("/api/catalog/selections?"):
+            payload, status = {**_empty_catalog_receipt(selection_revision["value"]),
+                               "items": [], "total": 0, "limit": 25, "offset": 0, "has_more": False}, 200
         elif path == "/api/selection/bulk":
-            selected["value"] = json.loads(request.post_data or "{}").get("action") != "clear"
-            payload, status = {"ok": True, "changed": 1, "scope": "strong", "minimum_score": 50}, 200
+            body = json.loads(request.post_data or "{}")
+            assert body["selection_revision"] == selection_revision["value"]
+            next_selected = body.get("action") != "clear"
+            changed = int(selected["value"] != next_selected)
+            selected["value"] = next_selected
+            selection_revision["value"] += changed
+            payload, status = {"ok": True, "changed": changed, "scope": "strong", "minimum_score": 50}, 200
         elif path == "/api/download":
             payload, status = {"download": {"token": "single.use.token", "expires_at": time.time() + 900, "ttl_seconds": 900, "size_bytes": 1234}, "summary": {"ready": 1, "published": 1, "success": True}}, 200
         else:
             payload, status = {"error": f"unexpected mocked request: {method} {path}"}, 500
+        if status < 400 and (path.startswith("/api/expansion/") or path == "/api/selection/bulk"):
+            payload.update(_empty_catalog_receipt(selection_revision["value"]))
         route.fulfill(status=status, content_type="application/json", body=json.dumps(payload))
 
     with playwright.sync_playwright() as runtime:
@@ -378,6 +958,7 @@ def test_public_authenticated_journey_to_download_ready(
         page.route("**/api/**", route_api)
         page.goto(base_url + "/", wait_until="networkidle")
 
+        page.get_by_text("Road trip", exact=True).wait_for()
         assert sum(
             method == "GET" and path == "/api/journey"
             for method, path, _body in api_calls
@@ -397,7 +978,7 @@ def test_public_authenticated_journey_to_download_ready(
         soundcloud_title = page.locator(".source-card--soundcloud h2")
         assert soundcloud_title.is_visible()
         assert page.locator(".source-card--soundcloud .source-icon").is_visible()
-        assert page.get_by_text("Optional export import", exact=True).is_visible()
+        assert page.get_by_text("CSV or JSON export", exact=True).is_visible()
         assert page.locator("#soundcloudCount").is_visible()
         page.locator("#soundcloudCount").evaluate(
             "element => { element.textContent = '2,354 unique songs, 53 playlists'; }"
@@ -413,7 +994,7 @@ def test_public_authenticated_journey_to_download_ready(
         if viewport["width"] > 820:
             assert abs(spotify_card["y"] - soundcloud_card["y"]) < 2
             assert spotify_card["width"] > soundcloud_card["width"]
-            assert soundcloud_card["width"] / spotify_card["width"] > 0.65
+            assert 0.35 < soundcloud_card["width"] / spotify_card["width"] < 0.6
         else:
             assert soundcloud_card["y"] >= spotify_card["y"] + spotify_card["height"]
         _capture(page, f"add-music-{viewport['width']}x{viewport['height']}.png")
@@ -452,7 +1033,7 @@ def test_public_authenticated_journey_to_download_ready(
         page.get_by_role("button", name="Select all playlists").click()
         assert page.locator(".spotify-playlist:checked").count() == 2
         assert not page.get_by_label("Liked Songs").is_checked()
-        page.get_by_role("button", name="Clear all playlists").click()
+        page.get_by_role("button", name="Clear playlist checks").click()
         assert page.locator(".spotify-playlist:checked").count() == 0
         assert not page.get_by_label("Liked Songs").is_checked()
         page.locator('input[value="playlist-unknown"]').check()
@@ -469,31 +1050,34 @@ def test_public_authenticated_journey_to_download_ready(
         add_music_text = page.locator("#stageAdd").inner_text()
         assert "unique Spotify tracks" not in add_music_text
         assert "imported SoundCloud songs" not in add_music_text
-        page.get_by_role("button", name="Find Clone Hero charts").click()
-        playwright.expect(page.get_by_text("50 of 200 songs complete", exact=True)).to_be_visible()
+        page.get_by_role("button", name="Find charts").click()
+        playwright.expect(page.get_by_text("50 of 200 songs checked", exact=True)).to_be_visible()
         assert page.locator("#progressPercent").inner_text() == "25%"
         assert page.locator("#progressEta").inner_text() == "About 4-6 minutes"
         _assert_in_viewport(page, "#progressEta")
         _assert_no_overflow(page)
-        page.get_by_role("heading", name="1 song has a recommended chart.").wait_for()
+        page.get_by_role("heading", name="Build your setlist.").wait_for()
         workspace_requests = [
             path for method, path, _body in api_calls
             if method == "GET" and path.startswith("/api/workspace?")
         ]
         assert workspace_requests
-        assert "tier=RECOMMENDED_EXACT%2CSAME_RECORDING_CHART_VARIANT%2CALTERNATE_RECORDING%2CPOSSIBLE_MATCH" in workspace_requests[-1]
+        assert "tier=" not in workspace_requests[-1]
+        assert "selected=" not in workspace_requests[-1]
+        playwright.expect(page.locator('[data-review-filter="all"]')).to_have_attribute("aria-pressed", "true")
         page.get_by_text("Alternate versions (1)", exact=True).click()
         playwright.expect(
-            page.get_by_text("Recording duration differs.", exact=True)
+            page.get_by_text("Different live recording.", exact=True)
         ).to_be_visible()
+        page.locator('details[data-disclosure-key$="ALTERNATE_RECORDING"] .concern-details > summary').click()
         assert page.get_by_text(
             "Recording duration differs from the imported track.", exact=True
-        ).count() == 0
+        ).is_visible()
         scope_posts = [json.loads(body or "{}") for method, path, body in api_calls if method == "POST" and path == "/api/spotify/scope"]
         assert scope_posts and scope_posts[-1]["playlist_ids"] == ["playlist-unknown"]
         assert page.locator("[data-step=confirm]").get_attribute("aria-current") == "step"
         _assert_no_overflow(page)
-        _capture(page, f"confirm-{viewport['width']}x{viewport['height']}.png")
+        _capture(page, f"journey-confirm-{viewport['width']}x{viewport['height']}.png")
 
         page.get_by_role("button", name="Search again").click()
         playwright.expect(page.get_by_label("Liked Songs")).to_be_visible()
@@ -508,10 +1092,10 @@ def test_public_authenticated_journey_to_download_ready(
         playwright.expect(
             page.get_by_text("2 combined unique songs in the latest import", exact=True)
         ).to_be_visible()
-        page.get_by_role("button", name="Find Clone Hero charts").click()
-        page.get_by_role("heading", name="1 song has a recommended chart.").wait_for()
+        page.get_by_role("button", name="Find charts").click()
+        page.get_by_role("heading", name="Build your setlist.").wait_for()
 
-        concern = page.get_by_text("1 chart concern", exact=True)
+        concern = page.locator(".song-group > .candidate-row .concern-details > summary")
         if has_touch:
             concern.click()
             assert page.get_by_text("This chart is an alternate album version.").is_visible()
@@ -521,22 +1105,23 @@ def test_public_authenticated_journey_to_download_ready(
         assert page.get_by_text("This chart is an alternate album version.").is_visible()
         _assert_no_overflow(page)
 
+        if page.locator(".selection-options").get_attribute("open") is None:
+            page.locator(".selection-options > summary").click()
         page.locator("#selectBestButton").click()
         page.locator("#continueDownloadButton").wait_for(state="visible")
         try:
             playwright.expect(page.locator("#continueDownloadButton")).to_be_enabled()
         except AssertionError:
             pytest.fail(f"selection did not settle: calls={api_calls!r}, error={page.locator('#appError').inner_text()!r}")
-        assert page.locator("#selectBestButton").get_attribute("aria-pressed") == "true"
-        assert page.get_by_text("Best Matches preset", exact=True).is_visible()
-        assert page.get_by_text("Selected chart", exact=True).is_visible()
-        assert page.locator("#continueDownloadButton").inner_text() == "Continue with 1 selected chart"
-        page.get_by_role("button", name="Continue with 1 selected chart").click()
-        assert page.get_by_role("heading", name="Prepare your Riff library.").is_visible()
+        assert page.locator("#selectionMode").inner_text() == "Last action: selected recommended charts."
+        assert page.get_by_role("button", name="Selected Misery Business chart by Community Charter. Clear this choice.").is_visible()
+        assert page.locator("#continueDownloadButton").inner_text() == "Review ZIP"
+        page.get_by_role("button", name="Review ZIP with 1 selected chart").click()
+        playwright.expect(page.locator("#downloadTitle")).to_have_text("Review your ZIP")
         assert "Songs folder" not in page.locator("#stageDownload").inner_text()
-        page.get_by_role("button", name="Prepare my Riff library").click()
-        page.get_by_role("heading", name="Your Riff library is ready.").wait_for()
-        download = page.get_by_role("link", name="Download library")
+        page.get_by_role("button", name="Prepare ZIP").click()
+        page.get_by_role("heading", name="Your ZIP is ready.").wait_for()
+        download = page.get_by_role("link", name="Download ZIP")
         assert download.is_visible()
         assert download.bounding_box()["height"] >= 44
         assert page.get_by_text("Scan Songs.", exact=True).is_visible()
@@ -674,6 +1259,9 @@ def test_public_expansion_confirm_and_reload_in_browser(public_server):
     _app, base_url, cookie_name, cookie = public_server
     expansion_started = {"value": False}
     expansion_selected = {"value": False}
+    selection_revision = {"value": 1}
+    expansion_job_polls = {"count": 0}
+    fail_expansion_recount = {"value": False}
 
     def route_api(route):
         request = route.request
@@ -713,10 +1301,16 @@ def test_public_expansion_confirm_and_reload_in_browser(public_server):
                 "job": ({"id": 12, "kind": "expansion", "status": "complete"} if expansion_started["value"] else None),
             }, 200
         elif path.startswith("/api/expansion/results?"):
+            if expansion_selected["value"] and fail_expansion_recount["value"]:
+                fail_expansion_recount["value"] = False
+                route.fulfill(status=503, content_type="application/json", body=json.dumps({"error": "Expansion summary is temporarily unavailable."}))
+                return
             candidate = {
                 "candidate_id": 51, "source": "enchor", "chart_id": 510,
                 "artist": "Paramore", "title": "Decode", "charter": "Community Charter",
                 "pack_name": "Full band", "artist_norm": "paramore", "kind": "expansion",
+                "instruments": ["guitar", "drums"], "diff_guitar": 4,
+                "result_tier": "RECOMMENDED_EXACT", "result_tier_reasons": [],
                 "score": 92, "quality": 20, "selected": expansion_selected["value"],
                 "selectable": True, "best": True,
                 "review": {"state": "strong", "label": "Recommended expansion", "concerns": [], "selectable": True},
@@ -735,6 +1329,7 @@ def test_public_expansion_confirm_and_reload_in_browser(public_server):
             expansion_started["value"] = True
             payload, status = {"job": {"id": 12, "kind": "expansion", "status": "queued"}}, 202
         elif path == "/api/jobs/12":
+            expansion_job_polls["count"] += 1
             payload, status = {"job": {
                 "id": 12, "kind": "expansion", "status": "complete", "phase": "complete",
                 "message": "Artist recommendations are ready.",
@@ -743,10 +1338,18 @@ def test_public_expansion_confirm_and_reload_in_browser(public_server):
         elif path == "/api/selection" and method == "POST":
             body = json.loads(request.post_data or "{}")
             assert body["kind"] == "expansion"
-            expansion_selected["value"] = body["action"] == "select"
+            assert body["selection_revision"] == selection_revision["value"]
+            next_selected = body["action"] == "select"
+            selection_revision["value"] += int(expansion_selected["value"] != next_selected)
+            expansion_selected["value"] = next_selected
             payload, status = {"ok": True}, 200
+        elif path == "/api/selection/history":
+            payload, status = {"operations": []}, 200
         else:
             payload, status = {"error": f"unexpected mocked request: {method} {path}"}, 500
+        if status < 400 and (path == "/api/journey" or path.startswith("/api/workspace?")
+                             or path.startswith("/api/expansion/") or path.startswith("/api/selection")):
+            payload.update(_empty_catalog_receipt(selection_revision["value"]))
         route.fulfill(status=status, content_type="application/json", body=json.dumps(payload))
 
     with playwright.sync_playwright() as runtime:
@@ -760,17 +1363,27 @@ def test_public_expansion_confirm_and_reload_in_browser(public_server):
         page.route("**/api/**", route_api)
         page.goto(base_url + "/", wait_until="networkidle")
 
-        playwright.expect(page.get_by_role("heading", name="Add more songs by artists you already love.")).to_be_visible()
+        playwright.expect(page.get_by_role("heading", name="More from your favorite artists.")).to_be_visible()
         page.get_by_label("Paramore", exact=False).check()
         page.get_by_role("button", name="Find more songs by selected artists").click()
         playwright.expect(page.locator(".review-card--expansion")).to_contain_text("Decode")
+        assert expansion_job_polls["count"] == 1
+        playwright.expect(page.locator(".review-card--expansion")).to_contain_text("guitar, drums")
+        playwright.expect(page.locator(".review-card--expansion")).to_contain_text("Guitar intensity rating 4")
+        fail_expansion_recount["value"] = True
         page.locator('[data-expansion-selection="select"]').click()
-        playwright.expect(page.get_by_text("1 charts selected", exact=True)).to_be_visible()
-        assert page.get_by_role("button", name="Continue with 1 selected chart").is_enabled()
+        playwright.expect(page.locator("#selectedCount")).to_have_text("Unknown")
+        playwright.expect(page.locator("#continueDownloadButton")).to_be_disabled()
+        playwright.expect(page.locator("#retrySelectionButton")).to_be_visible()
+        playwright.expect(page.locator('[data-expansion-selection="select"]')).to_be_disabled()
+        page.locator("#retrySelectionButton").click()
+        playwright.expect(page.locator("#selectedCount")).to_have_text("1")
+        assert page.get_by_role("button", name="Review ZIP with 1 selected chart").is_enabled()
         _assert_no_overflow(page)
 
         page.reload(wait_until="networkidle")
+        assert expansion_job_polls["count"] == 1
         assert page.get_by_label("Paramore", exact=False).is_checked()
-        playwright.expect(page.get_by_text("Selected chart", exact=True)).to_be_visible()
+        playwright.expect(page.locator('[data-expansion-selection="clear"]')).to_be_visible()
         _assert_no_overflow(page)
         browser.close()

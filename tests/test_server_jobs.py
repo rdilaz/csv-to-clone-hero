@@ -773,6 +773,23 @@ def test_spotify_only_live_fallback_refreshes_instead_of_using_stale_provenance(
         manager.shutdown(timeout=2)
 
 
+def test_live_yield_recomputation_does_not_count_blocked_high_quality_pair(config, db):
+    from tests.conftest import make_track, make_chart
+    workspace = db.get_workspace(Database.workspace_key_for_user("job-user"))
+    track = make_track("Acid Rain", "Chance the Rapper", spotify_id="legacy-acid-rain")
+    db.replace_tracks([track], {"yield.csv": 1})
+    db.replace_workspace_library_tracks(workspace["id"], [track])
+    generation = db.create_discovery_scan(workspace["id"], scan_key="legacy-yield", kind="exact", status="complete")
+    task = db.upsert_discovery_task(workspace["id"], scan_id=generation, source="test", query_key="legacy", status="complete")
+    wrong = make_chart("Mad Man", "Haste the Day", chart_id=98021, icon="rb2", charter="Harmonix")
+    db.upsert_workspace_candidate(workspace["id"], track.track_key, wrong, task_id=task,
+                                  score=82, eligibility="ELIGIBLE_REVIEW", decision="REVIEW")
+    stats = type("Stats", (), {"partial": False})()
+    audit = _live_yield_audit(config, db, workspace["id"], stats)
+    assert audit["yield_total"] == audit["yield_histogram"]["hard_rejected"] == 1
+    assert audit["yield_histogram"]["recommended_review"] == 0
+
+
 def test_live_yield_audit_keeps_failure_evidence_song_specific(config, db):
     from tests.conftest import make_track
 

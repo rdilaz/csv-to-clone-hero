@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 430 132" role="img" aria-labelledby="title">
+  <title id="title">Riff</title>
+  <defs>
+    <mask id="signal-cut">
+      <rect width="430" height="132" fill="white"/>
+
+      <path d="M-4 60h438v12H-4Z" fill="black"/>
+    </mask>
+  </defs>
+
+  <g fill="#f4f0e6" mask="url(#signal-cut)">
+    <path fill-rule="evenodd" d="M5 7h77c27 0 43 15 43 39 0 17-9 29-25 35l34 44H91L65 84H43v41H5V7Zm38 29v23h35c9 0 13-4 13-12 0-7-4-11-13-11H43Z"/>
+    <path d="M149 7h38v118h-38z"/>
+    <path d="M208 7h111v31h-73v21h61v31h-61v35h-38z"/>
+    <path d="M331 7h96v31h-58v22h52v31h-52v34h-38z"/>
+  </g>
+</svg>

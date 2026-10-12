@@ -1073,6 +1073,96 @@ def test_discovery_shortlists_broad_source_results(config):
     db.close()
 
 
+@pytest.mark.parametrize("recover", [False, True])
+def test_live_blocked_identity_never_counts_as_review_and_still_tries_song_fallback(config, recover):
+    from csv_to_clonehero.matching import BLOCKED, score_candidate
+    from .conftest import make_chart, make_track
+
+    titles = ["65th & Ingleside", "Acid Rain", "Good Ass Intro"]
+    wrong_pairs = [("10 Miles Wide", "Escape the Fate"), ("Mad Man", "Haste the Day")]
+
+    class Source:
+        name = "blocked-live-source"
+        supports_direct_download = True
+        download_hash_verified = False
+
+        def __init__(self):
+            self.calls = []
+
+        def chart(self, title, artist, chart_id):
+            chart = make_chart(title, artist, chart_id=chart_id, charter="Harmonix", icon="rb2")
+            chart.source = self.name
+            chart.pack_name = "Official Fixture Pack"
+            return chart
+
+        def search_artist(self, artist):
+            self.calls.append(("artist", artist))
+            return [self.chart(title, chart_artist, 910 + index)
+                    for index, (title, chart_artist) in enumerate(wrong_pairs)] + [
+                self.chart(titles[2], artist, 912)
+            ]
+
+        def search_song(self, artist, title):
+            self.calls.append(("song", artist, title))
+            return [self.chart(title, artist, 920 + titles.index(title))] if recover else []
+
+        def close(self):
+            pass
+
+    class Client:
+        def fetch_library(self, include_liked=True):
+            return LibraryImportResult([
+                SpotifyLibraryRecord(f"live-{index}", title, ["Chance the Rapper"])
+                for index, title in enumerate(titles)
+            ])
+
+    source = Source()
+    db = Database(config.database_path)
+    try:
+        for pass_index in range(2):
+            result = run_spotify_discovery(config, db, [source], Client())
+            assert result.status == "complete"
+            assert result.stats.fallback_tracks == 2
+            assert result.stats.exact_eligible == (3 if recover else 1)
+            assert result.stats.exact_recommended == (3 if recover else 1)
+            summary = db.get_discovery_song_progress_summary(result.workspace_id)
+            assert summary["review"] == 0
+            assert summary["strong"] == (3 if recover else 1)
+            assert summary["no_suitable"] == 0
+            assert summary["not_playable"] == (0 if recover else 2)
+            if not recover:
+                rows = db.get_discovery_song_progress(result.workspace_id)
+                assert all("title/artist uncertainty" in row["reason"]
+                           for row in rows if row["title"] in titles[:2])
+
+            # The reusable source response and numeric scoring remain intact;
+            # only effective workspace eligibility/terminal evidence changes.
+            key = db._conn.execute("SELECT query_key FROM search_queries WHERE kind='artist'").fetchone()[0]
+            cached, error = db.get_cached_query(key, 7)
+            assert error is None
+            assert {chart.chart_id for chart in cached} == {910, 911, 912}
+            candidates = db.get_workspace_candidates(result.workspace_id, include_rejected=True)
+            for index, requested in enumerate(titles[:2]):
+                row = next(row for row in candidates
+                           if row["chart_id"] == 910 + index and row["track_title"] == requested)
+                chart = db.get_candidate(row["candidate_id"])
+                raw = score_candidate(make_track(requested, "Chance the Rapper"), chart, config, source)
+                assert raw.eligibility == "ELIGIBLE_REVIEW"
+                assert raw.result_tier == BLOCKED
+                assert row["eligibility"] == "EXCLUDED"
+                assert row["score"] == pytest.approx(raw.final_score)
+                audit = json.loads(row["breakdown_json"])
+                assert audit["result_tier"] == BLOCKED
+                assert "title/artist uncertainty" in " ".join(audit["eligibility_reasons"])
+            # The second pass reevaluates cached metadata without provider calls.
+            assert len(source.calls) == 3
+            if pass_index:
+                assert result.stats.network_queries == 0
+                assert result.stats.cached_queries == result.stats.total_queries == 3
+    finally:
+        db.close()
+
+
 def test_discovery_cancellation_clears_partial_candidates(config):
     import threading
 

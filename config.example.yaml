@@ -76,9 +76,9 @@ monetization:
   ads_enabled: true
   ad_banner_slot: ""
   ad_sidebar_slot: ""
-  gofundme_enabled: true
-  gofundme_banner: true
-  # Leave empty for the built-in canonical campaign; GOFUNDME_URL overrides it.
+  gofundme_enabled: false
+  gofundme_banner: false
+  # Set a verified campaign before enabling; GOFUNDME_URL overrides this value.
   gofundme_url_env: GOFUNDME_URL
   gofundme_url: ""
 

@@ -290,10 +290,10 @@ def classify_result_tier(
     if (
         title_state == "borderline"
         and artist_state == "borderline"
-        and duration_conflict
+        and not gates.get("external_identity_match")
     ):
         return BLOCKED, [
-            "combined title/artist uncertainty plus material duration conflict"
+            "combined title/artist uncertainty without trusted song identity"
         ]
     if plausible_pair and (version_conflict or duration_conflict):
         reasons = []
@@ -1704,8 +1704,10 @@ def score_expansion_candidate(
     chart: ChartCandidate,
     config: AppConfig,
     source: Any = None,
+    *,
+    include_compatible: bool = False,
 ) -> ScoreBreakdown:
-    """Score a chart for artist-expansion (artist must match strongly)."""
+    """Score expansion quality; optionally retain exact-artist charts for review."""
     breakdown = _new_breakdown()
 
     if not has_playable_content(chart):
@@ -1790,6 +1792,29 @@ def score_expansion_candidate(
     # Eligibility still uses the shared 90/70 export thresholds.  The legacy
     # expansion minimum remains in ``decision`` for old planner callers.
     _set_threshold_eligibility(breakdown, config, update_decision=False)
+    if include_compatible:
+        selected_artist = normalize_artist(str(artist_norm or ""))
+        chart_artist = str(getattr(chart, "artist", "") or "")
+        chart_primary, _ = split_artists(chart_artist)
+        exact_artist = bool(selected_artist and selected_artist in {
+            normalize_artist(chart_artist), normalize_artist(chart_primary),
+        })
+        promoted = bool(
+            exact_artist
+            and not chart_markers & {"karaoke", "tribute", "cover"}
+            and breakdown.eligibility == EXCLUDED
+            and not breakdown.gate_factors.get("hard_gate")
+        )
+        _record_factor(breakdown, "expansion_coverage", {
+            "include_compatible": True,
+            "exact_artist_identity": exact_artist,
+            "quality_floor_bypassed": promoted,
+        })
+        if promoted:
+            _set_eligibility(breakdown, ELIGIBLE_REVIEW, [
+                "exact-artist compatible chart retained for explicit review",
+            ])
+            breakdown.decision = "REVIEW"
     _apply_result_tier(breakdown, kind="expansion")
     _sync_factors(breakdown)
     return breakdown

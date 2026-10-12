@@ -32,9 +32,13 @@ values are:
 | `CATALOG_PATH` | Complete catalog on persistent state; default `/data/catalog/enchor.jsonl` |
 
 Optional values configure SoundCloud OAuth, transactional email, and the
-GoFundMe link. For SoundCloud in production, set an explicit HTTPS
-`soundcloud.redirect_uri` in `config.yaml` and register the same URI with
-SoundCloud. The default loopback URI is for local use only.
+GoFundMe link. Support links and the banner are disabled by default; no campaign
+is assumed. Verify the destination before configuring `GOFUNDME_URL` and opting
+in with `monetization.gofundme_enabled` / `gofundme_banner`.
+For SoundCloud in production, register `<APP_BASE_URL>/api/auth/soundcloud/callback`
+with SoundCloud. With an empty `soundcloud.redirect_uri`, the public app derives
+that callback from `APP_BASE_URL`; an explicit configured URI overrides it.
+The loopback fallback is for local use only.
 
 Generate secrets with:
 
@@ -44,6 +48,27 @@ python -m csv_to_clonehero keys
 
 Back up `SECRET_KEY` and `TOKEN_ENCRYPTION_KEY` separately from the database.
 Losing the Fernet key makes stored refresh tokens permanently unreadable.
+
+### Disk capacity
+
+Set `EXPORT_MINIMUM_FREE_BYTES` in the existing deployment environment or `.env`
+to a positive integer chosen for this host's capacity and other storage users.
+Compose forwards it to the public application, where it overrides
+`export.minimum_free_bytes` without changing the saved YAML. Blank or unset
+preserves the YAML value; the bundled default is **0**, so leaving it blank does
+not configure a reserve. Negative, boolean, and non-integer values stop startup.
+
+The image does not copy the host's `config.yaml`, and Compose does not mount it.
+Editing only that host file therefore does not configure the running container.
+Verify the effective reserve inside the application before launching. Back up
+the existing environment separately from `/data`.
+
+`storage.max_library_gib` limits one export's chart contents (default 48 GiB),
+not total retained ZIP bytes. One worker serializes builds, but completed ZIPs
+can remain for 15 minutes, up to three per workspace, with no global byte cap.
+Size the persistent volume for retained ZIPs, temporary artifacts and a new
+ZIP, plus the chosen reserve. Watch free capacity and launch with a bounded
+audience until aggregate retention has been measured or separately limited.
 
 ## First Deployment
 
@@ -110,7 +135,11 @@ docker compose --profile backup run --rm backupper
 
 The sidecar writes `backups/csv_to_clonehero_<timestamp>.db`, and `backups/`
 is ignored by Git. Copy backups to an off-host location and retain an operator-
-chosen history, such as 30 days.
+chosen history, such as 30 days. This command backs up SQLite only, including
+the validation ledger; it does not copy `/data/catalog`. Separately preserve the
+checksum-valid catalog snapshot (or its reproducible acquisition inputs), and
+protect the stable encryption/session keys in the chosen secret manager.
+Losing `TOKEN_ENCRYPTION_KEY` makes stored refresh tokens unreadable.
 
 Restore only while the application is stopped:
 
@@ -140,7 +169,8 @@ an older image after a schema change.
 
 ## Health and Monitoring
 
-- `/healthz` is unauthenticated and is the container probe target.
+- `/healthz` is unauthenticated and is the container liveness probe target. It
+  does not prove database, catalog, provider, or worker readiness.
 - Repeated Enchor HTTP 429 responses indicate too much concurrency, another
   running instance, or an overly aggressive request delay. Reduce concurrency;
   do not add workers.
@@ -148,8 +178,16 @@ an older image after a schema change.
   checksum-valid, or `mode=live_fallback` with a catalog diagnostic otherwise.
 - Watch job statuses for `partial`, `failed`, `cancelled`, and `interrupted`.
   Cached successful queries remain resumable.
+- `POST /api/download` queues a ZIP preparation job and returns HTTP 202 with
+  its ID. The authenticated browser polls `GET /api/jobs/<id>` and reads the
+  single-use link from `/api/journey` only after the job completes. Preparation
+  uses the same one-worker queue as matching; do not add another service worker
+  to make large ZIPs appear faster.
 - Public chart ZIPs are short-lived and single-use. They are assembled in
-  transient staging and removed after streaming or expiry.
+  transient staging and removed after streaming or expiry. The job result
+  records a report and archive timestamp, never the token or file path. A
+  container restart can leave a completed job without a usable link; the user
+  must prepare a new ZIP from saved choices in that case.
 - User refresh tokens are encrypted at rest. Logs and diagnostics must not
   contain tokens, cookies, or OAuth authorization values.
 
@@ -163,4 +201,5 @@ an older image after a schema change.
 | Enchor returns 429 | Only one container instance, one job worker, low `network.concurrency`, seven-day cache |
 | Jobs remain interrupted | Container restart, database health, and job heartbeat/status rows |
 | ZIP creation fails | Selected eligible candidates, Enchor availability, writable `/data`, and container logs |
+| ZIP job completes but link is unavailable | Container restart, token expiry or consumption; ask the user to prepare again from saved choices |
 | Site is unreachable | Cloudflare Tunnel route, Compose health, port binding, `/healthz` |

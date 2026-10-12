@@ -1,13 +1,14 @@
 {% extends "base.html" %}
 {% block title %}{{ page }} | Riff{% endblock %}
 {% block content %}
-<section class="card">
+<section class="card static-page static-page--legal">
+  <p class="kicker">RIFF POLICIES</p>
   <h1>{{ page }}</h1>
 
   {% if page == "Terms of Service" %}
   <p class="muted">Last updated: {{ now_year }}. This is a plain-English summary; legally binding terms follow the same intent.</p>
   <h2>1. What this service does</h2>
-   <p>Riff connects your Spotify library to chart files hosted by
+   <p>Riff lets you browse community charts or connect your music library to chart files hosted by
       independent chart authors (via Chorus Encore). We help you find and
       download those chart files. Public ZIPs are staged only for delivery and
       are removed after download or expiry.</p>
@@ -40,6 +41,12 @@
       library metadata needed for matching. We never sell your data.</p>
   <h2>Cookies and sessions</h2>
   <p>We use a single signed, HttpOnly session cookie to keep you signed in.</p>
+  <h2>Chart audio previews</h2>
+  <p>When you choose Play, your browser requests available chart audio directly
+     from Enchor's file service. That service receives the request and your
+     network address. The listening queue is kept in this browser session,
+     separate from the chart choices saved for your ZIP. Signing out clears
+     the session's listening queue.</p>
   <h2>Your choices</h2>
   <p>Sign out at any time. You can revoke this app's access from your Spotify
      account settings, which deletes our ability to act for you.</p>
@@ -49,8 +56,8 @@
   <p>Chart files are the work of their individual authors and are available
       through Chorus Encore (enchor.us). We do not retain chart files as a
       hosted library. Song
-     metadata and track names are used solely to match your Spotify library to
-     existing charts.</p>
+     metadata and track names are used to browse the catalog, preview available
+     chart audio and match music-library tracks to existing charts.</p>
   <h2>DMCA takedowns</h2>
   <p>If you believe material available via this site or linked chart content
      infringes your copyright, please contact the operator with:

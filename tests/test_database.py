@@ -345,6 +345,25 @@ def test_cached_query_freshness_check_skips_candidate_materialization(tmp_path):
     db.close()
 
 
+@pytest.mark.parametrize("lookup_time", [100.0, 99.0])
+def test_zero_ttl_disables_cache_without_clock_progress(tmp_path, monkeypatch, lookup_time):
+    monkeypatch.setattr("csv_to_clonehero.database.time.time", lambda: 100.0)
+    db = Database(tmp_path / "state.db")
+    try:
+        key = db.query_key("song", "artist", "title", source_name="test")
+        db.record_query(key, "song", "Artist - Title", [make_chart("Title", "Artist")])
+        monkeypatch.setattr("csv_to_clonehero.database.time.time", lambda: lookup_time)
+
+        assert db.cached_query_is_fresh(key, ttl_days=7)
+        assert not db.cached_query_is_fresh(key, ttl_days=0)
+        assert db.fresh_cached_query(key, ttl_days=0) is None
+        assert db.get_cached_query(key, ttl_days=0) is None
+        assert db.get_cached_query_metadata(key) is not None
+        assert db.get_cached_query(key, ttl_days=-1) is not None
+    finally:
+        db.close()
+
+
 def test_select_workspace_candidate_force_allows_excluded_but_not_incompatible(tmp_path):
     from csv_to_clonehero.models import ChartCandidate
 

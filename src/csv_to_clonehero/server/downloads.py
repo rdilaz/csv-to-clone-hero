@@ -26,7 +26,7 @@ from typing import Any, Callable, Iterable
 
 from csv_to_clonehero.config import AppConfig
 from csv_to_clonehero.database import Database
-from csv_to_clonehero.exporter import ExportOptions, ExportService
+from csv_to_clonehero.exporter import ExportOptions, ExportService, SNG_VALIDATION_VERSION
 from csv_to_clonehero.models import ChartCandidate
 from csv_to_clonehero.sources.base import ChartSource
 
@@ -150,10 +150,14 @@ class BrowserDownloads:
     def create(self, user_id: int, workspace_id: int, archive_path: Path) -> dict[str, Any]:
         stamp = secrets.token_urlsafe(24)
         key = _safe_basename(stamp)
-        expires_at = time.time() + self.ttl_seconds
+        created_at = time.time()
+        expires_at = created_at + self.ttl_seconds
         expiry_int = int(expires_at)
         payload = f"{key}:{expiry_int}"
         token = f"{key}.{expiry_int}.{_sign(payload, self.key)}"
+        # Receipt identity is independent of the bearer URL and wall clock.
+        # It associates a job with its archive and never authorizes delivery.
+        archive_id = secrets.token_hex(16)
         archive_path = Path(archive_path)
         with self._lock:
             self._index[key] = {
@@ -164,23 +168,23 @@ class BrowserDownloads:
                 "size": archive_path.stat().st_size,
                 "signed": f"{key}.{expiry_int}",
                 "token": token,
-                "created_at": time.time(),
+                "archive_id": archive_id,
+                "created_at": created_at,
             }
-            retained = sorted(
-                (
-                    (old_key, meta)
-                    for old_key, meta in self._index.items()
-                    if int(meta.get("user_id", -1)) == int(user_id)
-                    and int(meta.get("workspace_id", -1)) == int(workspace_id)
-                ),
-                key=lambda item: float(item[1].get("created_at", 0)),
-                reverse=True,
-            )
+            # Registry insertion order survives equal or backward clock ticks.
+            retained = [
+                (old_key, meta)
+                for old_key, meta in reversed(self._index.items())
+                if int(meta.get("user_id", -1)) == int(user_id)
+                and int(meta.get("workspace_id", -1)) == int(workspace_id)
+            ]
             for old_key, meta in retained[_MAX_RETAINED_PER_WORKSPACE:]:
                 self._index.pop(old_key, None)
                 self._revoke_meta(meta)
         return {
             "token": token,
+            "archive_id": archive_id,
+            "created_at": created_at,
             "expires_at": expires_at,
             "ttl_seconds": self.ttl_seconds,
             "size_bytes": archive_path.stat().st_size,
@@ -274,9 +278,10 @@ class BrowserDownloads:
             ]
             if not matches:
                 return None
-            meta = max(matches, key=lambda item: float(item.get("created_at", 0)))
+            meta = matches[-1]
             return {
                 "token": meta["token"],
+                "archive_id": meta["archive_id"],
                 "expires_at": meta["expires_at"],
                 "ttl_seconds": self.ttl_seconds,
                 "size_bytes": meta["size"],
@@ -307,6 +312,33 @@ def _safe_basename(value: str) -> str:
     return name or "download"
 
 
+def selection_snapshot(db: Database, workspace_id: int) -> dict[str, Any]:
+    """Bind a queued archive to one exact generation and set of choices.
+
+    Persist only the digest and counts in the job; artist/title data and the
+    full selection list stay in the workspace tables.
+    """
+    current = db.get_current_exact_generation(workspace_id)
+    latest = db.get_latest_exact_generation(workspace_id)
+    generation_id = int(current["id"]) if current is not None else -1 if latest is not None else 0
+    choices = []
+    rows = db.list_workspace_selections(workspace_id)
+    if rows and all(row["kind"] == "catalog" for row in rows):
+        generation_id = 0
+    for row in rows:
+        item = dict(row)
+        choices.append(tuple(str(item.get(key) or "") for key in (
+            "kind", "track_id", "candidate_id", "artist_norm", "metadata_json"
+        )))
+    choices.sort()
+    encoded = json.dumps(choices, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return {
+        "generation_id": generation_id,
+        "selection_count": len(choices),
+        "selection_fingerprint": "sha256:" + hashlib.sha256(encoded).hexdigest(),
+    }
+
+
 def build_archive(
     config: AppConfig,
     db: Database,
@@ -315,6 +347,7 @@ def build_archive(
     staging_dir: Path,
     *,
     progress: Callable[[int, int, str], None] | None = None,
+    cancellation_event: threading.Event | None = None,
 ) -> tuple[Path, dict[str, Any]]:
     """Assemble the selected charts into one ZIP and return (archive, summary).
 
@@ -351,6 +384,9 @@ def build_archive(
         managed_sync=False,
         continue_on_error=True,
         include_manifest_in_zip=True,
+        minimum_free_bytes=max(
+            0, int(getattr(config.export, "minimum_free_bytes", 0) or 0)
+        ),
         download_workers=min(
             16,
             max(1, int(getattr(config.export, "download_workers", 3) or 3)),
@@ -367,7 +403,7 @@ def build_archive(
         metadata = json.loads(str(value.get("metadata_json") or "{}"))
         from csv_to_clonehero.matching import POSSIBLE_MATCH, SELECTABLE_RESULT_TIERS
 
-        return tier in SELECTABLE_RESULT_TIERS and (
+        return tier in (SELECTABLE_RESULT_TIERS | {"CATALOG_CHOICE"}) and (
             tier != POSSIBLE_MATCH
             or bool(metadata.get("possible_confirmed"))
             or not metadata.get("selection_origin")
@@ -387,6 +423,7 @@ def build_archive(
             options=options,
             eligibility_checker=checker,
             progress=progress,
+            cancellation_event=cancellation_event,
         )
         artifact_refs = {
             (str(item.get("source") or "").casefold(), int(item.get("chart_id") or 0)):
@@ -405,17 +442,23 @@ def build_archive(
                     *identity,
                     artifact_ref=artifact_ref,
                     state="VERIFIED",
-                    validator_version="sng-playability-v1",
+                    validator_version=item.validation_version,
                     artifact_sha256=item.sha256,
                     size_bytes=item.bytes_count,
                     playable_note_count=item.playable_note_count,
+                    validation={
+                        "valid": True,
+                        "validation_version": item.validation_version,
+                        "playable_note_count": item.playable_note_count,
+                        "note_counts": dict(item.note_counts),
+                    },
                 )
             elif item.status == "invalid":
                 db.record_chart_artifact_validation(
                     *identity,
                     artifact_ref=artifact_ref,
                     state="REJECTED",
-                    validator_version="sng-playability-v1",
+                    validator_version=SNG_VALIDATION_VERSION,
                     reason_code="ARTIFACT_VALIDATION_FAILED",
                     reason=item.failure,
                 )
@@ -506,7 +549,7 @@ def _validated_selections(
 
         data = dict(row) if hasattr(row, "keys") else {}
         kind = str(data.get("kind") or "exact").casefold()
-        if kind not in {"exact", "expansion"}:
+        if kind not in {"exact", "expansion", "catalog"}:
             continue
         if kind == "expansion" and (config is None or not config.server.enable_expansion):
             continue
@@ -519,7 +562,12 @@ def _validated_selections(
         current_score = data.get("score")
         selection_metadata = json.loads(str(data.get("metadata_json") or "{}"))
         current_tier = ""
-        if kind == "exact":
+        if kind == "catalog":
+            from csv_to_clonehero.server.catalog_browse import current_catalog_choice
+            if config is None or not current_catalog_choice(config, db, workspace_id, data, candidate):
+                continue
+            current_eligibility, current_tier, current_score = "ELIGIBLE_REVIEW", "CATALOG_CHOICE", 0
+        elif kind == "exact":
             track_id = int(data.get("track_id") or 0)
             if track_id not in workspace_track_ids:
                 continue
@@ -582,11 +630,15 @@ def _validated_selections(
                 normalize_artist(str(candidate.artist or "")),
                 normalize_title(str(candidate.name or "")),
             )
-            breakdown = score_expansion_candidate(artist_norm, candidate, config)
+            breakdown = score_expansion_candidate(
+                artist_norm, candidate, config,
+                include_compatible=metadata.get("coverage_mode") == "all",
+            )
             current_eligibility = str(getattr(breakdown, "eligibility", "") or "")
             current_tier = classify_result_tier(breakdown, kind="expansion")[0]
             if (
                 bool(getattr(breakdown, "gate_factors", {}).get("hard_gate"))
+                or current_eligibility not in {"RECOMMENDED", "ELIGIBLE_REVIEW"}
                 or current_tier == BLOCKED
                 or current_tier not in SELECTABLE_RESULT_TIERS
             ):

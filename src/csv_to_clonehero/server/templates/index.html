@@ -1,82 +1,69 @@
 {% extends "base.html" %}
-{% block title %}Riff | Music to Clone Hero{% endblock %}
+{% block title %}Riff | Your music, ready to play{% endblock %}
 {% block content %}
 {% if not authenticated %}
 <section class="landing" aria-labelledby="landing-title">
-  <div class="landing__copy">
-    <p class="kicker">YOUR MUSIC. PLAYABLE.</p>
-    <h1 id="landing-title">Turn the music you love into a Clone Hero library.</h1>
-    <p class="lede">Riff checks your Spotify music against community-made charts, helps you choose the right versions, and prepares one clean download.</p>
-    <a class="button button--spotify button--large" href="/login">
-      <span class="spotify-dot" aria-hidden="true"></span>
-      Continue with Spotify
-    </a>
-    <p class="consent">By continuing, you agree to the <a href="/terms">Terms</a> and <a href="/privacy">Privacy Policy</a>.</p>
+  <div class="landing__intro">
+    <p class="eyebrow"><span class="signal-dot" aria-hidden="true"></span> Your music. Your setlist.</p>
+    <h1 id="landing-title">Find your next<br><em>favorite riff.</em></h1>
+    <p class="landing__subline">From your Spotify library to the Clone Hero stage.</p>
   </div>
-  <div class="landing__art" aria-hidden="true">
-    <div class="record"><span></span></div>
-    <div class="signal signal--one"></div>
-    <div class="signal signal--two"></div>
-    <div class="signal signal--three"></div>
-    <div class="art-label"><b>RIFF</b><span>READY TO PLAY</span></div>
+  <div class="landing__art riff-scene-wrap" aria-hidden="true">
+    <div class="scene-fallback"><span></span><i></i></div>
+    <canvas id="riff-scene" data-riff-scene tabindex="-1"></canvas>
+    <div class="scene-caption"><span>RIFF / PLAYER 01</span><span>BUILD YOUR SETLIST</span></div>
+  </div>
+  <div class="landing__action">
+    <p class="lede">Discover playable community charts, shuffle through your finds, and build a ZIP full of songs you want to play.</p>
+    <a class="button button--large" href="/login">Connect Spotify <span aria-hidden="true">↗</span></a>
+    <p class="sign-in-note">Spotify is your sign-in. No separate Riff password. After sign-in, you can also add an optional SoundCloud export in the private Add Music step.</p>
+    <p class="consent">By continuing, you agree to the <a href="/terms">Terms</a> and <a href="/privacy">Privacy Policy</a>.</p>
   </div>
 </section>
 
 <section class="path" aria-label="How Riff works">
-  <div><span>01</span><strong>Your music</strong><small>Choose what you love</small></div>
-  <i aria-hidden="true"></i>
-  <div><span>02</span><strong>Community charts</strong><small>Matched with care</small></div>
-  <i aria-hidden="true"></i>
-  <div><span>03</span><strong>Clone Hero</strong><small>Download and play</small></div>
-</section>
-
-<aside class="optional-import">
-  <div class="optional-import__body optional-import__body--compact">
-    <div>
-      <h2>SoundCloud is welcome, too.</h2>
-      <p>Continue with Spotify first, then add an optional SoundCloud CSV or JSON export from the private Add Music step.</p>
-    </div>
-    <p class="fine-print"><a href="/browser-exporter.js">Get Riff's optional metadata exporter</a>. It reads rendered track details only.</p>
-  </div>
-</aside>
-
-<section class="trust-strip" aria-label="Riff privacy and delivery">
-  <div><strong>No new password</strong><span>Spotify's secure sign-in</span></div>
-  <div><strong>You choose every chart</strong><span>Nothing is installed automatically</span></div>
-  <div><strong>Browser download</strong><span>A short-lived library ZIP</span></div>
+  <div><span class="path__icon" aria-hidden="true">01</span><strong>Your music</strong><small>Choose the library you already love.</small></div>
+  <div><span class="path__icon" aria-hidden="true">02</span><strong>Community charts</strong><small>See the versions and evidence clearly.</small></div>
+  <div><span class="path__icon" aria-hidden="true">03</span><strong>Clone Hero</strong><small>Download only the charts you select.</small></div>
 </section>
 {% else %}
 <div class="app-shell" id="riffApp" data-user-name="{{ user.display_name }}">
-  <nav class="journey-steps" aria-label="Riff progress">
+  <nav class="journey-steps" aria-label="Signal Check progress">
     <ol>
-      <li data-step="add"><span>1</span><b>Add music</b></li>
-      <li data-step="find"><span>2</span><b>Find charts</b></li>
-      <li data-step="confirm"><span>3</span><b>Confirm charts</b></li>
-      <li data-step="download"><span>4</span><b>Download</b></li>
-      <li data-step="done"><span>5</span><b>Done</b></li>
+      <li data-step="add"><span>1</span><b><span class="step-label-full">Add Music</span><span class="step-label-short">Add</span></b></li>
+      <li data-step="find"><span>2</span><b><span class="step-label-full">Find Charts</span><span class="step-label-short">Find</span></b></li>
+      <li data-step="confirm"><span>3</span><b><span class="step-label-full">Build setlist</span><span class="step-label-short">Setlist</span></b></li>
+      <li data-step="download"><span>4</span><b><span class="step-label-full">Download</span><span class="step-label-short">Download</span></b></li>
+      <li data-step="done"><span>5</span><b><span class="step-label-full">Done</span><span class="step-label-short">Done</span></b></li>
     </ol>
   </nav>
 
-  <div class="app-error" id="appError" role="alert" hidden></div>
+  <div class="app-error" id="appError" role="alert" tabindex="-1" hidden></div>
 
   <section class="journey-stage" id="stageLoading" aria-labelledby="loadingTitle">
-    <p class="kicker">RIFF</p>
-    <h1 id="loadingTitle">Restoring your library...</h1>
+    <p class="kicker">OPENING YOUR STUDIO</p>
+    <h1 id="loadingTitle">Loading your music...</h1>
     <div class="loading-line" aria-hidden="true"><span></span></div>
   </section>
 
   <section class="journey-stage" id="stageAdd" aria-labelledby="addTitle" hidden>
+    <div class="studio-stage-hero">
     <header class="stage-heading">
       <p class="kicker">ADD MUSIC</p>
-      <h1 id="addTitle">Choose the music you want to play.</h1>
-      <p>Pick Liked Songs, playlists, or both. Riff will merge duplicates before looking for charts.</p>
+      <h1 id="addTitle">Start with<br><em>your music.</em></h1>
+      <p>Select Liked Songs, playlists, or both. Riff reports source entries first, then the exact combined unique-song total after import.</p>
+      <p>You can also browse the chart catalog and add charts directly to your final ZIP. Importing a music library is optional for catalog browsing.</p>
+      <button class="button button--secondary" type="button" data-open-catalog>Browse chart catalog</button>
     </header>
+    <div class="studio-stage-art riff-scene-wrap" aria-hidden="true"><div class="scene-fallback"><span></span><i></i></div><canvas data-riff-scene tabindex="-1"></canvas></div>
+    </div>
 
     <div class="source-grid">
       <article class="source-card source-card--spotify">
+        <p class="source-card__channel">Primary source</p>
         <div class="source-card__header">
           <span class="source-icon source-icon--spotify" aria-hidden="true">S</span>
-          <div class="source-card__identity"><h2>Spotify</h2><p>Connected as {{ user.display_name }}</p></div>
+          <div class="source-card__identity"><h2>Spotify</h2><p>{{ user.display_name }}</p></div>
           <span class="status-pill">Connected</span>
         </div>
         <div class="source-refresh">
@@ -84,21 +71,22 @@
           <button class="text-button" id="refreshSpotifyButton" type="button">Refresh Spotify</button>
         </div>
         <div class="playlist-actions" role="group" aria-label="Spotify playlist selection">
-          <button class="button button--secondary" id="selectAllPlaylistsButton" type="button">Select all playlists</button>
-          <button class="button button--secondary" id="clearPlaylistsButton" type="button">Clear all playlists</button>
+          <button class="text-button" id="selectAllPlaylistsButton" type="button">Select all playlists</button>
+          <button class="text-button" id="clearPlaylistsButton" type="button">Clear playlist checks</button>
         </div>
         <div id="spotifyChoices" class="choice-list" aria-busy="true"><p>Loading your Spotify music...</p></div>
         <p class="fine-print" id="spotifyImportedSummary"></p>
       </article>
 
       <article class="source-card source-card--soundcloud">
+        <p class="source-card__channel">Optional source</p>
         <div class="source-card__header">
           <span class="source-icon" aria-hidden="true">SC</span>
-          <div class="source-card__identity"><h2>SoundCloud</h2><p>Optional export import</p></div>
+          <div class="source-card__identity"><h2>SoundCloud</h2><p>CSV or JSON export</p></div>
           <span class="status-pill status-pill--quiet" id="soundcloudCount">Not added</span>
         </div>
         <details class="source-details">
-          <summary>Add SoundCloud music</summary>
+          <summary>Add a SoundCloud export</summary>
           <form id="soundcloudForm" class="upload-form upload-form--stacked">
             <label class="file-control" for="soundcloudFile"><span>Choose CSV or JSON</span><input id="soundcloudFile" name="file" type="file" accept=".csv,.json" required></label>
             <button class="button button--secondary" type="submit">Import export</button>
@@ -113,131 +101,247 @@
     </div>
 
     <aside class="music-tally" id="musicTally" aria-live="polite">
-      <span>Your selection</span><strong>Choose music above</strong><small>Exact unique-song count is shown after import.</small>
+      <span>Selected library</span><strong>Choose music above</strong><small>Exact combined unique-song count appears after import.</small>
     </aside>
     <div class="primary-action">
-      <button class="button button--large" id="findChartsButton" type="button">Find Clone Hero charts</button>
-      <p>Riff checks the community library carefully. Large collections can take time.</p>
+      <button class="button button--large" id="findChartsButton" type="button">Find charts</button>
+      <p>Your source choices are saved when the search starts.</p>
     </div>
   </section>
 
   <section class="journey-stage" id="stageFind" aria-labelledby="findTitle" hidden>
     <div class="matching-layout">
-      <div class="progress-disc" id="progressDisc" role="progressbar" aria-label="Chart matching progress" aria-valuemin="0" aria-valuemax="100">
-        <span id="progressPercent">0%</span><small>complete</small>
+      <div class="matching-art riff-scene-wrap" aria-hidden="true">
+        <div class="scene-fallback"><span></span><i></i></div><canvas data-riff-scene tabindex="-1"></canvas>
+        <div class="scene-caption"><span>SEARCH / IN PROGRESS</span><span>YOUR MUSIC IS SAVED</span></div>
       </div>
-      <div class="matching-copy">
+      <div class="matching-copy progress-module">
         <p class="kicker">FIND CHARTS</p>
-        <h1 id="findTitle">Finding your Clone Hero charts.</h1>
-        <p id="progressMessage" class="lede" role="status" aria-live="polite">Preparing your music...</p>
-        <p class="progress-eta"><span>Estimated time left</span><strong id="progressEta">Estimating...</strong></p>
-        <div class="thin-progress" aria-hidden="true"><span id="progressBar"></span></div>
+        <h1 id="findTitle">Finding your charts</h1>
+        <section class="search-recovery" id="searchRecovery" aria-labelledby="searchRecoveryTitle" hidden>
+          <p class="kicker">SEARCH PAUSED</p>
+          <h2 id="searchRecoveryTitle">Your music is still here.</h2>
+          <p id="searchRecoveryMessage" role="status" aria-live="polite"></p>
+          <p class="fine-print">Your saved music choices are kept. You can try again or choose different music.</p>
+          <div class="search-recovery__actions">
+            <button class="button" id="retrySearchButton" type="button">Try search again</button>
+            <button class="button" id="retryJobButton" type="button" hidden>Check search status</button>
+            <button class="text-button" id="changeMusicButton" type="button">Change music</button>
+            <button class="text-button" id="savedSearchResultsButton" type="button" hidden>View saved results</button>
+          </div>
+          <p class="fine-print" id="savedSearchResultsNote" hidden>Saved results may be from an earlier search.</p>
+          <details class="delivery-technical" id="searchTechnicalDetails" hidden><summary>Technical details</summary><p id="searchTechnicalError"></p></details>
+        </section>
+        <p class="progress-phase"><span>Current phase</span><strong id="progressMessage">Preparing your music...</strong></p>
+        <p class="progress-percent" id="progressPercent">Working...</p>
+        <div class="thin-progress is-indeterminate" id="progressDisc" role="progressbar" aria-label="Chart matching progress" aria-valuemin="0" aria-valuemax="100"><span id="progressBar"></span></div>
         <p class="progress-count" id="progressCount">Starting...</p>
-        <p class="current-song" id="currentSong"></p>
-        <p class="calm-note">You can close this page and come back. Your progress is saved to your account.</p>
+        <p class="current-song"><span>Checking now</span><strong id="currentSong">Waiting for the first song...</strong></p>
+        <p class="calm-note" id="searchLeaveNote"><strong>Safe to leave.</strong> Once the search starts, progress is saved to your account. You can close this page and come back.</p>
+        <details class="activity-details" id="activityDetails">
+          <summary>Matching details</summary>
+          <div class="activity-toolbar"><label for="activitySearch">Filter songs</label><input id="activitySearch" type="search" autocomplete="off"></div>
+          <ul class="activity-list" id="activityList"></ul>
+          <div class="pager"><button class="button button--secondary" id="activityPrev" type="button">Previous</button><span id="activityPage"></span><button class="button button--secondary" id="activityNext" type="button">Next</button></div>
+        </details>
+        <div class="progress-footer">
+          <button class="text-button" id="cancelJobButton" type="button">Cancel search</button>
+          <p class="progress-eta"><span>Estimated time left</span><strong id="progressEta">Estimating...</strong></p>
+        </div>
       </div>
     </div>
-    <details class="activity-details" id="activityDetails">
-      <summary>Matching details</summary>
-      <div class="activity-toolbar"><label for="activitySearch">Filter songs</label><input id="activitySearch" type="search" autocomplete="off"></div>
-      <ul class="activity-list" id="activityList"></ul>
-      <div class="pager"><button class="button button--secondary" id="activityPrev" type="button">Previous</button><span id="activityPage"></span><button class="button button--secondary" id="activityNext" type="button">Next</button></div>
-    </details>
-    <div class="secondary-action"><button class="text-button" id="cancelJobButton" type="button">Cancel this search</button></div>
   </section>
 
   <section class="journey-stage" id="stageConfirm" aria-labelledby="confirmTitle" hidden>
-    <header class="stage-heading stage-heading--wide">
-      <p class="kicker">CONFIRM CHARTS</p>
-      <h1 id="confirmTitle"><span id="chartsFoundCount">0</span> <span id="chartsFoundLabel">songs have recommendations.</span></h1>
-      <p>Start with the cleanest matches, then disclose chart variants and alternate recordings only when wanted.</p>
-    </header>
+    <div class="confirm-layout">
+      <div class="confirm-ledger">
+        <header class="confirm-heading">
+          <p class="kicker">YOUR MUSIC STUDIO</p>
+          <h1 id="confirmTitle">Build your <em>setlist.</em></h1>
+          <dl class="library-totals" aria-label="Imported music and chart counts">
+            <div><dt>All imported unique songs</dt><dd id="librarySongCount">...</dd></div>
+            <div><dt id="chartsFoundLabel">Songs with recommended charts</dt><dd id="chartsFoundCount">...</dd></div>
+            <div><dt>Selected charts from your music</dt><dd id="librarySelectedChartCount">...</dd></div>
+          </dl>
+          <div class="library-context">
+            <div><p class="library-boundary">Selected imports only</p><p class="catalog-brief" id="catalogCoverageBrief" role="status">Loading chart catalog coverage...</p></div>
+            {% if config.server.enable_expansion %}<a class="expansion-jump" href="#expansionTitle" aria-label="Find more songs by artists in your imported music">Artist expansion ↓</a>{% endif %}
+          </div>
+        </header>
 
-    <div class="cohort-grid" role="group" aria-label="Quick chart selection">
-      <button class="cohort-card" id="selectBestButton" type="button" aria-pressed="false">
-        <span class="cohort-card__option">OPTION A</span><b>Best Matches</b>
-        <small>Only confident song and artist matches</small><strong id="bestMatchCount">0 charts</strong>
-      </button>
-      <button class="cohort-card" id="selectAllButton" type="button" aria-pressed="false">
-        <span class="cohort-card__option">OPTION B</span><b>All Safe Charts</b>
-        <small>Recommended charts and variants of the same recording</small><strong id="allMatchCount">0 charts</strong>
-      </button>
-      <button class="cohort-card" id="selectMaximumButton" type="button" aria-pressed="false">
-        <span class="cohort-card__option">OPTION C</span><b>Maximum Playable</b>
-        <small>Adds alternate live, remix, acoustic, cover, and instrumental recordings</small><strong id="maximumMatchCount">0 charts</strong>
-      </button>
-    </div>
+        <section class="studio-panel" id="studio-panel" aria-labelledby="studio-panel-title">
+          <div class="studio-quick-select">
+            <p class="kicker">BULK SELECTION</p>
+            <h2 id="studio-panel-title">Choose your song pool.</h2>
+            <p class="studio-panel-copy">Select across every page. Eligible charts still need file validation before they can enter the ZIP.</p>
+            <div class="studio-select-controls">
+              <label for="studio-select-scope">Song pool<select id="studio-select-scope"><option value="both" selected>My music + artist expansion</option><option value="library">My imported music</option><option value="expansion">Artist expansion</option></select></label>
+              <label for="studio-select-policy">Versions<select id="studio-select-policy"><option value="one_per_song" selected>One chart per song</option><option value="all_versions">Every compatible version</option></select></label>
+            </div>
+            <label class="studio-uncertain-choice"><input id="studio-include-uncertain" type="checkbox"> Include possible matches with uncertain song identity</label>
+            <p class="fine-print">Alternate recordings may be included. Hard-blocked identities remain unavailable. Unknown difficulties are checked during preparation.</p>
+            <div class="studio-selection-preview" id="studio-selection-preview" role="status" aria-live="polite">Checking the operation scope…</div>
+            <button class="button studio-select-all" id="studio-select-all" type="button" disabled><span aria-hidden="true">＋</span> Apply selection</button>
+            <p class="studio-action-status" id="studio-select-status" role="status" aria-live="polite">Loading your chart pool…</p>
+          </div>
+          <section class="studio-deck" id="studio-deck" aria-labelledby="studio-deck-title" aria-describedby="studio-deck-keys" tabindex="0">
+            <p class="sr-only" id="studio-deck-keys">When this listening deck is focused, press Right Arrow for the next song or A to select its chart.</p>
+            <div class="studio-deck-heading"><p class="kicker" id="studio-deck-title">SHUFFLE &amp; DISCOVER</p><span class="studio-deck-mark" aria-hidden="true">◉</span></div>
+            <div class="studio-deck-now">
+              <div class="studio-deck-art riff-scene-wrap" id="studio-deck-art" aria-hidden="true"><div class="scene-fallback"><span></span><i></i></div><canvas data-riff-scene tabindex="-1"></canvas></div>
+              <div class="studio-deck-track"><span class="studio-now-tier" id="studio-now-tier">YOUR CHART POOL</span><h3 id="studio-now-title">Your next eligible song</h3><p id="studio-now-artist">Shuffle or browse every eligible result.</p><p class="studio-now-coverage" id="studio-now-coverage">Expert-only charts stay in the mix.</p><p class="studio-chart-title" id="studio-chart-title" hidden></p></div>
+            </div>
+            <div class="studio-deck-actions"><button class="button button--secondary" id="studio-shuffle" type="button" disabled><span aria-hidden="true">⤨</span> Shuffle</button><button class="button button--secondary" id="studio-next" type="button" disabled>Next <span aria-hidden="true">→</span></button><button class="button" id="studio-add" type="button" disabled><span aria-hidden="true">＋</span> Select chart</button></div>
+            <p class="studio-queue-position" id="studio-queue-position">Browse all eligible songs; 100 load per page.</p>
+            <p class="fine-print studio-key-hints">Focus this deck: Right Arrow advances; A adds the chart. Shuffle keeps its order until you shuffle again.</p>
+            <div class="studio-deck-options"><label><input id="studio-skip-selected" type="checkbox" checked> Skip selected songs</label><button class="text-button" id="studio-undo" type="button" disabled>Undo last selection change</button><button class="text-button" id="studio-player-toggle" type="button" disabled>Preview chart audio</button></div>
+            <a class="studio-now-link" id="studio-now-link" href="https://open.spotify.com/" target="_blank" rel="noopener noreferrer" hidden>Original song on Spotify ↗</a>
+            <div class="studio-player-host" id="studio-player-host" hidden></div>
+            <p class="studio-action-status" id="studio-deck-status" role="status" aria-live="polite">Chart audio is checked when played. Listening and ZIP choices are separate.</p>
+          </section>
+        </section>
 
-    <div class="selection-bar">
-      <p><span><strong id="selectedCount">0</strong> charts selected</span><small id="selectionMode">No selection preset</small></p>
-      <button class="text-button" id="clearSelectionButton" type="button">Clear choices</button>
-    </div>
+        <section class="selection-tools" aria-labelledby="selectionToolsTitle">
+          <h2 class="sr-only" id="selectionToolsTitle">Selection options</h2>
+          <div class="selection-tools__actions">
+            <details class="selection-options">
+              <summary>Fine-tune selections &amp; catalog details</summary>
+              <div>
+                <p class="library-scope">Selected imports only: music you haven't imported is not included. Browse every imported song, including songs without a selectable chart.</p>
+                <aside class="catalog-coverage" aria-labelledby="catalogCoverageTitle">
+                  <h2 id="catalogCoverageTitle">Chart catalog</h2>
+                  <p id="catalogCoverage">Loading chart catalog coverage...</p>
+                  <p class="catalog-snapshot" id="catalogSnapshot" hidden></p>
+                </aside>
+                <button class="button button--compact" id="selectBestButton" type="button">Select recommended <span id="bestMatchCount">0</span></button>
+                <button class="button button--secondary" id="selectAllButton" type="button">Select same-recording charts <span id="allMatchCount">0</span></button>
+                <button class="button button--secondary" id="selectMaximumButton" type="button">Include alternate recordings <span id="maximumMatchCount">0</span></button>
+                <button class="text-button" id="clearSelectionButton" type="button" aria-label="Clear choices from your music">Clear</button>
+              </div>
+            </details>
+          </div>
+          <p class="selection-scope">Presets affect this review scope: your music only.</p>
+        </section>
 
-    <section class="review-list" aria-labelledby="quickReviewTitle">
-      <div class="review-toolbar">
-        <div><h2 id="quickReviewTitle">Quick confirmation</h2><p id="reviewSummary">Your recommendations</p></div>
-        <label class="search-field"><span class="sr-only">Search recommendations</span><input id="reviewSearch" type="search" placeholder="Search artist or song" autocomplete="off"></label>
-      </div>
-      <div class="filter-row" role="group" aria-label="Filter chart recommendations">
-        <button type="button" data-review-filter="recommended" aria-pressed="true">All playable</button>
-        <button type="button" data-review-filter="strong" aria-pressed="false">Recommended</button>
-        <button type="button" data-review-filter="review" aria-pressed="false">Possible matches</button>
-        <button type="button" data-review-filter="selected" aria-pressed="false">Selected</button>
-      </div>
-      <div id="reviewCards" aria-live="polite"></div>
-      <div class="pager" id="reviewPager"><button class="button button--secondary" id="reviewPrev" type="button">Previous</button><span id="reviewPage"></span><button class="button button--secondary" id="reviewNext" type="button">Next</button></div>
-    </section>
+        <section class="review-list" aria-labelledby="quickReviewTitle">
+          <div class="review-toolbar">
+            <div><p class="kicker">THE CRATE</p><h2 id="quickReviewTitle">All imported songs</h2><p id="reviewSummary">Loading your music...</p></div>
+            <label class="search-field"><span class="sr-only">Search imported songs</span><input id="reviewSearch" type="search" placeholder="Search your music" autocomplete="off"></label>
+          </div>
+          <div class="filter-row" role="group" aria-label="Filter imported songs">
+            <button type="button" data-review-filter="all" aria-pressed="true">All imported songs</button>
+            <button type="button" data-review-filter="recommended" aria-pressed="false">All eligible</button>
+            <button type="button" data-review-filter="strong" aria-pressed="false">Recommended</button>
+            <button type="button" data-review-filter="review" aria-pressed="false">Possible matches</button>
+            <button type="button" data-review-filter="selected" aria-pressed="false">Selected</button>
+          </div>
+          <div class="selection-change-receipt"><p class="selection-message" id="selectionMessage" role="status" aria-live="polite"></p><button class="button button--secondary" id="selectionUndoButton" type="button" disabled>Undo last selection change</button><p class="fine-print" id="selectionUndoStatus">No confirmed selection change to undo.</p></div>
+          <div class="selection-error" id="selectionError" role="alert" hidden></div>
+          <button class="text-button selection-retry" id="retrySelectionButton" type="button" hidden>Refresh selection summary</button>
+          <div id="reviewCards" aria-busy="true"></div>
+          <div class="pager" id="reviewPager"><button class="button button--secondary" id="reviewPrev" type="button">Previous</button><span id="reviewPage"></span><button class="button button--secondary" id="reviewNext" type="button">Next</button></div>
+        </section>
     {% if config.server.enable_expansion %}
     <section class="expansion-panel" id="expansionPanel" aria-labelledby="expansionTitle">
       <div class="expansion-panel__heading">
-        <div><p class="kicker">OPTIONAL</p><h2 id="expansionTitle">Add more songs by artists you already love.</h2></div>
+        <div><p class="kicker">GO DEEPER</p><h2 id="expansionTitle" tabindex="-1">More from<br><em>your favorite artists.</em></h2></div>
         <p>Choose artists from your imported music. Riff only uses verified catalog coverage, skips every song already in your library, and keeps these choices separate from exact matches.</p>
       </div>
+      <fieldset class="expansion-coverage" id="expansionCoverageChoices">
+        <legend>How many additional songs?</legend>
+        <label><input type="radio" name="expansionCoverage" value="all" checked disabled><span>All eligible songs <small>Maximum catalog coverage</small></span></label>
+        <label><input type="radio" name="expansionCoverage" value="recommended"><span>Recommended amount <small>Use the per-artist song limit</small></span></label>
+      </fieldset>
+      <p class="fine-print" id="expansionCoverageExplanation">Loading expansion options...</p>
+      <label class="expansion-all-artists"><input type="checkbox" id="allExpansionArtists" disabled><span>All artists in my imported music <small id="allExpansionArtistCount">Loading eligible artists...</small></span></label>
       <div class="expansion-choices" id="expansionChoices" aria-live="polite"><p>Loading eligible artists...</p></div>
       <div class="expansion-actions">
         <button class="button button--secondary" id="startExpansionButton" type="button" disabled>Find more songs by selected artists</button>
+        <button class="button" id="retryExpansionButton" type="button" hidden>Check expansion status</button>
+        <details class="delivery-technical" id="expansionTechnicalDetails" hidden><summary>Technical details</summary><p id="expansionTechnicalError"></p></details>
         <p id="expansionStatus" role="status" aria-live="polite"></p>
       </div>
+      <p class="fine-print">Optional, not part of your imported song count. Finding again replaces the entire expansion set, including choices for unchecked artists; your music selections stay unchanged.</p>
       <div class="expansion-results" id="expansionResults" hidden>
         <div class="review-toolbar"><div><h2>Expansion recommendations</h2><p><span id="expansionResultCount">0</span> additional songs available</p></div></div>
+        <button class="button button--secondary" id="selectExpansionSongsButton" type="button" disabled>Select one chart per additional song</button>
+        <p class="fine-print">Prefer inspected charts with multiple guitar difficulty levels when available. Expert-only charts remain included; unknown levels are checked during ZIP preparation.</p>
       <div id="expansionCards"></div>
       <button class="button button--secondary" id="loadMoreExpansion" type="button" hidden>Load more songs</button>
       </div>
     </section>
     {% endif %}
-    <div class="primary-action">
-      <button class="button button--large" id="continueDownloadButton" type="button" disabled>Continue with selected charts</button>
+        <div class="confirm-secondary-actions">
       <button class="text-button" id="searchAgainButton" type="button">Search again</button>
+        </div>
+      </div>
+      <aside class="selection-rail" id="selectionRail" aria-labelledby="selectionRailTitle">
+        <div class="zip-crate-icon" aria-hidden="true"><span></span><span></span><span></span></div>
+        <p class="kicker" id="selectionRailTitle">YOUR SELECTION</p>
+        <p class="selection-rail__total"><strong id="selectedCount">0</strong><span>charts</span></p>
+        <dl>
+          <div><dt>From your music</dt><dd><strong id="exactSelectedCount">0</strong> <span id="exactSelectedLabel">charts</span> for <strong id="selectedSongCount">0</strong> <span id="selectedSongLabel">songs</span></dd></div>
+          <div><dt>Artist expansion</dt><dd><strong id="expansionSelectedCount">0</strong> additional</dd></div>
+          <div><dt>Catalog browsing</dt><dd><strong id="catalogSelectedCount">0</strong> charts</dd></div>
+        </dl>
+        <p class="fine-print" id="catalogSelectionStatus">Catalog choices are saved separately from imported-song matches.</p>
+        <p class="selection-rail__state" id="selectionMode">Selections are saved as you make them.</p>
+        <button class="button button--large" id="continueDownloadButton" type="button" disabled>Review ZIP <span aria-hidden="true">→</span></button>
+      </aside>
     </div>
   </section>
 
   <section class="journey-stage" id="stageDownload" aria-labelledby="downloadTitle" hidden>
-    <header class="stage-heading">
-      <p class="kicker">DOWNLOAD</p>
-      <h1 id="downloadTitle">Prepare your Riff library.</h1>
-      <p>Riff will download and validate your selected charts, then package them into one ZIP for your browser.</p>
-    </header>
-    <div class="download-card">
-      <div class="zip-art" aria-hidden="true"><span>ZIP</span></div>
-      <div><span class="eyebrow">YOUR RIFF LIBRARY</span><strong><span id="downloadSelectionCount">0</span> selected charts</strong><p>Only validated playable chart files are included. The delivery link expires shortly and works once.</p></div>
-    </div>
-    <div class="boundary-note"><strong>Browser download only</strong><span>Riff cannot see or write to folders on your computer.</span></div>
-    <div class="primary-action">
-      <button class="button button--large" id="prepareDownloadButton" type="button">Prepare my Riff library</button>
+    <section class="download-preparation-panel" id="downloadPreparationPanel" aria-labelledby="downloadTitle">
+      <header class="stage-heading">
+        <p class="kicker">DOWNLOAD / PREPARATION</p>
+        <h1 id="downloadTitle">Review your ZIP.</h1>
+        <p>Riff validates the selected chart files and packages eligible files into one ZIP for your browser.</p>
+      </header>
+      <div class="delivery-status">
+      <p id="downloadStatus" role="status" aria-live="polite">Checking the current saved selection.</p>
+      <p class="fine-print" id="downloadLastCheck"></p>
+      <div class="delivery-busy" id="downloadBusyIndicator" aria-hidden="true" hidden><span></span></div>
+      </div>
+    <div class="primary-action delivery-actions">
+      <button class="button button--large" id="prepareDownloadButton" type="button" disabled>Prepare ZIP</button>
+      <button class="button button--secondary" id="refreshDownloadButton" type="button" hidden>Check preparation status</button>
+      <button class="text-button" id="cancelDownloadButton" type="button" hidden>Cancel preparation</button>
       <button class="text-button" id="backToChartsButton" type="button">Change chart choices</button>
-      <p id="downloadStatus" role="status" aria-live="polite"></p>
+      <button class="text-button" id="previousDownloadButton" type="button" hidden>View the earlier ZIP</button>
     </div>
+      <details class="delivery-technical" id="downloadTechnicalDetails" hidden><summary>Technical details</summary><p id="downloadTechnicalError"></p></details>
+    </section>
+    <div class="delivery-ledger">
+      <div class="delivery-total"><span class="eyebrow">SELECTED CHART ENTRIES</span><strong id="downloadSelectionCount">Awaiting confirmation</strong><span id="downloadSelectionFreshness">Checking the current saved choices.</span></div>
+      <dl class="delivery-counts">
+        <div><dt>From your music</dt><dd id="downloadExactSummary">Checking saved choices...</dd></div>
+        <div><dt>Artist expansion</dt><dd id="downloadExpansionSummary">Checking additional charts...</dd></div>
+        <div><dt>From catalog browsing</dt><dd id="downloadCatalogSummary">Checking catalog choices...</dd></div>
+      </dl>
+    </div>
+    <details class="delivery-details" id="deliveryDetails" data-disclosure-key="delivery:selection">
+      <summary>Selected chart details</summary>
+      <p class="fine-print">Saved selections, not a delivery manifest. The preparation report gives the final artifact count.</p>
+      <div id="deliverySelectionList"></div>
+      <p class="fine-print" id="deliverySelectionStatus" role="status"></p>
+      <button class="button button--secondary" id="deliverySelectionMore" type="button" hidden>Load more chart details</button>
+    </details>
+    <div class="boundary-note"><strong>Browser download only</strong><span>Riff cannot see or write to folders on your computer. Duplicate selections may share one file; validation can exclude charts. Preparation continues on the server if you leave this page; return to check its status and download the ZIP before its link expires.</span></div>
   </section>
 
   <section class="journey-stage done-stage" id="stageDone" aria-labelledby="doneTitle" hidden>
-    <div class="done-mark" aria-hidden="true"><span></span></div>
-    <p class="kicker">DONE</p>
-    <h1 id="doneTitle">Your Riff library is ready.</h1>
-    <p class="lede" id="doneSummary">Your selected charts passed Riff's checks and are packaged for download.</p>
-    <a class="button button--large" id="downloadLibraryLink" href="#">Download library</a>
+    <p class="kicker">DONE / DELIVERY REPORT</p>
+    <h1 id="doneTitle">Your ZIP is ready.</h1>
+    <p class="lede" id="doneSummary"></p>
+    <dl class="delivery-counts done-counts" id="doneCounts" hidden></dl>
+    <div class="delivery-warnings" id="doneWarnings" role="status" hidden></div>
+    <a class="button button--large" id="downloadLibraryLink" download="riff-library.zip" hidden>Download ZIP</a>
     <p class="expiry-note" id="downloadExpiry"></p>
+    <p class="fine-print" id="downloadHandoff" role="status">Ready to download is not confirmation that your browser saved the ZIP.</p>
+    <button class="text-button" id="refreshLinkButton" type="button" hidden>Check download availability</button>
     <div class="install-steps">
-      <h2>Put it into Clone Hero</h2>
+      <h2>Add it to Clone Hero or YARG</h2>
       <ol>
         <li><span>1</span><p><strong>Extract the ZIP.</strong><small>Open the downloaded file and extract its contents.</small></p></li>
         <li><span>2</span><p><strong>Move the songs.</strong><small>Put the extracted song folders in your Clone Hero Songs folder.</small></p></li>
@@ -246,6 +350,7 @@
       </ol>
     </div>
     <button class="text-button" id="prepareAgainButton" type="button">Prepare a new download</button>
+    <button class="text-button" id="doneReviewButton" type="button">Review chart choices</button>
   </section>
 </div>
 {% endif %}

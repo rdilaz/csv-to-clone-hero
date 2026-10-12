@@ -18,16 +18,19 @@ the worker advances one job at a time.
 from __future__ import annotations
 
 import logging
+import hashlib
 import threading
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from csv_to_clonehero.config import AppConfig
 from csv_to_clonehero.database import Database
 from csv_to_clonehero.sources.base import ChartSource
 from csv_to_clonehero.server.auth import build_oauth, build_soundcloud_oauth, build_spotify_client
+from csv_to_clonehero.server.downloads import BrowserDownloads, build_archive, selection_snapshot
 from csv_to_clonehero.server.notifications import EmailSender
 from csv_to_clonehero.server.security import TokenCipher
 from csv_to_clonehero.server.throttle import global_gate
@@ -50,6 +53,7 @@ class JobResult:
     error: str = ""
     progress: dict[str, Any] = field(default_factory=dict)
     result: dict[str, Any] = field(default_factory=dict)
+    created_at: float | None = None
     started_at: float | None = None
     finished_at: float | None = None
     cancel_requested: bool = False
@@ -119,6 +123,7 @@ def _from_row(row: Any) -> JobResult:
         error=payload["error"],
         progress=payload["progress"],
         result=payload["result"],
+        created_at=payload["created_at"],
         started_at=payload["started_at"],
         finished_at=payload["finished_at"],
         cancel_requested=payload["cancel_requested"],
@@ -135,6 +140,7 @@ class JobManager:
         cipher: TokenCipher,
         *,
         source_factory: Callable[[AppConfig], list[ChartSource]] | None = None,
+        downloads: BrowserDownloads | None = None,
         sender: EmailSender | None = None,
         poll_interval: float = 1.0,
         auto_start: bool = True,
@@ -142,6 +148,7 @@ class JobManager:
         self.config = config
         self.cipher = cipher
         self.source_factory = source_factory or _default_source_factory
+        self.downloads = downloads
         self.sender = sender or EmailSender(config.notifications)
         self.poll_interval = max(0.1, float(poll_interval))
         self._cv = threading.Condition()
@@ -149,6 +156,10 @@ class JobManager:
         self._thread: threading.Thread | None = None
         self._handles: dict[int, JobResult] = {}
         self._cancel_events: dict[int, threading.Event] = {}
+        self._availability_lock = threading.Lock()
+        self._availability_cache: tuple[tuple, dict[str, Any]] | None = None
+        from csv_to_clonehero.server.catalog_browse import CatalogBrowser
+        self.catalog_browser = CatalogBrowser(config)
         self._recover_orphaned_jobs()
         if auto_start:
             self.start()
@@ -159,6 +170,7 @@ class JobManager:
         try:
             recovered = db.recover_running_jobs()
             recovered_discovery = db.recover_interrupted_discovery()
+            db.recover_public_expansion_changes()
         finally:
             db.close()
         if recovered:
@@ -189,6 +201,58 @@ class JobManager:
             self._thread.join(timeout=timeout)
 
     # ---- public API --------------------------------------------------------
+    def request_catalog_browse(self) -> None:
+        self.catalog_browser.request()
+        with self._cv:
+            self._cv.notify_all()
+
+    def _availability_key(self, db: Database) -> tuple:
+        from csv_to_clonehero.catalog import MAX_CATALOG_HEADER_BYTES
+
+        path = self.config.catalog_path
+        try:
+            stat = path.stat()
+            identity = (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
+            # A bounded header read catches atomic/content replacements even
+            # when an operator preserves the file's size and modification time.
+            with path.open("rb") as stream:
+                header = stream.readline(MAX_CATALOG_HEADER_BYTES + 1)
+            header_identity = hashlib.sha256(header).hexdigest()
+        except OSError:
+            identity = None
+            header_identity = None
+        return (str(path), identity, header_identity, db.chart_validation_fingerprint())
+
+    def discovery_availability(self, db: Database) -> dict[str, Any]:
+        """A request reads readiness; only the worker parses a cold catalog."""
+        from csv_to_clonehero.server.safeguards import get_enchor_preflight
+
+        key = self._availability_key(db)
+        with self._availability_lock:
+            cached = self._availability_cache
+        if cached is not None and cached[0] == key:
+            result = dict(cached[1])
+            if result.get("mode") == "catalog" or float(result.get("expires_at") or 0) > time.time():
+                return result
+        if key[1] is None:
+            result = get_enchor_preflight(db)
+            result.update(mode="live_fallback", catalog_available=False,
+                          catalog_diagnostic="The local chart catalog is unavailable.")
+            return result
+        return {"available": False, "fresh": False, "usable": False,
+                "status": "check_required", "busy": False, "retryable": True,
+                "retry_after_seconds": 0, "source": "enchor",
+                "message": "Check chart readiness before finding charts."}
+
+    def _save_discovery_availability(self, db: Database, result: dict[str, Any], key: tuple) -> dict[str, Any]:
+        if key != self._availability_key(db):
+            return {"available": False, "fresh": False, "usable": False,
+                    "status": "stale", "busy": False, "retryable": True,
+                    "message": "The chart catalog changed during its check. Check readiness again."}
+        with self._availability_lock:
+            self._availability_cache = (key, dict(result))
+        return result
+
     def enqueue(
         self,
         user_id: int,
@@ -250,12 +314,23 @@ class JobManager:
         finally:
             db.close()
 
+    def latest_for_user_workspace(self, user_id: int, *, workspace_key: str, kind: str) -> JobResult | None:
+        db = Database(self.config.database_path)
+        try:
+            row = db.get_latest_job(user_id, workspace_key=workspace_key, kind=kind)
+            return _from_row(row) if row is not None else None
+        finally:
+            db.close()
+
     # ---- worker ------------------------------------------------------------
     def _loop(self) -> None:
         global_gate()  # ensure the shared gate exists
         while not self._shutdown_event.is_set():
             next_job = self._dequeue_next()
             if next_job is None:
+                if self.catalog_browser.pending():
+                    self.catalog_browser.prepare()
+                    continue
                 with self._cv:
                     if self._shutdown_event.is_set():
                         break
@@ -283,6 +358,9 @@ class JobManager:
             if self._cancelled(job.id):
                 self._mark(job.id, status="cancelled", phase="cancelled", message="Job cancelled")
                 return
+            if job.kind == "preflight":
+                self._run_preflight(job)
+                return
             if job.kind == "discovery":
                 from csv_to_clonehero.server.safeguards import (
                     get_discovery_availability,
@@ -291,8 +369,14 @@ class JobManager:
 
                 db = Database(self.config.database_path)
                 try:
+                    self._mark(job.id, status="running", phase="checking_catalog",
+                               message="Checking chart readiness")
+                    key = self._availability_key(db)
                     if not get_discovery_availability(self.config, db).get("fresh"):
-                        refresh_enchor_preflight(self.config, db, self.source_factory)
+                        result = refresh_enchor_preflight(self.config, db, self.source_factory)
+                    else:
+                        result = get_discovery_availability(self.config, db)
+                    self._save_discovery_availability(db, result, key)
                 finally:
                     db.close()
             if self._cancelled(job.id):
@@ -332,8 +416,141 @@ class JobManager:
             self._run_discovery(job)
         elif job.kind == "expansion":
             self._run_expansion(job)
+        elif job.kind == "download":
+            self._run_download(job)
         else:
             raise ValueError(f"unknown job kind: {job.kind}")
+
+    def _run_preflight(self, job: JobResult) -> None:
+        """Catalog verification/provider probes share the existing FIFO worker."""
+        from csv_to_clonehero.server.safeguards import refresh_enchor_preflight
+
+        self._mark(job.id, status="running", phase="checking_catalog", message="Checking chart catalog readiness")
+        db = Database(self.config.database_path)
+        try:
+            user = db.get_user(job.user_id)
+            if user is None or job.workspace_key != Database.workspace_key_for_user(str(user["spotify_user_id"])):
+                raise RuntimeError("This chart-readiness check is no longer available.")
+            key = self._availability_key(db)
+            result = refresh_enchor_preflight(self.config, db, self.source_factory)
+            result = self._save_discovery_availability(db, result, key)
+            if result.get("mode") == "catalog":
+                self.catalog_browser.request()
+                self.catalog_browser.prepare()
+            if self._cancelled(job.id):
+                self._mark(job.id, status="cancelled", phase="cancelled", message="Chart-readiness check cancelled")
+                return
+            self._mark(job.id, status="complete", phase="complete",
+                       message="Charts ready" if result.get("usable") else "Chart-readiness check finished",
+                       result={"preflight": result})
+        finally:
+            db.close()
+
+    def _run_download(self, job: JobResult) -> None:
+        """Prepare one user-owned ZIP off the request thread.
+
+        The durable job records status and a safe report. Signed delivery
+        tokens and staging paths remain solely in BrowserDownloads memory.
+        """
+        if self.downloads is None:
+            raise RuntimeError("Download preparation is unavailable.")
+        db = Database(self.config.database_path)
+        archive: Path | None = None
+        registered_token: str | None = None
+        try:
+            workspace = db.get_workspace(job.workspace_key)
+            user = db.get_user(job.user_id)
+            if (
+                workspace is None
+                or user is None
+                or str(workspace["workspace_key"]) != Database.workspace_key_for_user(
+                    str(user["spotify_user_id"])
+                )
+            ):
+                raise RuntimeError("The selected workspace is no longer available.")
+            workspace_id = int(workspace["id"])
+            current_snapshot = selection_snapshot(db, workspace_id)
+            if (
+                not current_snapshot["selection_count"]
+                or current_snapshot["generation_id"] != job.progress.get("generation_id")
+                or current_snapshot["selection_fingerprint"] != job.progress.get("selection_fingerprint")
+            ):
+                raise RuntimeError("Chart choices changed while the download was queued. Review and prepare again.")
+
+            self._mark(
+                job.id, status="running", phase="preparing",
+                message="Validating and packaging selected charts",
+                progress={**job.progress, "completed": 0, "total": current_snapshot["selection_count"]},
+            )
+            cancel_event = self._cancel_events[job.id]
+            last_update = 0.0
+
+            def on_progress(completed: int, total: int, label: str) -> None:
+                nonlocal last_update
+                now = time.monotonic()
+                if now - last_update < 0.5 and completed < total:
+                    return
+                last_update = now
+                packaging = label == "Writing ZIP archive"
+                self._mark(
+                    job.id, status="running", phase="packaging" if packaging else "validating",
+                    message="Packaging ZIP archive" if packaging else "Validating selected charts",
+                    progress={**job.progress, "completed": completed, "total": total},
+                    heartbeat_at=time.time(),
+                )
+
+            with self.downloads.building(workspace_id):
+                archive, summary = build_archive(
+                    self.config, db, workspace_id, None, self.downloads.root,
+                    progress=on_progress, cancellation_event=cancel_event,
+                )
+                after_build = selection_snapshot(db, workspace_id)
+                if (
+                    after_build["generation_id"] != current_snapshot["generation_id"]
+                    or after_build["selection_count"] != current_snapshot["selection_count"]
+                    or after_build["selection_fingerprint"] != current_snapshot["selection_fingerprint"]
+                ):
+                    raise RuntimeError("Chart choices changed while the ZIP was prepared. Review and prepare again.")
+                if self._cancelled(job.id) or self._shutdown_event.is_set():
+                    self._mark(job.id, status="cancelled", phase="cancelled", message="Download preparation cancelled")
+                    return
+                download = self.downloads.create(job.user_id, workspace_id, archive)
+                registered_token = download["token"]
+                archive = None  # BrowserDownloads now owns and sweeps the ZIP.
+                if self._cancelled(job.id) or self._shutdown_event.is_set():
+                    self.downloads.revoke(registered_token)
+                    registered_token = None
+                    self._mark(job.id, status="cancelled", phase="cancelled", message="Download preparation cancelled")
+                    return
+            partial = bool(summary.get("failed") or summary.get("remaining") or summary.get("errors"))
+            finished = db.finish_download_job_if_active(
+                job.id,
+                status="partial" if partial else "complete",
+                message="ZIP ready with exceptions" if partial else "ZIP ready",
+                progress={**job.progress, "completed": summary.get("selected", 0), "total": summary.get("selected", 0)},
+                result={
+                    "summary": summary,
+                    "archive_id": download["archive_id"],
+                    "archive_created_at": download["created_at"],
+                    "size_bytes": download["size_bytes"],
+                },
+            )
+            if finished is None:
+                self.downloads.revoke(registered_token)
+                registered_token = None
+                if self._cancelled(job.id):
+                    self._mark(job.id, status="cancelled", phase="cancelled", message="Download preparation cancelled")
+                return
+            self._handles[job.id] = _from_row(finished)
+            registered_token = None
+        except Exception:
+            if registered_token is not None:
+                self.downloads.revoke(registered_token)
+            raise
+        finally:
+            if archive is not None:
+                archive.unlink(missing_ok=True)
+            db.close()
 
     def _run_expansion(self, job: JobResult) -> None:
         """Build a confirmed expansion solely from the validated local catalog."""
@@ -343,6 +560,9 @@ class JobManager:
         if not self.config.server.enable_expansion:
             raise RuntimeError("Artist expansion is disabled.")
         artists = [str(value) for value in job.progress.get("artists", ())]
+        coverage_mode = str(job.progress.get("coverage_mode") or "recommended")
+        if coverage_mode not in {"all", "recommended"}:
+            raise RuntimeError("coverage_mode must be all or recommended")
         expected_generation = int(job.progress.get("exact_generation_id") or 0)
         if not artists:
             raise RuntimeError("Choose at least one artist to expand.")
@@ -355,6 +575,8 @@ class JobManager:
             progress={**job.progress, "completed_artists": 0, "total_artists": len(artists)},
         )
         db = Database(self.config.database_path)
+        restore_context = None
+        restore_workspace = None
         try:
             workspace = db.get_workspace(job.workspace_key)
             if workspace is None:
@@ -383,6 +605,12 @@ class JobManager:
             )
             if not catalog.available:
                 raise RuntimeError(catalog.diagnostic or "The local chart catalog is unavailable.")
+            restore_workspace = int(workspace["id"])
+            with db.atomic_workspace_selection():
+                expected_revision = job.progress.get("selection_revision")
+                if expected_revision is not None and int(expected_revision) != db.public_selection_revision(restore_workspace):
+                    raise RuntimeError("The choices changed before artist expansion started; review them and try again.")
+                restore_context = db.begin_public_expansion_change(restore_workspace, expected_generation)
 
             def on_progress(payload: Mapping[str, Any]) -> None:
                 if self._cancelled(job.id):
@@ -404,6 +632,7 @@ class JobManager:
                 catalog=catalog,
                 exact_generation_id=expected_generation,
                 on_progress=on_progress,
+                coverage_mode=coverage_mode,
             )
             current = db.get_current_exact_generation(workspace["id"])
             if current is None or int(current["id"]) != expected_generation:
@@ -421,9 +650,15 @@ class JobManager:
                 "total_artists": len(artists),
                 "completed_artists": len(artists),
                 "recommendations": int(result.candidates),
+                "coverage_mode": coverage_mode,
+                "all_artists": bool(job.progress.get("all_artists", False)),
                 "catalog_snapshot_id": result.catalog_snapshot_id,
                 "network_requests": 0,
             }
+            with db.atomic_workspace_selection():
+                db.finish_public_expansion_change(restore_workspace, expected_generation, restore_context)
+            restore_context = None
+            payload.update(db.public_selection_receipt(restore_workspace))
             self._mark(
                 job.id,
                 status="cancelled" if cancelled else "complete",
@@ -433,6 +668,11 @@ class JobManager:
                 result=payload,
             )
         finally:
+            if restore_context is not None:
+                # A failed/cancelled replacement may already have changed some
+                # artists. Its owned restore point survives the terminal job.
+                with db.atomic_workspace_selection():
+                    db.finish_public_expansion_change(restore_workspace, expected_generation, restore_context)
             db.close()
 
     def _run_discovery(self, job: JobResult) -> None:
@@ -898,7 +1138,7 @@ def _live_yield_audit(
 ) -> dict[str, Any]:
     """Partition fallback results without converting source failures into absence."""
     from csv_to_clonehero.combined_pipeline import TERMINAL_YIELD_CLASSES, _primary_rejection_reason
-    from csv_to_clonehero.matching import score_candidate
+    from csv_to_clonehero.matching import BLOCKED, SELECTABLE_RESULT_TIERS, score_candidate
 
     histogram = {name: 0 for name in TERMINAL_YIELD_CLASSES}
     persisted = db.get_discovery_song_yield_summary(workspace_id)
@@ -951,14 +1191,17 @@ def _live_yield_audit(
             candidate = db.get_candidate(int(row["candidate_id"]))
             if candidate is not None:
                 scored.append((candidate, score_candidate(track, candidate, config)))
-        if any(str(value.eligibility).upper() == "RECOMMENDED" for _, value in scored):
+        if any(str(value.eligibility).upper() == "RECOMMENDED"
+               and value.result_tier in SELECTABLE_RESULT_TIERS for _, value in scored):
             histogram["recommended_strong"] += 1
             continue
-        if any(str(value.eligibility).upper() == "ELIGIBLE_REVIEW" for _, value in scored):
+        if any(str(value.eligibility).upper() == "ELIGIBLE_REVIEW"
+               and value.result_tier in SELECTABLE_RESULT_TIERS for _, value in scored):
             histogram["recommended_review"] += 1
             continue
         if scored:
-            hard = all(bool(value.gate_factors.get("hard_gate")) for _, value in scored)
+            hard = all(bool(value.gate_factors.get("hard_gate")) or value.result_tier == BLOCKED
+                       for _, value in scored)
             bucket = "hard_rejected" if hard else "soft_rejected"
             classification = "not_playable" if hard else "no_suitable"
             reason = _primary_rejection_reason(classification, scored)

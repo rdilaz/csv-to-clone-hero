@@ -1,9 +1,19 @@
 # Documentation
 
+Persistent chart audio, full-catalog browsing and independent ZIP choices:
+[Catalog browser and player](CATALOG_BROWSER.md).
+
+More songs and difficulty labels: [Chart coverage](CHART_COVERAGE.md).
+
+The musical setlist interface, whole-library selection, listening deck and
+performance boundaries: [Riff Studio](RIFF_STUDIO.md).
+
 - [`ARCHITECTURE.md`](ARCHITECTURE.md): current local/public surfaces, data
   flow, boundaries, matching methodology, and security model.
 - [`CONFIGURATION.md`](CONFIGURATION.md): configuration precedence, paths,
   secrets, catalog snapshots, and retention rules.
+- [`LIBRARY_COUNTS.md`](LIBRARY_COUNTS.md): full imported-song preview, separate
+  song/chart totals, and how to identify the active chart index.
 - [`runbook.md`](runbook.md): single-host Docker, Cloudflare, backups, restore,
   rollback, and incident checks.
 - [`adr/0001-source-neutral-master-catalog.md`](adr/0001-source-neutral-master-catalog.md):

@@ -31,6 +31,7 @@ from csv_to_clonehero.normalization import (
 )
 
 FORMAT_VERSION = 1
+MAX_CATALOG_HEADER_BYTES = 32 * 1024
 DEFAULT_CATALOG_PATH = Path(__file__).resolve().parents[2] / "catalog" / "enchor.jsonl"
 
 
@@ -577,7 +578,10 @@ class EnchorCatalog:
     def _load(self) -> None:
         try:
             with self.path.open("rb") as stream:
-                raw = stream.read()
+                header_line = stream.readline(MAX_CATALOG_HEADER_BYTES + 1)
+                if len(header_line) > MAX_CATALOG_HEADER_BYTES:
+                    raise CatalogLoadError("catalog header is too large")
+                raw = header_line + stream.read()
             lines = raw.splitlines()
             if not lines:
                 raise CatalogLoadError("catalog is empty")
@@ -656,10 +660,11 @@ def _load_enchor_catalog_cached(
     path: str,
     modified_ns: int,
     size: int,
+    header_fingerprint: str,
     excluded_identities: tuple[tuple[str, int], ...],
     validation_fingerprint: str,
 ) -> EnchorCatalog:
-    del modified_ns, size
+    del modified_ns, size, header_fingerprint
     return EnchorCatalog(
         path,
         excluded_identities=frozenset(excluded_identities),
@@ -681,8 +686,23 @@ def load_enchor_catalog(
     except OSError:
         modified_ns, size = 0, 0
     blocked = tuple(sorted((str(source), int(chart_id)) for source, chart_id in excluded_identities))
+    # Valid immutable snapshots declare the body checksum in their header.
+    # Replacements can preserve mtime and size; fingerprint only the bounded
+    # header here and retain full checksum verification on a cache miss.
+    try:
+        with resolved.open("rb") as stream:
+            header_line = stream.readline(MAX_CATALOG_HEADER_BYTES + 1)
+        if not header_line or len(header_line) > MAX_CATALOG_HEADER_BYTES:
+            raise CatalogLoadError("catalog header is unavailable")
+    except (OSError, CatalogLoadError):
+        return EnchorCatalog(
+            resolved, excluded_identities=frozenset(blocked),
+            validation_fingerprint=str(validation_fingerprint or ""),
+        )
+    header_fingerprint = hashlib.sha256(header_line).hexdigest()
     return _load_enchor_catalog_cached(
-        str(resolved), modified_ns, size, blocked, str(validation_fingerprint or "")
+        str(resolved), modified_ns, size, header_fingerprint,
+        blocked, str(validation_fingerprint or "")
     )
 
 

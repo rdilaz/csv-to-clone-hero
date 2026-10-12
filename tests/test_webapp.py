@@ -169,7 +169,7 @@ def test_index_serves_source_neutral_workflow(client):
     html = response.get_data(as_text=True)
     for text in (
         "Riff",
-        "music to Clone Hero",
+        "local export to this host",
         "journey.css",
         "journey.js",
         "Restoring your library...",
@@ -1001,6 +1001,12 @@ def test_local_export_reports_one_human_readable_success(config):
         assert status["result"]["published"] == 1
         assert status["result"]["failed"] == 0
         assert status["result"]["ready"] == 1
+        assert status["receipt"]["verified_at_export"] is True
+        assert status["receipt"]["kind"] == "host_folder"
+        assert status["receipt"]["destination"] == str((config.base_dir / "Songs").resolve())
+        assert status["receipt"]["completed_chart_entries"] == 1
+        assert status["receipt"]["game_scan_required"] is True
+        assert status["receipt"]["game_scan_verified"] is False
         db = Database(config.database_path)
         try:
             records = db.list_export_records(workspace_id)
@@ -1990,12 +1996,32 @@ def test_upload_accepts_itunes_txt_and_xml(client, config):
     assert names == ["My iTunes Export.txt"]
 
 
-def test_upload_sanitizes_filename(client, config):
-    data = {"files": (io.BytesIO(b"Song,Artist\nX,Y\n"), "..\\..\\evil?.csv")}
-    response = client.post("/api/upload", data=data, content_type="multipart/form-data")
+@pytest.mark.parametrize(
+    "client_filename",
+    ["..\\..\\evil?.csv", "../../evil?.csv"],
+    ids=["windows-client", "posix-client"],
+)
+def test_upload_sanitizes_filename(client, config, client_filename):
+    # The uploading browser's OS picks the separator, so both must be stripped
+    # regardless of the OS the server runs on.
+    # Preserve literal backslashes across the multipart quoted-string boundary.
+    # Werkzeug's test builder does not escape them, while newer parsers correctly
+    # consume an unescaped backslash as a quoted-pair escape before our route runs.
+    quoted_filename = client_filename.replace("\\", "\\\\").replace('"', '\\"')
+    boundary = "riff-upload-filename-test"
+    data = (
+        f"--{boundary}\r\n"
+        f'Content-Disposition: form-data; name="files"; filename="{quoted_filename}"\r\n'
+        "Content-Type: text/csv\r\n\r\nSong,Artist\nX,Y\n"
+        f"\r\n--{boundary}--\r\n"
+    ).encode()
+    response = client.post(
+        "/api/upload", data=data,
+        content_type=f"multipart/form-data; boundary={boundary}",
+    )
     saved = response.get_json()["saved"][0]
     assert ".." not in saved and "?" not in saved
-    assert saved.endswith(".csv")
+    assert saved == "evil_.csv"
     assert (config.input_path / saved).exists()
 
 
@@ -2148,9 +2174,12 @@ def test_output_path_check_rejects_bad_paths(client, config):
         json={"path": str(config.input_path / "out")},
     ).get_json()
     assert inside["ok"] is False
-    # Drive root
-    root = client.post("/api/output-path/check", json={"path": "C:\\\\"}).get_json()
+    # Drive/filesystem root of the host OS ("C:\" on Windows, "/" on POSIX,
+    # where "C:\" is just a relative folder name).
+    filesystem_root = config.base_dir.anchor
+    root = client.post("/api/output-path/check", json={"path": filesystem_root}).get_json()
     assert root["ok"] is False
+    assert "drive root" in root["error"]
     # Folder that would contain the state DB
     state_holder = client.post(
         "/api/output-path/check", json={"path": str(config.base_dir)}
@@ -2730,7 +2759,7 @@ def test_open_folder_prefers_actual_completed_export_destination(client, config,
 
 def test_primary_root_does_not_serve_the_retired_build_surface(client):
     html = client.get("/").get_data(as_text=True)
-    assert "journey.js?v=2.5.3" in html
+    assert "journey.js?v=2.6.0-ux" in html
     assert "done: status.done" not in html
     assert "Calculating build preview" not in html
     assert "LIBRARY READY" not in html
@@ -3061,8 +3090,11 @@ def test_simple_run_end_to_end(config, monkeypatch):
         assert result["downloaded"] == 1
         assert result["no_match"] == 3
         # Downloads went to the per-run override folder (hybrid layout)...
+        # The album "DAMN." is written as "DAMN": sanitize_component strips
+        # trailing dots, which Windows cannot store. Win32 also drops a
+        # trailing dot on lookup, so "DAMN." only happened to match there.
         target = (
-            config.base_dir / "chosen_songs" / "Kendrick Lamar" / "DAMN."
+            config.base_dir / "chosen_songs" / "Kendrick Lamar" / "DAMN"
             / "Kendrick Lamar - Humble [TestCharter].sng"
         )
         assert target.exists()

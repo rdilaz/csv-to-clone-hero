@@ -29,12 +29,9 @@ TOKEN_ENCRYPTION_KEY_ENV = "TOKEN_ENCRYPTION_KEY"  # Fernet key for refresh toke
 APP_BASE_URL_ENV = "APP_BASE_URL"  # public HTTPS origin
 DATABASE_URL_ENV = "DATABASE_URL"  # optional absolute sqlite path override
 CATALOG_PATH_ENV = "CATALOG_PATH"  # operator-managed catalog on persistent state
+EXPORT_MINIMUM_FREE_BYTES_ENV = "EXPORT_MINIMUM_FREE_BYTES"  # non-secret disk reserve
 NOTIFICATIONS_API_KEY_ENV = "NOTIFICATIONS_API_KEY"  # transactional email key
 GOFUNDME_URL_ENV = "GOFUNDME_URL"
-DEFAULT_GOFUNDME_URL = (
-    "https://www.gofundme.com/f/"
-    "cancer-deudas-y-a-punto-de-perder-nuestro-hogar-apoyanos"
-)
 
 # Required in production (when server.enforce_secret_key is true). Keep the
 # defaults empty so the existing offline CLI and test flows keep working.
@@ -453,7 +450,7 @@ class ExportConfig(BaseModel):
     managed_sync: bool = False
     overwrite_owned: bool = True
     include_manifest_in_zip: bool = True
-    minimum_free_bytes: int = 0
+    minimum_free_bytes: int = Field(default=0, ge=0, strict=True)
     # Number of concurrent download workers; 1 is serial. Enchor's file CDN
     # tolerates a handful of parallel streams, which hides per-request latency.
     download_workers: int = 3
@@ -613,15 +610,15 @@ class MonetizationConfig(BaseModel):
     ads_enabled: bool = True
     ad_banner_slot: str = ""
     ad_sidebar_slot: str = ""
-    gofundme_enabled: bool = True
+    gofundme_enabled: bool = False
     gofundme_url_env: str = GOFUNDME_URL_ENV
     gofundme_url: str = ""
-    gofundme_banner: bool = True
+    gofundme_banner: bool = False
 
     @property
     def effective_gofundme_url(self) -> str:
         env_value = os.environ.get(self.gofundme_url_env, "").strip()
-        return env_value or self.gofundme_url.strip() or DEFAULT_GOFUNDME_URL
+        return env_value or self.gofundme_url.strip()
 
 
 class AdminConfig(BaseModel):
@@ -1014,6 +1011,21 @@ def load_config(config_path: str | Path | None = None) -> AppConfig:
                 config_path.write_text("# CSV to Clone Hero configuration\n", encoding="utf-8")
 
     raw = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    reserve = os.environ.get(EXPORT_MINIMUM_FREE_BYTES_ENV, "").strip()
+    if reserve:
+        try:
+            reserve_bytes = int(reserve)
+        except ValueError:
+            raise ValueError(
+                f"{EXPORT_MINIMUM_FREE_BYTES_ENV} must be a non-negative integer"
+            ) from None
+        if reserve_bytes < 0:
+            raise ValueError(
+                f"{EXPORT_MINIMUM_FREE_BYTES_ENV} must be a non-negative integer"
+            )
+        raw = dict(raw)
+        raw["export"] = dict(raw.get("export") or {})
+        raw["export"]["minimum_free_bytes"] = reserve_bytes
     config = AppConfig.model_validate(raw)
     config.base_dir = config_path.resolve().parent
     return config

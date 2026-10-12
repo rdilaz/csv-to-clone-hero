@@ -243,7 +243,11 @@ def resolve_python(requested: str | None = None) -> Path:
     else:
         candidates.append(REPOSITORY / ".venv" / "bin" / "python")
     for candidate in candidates:
-        resolved = candidate.expanduser().resolve()
+        # Absolute, but do not follow symlinks: a POSIX venv's bin/python is
+        # a symlink to the base interpreter, and running the link target
+        # drops the venv's site-packages (the server then cannot import the
+        # app). Windows venvs ship a real python.exe, so this is unchanged there.
+        resolved = Path(os.path.abspath(candidate.expanduser()))
         if resolved.is_file():
             return resolved
     raise AcceptanceError(

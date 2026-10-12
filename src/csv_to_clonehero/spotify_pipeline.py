@@ -28,10 +28,12 @@ from rapidfuzz import fuzz
 from csv_to_clonehero.config import AppConfig
 from csv_to_clonehero.database import Database
 from csv_to_clonehero.matching import (
+    BLOCKED,
     ELIGIBLE_REVIEW,
     EXCLUDED,
     INCOMPATIBLE,
     RECOMMENDED,
+    SELECTABLE_RESULT_TIERS,
     eligibility_for,
     score_candidate,
     score_expansion_candidate,
@@ -1773,7 +1775,9 @@ def _score_exact_track(
 
     has_eligible = False
     states: list[str] = []
+    tiers: list[str] = []
     hard_reasons: list[str] = []
+    tier_block_reasons: list[str] = []
     shortlisted = _shortlist_exact_candidates(config, track, by_identity.values())
     for candidate, origins in shortlisted:
         source = source_by_name.get(str(candidate.source))
@@ -1785,7 +1789,23 @@ def _score_exact_track(
             breakdown = _scoring_error(exc)
             db.record_error("spotify_discovery_score", _error_text(exc), track.track_key)
         eligibility, reasons = _score_eligibility(breakdown, config)
+        result_tier = str(getattr(breakdown, "result_tier", "") or "")
+        tier_reasons = list(getattr(breakdown, "result_tier_reasons", ()) or ())
+        if result_tier == BLOCKED and not bool(getattr(breakdown, "gate_factors", {}).get("hard_gate")):
+            tier_block_reasons.extend(str(reason) for reason in tier_reasons)
+        if (
+            result_tier
+            and result_tier not in SELECTABLE_RESULT_TIERS
+            and eligibility in {RECOMMENDED, ELIGIBLE_REVIEW}
+        ):
+            # Preserve numeric scoring and source-cache metadata while keeping
+            # blocked identity out of counts and allowing per-song recovery.
+            eligibility = EXCLUDED
+            reasons = tier_reasons or [
+                "chart is blocked by current identity checks"
+            ]
         states.append(eligibility)
+        tiers.append(result_tier)
         hard_reasons.extend(str(reason) for reason in reasons if reason)
         ctx.note_exact_score(track, candidate, eligibility)
         if eligibility in {RECOMMENDED, ELIGIBLE_REVIEW}:
@@ -1841,11 +1861,12 @@ def _score_exact_track(
         classification, reason = "review", ""
     elif had_error or truncated:
         classification, reason = "incomplete_evidence", "live provider failure or truncated evidence"
-    elif states and all(state == INCOMPATIBLE for state in states):
+    elif states and all(state == INCOMPATIBLE or tier == BLOCKED for state, tier in zip(states, tiers)):
         classification = "not_playable"
         joined = " | ".join(value.casefold() for value in hard_reasons)
         reason = (
-            "no required 5-fret guitar" if "no 5-fret" in joined
+            tier_block_reasons[0] if tier_block_reasons
+            else "no required 5-fret guitar" if "no 5-fret" in joined
             else "no playable chart content" if "no playable chart content" in joined
             else "artist identity conflict" if "artist conflict" in joined
             else "title identity/version conflict" if "title conflict" in joined
@@ -1853,7 +1874,9 @@ def _score_exact_track(
             else "hard compatibility gate"
         )
     elif states:
-        classification, reason = "no_suitable", "below safe score threshold"
+        classification, reason = "no_suitable", (
+            tier_block_reasons[0] if tier_block_reasons else "below safe score threshold"
+        )
     else:
         classification, reason = "no_catalog_candidate", "no plausible catalog candidate"
     return had_error, has_eligible, {
@@ -2031,7 +2054,8 @@ def _cancel_discovery(
     library_result: LibraryImportResult | None = None,
 ) -> DiscoveryResult:
     try:
-        db.clear_workspace_candidates(ctx.workspace_id)
+        db.clear_workspace_candidates(ctx.workspace_id, kind="exact")
+        db.clear_workspace_candidates(ctx.workspace_id, kind="expansion")
         db.update_workspace(
             ctx.workspace_id,
             status="cancelled",

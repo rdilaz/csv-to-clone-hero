@@ -30,6 +30,7 @@ import threading
 import time
 import uuid
 import zipfile
+import zlib
 from collections.abc import Callable, Iterable, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field, fields, is_dataclass
@@ -49,6 +50,31 @@ APP_ID = "csv-to-clonehero"
 MANIFEST_FORMAT = "csv-to-clonehero-manifest"
 MANIFEST_VERSION = 1
 MANIFEST_FILENAME = "csv-to-clonehero-manifest.json"
+SNG_VALIDATION_VERSION = "sng-playability-v2"
+
+
+def _artifact_zip_compression(path: Path, size_bytes: int) -> int:
+    """Avoid recompressing incompressible packages, using bounded samples.
+
+    Small/text-heavy packages retain deflate. Most audio packages contain
+    compressed or masked audio; three 64 KiB probes avoid spending CPU on the
+    entire package when deflate would save less than two percent.
+    """
+    sample_size = 64 * 1024
+    if size_bytes < 4 * sample_size:
+        return zipfile.ZIP_DEFLATED
+    offsets = {0, max(0, size_bytes // 2 - sample_size // 2), max(0, size_bytes - sample_size)}
+    raw = compressed = 0
+    try:
+        with path.open("rb") as stream:
+            for offset in sorted(offsets):
+                stream.seek(offset)
+                sample = stream.read(sample_size)
+                raw += len(sample)
+                compressed += len(zlib.compress(sample, level=1))
+    except OSError:
+        return zipfile.ZIP_DEFLATED
+    return zipfile.ZIP_STORED if raw and compressed >= raw * 0.98 else zipfile.ZIP_DEFLATED
 
 _INVALID_NAME_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 _DRIVE_RE = re.compile(r"^[A-Za-z]:($|/)")
@@ -148,7 +174,7 @@ class SngValidation:
     chart_member: str = ""
     playable_note_count: int = 0
     note_counts: tuple[tuple[str, int], ...] = ()
-    validation_version: str = "sng-playability-v1"
+    validation_version: str = SNG_VALIDATION_VERSION
 
     def __bool__(self) -> bool:
         return self.valid
@@ -175,6 +201,8 @@ class VerifiedArtifact:
     source_hash: str = ""
     source_hash_algorithm: str = ""
     playable_note_count: int = 0
+    note_counts: tuple[tuple[str, int], ...] = ()
+    validation_version: str = ""
 
 
 @dataclass
@@ -297,6 +325,8 @@ class ExportItemResult:
     artifact_key: str = ""
     failure: str = ""
     playable_note_count: int = 0
+    note_counts: tuple[tuple[str, int], ...] = ()
+    validation_version: str = ""
     warnings: list[str] = field(default_factory=list)
 
     @property
@@ -875,29 +905,31 @@ def parse_sngpkg_metadata(data: bytes) -> dict[str, str]:
 
 _SNGPKG_HEADER_SIZE = 6 + 4 + 16
 _SNGPKG_SECTION_LIMIT = 64 * 1024 * 1024
-_MIDI_MARKER_NOTES = {103, 116, 120, 126, 127}
 _MIDI_DIFFICULTY_RANGES = (
-    ("easy", 58, 69),
-    ("medium", 70, 81),
-    ("hard", 82, 93),
-    ("expert", 94, 102),
+    ("easy", 60),
+    ("medium", 72),
+    ("hard", 84),
+    ("expert", 96),
 )
-_MIDI_TRACK_INSTRUMENTS = (
-    ("guitar coop ghl", "guitarcoopghl"),
-    ("guitar ghl", "guitarghl"),
-    ("guitar coop", "guitarcoop"),
-    ("double guitar", "guitarcoop"),
-    ("rhythm ghl", "rhythmghl"),
-    ("rhythm", "rhythm"),
-    ("bass ghl", "bassghl"),
-    ("bass", "bass"),
-    ("guitar", "guitar"),
-    ("drums", "drums"),
-    ("keys", "keys"),
-    ("keyboard", "keys"),
-    ("vocals", "vocals"),
-    ("vocal", "vocals"),
-)
+_MIDI_TRACK_INSTRUMENTS = {
+    "t1 gems": "guitar",
+    "part guitar": "guitar",
+    "part guitar coop": "guitarcoop",
+    "part rhythm": "rhythm",
+    "part bass": "bass",
+    "part keys": "keys",
+    "part guitar ghl": "guitarghl",
+    "part guitar coop ghl": "guitarcoopghl",
+    "part rhythm ghl": "rhythmghl",
+    "part bass ghl": "bassghl",
+    "part keys ghl": "keysghl",
+    "part drums": "drums",
+    "part drum": "drums",
+    "part drums_2x": "drums",
+    "part vocals": "vocals",
+    **{name: "vocals" for name in ("harm1", "harm2", "harm3", "part harm1", "part harm2", "part harm3")},
+}
+_FIVE_FRET_INSTRUMENTS = {"guitar", "guitarcoop", "rhythm", "bass", "keys"}
 _CHART_NOTE_RE = re.compile(r"^\s*\d+\s*=\s*N\s+(-?\d+)(?:\s+\d+)?\s*$", re.IGNORECASE)
 _CHART_SECTION_RE = re.compile(r"^\s*\[([^\]]+)\]\s*$")
 _MIDI_TRACK_NAME_RE = re.compile(r"\s+", re.UNICODE)
@@ -990,9 +1022,12 @@ def _parse_chart_notes(data: bytes) -> dict[str, int]:
         if note is None:
             continue
         fret = int(note.group(1))
-        if not 0 <= fret <= 7:
-            continue
         instrument, difficulty = current
+        playable_frets = {0, 1, 2, 3, 4, 5, 32} if instrument == "drums" else {0, 1, 2, 3, 4, 7}
+        if fret not in playable_frets:
+            # Five-fret N5/N6 and drum cymbal/accent events modify real notes.
+            # A modifier by itself never proves playable content.
+            continue
         groups.setdefault(f"{instrument}:{difficulty}", set()).add(
             int(line.split("=", 1)[0].strip())
         )
@@ -1014,20 +1049,22 @@ def _read_vlq(data: bytes, offset: int, end: int) -> tuple[int, int]:
 
 def _midi_track_instrument(name: str) -> str:
     value = _MIDI_TRACK_NAME_RE.sub(" ", name.casefold()).strip()
-    if value.startswith("part "):
-        value = value[5:]
-    for marker, instrument in _MIDI_TRACK_INSTRUMENTS:
-        if marker in value:
-            return instrument
-    if "vocals" in value or "vocal" in value:
-        return "vocals"
-    return "unknown"
+    # Pro-guitar and arbitrary track names must not masquerade as five-fret.
+    return _MIDI_TRACK_INSTRUMENTS.get(value, "unknown")
 
 
-def _midi_note_class(note: int) -> str | None:
-    if note in _MIDI_MARKER_NOTES:
-        return None
-    for difficulty, low, high in _MIDI_DIFFICULTY_RANGES:
+def _midi_note_class(note: int, instrument: str, *, enhanced_opens: bool = False) -> str | None:
+    if instrument == "vocals":
+        return "vocals" if 36 <= note <= 84 or note == 96 else None
+    for difficulty, base in _MIDI_DIFFICULTY_RANGES:
+        if instrument in _FIVE_FRET_INSTRUMENTS:
+            low, high = base - int(enhanced_opens), base + 4
+        elif instrument.endswith("ghl"):
+            low, high = base - 2, base + 4
+        elif instrument == "drums":
+            low, high = base - int(difficulty == "expert"), base + 5
+        else:
+            return None
         if low <= note <= high:
             return difficulty
     return None
@@ -1057,6 +1094,7 @@ def _parse_midi_notes(data: bytes) -> dict[str, int]:
         absolute_tick = 0
         running_status: int | None = None
         track_name = ""
+        enhanced_opens = False
         active: dict[tuple[int, int], list[tuple[int, str, str | None]]] = {}
         while position < end:
             delta, position = _read_vlq(data, position, end)
@@ -1083,6 +1121,10 @@ def _parse_midi_notes(data: bytes) -> dict[str, int]:
                     raise ValueError("truncated MIDI meta payload")
                 if meta_type == 0x03:
                     track_name = data[position:payload_end].decode("utf-8", errors="replace")
+                elif meta_type == 0x01:
+                    event = data[position:payload_end].decode("utf-8", errors="replace").strip().casefold()
+                    if event in {"[enhanced_opens]", "enhanced_opens"}:
+                        enhanced_opens = True
                 position = payload_end
                 running_status = None
                 continue
@@ -1102,10 +1144,8 @@ def _parse_midi_notes(data: bytes) -> dict[str, int]:
             second = data[position + 1] if data_length == 2 else 0
             position += data_length
             if event_type == 0x90 and second:
-                difficulty = _midi_note_class(first)
                 instrument = _midi_track_instrument(track_name)
-                if instrument == "vocals":
-                    difficulty = "vocals"
+                difficulty = _midi_note_class(first, instrument, enhanced_opens=enhanced_opens)
                 if difficulty is not None:
                     active.setdefault((channel, first), []).append(
                         (absolute_tick, instrument, difficulty)
@@ -1471,6 +1511,21 @@ def _hash_file(path: Path, algorithm: str = "sha256") -> str:
     return digest.hexdigest()
 
 
+def _discard_staged_file(path: Path) -> None:
+    """Remove a staging file that may not exist, on every platform.
+
+    ``unlink(missing_ok=True)`` only absorbs ``FileNotFoundError``. When a
+    regular file sits where the parent folder should be, Windows reports that
+    as path-not-found (``FileNotFoundError``) but POSIX raises
+    ``NotADirectoryError``; either way there is nothing to remove, and the
+    caller's copy step reports the real per-item failure.
+    """
+    try:
+        path.unlink()
+    except (FileNotFoundError, NotADirectoryError):
+        pass
+
+
 def _copy_file(source: Path, target: Path) -> int:
     target.parent.mkdir(parents=True, exist_ok=True)
     written = 0
@@ -1763,7 +1818,7 @@ class ExportService:
         result_tier = str(_field(selection, "result_tier", "") or "").upper()
         tier_selectable = result_tier in {
             "RECOMMENDED_EXACT", "SAME_RECORDING_CHART_VARIANT",
-            "ALTERNATE_RECORDING", "POSSIBLE_MATCH",
+            "ALTERNATE_RECORDING", "POSSIBLE_MATCH", "CATALOG_CHOICE",
         }
         if eligibility is None:
             eligibility = _field(selection, "eligibility_state", None)
@@ -1899,7 +1954,7 @@ class ExportService:
             item.source_name = str(_field(candidate, "source", "") or _field(selection, "source", "") or "")
             item.chart_id = _field(candidate, "chart_id", _field(selection, "chart_id", ""))
             item.kind = str(_field(selection, "kind", "exact") or "exact").casefold()
-            if item.kind not in {"exact", "expansion"}:
+            if item.kind not in {"exact", "expansion", "catalog"}:
                 item.issues.append(PreflightIssue("invalid_selection_kind", f"unsupported selection kind: {item.kind!r}", selection_index=index))
             track_value = _field(selection, "track", None)
             if track_value is None:
@@ -2287,6 +2342,8 @@ class ExportService:
             source_hash=source_hash,
             source_hash_algorithm=source_algorithm,
             playable_note_count=playable_note_count,
+            note_counts=tuple(getattr(validation, "note_counts", ()) or ()),
+            validation_version=str(getattr(validation, "validation_version", "") or ""),
         )
 
     def _materialize(self, item: PreflightItem, options: ExportOptions) -> VerifiedArtifact:
@@ -2529,6 +2586,8 @@ class ExportService:
             item_result.source_hash = artifact.source_hash
             item_result.source_hash_algorithm = artifact.source_hash_algorithm
             item_result.playable_note_count = artifact.playable_note_count
+            item_result.note_counts = artifact.note_counts
+            item_result.validation_version = artifact.validation_version
             notify(item_result)
             with progress_lock:
                 completed += 1
@@ -2787,6 +2846,8 @@ class ExportService:
                     item_result.source_hash = artifact.source_hash
                     item_result.source_hash_algorithm = artifact.source_hash_algorithm
                     item_result.playable_note_count = artifact.playable_note_count
+                    item_result.note_counts = artifact.note_counts
+                    item_result.validation_version = artifact.validation_version
                     self._remove_owned_artifact_duplicates(
                         item_result,
                         artifact,
@@ -2802,12 +2863,12 @@ class ExportService:
                     errors.append(f"{item_result.target_relpath}: {item_result.failure}")
                     continue
             part = target.with_name(target.name + ".part")
-            part.unlink(missing_ok=True)
+            _discard_staged_file(part)
             try:
                 _copy_file(artifact.path, part)
                 parts.append((index, part, target))
             except OSError as exc:
-                part.unlink(missing_ok=True)
+                _discard_staged_file(part)
                 item_result.status = "failed"
                 item_result.result = "stage_failed"
                 item_result.failure = str(exc)
@@ -2838,6 +2899,8 @@ class ExportService:
             item_result.source_hash = artifacts[index].source_hash
             item_result.source_hash_algorithm = artifacts[index].source_hash_algorithm
             item_result.playable_note_count = artifacts[index].playable_note_count
+            item_result.note_counts = artifacts[index].note_counts
+            item_result.validation_version = artifacts[index].validation_version
             self._remove_owned_artifact_duplicates(
                 item_result,
                 artifacts[index],
@@ -2894,7 +2957,7 @@ class ExportService:
                         raise ExportError(str(exc)) from exc
                     info = zipfile.ZipInfo(arcname)
                     info.date_time = (1980, 1, 1, 0, 0, 0)
-                    info.compress_type = zipfile.ZIP_DEFLATED
+                    info.compress_type = _artifact_zip_compression(artifact.path, artifact.size_bytes)
                     info.create_system = 0
                     info.external_attr = 0
                     with archive.open(info, "w") as target, artifact.path.open("rb") as source:
@@ -2907,6 +2970,8 @@ class ExportService:
                     item_result.source_hash = artifact.source_hash
                     item_result.source_hash_algorithm = artifact.source_hash_algorithm
                     item_result.playable_note_count = artifact.playable_note_count
+                    item_result.note_counts = artifact.note_counts
+                    item_result.validation_version = artifact.validation_version
                 manifest.records = self._make_manifest(
                     results,
                     root=Path(preflight.destination_root),
@@ -3098,6 +3163,8 @@ class ExportService:
                 duplicate_result.source_hash = artifact.source_hash
                 duplicate_result.source_hash_algorithm = artifact.source_hash_algorithm
                 duplicate_result.playable_note_count = artifact.playable_note_count
+                duplicate_result.note_counts = artifact.note_counts
+                duplicate_result.validation_version = artifact.validation_version
                 _emit_item_progress([duplicate_result], item_progress)
                 del artifacts[index]
             else:
@@ -3253,6 +3320,8 @@ class ExportService:
                 duplicate_result.source_hash = artifact.source_hash
                 duplicate_result.source_hash_algorithm = artifact.source_hash_algorithm
                 duplicate_result.playable_note_count = artifact.playable_note_count
+                duplicate_result.note_counts = artifact.note_counts
+                duplicate_result.validation_version = artifact.validation_version
                 _emit_item_progress([duplicate_result], item_progress)
                 del artifacts[index]
             else:
