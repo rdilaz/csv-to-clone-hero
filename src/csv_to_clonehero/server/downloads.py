@@ -544,6 +544,10 @@ def _validated_selections(
     })
     selections: list[dict[str, Any]] = []
     seen_expansion_songs: set[tuple[str, str]] = set()
+    # Membership is workspace-wide. Loading it for every selection turns a
+    # large expansion setlist into repeated scans of the same candidate rows.
+    exact_memberships: set[tuple[int, int]] | None = None
+    expansion_memberships: dict[tuple[int, str], Any] | None = None
     for row in reversed(rows):
         from dataclasses import fields
 
@@ -571,18 +575,18 @@ def _validated_selections(
             track_id = int(data.get("track_id") or 0)
             if track_id not in workspace_track_ids:
                 continue
-            current_rows = db.get_workspace_candidates(
-                workspace_id,
-                track_id=track_id,
-                kind="exact",
-                include_rejected=True,
-                include_candidate_data=False,
-                generation_id=generation_id,
-            )
-            if not any(
-                int(current["candidate_id"] or 0) == int(data.get("candidate_id") or 0)
-                for current in current_rows
-            ):
+            if exact_memberships is None:
+                exact_memberships = {
+                    (int(current["track_id"] or 0), int(current["candidate_id"] or 0))
+                    for current in db.get_workspace_candidates(
+                        workspace_id,
+                        kind="exact",
+                        include_rejected=True,
+                        include_candidate_data=False,
+                        generation_id=generation_id,
+                    )
+                }
+            if (track_id, int(data.get("candidate_id") or 0)) not in exact_memberships:
                 continue
             if config is not None:
                 from csv_to_clonehero.matching import BLOCKED, SELECTABLE_RESULT_TIERS, classify_result_tier, score_candidate
@@ -602,17 +606,21 @@ def _validated_selections(
             if generation_id is None or generation_id < 0:
                 continue
             artist_norm = str(data.get("artist_norm") or "")
-            current_rows = db.get_workspace_candidates(
-                workspace_id,
-                kind="expansion",
-                include_rejected=True,
-                include_candidate_data=False,
-            )
-            current = next((
-                item for item in current_rows
-                if int(item["candidate_id"] or 0) == int(data.get("candidate_id") or 0)
-                and str(item["artist_norm"] or "") == artist_norm
-            ), None)
+            if expansion_memberships is None:
+                expansion_memberships = {}
+                for item in db.get_workspace_candidates(
+                    workspace_id,
+                    kind="expansion",
+                    include_rejected=True,
+                    include_candidate_data=False,
+                ):
+                    # Preserve the first row chosen by the previous ordered
+                    # lookup if multiple candidate rows share an identity.
+                    expansion_memberships.setdefault(
+                        (int(item["candidate_id"] or 0), str(item["artist_norm"] or "")),
+                        item,
+                    )
+            current = expansion_memberships.get((int(data.get("candidate_id") or 0), artist_norm))
             if current is None:
                 continue
             metadata = json.loads(str(current["metadata_json"] or "{}"))

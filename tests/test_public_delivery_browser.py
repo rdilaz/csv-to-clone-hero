@@ -661,14 +661,12 @@ def test_delivery_recount_unknown_never_uses_confirm_cache(delivery_page, unknow
 
     def route_api(route):
         path = urlsplit(route.request.url).path
-        target = "/api/expansion/results" if unknown == "expansion" else "/api/workspace"
-        if invalidate["value"] and path == target:
+        if invalidate["value"] and path == "/api/delivery/status":
             status, payload = fixtures.respond(route.request.method, route.request.url)
             if unknown == "read-error":
                 route.fulfill(status=503, json={"error": "Selection report temporarily unavailable."})
                 return
-            for key in (["selected_charts", "selection_count"] if unknown == "exact" else ["selected"]):
-                payload["summary"].pop(key)
+            payload["selection_summary"]["expansion" if unknown == "expansion" else "library"].pop("charts")
             route.fulfill(status=status, json=payload)
             return
         fixtures.fulfill(route)
@@ -698,7 +696,7 @@ def test_delivery_recount_authoritative_zero_blocks_preparation(delivery_page):
     page.locator("#continueDownloadButton").click()
     _assert_download_counts(page, exact=0, songs=0)
     playwright.expect(page.locator("#prepareDownloadButton")).to_be_disabled()
-    playwright.expect(page.locator("#downloadStatus")).to_contain_text("No eligible selected charts remain")
+    playwright.expect(page.locator("#downloadStatus")).to_contain_text("No charts are selected")
     page.locator("#backToChartsButton").click()
     playwright.expect(page.locator("#selectedCount")).to_have_text("0")
     assert _posts(requests) == []
@@ -798,7 +796,7 @@ def test_delivery_stale_link_reconciliation_cannot_replace_reprepare_stage(deliv
     hold = {"value": False}
 
     def route_api(route):
-        if hold["value"] and urlsplit(route.request.url).path == "/api/journey":
+        if hold["value"] and urlsplit(route.request.url).path == "/api/delivery/status":
             hold["value"] = False
             status, payload = fixtures.respond("GET", route.request.url)
             pending.append((route, status, payload))
@@ -1212,7 +1210,7 @@ def test_delivery_keyboard_refresh_restores_focus_after_disabling_control(delive
     hold = {"value": False}
 
     def route_api(route):
-        if hold["value"] and urlsplit(route.request.url).path == "/api/journey":
+        if hold["value"] and urlsplit(route.request.url).path == "/api/delivery/status":
             pending.append(route)
             return
         fixtures.fulfill(route)

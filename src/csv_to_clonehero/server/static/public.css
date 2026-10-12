@@ -978,7 +978,7 @@ body[data-authenticated="true"] .main-content { padding-top: 28px; }
 .delivery-counts { margin: 0; }
 .delivery-counts > div { padding-block: 15px; }
 .delivery-counts > div + div { border-top: 1px solid var(--line); }
-.delivery-counts dt { color: var(--muted); font-size: .75rem; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; }
+.delivery-counts dt { color: var(--muted); font-size: .75rem; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; overflow-wrap: anywhere; }
 .delivery-counts dd { margin: 3px 0 0; overflow-wrap: anywhere; }
 .delivery-status { margin-top: 24px; }
 .delivery-status .kicker { margin-bottom: 5px; color: var(--muted); }

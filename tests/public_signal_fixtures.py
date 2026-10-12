@@ -848,6 +848,19 @@ class SignalCheckFixtures:
 
         if path == "/api/journey" and method == "GET":
             return 200, self.journey()
+        if path == "/api/delivery/status" and method == "GET":
+            journey = self.journey()
+            selection = self.selected_response()
+            payload = {key: journey.get(key) for key in (
+                "workspace_id", "workspace_status", "workspace", "job", "download_job", "preflight_job", "download"
+            )}
+            payload.update({key: selection[key] for key in (
+                "selection_revision", "exact_generation_id", "undo", "catalog_summary"
+            )})
+            payload.update(selection_summary=selection["summary"],
+                           selection_count=sum(value["charts"] for value in selection["summary"].values()),
+                           selection_counts_are_saved=True)
+            return 200, payload
         if path == "/api/selection/history" and method == "GET":
             return 200, {**self.selected_response(), "operations": [
                 {key: value for key, value in operation.items() if key != "previous"}
@@ -1046,7 +1059,12 @@ class SignalCheckFixtures:
             return 200, {"job": self.expansion_job()}
         if path == "/api/expansion/results" and method == "GET":
             try:
-                return 200, self.expansion_results(query)
+                payload = self.expansion_results(query)
+                selection = self.selected_response()
+                payload.update({key: selection[key] for key in (
+                    "selection_revision", "exact_generation_id", "undo", "catalog_summary"
+                )})
+                return 200, payload
             except (TypeError, ValueError):
                 return 400, {"error": "invalid expansion paging parameters"}
         if path == "/api/download" and method == "POST":
