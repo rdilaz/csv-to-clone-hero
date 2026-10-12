@@ -130,9 +130,10 @@ class SignalCheckFixtures:
         summary = {"library": {"songs": sum(track["selected"] for track in tracks), "charts": len(library)},
                    "expansion": {"songs": sum(any(candidate["selected"] for candidate in song["candidates"])
                                               for song in self.expansion_songs()), "charts": len(expansion)}}
-        return {"ok": True, "summary": summary,
+        summary["catalog"] = {"songs": 0, "charts": 0}
+        return {"ok": True, "summary": summary, "catalog_summary": summary["catalog"],
                 "songs": summary["library"]["songs"] + summary["expansion"]["songs"],
-                "charts": len(library) + len(expansion), "selected": {"library": library, "expansion": expansion},
+                "charts": len(library) + len(expansion), "selected": {"library": library, "expansion": expansion, "catalog": []},
                 "selection_revision": self.selection_revision, "exact_generation_id": self.generation_id,
                 "undo": self.undo()}
 
@@ -1072,11 +1073,20 @@ class SignalCheckFixtures:
         return 500, {"error": f"unexpected fixture request: {unexpected}"}
 
     def fulfill(self, route) -> None:
+        path = urlsplit(route.request.url).path
+        if path == "/api/catalog/selections" and route.request.method == "GET":
+            query = parse_qs(urlsplit(route.request.url).query)
+            payload = {**self.selected_response(), "items": [], "total": 0,
+                       "offset": int(query.get("offset", [0])[0]), "limit": int(query.get("limit", [25])[0]), "has_more": False}
+            route.fulfill(status=200, content_type="application/json", body=json.dumps(payload))
+            return
         status, payload = self.respond(
             route.request.method,
             route.request.url,
             route.request.post_data,
         )
+        if isinstance(payload, dict) and "selection_revision" in payload:
+            payload.setdefault("catalog_summary", {"songs": 0, "charts": 0})
         route.fulfill(
             status=status,
             content_type="application/zip" if isinstance(payload, bytes) else "application/json",

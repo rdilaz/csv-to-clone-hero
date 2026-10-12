@@ -2054,7 +2054,8 @@ def _cancel_discovery(
     library_result: LibraryImportResult | None = None,
 ) -> DiscoveryResult:
     try:
-        db.clear_workspace_candidates(ctx.workspace_id)
+        db.clear_workspace_candidates(ctx.workspace_id, kind="exact")
+        db.clear_workspace_candidates(ctx.workspace_id, kind="expansion")
         db.update_workspace(
             ctx.workspace_id,
             status="cancelled",

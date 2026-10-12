@@ -1,5 +1,8 @@
 # Documentation
 
+Persistent chart audio, full-catalog browsing and independent ZIP choices:
+[Catalog browser and player](CATALOG_BROWSER.md).
+
 More songs and difficulty labels: [Chart coverage](CHART_COVERAGE.md).
 
 The musical setlist interface, whole-library selection, listening deck and

@@ -8,7 +8,7 @@ from pathlib import Path
 from flask import request
 
 
-ASSET_VERSION = "riff-ux-20261010"
+ASSET_VERSION = "riff-catalog-20261011"
 
 
 @lru_cache(maxsize=32)

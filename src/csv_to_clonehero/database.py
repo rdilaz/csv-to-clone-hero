@@ -17,7 +17,7 @@ from typing import Any
 
 from csv_to_clonehero.models import ChartCandidate, Track
 
-SCHEMA_VERSION = 22
+SCHEMA_VERSION = 23
 PUBLIC_RESTORE_POINT_BYTES = 32 * 1024 * 1024
 
 SCHEMA = """
@@ -384,6 +384,8 @@ CREATE TABLE IF NOT EXISTS workspace_task_candidates (
 
 CREATE VIEW IF NOT EXISTS discovery_candidates AS
     SELECT * FROM workspace_candidates;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_workspace_catalog_candidate
+ON workspace_candidates(workspace_id,candidate_id) WHERE kind='catalog' AND track_id IS NULL;
 
 CREATE TABLE IF NOT EXISTS workspace_selections (
     id INTEGER PRIMARY KEY,
@@ -408,6 +410,8 @@ CREATE TABLE IF NOT EXISTS public_selection_clock (
     workspace_id INTEGER PRIMARY KEY REFERENCES discovery_workspaces(id) ON DELETE CASCADE,
     revision INTEGER NOT NULL DEFAULT 0
 );
+CREATE INDEX IF NOT EXISTS idx_workspace_catalog_selection ON workspace_selections(workspace_id)
+WHERE kind='catalog' AND status='selected';
 CREATE TABLE IF NOT EXISTS public_selection_operations (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     workspace_id INTEGER NOT NULL REFERENCES discovery_workspaces(id) ON DELETE CASCADE,
@@ -4474,7 +4478,7 @@ class Database:
         if not self._conn.in_transaction:
             raise ValueError("bulk selection requires a locked snapshot")
         kinds = tuple(sorted(set(kinds)))
-        if not kinds or not set(kinds) <= {"exact", "expansion"}:
+        if not kinds or not set(kinds) <= {"exact", "expansion", "catalog"}:
             raise ValueError("invalid selection scope")
         available = {}
         for row in self.get_workspace_candidates(workspace_id, include_artifact_validation=True):
@@ -4522,10 +4526,16 @@ class Database:
         from csv_to_clonehero.normalization import normalize_artist, normalize_title
 
         rows = self.list_workspace_selections(workspace_id)
-        selected = {"library": [], "expansion": []}
-        identities = {"library": set(), "expansion": set()}
+        selected = {"library": [], "expansion": [], "catalog": []}
+        identities = {scope: set() for scope in selected}
+        global_songs = set()
         for row in rows:
-            scope = "library" if row["kind"] == "exact" else "expansion"
+            scope = "library" if row["kind"] == "exact" else str(row["kind"])
+            if scope not in selected:
+                continue
+            chart = self.candidate_from_workspace_row(row)
+            song_identity = (normalize_artist(chart.artist), normalize_title(chart.name))
+            global_songs.add(song_identity)
             item = {"candidate_id": int(row["candidate_id"])}
             if scope == "library":
                 item["track_key"] = row["track_key"]
@@ -4535,12 +4545,31 @@ class Database:
                 item["artist_norm"] = str(row["artist_norm"] or "")
                 item["song_key"] = "|".join((normalize_artist(chart.artist), normalize_title(chart.name)))
                 identities[scope].add((chart.artist_norm, chart.name_norm))
+                if scope == "catalog":
+                    item["catalog_key"] = f"{chart.source}:{int(chart.chart_id)}"
+                    item.update(source=chart.source, chart_id=int(chart.chart_id), md5=str(chart.md5 or "").lower())
             selected[scope].append(item)
         summary = {scope: {"songs": len(identities[scope]), "charts": len(selected[scope])} for scope in selected}
         return {"selected": selected, "summary": summary,
-                "songs": sum(value["songs"] for value in summary.values()),
+                "songs": len(global_songs),
                 "charts": sum(value["charts"] for value in summary.values()),
                 **self.public_selection_receipt(workspace_id)}
+
+    def ensure_catalog_candidate(self, workspace_id: int, chart: ChartCandidate, snapshot_token: str, gates: Mapping[str, Any]) -> int:
+        if not self._conn.in_transaction or not self._conn.selection_atomic:
+            raise ValueError("catalog selection requires a locked owner snapshot")
+        candidate = self.upsert_candidate(chart)
+        metadata = {"catalog_key": f"{chart.source}:{int(chart.chart_id)}", "catalog_snapshot_token": snapshot_token,
+                    "catalog_row_hash": str(getattr(chart, "_catalog_row_hash", "")), "selection_origin": "catalog_browser"}
+        self._conn.execute("""INSERT INTO workspace_candidates(workspace_id,candidate_id,kind,artist_norm,eligibility,decision,breakdown_json,metadata_json)
+                            VALUES(?,?,'catalog',?,'ELIGIBLE_REVIEW','REVIEW',?,?)
+                            ON CONFLICT(workspace_id,candidate_id) WHERE kind='catalog' AND track_id IS NULL
+                            DO UPDATE SET artist_norm=excluded.artist_norm,eligibility=excluded.eligibility,decision=excluded.decision,
+                                          breakdown_json=excluded.breakdown_json,metadata_json=excluded.metadata_json""",
+                           (workspace_id, candidate.db_id, chart.artist_norm, _json_text({"gate_factors": dict(gates)}, {}), _json_text(metadata, {})))
+        # Catalog membership has its own snapshot identity. It must not alter
+        # the matching revision or invalidate earlier selection-only undo.
+        return int(candidate.db_id)
 
     def public_selection_revision(self, workspace_id: int) -> int:
         row = self._conn.execute("SELECT revision FROM public_selection_clock WHERE workspace_id=?", (workspace_id,)).fetchone()
@@ -4558,7 +4587,12 @@ class Database:
                          and int(row["candidate_revision"]) == self.get_workspace_candidate_revision(workspace_id))
         workspace = self.get_workspace(workspace_id)
         metadata = _load_json(workspace["metadata_json"], {}) if workspace is not None else {}
-        return {"selection_revision": revision, "undo": {
+        catalog_charts = int(self._conn.execute("SELECT COUNT(*) FROM workspace_selections WHERE workspace_id=? AND kind='catalog' AND status='selected'", (workspace_id,)).fetchone()[0])
+        catalog_songs = int(self._conn.execute("""SELECT COUNT(*) FROM (SELECT json_extract(c.data_json,'$.artist_norm'),json_extract(c.data_json,'$.name_norm')
+            FROM workspace_selections s JOIN candidate_charts c ON c.id=s.candidate_id
+            WHERE s.workspace_id=? AND s.kind='catalog' AND s.status='selected'
+            GROUP BY json_extract(c.data_json,'$.artist_norm'),json_extract(c.data_json,'$.name_norm'))""", (workspace_id,)).fetchone()[0])
+        return {"catalog_summary": {"songs": catalog_songs, "charts": catalog_charts}, "selection_revision": revision, "undo": {
             "available": available,
             "operation_id": int(row["id"]) if available else None,
             "label": str(row["label"]) if available else "",
@@ -4762,7 +4796,7 @@ class Database:
         # the original customized metadata, order and timestamps.
         choices = [{"kind": item["kind"], "track_id": item["track_id"], "candidate_id": item["candidate_id"], "artist_norm": item["artist_norm"] or ""} for item in before]
         try:
-            self.replace_public_selection(workspace_id, ("exact", "expansion"), choices)
+            self.replace_public_selection(workspace_id, ("exact", "expansion", "catalog"), choices)
         except ValueError as exc:
             raise SelectionConflict("Some earlier choices are no longer eligible. Review current chart options.") from exc
         self._restore_public_selection_rows(workspace_id, before)

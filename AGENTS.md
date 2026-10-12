@@ -151,3 +151,11 @@
   owner-workspace selection revision/history/undo and asynchronous preflight.
   See `docs/UX_RECOVERY_RELEASE.md`. Keep status reconnection read-only after
   unknown outcomes and never probe signed single-use ZIP links with fetch.
+
+- Catalog player release: public assets `riff-catalog-20261011`, additive
+  schema 23; see `docs/CATALOG_BROWSER.md`. Direct catalog choices are an
+  independent owner-workspace cohort, with generation-zero ZIP support and
+  guarded Add/Remove/Undo. The browser listening queue and package-audio
+  previews are separate from ZIP authority. Preserve same-artifact aliases,
+  owner isolation, bounded media reads, cancellation and paused restoration.
+  Production remains Python; Node.js 22 is used only by the offline JS harness.

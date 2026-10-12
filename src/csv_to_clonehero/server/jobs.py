@@ -158,6 +158,8 @@ class JobManager:
         self._cancel_events: dict[int, threading.Event] = {}
         self._availability_lock = threading.Lock()
         self._availability_cache: tuple[tuple, dict[str, Any]] | None = None
+        from csv_to_clonehero.server.catalog_browse import CatalogBrowser
+        self.catalog_browser = CatalogBrowser(config)
         self._recover_orphaned_jobs()
         if auto_start:
             self.start()
@@ -199,6 +201,11 @@ class JobManager:
             self._thread.join(timeout=timeout)
 
     # ---- public API --------------------------------------------------------
+    def request_catalog_browse(self) -> None:
+        self.catalog_browser.request()
+        with self._cv:
+            self._cv.notify_all()
+
     def _availability_key(self, db: Database) -> tuple:
         from csv_to_clonehero.catalog import MAX_CATALOG_HEADER_BYTES
 
@@ -321,6 +328,9 @@ class JobManager:
         while not self._shutdown_event.is_set():
             next_job = self._dequeue_next()
             if next_job is None:
+                if self.catalog_browser.pending():
+                    self.catalog_browser.prepare()
+                    continue
                 with self._cv:
                     if self._shutdown_event.is_set():
                         break
@@ -424,6 +434,9 @@ class JobManager:
             key = self._availability_key(db)
             result = refresh_enchor_preflight(self.config, db, self.source_factory)
             result = self._save_discovery_availability(db, result, key)
+            if result.get("mode") == "catalog":
+                self.catalog_browser.request()
+                self.catalog_browser.prepare()
             if self._cancelled(job.id):
                 self._mark(job.id, status="cancelled", phase="cancelled", message="Chart-readiness check cancelled")
                 return

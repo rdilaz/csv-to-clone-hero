@@ -322,7 +322,10 @@ def selection_snapshot(db: Database, workspace_id: int) -> dict[str, Any]:
     latest = db.get_latest_exact_generation(workspace_id)
     generation_id = int(current["id"]) if current is not None else -1 if latest is not None else 0
     choices = []
-    for row in db.list_workspace_selections(workspace_id):
+    rows = db.list_workspace_selections(workspace_id)
+    if rows and all(row["kind"] == "catalog" for row in rows):
+        generation_id = 0
+    for row in rows:
         item = dict(row)
         choices.append(tuple(str(item.get(key) or "") for key in (
             "kind", "track_id", "candidate_id", "artist_norm", "metadata_json"
@@ -400,7 +403,7 @@ def build_archive(
         metadata = json.loads(str(value.get("metadata_json") or "{}"))
         from csv_to_clonehero.matching import POSSIBLE_MATCH, SELECTABLE_RESULT_TIERS
 
-        return tier in SELECTABLE_RESULT_TIERS and (
+        return tier in (SELECTABLE_RESULT_TIERS | {"CATALOG_CHOICE"}) and (
             tier != POSSIBLE_MATCH
             or bool(metadata.get("possible_confirmed"))
             or not metadata.get("selection_origin")
@@ -546,7 +549,7 @@ def _validated_selections(
 
         data = dict(row) if hasattr(row, "keys") else {}
         kind = str(data.get("kind") or "exact").casefold()
-        if kind not in {"exact", "expansion"}:
+        if kind not in {"exact", "expansion", "catalog"}:
             continue
         if kind == "expansion" and (config is None or not config.server.enable_expansion):
             continue
@@ -559,7 +562,12 @@ def _validated_selections(
         current_score = data.get("score")
         selection_metadata = json.loads(str(data.get("metadata_json") or "{}"))
         current_tier = ""
-        if kind == "exact":
+        if kind == "catalog":
+            from csv_to_clonehero.server.catalog_browse import current_catalog_choice
+            if config is None or not current_catalog_choice(config, db, workspace_id, data, candidate):
+                continue
+            current_eligibility, current_tier, current_score = "ELIGIBLE_REVIEW", "CATALOG_CHOICE", 0
+        elif kind == "exact":
             track_id = int(data.get("track_id") or 0)
             if track_id not in workspace_track_ids:
                 continue

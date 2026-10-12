@@ -87,6 +87,33 @@ def _assert_in_viewport(page, selector):
     assert box["y"] + box["height"] <= page.evaluate("window.innerHeight")
 
 
+def _assert_control_reachable_above_player(page, selector):
+    control = page.locator(selector)
+    control.scroll_into_view_if_needed()
+    _assert_in_viewport(page, selector)
+    box = control.bounding_box()
+    assert box is not None and box["height"] >= 44
+    dock = page.locator("#catalogPlayerDock").bounding_box()
+    assert dock is not None and box["y"] + box["height"] <= dock["y"]
+    assert control.evaluate("""element => {
+      const box = element.getBoundingClientRect();
+      const hit = document.elementFromPoint(box.x + box.width / 2, box.y + box.height / 2);
+      return Boolean(hit && (hit === element || element.contains(hit)));
+    }"""), f"{selector} is covered at its center"
+    return box
+
+
+def _empty_catalog_receipt(revision, generation_id=1):
+    """This fixture owns no catalog choices; provide the current API guards."""
+    return {
+        "catalog_summary": {"songs": 0, "charts": 0},
+        "selection_revision": revision,
+        "exact_generation_id": generation_id,
+        "undo": {"available": False, "operation_id": None, "label": "",
+                 "revision": revision, "generation_id": generation_id, "reason": ""},
+    }
+
+
 def _capture(page, name):
     root = os.environ.get("RIFF_BROWSER_EVIDENCE_DIR", "").strip()
     if not root:
@@ -254,35 +281,22 @@ def test_signal_check_confirm_keeps_multi_chart_selection_truthful(
         assert page.get_by_text("Different live recording.", exact=True).is_visible()
         _assert_no_overflow(page)
 
-        if viewport["width"] <= 1000:
-            page.locator("#studio-select-all").scroll_into_view_if_needed()
-            primary_box = page.locator("#studio-select-all").bounding_box()
-            initial_rail = page.locator("#selectionRail").bounding_box()
-            assert primary_box and initial_rail and 0 <= primary_box["y"] and primary_box["y"] + primary_box["height"] + 7 <= initial_rail["y"]
-            page.locator('[data-candidate="101"]').scroll_into_view_if_needed()
-            group_box = page.locator(".song-group").first.bounding_box()
-            action_box = page.locator('[data-candidate="101"]').bounding_box()
-            band_box = page.locator("#selectionRail").bounding_box()
-            assert group_box is not None and action_box is not None and band_box is not None
-            if viewport["width"] == 390:
-                banner_height = 0
-                if support_enabled:
-                    banner_box = page.locator(".cause-bar").bounding_box()
-                    assert banner_box is not None and banner_box["height"] <= 44
-                    banner_height = banner_box["height"]
-                else:
-                    assert page.locator(".cause-bar").count() == 0
-                # The reviewed action and individual chart controls remain
-                # clear of the tray when browsing their respective sections.
-                assert group_box["y"] < action_box["y"] and action_box["y"] >= 0
-            assert "is-in-flow" not in (page.locator("#selectionRail").get_attribute("class") or "")
-            assert action_box["y"] + action_box["height"] + 7 <= band_box["y"]
-        else:
-            rail_box = page.locator("#selectionRail").bounding_box()
-            continue_box = page.locator("#continueDownloadButton").bounding_box()
-            assert rail_box is not None and continue_box is not None
-            assert rail_box["height"] < viewport["height"] * 0.75
-            assert continue_box["y"] + continue_box["height"] <= viewport["height"]
+        # The persistent player owns the fixed bottom area. The selection
+        # summary stays in document flow, with every chart action reachable.
+        rail = page.locator("#selectionRail")
+        assert "is-in-flow" in (rail.get_attribute("class") or "")
+        assert rail.evaluate("element => getComputedStyle(element).position") == "relative"
+        _assert_control_reachable_above_player(page, "#studio-select-all")
+        action_box = _assert_control_reachable_above_player(page, '[data-candidate="101"]')
+        group_box = page.locator(".song-group").first.bounding_box()
+        assert group_box is not None and group_box["y"] < action_box["y"]
+        if viewport["width"] == 390:
+            if support_enabled:
+                banner_box = page.locator(".cause-bar").bounding_box()
+                assert banner_box is not None and banner_box["height"] <= 44
+            else:
+                assert page.locator(".cause-bar").count() == 0
+        _assert_control_reachable_above_player(page, "#continueDownloadButton")
         _capture(page, f"confirm-{viewport['width']}x{viewport['height']}.png")
 
         sibling = page.locator('[data-candidate="102"]')
@@ -476,33 +490,20 @@ def test_signal_check_selection_summary_reflows_at_tablet_widths(
         page.route("**/api/**", fixtures.fulfill)
         page.goto(base_url + "/", wait_until="networkidle")
 
-        page.locator("#studio-select-all").scroll_into_view_if_needed()
-        primary = page.locator("#studio-select-all").bounding_box()
-        assert primary and 0 <= primary["y"] and primary["y"] + primary["height"] <= viewport["height"]
-        page.locator('[data-candidate="101"]').scroll_into_view_if_needed()
+        _assert_control_reachable_above_player(page, "#studio-select-all")
+        _assert_control_reachable_above_player(page, '[data-candidate="101"]')
         rail = page.locator("#selectionRail")
-        rail_box = rail.bounding_box()
-        continue_box = page.locator("#continueDownloadButton").bounding_box()
         source_box = page.locator(".song-group > .candidate-row .candidate-source").first.bounding_box()
-        assert rail_box is not None and continue_box is not None and source_box is not None
-        if viewport["width"] <= 1000:
-            assert rail.evaluate("element => getComputedStyle(element).position") == "fixed"
-            assert rail_box["height"] <= viewport["height"] * 0.2
-            action_box = page.locator('[data-candidate="101"]').bounding_box()
-            assert action_box is not None
-            assert action_box["y"] + action_box["height"] + 7 <= rail_box["y"]
-        else:
-            assert rail.evaluate("element => getComputedStyle(element).position") == "sticky"
-            assert rail_box["height"] < viewport["height"] * 0.75
-            assert continue_box["y"] + continue_box["height"] <= viewport["height"]
+        assert source_box is not None
+        assert "is-in-flow" in (rail.get_attribute("class") or "")
+        assert rail.evaluate("element => getComputedStyle(element).position") == "relative"
+        _assert_control_reachable_above_player(page, "#continueDownloadButton")
         _assert_no_overflow(page)
         if viewport["width"] in {768, 1024}:
             page.evaluate("document.documentElement.style.fontSize = '200%'; window.dispatchEvent(new Event('resize'))")
             page.wait_for_timeout(50)
             _assert_no_overflow(page)
-            if viewport["width"] == 1024:
-                page.locator("#continueDownloadButton").scroll_into_view_if_needed()
-                _assert_in_viewport(page, "#continueDownloadButton")
+            _assert_control_reachable_above_player(page, "#continueDownloadButton")
         browser.close()
 
 
@@ -693,8 +694,7 @@ def test_signal_check_reflows_at_320_and_respects_reduced_motion(public_server, 
         page.goto(base_url + "/", wait_until="networkidle")
 
         _assert_no_overflow(page)
-        page.locator("#studio-select-all").scroll_into_view_if_needed()
-        _assert_in_viewport(page, "#studio-select-all")
+        _assert_control_reachable_above_player(page, "#studio-select-all")
         assert page.evaluate("""() => ['studio-select-scope', 'studio-select-policy',
             'studio-include-uncertain', 'studio-selection-preview'].every(id =>
             Boolean(document.getElementById(id).compareDocumentPosition(
@@ -730,14 +730,11 @@ def test_signal_check_reflows_at_320_and_respects_reduced_motion(public_server, 
             "element => ({outline: getComputedStyle(element).outlineColor, shadow: getComputedStyle(element).boxShadow})"
         )
         assert focus_style["shadow"] != "none"
-        page.locator('[data-candidate="101"]').scroll_into_view_if_needed()
+        _assert_control_reachable_above_player(page, '[data-candidate="101"]')
         rail = page.locator("#selectionRail")
-        action_box = page.locator('[data-candidate="101"]').bounding_box()
-        rail_box = rail.bounding_box()
-        assert action_box is not None and rail_box is not None
-        if "is-in-flow" not in (rail.get_attribute("class") or ""):
-            assert action_box["y"] + action_box["height"] + 7 <= rail_box["y"]
-            assert rail_box["height"] <= 800 * 0.2
+        assert "is-in-flow" in (rail.get_attribute("class") or "")
+        assert rail.evaluate("element => getComputedStyle(element).position") == "relative"
+        _assert_control_reachable_above_player(page, "#continueDownloadButton")
         animation_duration = page.locator(".loading-line span").evaluate(
             "element => getComputedStyle(element).animationDuration"
         )
@@ -745,6 +742,7 @@ def test_signal_check_reflows_at_320_and_respects_reduced_motion(public_server, 
         page.evaluate("document.documentElement.style.fontSize = '200%'; window.dispatchEvent(new Event('resize'))")
         page.wait_for_timeout(50)
         _assert_no_overflow(page)
+        _assert_control_reachable_above_player(page, "#continueDownloadButton")
         browser.close()
 
 
@@ -757,6 +755,7 @@ def test_public_authenticated_journey_to_download_ready(
 ):
     _app, base_url, cookie_name, cookie = public_server
     selected = {"value": False}
+    selection_revision = {"value": 1}
     scope_saved = {"value": False}
     job_polls = {"count": 0}
     api_calls = []
@@ -775,6 +774,7 @@ def test_public_authenticated_journey_to_download_ready(
             else {"known": True, "include_liked": False, "playlist_ids": ["playlist-1"]}
         )
         return {
+            **_empty_catalog_receipt(selection_revision["value"], 1 if complete else 0),
             "workspace_id": 1,
             "workspace_status": "complete" if complete else "created",
             "workspace": {"id": 1, "status": "complete" if complete else "created", "phase": "complete" if complete else "source_setup", "updated_at": time.time()},
@@ -859,6 +859,7 @@ def test_public_authenticated_journey_to_download_ready(
             },
         }
         return {
+            **_empty_catalog_receipt(selection_revision["value"]),
             "workspace": 1,
             "minimum_score": 50,
             "tracks": [{
@@ -925,13 +926,25 @@ def test_public_authenticated_journey_to_download_ready(
             payload, status = {"available": False, "reason": "Expansion is not enabled for this fixture.", "artists": [], "job": None}, 200
         elif path.startswith("/api/expansion/results"):
             payload, status = {"songs": [], "total": 0, "offset": 0, "limit": 25, "has_more": False, "summary": {"selected": 0}}, 200
+        elif path == "/api/selection/history":
+            payload, status = {**_empty_catalog_receipt(selection_revision["value"]), "operations": []}, 200
+        elif path.startswith("/api/catalog/selections?"):
+            payload, status = {**_empty_catalog_receipt(selection_revision["value"]),
+                               "items": [], "total": 0, "limit": 25, "offset": 0, "has_more": False}, 200
         elif path == "/api/selection/bulk":
-            selected["value"] = json.loads(request.post_data or "{}").get("action") != "clear"
-            payload, status = {"ok": True, "changed": 1, "scope": "strong", "minimum_score": 50}, 200
+            body = json.loads(request.post_data or "{}")
+            assert body["selection_revision"] == selection_revision["value"]
+            next_selected = body.get("action") != "clear"
+            changed = int(selected["value"] != next_selected)
+            selected["value"] = next_selected
+            selection_revision["value"] += changed
+            payload, status = {"ok": True, "changed": changed, "scope": "strong", "minimum_score": 50}, 200
         elif path == "/api/download":
             payload, status = {"download": {"token": "single.use.token", "expires_at": time.time() + 900, "ttl_seconds": 900, "size_bytes": 1234}, "summary": {"ready": 1, "published": 1, "success": True}}, 200
         else:
             payload, status = {"error": f"unexpected mocked request: {method} {path}"}, 500
+        if status < 400 and (path.startswith("/api/expansion/") or path == "/api/selection/bulk"):
+            payload.update(_empty_catalog_receipt(selection_revision["value"]))
         route.fulfill(status=status, content_type="application/json", body=json.dumps(payload))
 
     with playwright.sync_playwright() as runtime:
@@ -1246,6 +1259,7 @@ def test_public_expansion_confirm_and_reload_in_browser(public_server):
     _app, base_url, cookie_name, cookie = public_server
     expansion_started = {"value": False}
     expansion_selected = {"value": False}
+    selection_revision = {"value": 1}
     expansion_job_polls = {"count": 0}
     fail_expansion_recount = {"value": False}
 
@@ -1324,10 +1338,18 @@ def test_public_expansion_confirm_and_reload_in_browser(public_server):
         elif path == "/api/selection" and method == "POST":
             body = json.loads(request.post_data or "{}")
             assert body["kind"] == "expansion"
-            expansion_selected["value"] = body["action"] == "select"
+            assert body["selection_revision"] == selection_revision["value"]
+            next_selected = body["action"] == "select"
+            selection_revision["value"] += int(expansion_selected["value"] != next_selected)
+            expansion_selected["value"] = next_selected
             payload, status = {"ok": True}, 200
+        elif path == "/api/selection/history":
+            payload, status = {"operations": []}, 200
         else:
             payload, status = {"error": f"unexpected mocked request: {method} {path}"}, 500
+        if status < 400 and (path == "/api/journey" or path.startswith("/api/workspace?")
+                             or path.startswith("/api/expansion/") or path.startswith("/api/selection")):
+            payload.update(_empty_catalog_receipt(selection_revision["value"]))
         route.fulfill(status=status, content_type="application/json", body=json.dumps(payload))
 
     with playwright.sync_playwright() as runtime:

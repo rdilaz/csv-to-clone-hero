@@ -32,7 +32,7 @@ from collections.abc import Mapping
 from contextlib import contextmanager
 from typing import Any, Callable
 
-from flask import Flask, abort, g, jsonify, redirect, render_template, request, send_file, session, url_for
+from flask import Flask, abort, current_app, g, jsonify, redirect, render_template, request, send_file, session, url_for
 
 from csv_to_clonehero.config import AppConfig
 from csv_to_clonehero.catalog_validation import (
@@ -52,6 +52,7 @@ from csv_to_clonehero.matching import (
 from csv_to_clonehero.normalization import normalize_artist, normalize_title
 from csv_to_clonehero.server.auth import build_oauth, build_soundcloud_oauth, user_workspace_key
 from csv_to_clonehero.server.downloads import BrowserDownloads, DownloadError, selection_snapshot
+from csv_to_clonehero.server.catalog_browse import catalog_key, catalog_compatibility, public_catalog_item
 from csv_to_clonehero.server.jobs import JobManager
 from csv_to_clonehero.server.safeguards import (
     get_discovery_availability,
@@ -75,6 +76,7 @@ _STUDIO_CAPABILITIES = {
     "select_all": True, "selection_scopes": ["library", "expansion", "both"],
     "selection_policies": ["one_per_song", "all_versions"], "listening_deck": True,
     "spotify_embed": True, "expansion_spotify_lookup": False,
+    "catalog_browser": True, "catalog_selection": True,
 }
 
 
@@ -173,7 +175,7 @@ def create_app(
         response.headers.setdefault("Referrer-Policy", "no-referrer")
         if not response.headers.get("Content-Security-Policy"):
             response.headers["Content-Security-Policy"] = (
-                "default-src 'self'; base-uri 'self'; connect-src 'self'; "
+                "default-src 'self'; base-uri 'self'; connect-src 'self' https://files.enchor.us; media-src 'self' blob:; "
                 "font-src 'self'; form-action 'self'; frame-ancestors 'self'; "
                 "frame-src 'self' https://open.spotify.com; "
                 "img-src 'self' data: https:; object-src 'none'; "
@@ -305,15 +307,15 @@ def create_app(
 
     @app.get("/terms")
     def terms():
-        return render_template("legal.html", page="Terms of Service", config=config)
+        return render_template("legal.html", page="Terms of Service", user=_public_user(g.get("user")), config=config)
 
     @app.get("/privacy")
     def privacy():
-        return render_template("legal.html", page="Privacy Policy", config=config)
+        return render_template("legal.html", page="Privacy Policy", user=_public_user(g.get("user")), config=config)
 
     @app.get("/dmca")
     def dmca():
-        return render_template("legal.html", page="Copyright & DMCA", config=config)
+        return render_template("legal.html", page="Copyright & DMCA", user=_public_user(g.get("user")), config=config)
 
     # ---- Spotify OAuth (multi-user) -----------------------------------------
     @app.get("/login")
@@ -971,6 +973,155 @@ def create_app(
         if job is None:
             abort(404)
         return jsonify({"job": _job_public(job)})
+
+    # ---- full catalog + independent catalog selections -----------------------
+    def _catalog_artifacts(db, workspace):
+        if workspace is None:
+            return {}
+        return {(str(row["source"]).casefold(), str(row["md5"]).casefold() if row["md5"] else f"chart:{row['chart_id']}"): dict(row)
+                for row in db._conn.execute("""SELECT s.kind,s.candidate_id,c.source,c.chart_id,c.md5 FROM workspace_selections s
+                    JOIN candidate_charts c ON c.id=s.candidate_id WHERE s.workspace_id=? AND s.status='selected'""", (workspace,))}
+
+    def _catalog_receipts(db, workspace):
+        if workspace is None:
+            return {"selection_revision": 0, "exact_generation_id": 0, "catalog_summary": {"songs": 0, "charts": 0},
+                    "summary": {"catalog": {"songs": 0, "charts": 0}},
+                    "undo": {"available": False, "operation_id": None, "label": "", "revision": 0, "generation_id": 0}}
+        receipt = db.public_selection_receipt(workspace)
+        return {**receipt, "exact_generation_id": int(_public_generation_id(db, workspace) or 0),
+                "summary": {"catalog": receipt["catalog_summary"]}}
+
+    @app.get("/api/catalog")
+    def browse_catalog():
+        try:
+            limit = min(100, max(1, int(request.args.get("limit", 25))))
+            offset = max(0, int(request.args.get("offset", 0)))
+            order = request.args.get("order", "source")
+            seed = str(request.args.get("seed", "0"))[:64]
+            q = str(request.args.get("q", ""))[:200]
+            if order not in {"source", "shuffle"}:
+                raise ValueError("Choose source or shuffle order.")
+        except (TypeError, ValueError) as exc:
+            return jsonify({"error": str(exc)}), 400
+        jobs.request_catalog_browse()
+        db = _user_db()
+        try:
+            workspace = _ensure_workspace(db, g.user) if g.get("user") is not None else None
+            with jobs.catalog_browser._lock:
+                readiness = jobs.catalog_browser.readiness()
+                if not readiness["available"]:
+                    return jsonify({**readiness, "readiness": readiness, "items": [], "limit": limit, "offset": offset,
+                                    "has_more": False, **_catalog_receipts(db, workspace)}), 503 if readiness["status"] == "unavailable" else 202
+                if request.args.get("snapshot_token") not in (None, readiness["snapshot_token"]):
+                    raise SelectionConflict("The chart catalog changed. Reload the catalog browser.")
+                rows, total = jobs.catalog_browser.page(offset=offset, limit=limit, q=q, order=order, seed=seed)
+                selected = _catalog_artifacts(db, workspace)
+                return jsonify({**readiness, "readiness": readiness,
+                    "items": [public_catalog_item(config, db, chart, selected) for chart in rows],
+                    "limit": limit, "offset": offset, "has_more": offset + len(rows) < total,
+                    "total_filtered_charts": total, "q": q, "order": order, "seed": seed, **_catalog_receipts(db, workspace)})
+        finally:
+            db.close()
+
+    @app.get("/api/catalog/<source>/<int:chart_id>")
+    def catalog_detail(source, chart_id):
+        jobs.request_catalog_browse()
+        db = _user_db()
+        try:
+            workspace = _ensure_workspace(db, g.user) if g.get("user") is not None else None
+            with jobs.catalog_browser._lock:
+                readiness = jobs.catalog_browser.readiness()
+                if not readiness["available"]:
+                    return jsonify({**readiness, "readiness": readiness}), 503 if readiness["status"] == "unavailable" else 202
+                chart = jobs.catalog_browser.chart(source, chart_id)
+                if chart is None:
+                    abort(404)
+                return jsonify({"item": public_catalog_item(config, db, chart, _catalog_artifacts(db, workspace)),
+                                "snapshot_token": readiness["snapshot_token"], **_catalog_receipts(db, workspace)})
+        finally:
+            db.close()
+
+    @app.get("/api/catalog/selections")
+    def selected_catalog():
+        user = _require_user()
+        db = _user_db()
+        try:
+            limit = min(100, max(1, int(request.args.get("limit", 25))))
+            offset = max(0, int(request.args.get("offset", 0)))
+            workspace = _ensure_workspace(db, user)
+            rows = db._conn.execute("""SELECT s.candidate_id FROM workspace_selections s WHERE s.workspace_id=?
+                AND s.kind='catalog' AND s.status='selected' ORDER BY s.selected_at,s.id LIMIT ? OFFSET ?""", (workspace, limit, offset)).fetchall()
+            selected = _catalog_artifacts(db, workspace)
+            items = [public_catalog_item(config, db, db.get_candidate(int(row["candidate_id"])), selected) for row in rows]
+            receipt = _catalog_receipts(db, workspace)
+            total = receipt["catalog_summary"]["charts"]
+            return jsonify({"items": items, "limit": limit, "offset": offset, "total": total,
+                "has_more": offset + len(items) < total, "snapshot_token": jobs.catalog_browser.readiness()["snapshot_token"], **receipt})
+        except (TypeError, ValueError) as exc:
+            return jsonify({"error": str(exc)}), 400
+        finally:
+            db.close()
+
+    @app.post("/api/catalog/selection")
+    def select_catalog():
+        user = _require_user()
+        payload = request.get_json(silent=True) or {}
+        if not isinstance(payload, dict) or payload.get("action", "select") not in {"select", "clear"}:
+            return jsonify({"error": "Choose select or clear."}), 400
+        match = re.fullmatch(r"([a-zA-Z0-9_-]{1,32}):([1-9][0-9]*)", str(payload.get("catalog_key") or ""))
+        if match is None or type(payload.get("selection_revision")) is not int:
+            return jsonify({"error": "A catalog identity and current selection revision are required."}), 400
+        source, chart_id = match.group(1), int(match.group(2))
+        db = _user_db()
+        try:
+            workspace = _ensure_workspace(db, user)
+            already, selected_scope, changed = False, None, 0
+            with _public_selection_edit(db, user, workspace, payload, "Remove catalog chart" if payload.get("action") == "clear" else "Add catalog chart", allow_catalog=True):
+                if payload.get("action") == "clear":
+                    candidate = db._conn.execute("SELECT id FROM candidate_charts WHERE source=? AND chart_id=?", (source, chart_id)).fetchone()
+                    chart = db.get_candidate(int(candidate["id"])) if candidate is not None else jobs.catalog_browser.chart(source, chart_id)
+                    if chart is not None:
+                        artifact = (chart.source.casefold(), chart.md5.casefold() if chart.md5 else f"chart:{chart.chart_id}")
+                        # Browse aliases describe a shared package as selected.
+                        # Clear its owned catalog choice while preserving music
+                        # and expansion selections of the same package.
+                        for choice in db.list_workspace_selections(workspace):
+                            if choice["kind"] != "catalog":
+                                continue
+                            saved = db.candidate_from_workspace_row(choice)
+                            saved_artifact = (saved.source.casefold(), saved.md5.casefold() if saved.md5 else f"chart:{saved.chart_id}")
+                            if saved_artifact == artifact:
+                                changed += db.clear_workspace_selection(workspace, candidate_id=int(choice["candidate_id"]), kind="catalog")
+                else:
+                    with jobs.catalog_browser._lock:
+                        readiness = jobs.catalog_browser.readiness()
+                        if not readiness["available"] or payload.get("snapshot_token") != readiness["snapshot_token"]:
+                            raise SelectionConflict("The chart catalog is not current. Reload it before adding charts.")
+                        chart = jobs.catalog_browser.chart(source, chart_id)
+                        if chart is None:
+                            raise ValueError("This chart is not in the current catalog.")
+                        eligible, reason, gates = catalog_compatibility(config, chart, db)
+                        if not eligible:
+                            raise ValueError(reason)
+                        artifact = (chart.source.casefold(), chart.md5.casefold() if chart.md5 else f"chart:{chart.chart_id}")
+                        saved = _catalog_artifacts(db, workspace).get(artifact)
+                        if saved is not None:
+                            already, selected_scope = True, saved["kind"]
+                        else:
+                            candidate_id = db.ensure_catalog_candidate(workspace, chart, readiness["snapshot_token"], gates)
+                            db.select_workspace_candidate(workspace, None, candidate_id, kind="catalog", artist_norm=chart.artist_norm,
+                                force=True, require_workspace_candidate=True, score=0, eligibility="ELIGIBLE_REVIEW",
+                                metadata={"selection_origin": "catalog_browser", "catalog_key": catalog_key(chart),
+                                    "catalog_snapshot_token": readiness["snapshot_token"], "catalog_row_hash": str(getattr(chart, "_catalog_row_hash", ""))})
+                            changed = 1
+            return jsonify({"ok": True, "changed": changed, "already_selected": already, "selected_in_scope": selected_scope,
+                **db.public_selection_state(workspace), "exact_generation_id": int(_public_generation_id(db, workspace) or 0)})
+        except SelectionConflict:
+            raise
+        except (TypeError, ValueError) as exc:
+            return jsonify({"error": str(exc)}), 400
+        finally:
+            db.close()
 
     # ---- workspace + review ---------------------------------------------------
     @app.get("/api/journey")
@@ -1643,6 +1794,8 @@ def _is_public_path(path: str) -> bool:
         "/about",
     }:
         return True
+    if path == "/api/catalog" or re.fullmatch(r"/api/catalog/[a-zA-Z0-9_-]+/[0-9]+", path):
+        return True
     if path.startswith(("/terms", "/privacy", "/dmca")):
         return True
     if path.startswith("/api/download/"):
@@ -1958,7 +2111,7 @@ def _ensure_workspace(db: Database, user: Any) -> int:
 
 @contextmanager
 def _public_selection_edit(db: Database, user: Any, workspace: int,
-                           payload: dict[str, Any], label: str, *, record: bool = True):
+                           payload: dict[str, Any], label: str, *, record: bool = True, allow_catalog: bool = False):
     """Lock ownership, job status, generation and revision through the edit."""
     with db.atomic_workspace_selection():
         key = user_workspace_key(user["spotify_user_id"])
@@ -1969,10 +2122,10 @@ def _public_selection_edit(db: Database, user: Any, workspace: int,
                for kind in ("discovery", "expansion", "download")):
             raise SelectionConflict("Wait for matching or ZIP preparation to finish before changing chart choices.")
         generation = _public_generation_id(db, workspace)
-        if generation is not None and generation < 0:
+        if generation is not None and generation < 0 and not allow_catalog:
             raise SelectionConflict("The chart results changed. Complete matching before changing choices.")
         for name, actual in (("selection_revision", db.public_selection_revision(workspace)),
-                             ("exact_generation_id", generation)):
+                             ("exact_generation_id", int(generation or 0))):
             expected = payload.get(name)
             if expected is not None and (type(expected) is not int or expected != actual):
                 raise SelectionConflict("The selection or chart results changed. Refresh the summary before continuing.")
@@ -1998,6 +2151,14 @@ def _public_restore_choice_eligible(config: AppConfig, db: Database, workspace: 
     candidate = db.get_candidate(int(choice["candidate_id"]))
     if candidate is None or not db.is_chart_artifact_eligible(candidate.source, candidate.chart_id):
         return False
+    if choice["kind"] == "catalog":
+        from csv_to_clonehero.server.catalog_browse import current_catalog_choice
+        jobs = current_app.extensions["jobs"]
+        if not jobs.catalog_browser.readiness()["available"]:
+            jobs.request_catalog_browse()
+            raise SelectionConflict("The chart catalog is preparing or unavailable. Retry Undo once the catalog is ready.")
+        chart = jobs.catalog_browser.chart(candidate.source, candidate.chart_id)
+        return current_catalog_choice(config, db, workspace, choice, candidate, catalog_chart=chart, allow_load=False)
     if choice["kind"] == "exact":
         eligibility, hard_gate, _, _, breakdown = _current_match(config, _track_by_id(db, choice["track_id"]), candidate)
     else:
@@ -2297,6 +2458,7 @@ def _listening_deck_items(config: AppConfig, db: Database, workspace: int, scope
             "scope": kind, "track_key": track_key,
             "song_key": card.get("song_key") if kind == "expansion" else None,
             "candidate_id": int(candidate["candidate_id"]),
+            "catalog_key": f"{candidate['source']}:{int(candidate['chart_id'])}",
             "artist_norm": candidate.get("artist_norm") if kind == "expansion" else None,
             "selected": False, "selectable": True,
             "result_tier": candidate["result_tier"],
@@ -2305,6 +2467,7 @@ def _listening_deck_items(config: AppConfig, db: Database, workspace: int, scope
             "spotify_url": f"https://open.spotify.com/track/{spotify_id}" if spotify_id else None,
             "_versions": [{
                 "candidate_id": int(version["candidate_id"]),
+                "catalog_key": f"{version['source']}:{int(version['chart_id'])}",
                 "chart_title": version["title"], "chart_artist": version["artist"],
                 "result_tier": version["result_tier"],
                 "difficulty_coverage": version["difficulty_coverage"],

@@ -437,3 +437,13 @@ select:disabled { color: var(--disabled-ink); cursor: not-allowed; }
   .studio-quick-select, .studio-deck, .selection-rail, .motion-control { border: 1px solid CanvasText; }
   .studio-deck { margin-top: 12px; }
 }
+
+/* The global catalog player owns the only fixed bottom surface. */
+body[data-riff-ui="riff-catalog-20261011"] .selection-rail {
+  position: relative; top: auto; right: auto; bottom: auto; left: auto;
+}
+@media (max-width: 1000px) {
+  body[data-riff-ui="riff-catalog-20261011"] #stageConfirm { padding-bottom: 0; }
+  body[data-riff-ui="riff-catalog-20261011"] .selection-rail { grid-template-columns: auto minmax(0, 1fr); margin-top: 16px; }
+  body[data-riff-ui="riff-catalog-20261011"] .selection-rail .button { grid-column: 1 / -1; }
+}

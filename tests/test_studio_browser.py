@@ -1,4 +1,4 @@
-"""Real Chromium interactions with synthetic songs and intercepted Spotify embeds."""
+"""Real Chromium interactions with synthetic songs and the persistent preview bridge."""
 
 from __future__ import annotations
 
@@ -30,6 +30,7 @@ class StudioFixtures(YieldFixtures):
         self.omit_save_summary = False
         self.change_generation_on_page = False
         self.invalid_spotify_id = False
+        self.invalid_catalog_key = False
         self.reported_deck_total = None
         self.invalid_deck_offset = False
 
@@ -62,14 +63,15 @@ class StudioFixtures(YieldFixtures):
                 items.append({"key": f"library:{track['track_key']}", "scope": "library", "track_key": track["track_key"], "candidate_id": candidate["candidate_id"],
                     "title": track["title"], "artist": track["artist"], "chart_title": candidate["title"], "chart_artist": candidate["artist"], "album": track.get("album"),
                     "selected": candidate["selected"], "song_selected": track["selected"], "selectable": True, "result_tier": candidate["result_tier"], "difficulty_coverage": candidate["difficulty_coverage"],
-                    "spotify_id": "not-a-confirmed-id" if self.invalid_spotify_id else track["spotify_id"], "spotify_url": None, "artist_norm": None})
+                    "spotify_id": "not-a-confirmed-id" if self.invalid_spotify_id else track["spotify_id"], "spotify_url": None, "artist_norm": None,
+                    "catalog_key": None if self.invalid_catalog_key else f"enchor:{candidate['candidate_id']}"})
         if selected_scope in {"expansion", "both"}:
             for song in self.expansion_songs():
                 candidate = song["candidates"][0]
                 items.append({"key": f"expansion:{song['song_key']}", "scope": "expansion", "track_key": None, "candidate_id": candidate["candidate_id"],
                     "title": song["title"], "artist": song["artist"], "chart_title": candidate["title"], "chart_artist": candidate["artist"], "album": None,
                     "selected": candidate["selected"], "song_key": song["song_key"], "song_selected": any(item["selected"] for item in song["candidates"]), "selectable": True, "result_tier": "POSSIBLE_MATCH", "difficulty_coverage": candidate["difficulty_coverage"],
-                    "spotify_id": None, "spotify_url": None, "artist_norm": candidate["artist_norm"]})
+                    "spotify_id": None, "spotify_url": None, "artist_norm": candidate["artist_norm"], "catalog_key": f"enchor:{candidate['candidate_id']}"})
         seed = query.get("seed", [""])[0]
         if query.get("order", [""])[0] == "shuffle":
             items.sort(key=lambda item: hashlib.sha256((seed + item["key"]).encode()).digest())
@@ -214,36 +216,50 @@ def test_seeded_shuffle_visits_all_pages_once_before_repeating(delivery_page):
     assert page.locator("#studio-now-title").inner_text() == titles[0]
 
 
-def test_spotify_embed_is_lazy_single_and_original_recording_only(delivery_page):
+def test_chart_preview_bridge_is_lazy_and_never_creates_spotify_embed(delivery_page):
     fixtures = StudioFixtures(count=3)
     page, requests = delivery_page(fixtures)
     spotify = []
     page.route("https://open.spotify.com/**", lambda route: (spotify.append(route.request.url), route.fulfill(status=200, body="<html>Offline synthetic Spotify embed</html>", content_type="text/html")))
+    page.evaluate("window.qaPreviewKeys=[]; window.RiffCatalog={...window.RiffCatalog,playKey:async key=>window.qaPreviewKeys.push(key)}")
     assert not spotify and page.locator("#studio-player-host iframe").count() == 0
     page.locator("#studio-next").click()
     playwright.expect(page.locator("#studio-add")).to_be_enabled()
     assert not spotify
     page.locator("#studio-player-toggle").click()
-    playwright.expect(page.locator("#studio-player-host iframe")).to_have_count(1)
-    playwright.expect(page.locator("#studio-player-host iframe")).to_be_visible()
-    assert page.locator("#studio-player-host iframe").get_attribute("src") == "https://open.spotify.com/embed/track/0000000000000000000000?theme=0"
-    assert "Original song on Spotify" in page.locator("#studio-player-host iframe").get_attribute("title")
-    assert "autoplay" not in page.locator("#studio-player-host iframe").get_attribute("allow")
+    page.wait_for_function("() => window.qaPreviewKeys.length===1")
+    assert page.evaluate("window.qaPreviewKeys") == ["enchor:1000"]
+    assert not spotify and page.locator("#studio-player-host iframe").count() == 0
     page.locator("#studio-next").click()
-    playwright.expect(page.locator("#studio-player-host iframe")).to_have_count(1)
-    assert page.locator("#studio-player-host iframe").get_attribute("src").endswith("0000000000000000000001?theme=0")
+    assert page.evaluate("window.qaPreviewKeys") == ["enchor:1000"]
+    page.locator("#studio-player-toggle").click()
+    assert page.evaluate("window.qaPreviewKeys") == ["enchor:1000", "enchor:1001"]
     assert not _requests(requests, "/api/selection", "POST")
 
 
-def test_preview_can_be_first_action_and_closes_visibly(delivery_page):
+def test_chart_preview_can_be_first_explicit_action(delivery_page):
     page, _requests_log = delivery_page(StudioFixtures(count=3))
     page.route("https://open.spotify.com/**", lambda route: route.fulfill(status=200, body="<html>Offline synthetic embed</html>", content_type="text/html"))
+    page.evaluate("window.qaPreviewKeys=[]; window.RiffCatalog={...window.RiffCatalog,playKey:async key=>window.qaPreviewKeys.push(key)}")
     page.locator("#studio-player-toggle").click()
-    playwright.expect(page.locator("#studio-player-host iframe")).to_be_visible()
+    page.wait_for_function("() => window.qaPreviewKeys.length===1")
+    assert page.evaluate("window.qaPreviewKeys") == ["enchor:1000"]
     playwright.expect(page.locator("#studio-now-title")).to_have_text("Studio song 0 (Expert only)")
-    page.locator("#studio-player-toggle").click()
-    playwright.expect(page.locator("#studio-player-host")).to_be_hidden()
+    assert page.locator("#catalogPlayerDock").is_visible()
     assert page.locator("#studio-player-host iframe").count() == 0
+
+
+def test_cancelled_chart_preview_bridge_does_not_announce_playback_started(delivery_page):
+    page, requests = delivery_page(StudioFixtures(count=3))
+    page.locator("#studio-next").click()
+    playwright.expect(page.locator("#studio-add")).to_be_enabled()
+    previous_status = page.locator("#studio-deck-status").inner_text()
+    page.evaluate("window.qaCancelledPreview=false;window.RiffCatalog={...window.RiffCatalog,playKey:async()=>{window.qaCancelledPreview=true;return false;}}")
+    page.locator("#studio-player-toggle").click()
+    page.wait_for_function("() => window.qaCancelledPreview")
+    assert page.locator("#studio-deck-status").inner_text() == previous_status
+    assert page.locator("#catalogAudio").evaluate("audio=>audio.paused")
+    assert not _requests(requests, "/api/selection", "POST")
 
 
 def test_unconfirmed_spotify_id_never_embeds(delivery_page):
@@ -252,19 +268,28 @@ def test_unconfirmed_spotify_id_never_embeds(delivery_page):
     page, _requests_log = delivery_page(fixtures)
     page.locator("#studio-next").click()
     playwright.expect(page.locator("#studio-add")).to_be_enabled()
-    playwright.expect(page.locator("#studio-player-toggle")).to_be_disabled()
+    playwright.expect(page.locator("#studio-player-toggle")).to_be_enabled()
     playwright.expect(page.locator("#studio-now-link")).to_be_hidden()
     assert page.locator("iframe[src*=spotify]").count() == 0
 
 
-def test_expansion_has_no_guessed_preview_and_add_requires_explicit_review(delivery_page):
+def test_unconfirmed_catalog_identity_never_opens_audio_preview(delivery_page):
+    fixtures = StudioFixtures(count=2)
+    fixtures.invalid_catalog_key = True
+    page, _requests_log = delivery_page(fixtures)
+    page.locator("#studio-next").click()
+    playwright.expect(page.locator("#studio-player-toggle")).to_be_disabled()
+    assert not page.locator("#catalogAudio").get_attribute("src")
+
+
+def test_expansion_uses_catalog_identity_and_add_requires_explicit_review(delivery_page):
     fixtures = StudioFixtures(count=2)
     fixtures.expansion_groups = deepcopy(fixtures.expansion_catalog)
     page, requests = delivery_page(fixtures)
     page.locator("#studio-select-scope").select_option("expansion")
     page.locator("#studio-next").click()
     playwright.expect(page.locator("#studio-add")).to_be_enabled()
-    playwright.expect(page.locator("#studio-player-toggle")).to_be_disabled()
+    playwright.expect(page.locator("#studio-player-toggle")).to_be_enabled()
     page.once("dialog", lambda dialog: dialog.dismiss())
     page.locator("#studio-add").click()
     assert not _requests(requests, "/api/selection", "POST")

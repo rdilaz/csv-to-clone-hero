@@ -24,12 +24,14 @@ a setlist without repeatedly opening chart diagnostics. Add to ZIP changes
 the selection, not the downloaded archive; ZIP preparation still validates
 actual supported note tracks before publishing a file.
 
-The preview is the original song through an official Spotify embed. It is
-loaded only after an explicit preview action for a confirmed Spotify track ID.
-Spotify determines playback availability. Artist discoveries without a
-confirmed Spotify ID have no preview. Spotify audio is never extracted,
-proxied, saved, or added to the chart ZIP. A chart for an alternate recording
-may differ from the original Spotify song shown in the preview.
+Chart previews now use the persistent catalog player: choose Preview chart
+audio to open the selected chart package's available audio. Browse also opens
+the full installed catalog independently of imported music. Its listening
+queue and Add to ZIP choices are separate. Single song mixes use native audio;
+common multiple stems produce a short mixed preview. Availability is checked
+on Play, rather than inferred from chart metadata. Spotify audio is never
+extracted or added to chart ZIPs. See [Catalog browser](CATALOG_BROWSER.md)
+for the audio bounds, catalog contracts and unavailable states.
 
 The decorative scene uses actual WebGL geometry with perspective and lighting.
 Its movement is independent of music playback. Reduced motion, off-screen
@@ -56,5 +58,5 @@ package. They do not establish hosted account performance or owner ZIP
 acceptance. Deploy the exact reviewed commit with the preserving host updater,
 then verify the studio controls and a real ZIP on the hosting computer.
 
-Official embed reference:
-https://developer.spotify.com/documentation/embeds/tutorials/creating-an-embed
+The small player vinyl is a play/pause button. The independent WebGL scene
+remains decorative and its motion toggle does not mute the player.

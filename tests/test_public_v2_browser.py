@@ -30,12 +30,13 @@ def test_v2_brand_and_assets_identify_the_new_design(public_server, width):
             assert page.locator("body").get_attribute("data-riff-release") == "riff-v2-20261008"
             assert page.locator(".release-badge").inner_text() == "V2"
             assert page.locator(".brand__wordmark").is_visible()
-            assert page.locator("body").get_attribute("data-riff-ui") == "riff-ux-20261010"
-            for stylesheet in ("public.css", "studio.css"):
+            assert page.locator("body").get_attribute("data-riff-ui") == "riff-catalog-20261011"
+            for stylesheet in ("public.css", "studio.css", "catalog.css"):
                 asset = page.locator(f'link[rel="stylesheet"][href*="/{stylesheet}"]')
                 playwright.expect(asset).to_have_count(1)
-                assert "v=riff-ux-20261010" in asset.get_attribute("href")
-            assert "v=riff-ux-20261010" in page.locator('script[src*="public.js"]').get_attribute("src")
+                assert "v=riff-catalog-20261011" in asset.get_attribute("href")
+            for script in ("public.js", "catalog.js", "catalog-audio.js"):
+                assert "v=riff-catalog-20261011" in page.locator(f'script[src*="{script}"]').get_attribute("src")
             _assert_no_overflow(page)
             if width in {390, 1440}:
                 _capture(page, f"v2-landing-{width}.png")

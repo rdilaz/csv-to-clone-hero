@@ -1,10 +1,13 @@
 (() => {
+  function mountJourney() {
   "use strict";
 
   const $ = (selector, root = document) => root.querySelector(selector);
   const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
   const authenticated = document.body.dataset.authenticated === "true";
   const app = $("#riffApp");
+  if (app?.dataset.riffMounted === "true") return;
+  if (app) app.dataset.riffMounted = "true";
   const state = {
     journey: null,
     scope: null,
@@ -32,6 +35,9 @@
     exactSelectedSongsKnown: false,
     expansionSelected: 0,
     expansionSelectionKnown: false,
+    catalogSelected: 0,
+    catalogSelectedSongs: 0,
+    catalogSelectionKnown: false,
     expansionJobId: null,
     expansionPollTimer: null,
     expansionPolling: false,
@@ -54,6 +60,8 @@
     selectionStale: false,
     selectionTotalKnown: false,
     selectionRevision: null,
+    selectionGeneration: null,
+    discoveryBusy: false,
     selectionUndo: null,
     selectionHistoryRequest: 0,
     openDisclosures: new Set(),
@@ -213,6 +221,7 @@
   }
 
   async function logout() {
+    window.RiffCatalog?.stop?.(true);
     document.dispatchEvent(new CustomEvent("riff:studio-reset"));
     try { await api("/api/auth/logout", {method: "POST", body: "{}"}); } catch (_) { /* redirect regardless */ }
     window.location.assign("/");
@@ -881,6 +890,7 @@
   function attachJob(jobId) {
     const expectedJobId = Number(jobId);
     state.jobId = expectedJobId;
+    state.discoveryBusy = true;
     $("#searchLeaveNote").innerHTML = "<strong>Safe to leave.</strong> Once the search starts, progress is saved to your account. You can close this page and come back.";
     document.body.dataset.riffSearchState = "running";
     $("#searchRecovery").hidden = true;
@@ -1075,6 +1085,10 @@
   }
 
   function renderProgress(job) {
+    if (["queued", "running", "complete", "failed", "cancelled", "interrupted"].includes(job?.status)) {
+      state.discoveryBusy = ["queued", "running"].includes(job.status);
+      document.dispatchEvent(new CustomEvent("riff:selection-state", {detail: selectionSnapshot()}));
+    }
     const {progress, total, done, percent, unit} = progressNumbers(job);
     const disc = $("#progressDisc");
     disc.classList.toggle("is-indeterminate", !total);
@@ -1329,8 +1343,9 @@
   function refreshSelectionUi() {
     const exactConfirmed = state.exactSelectionKnown ? state.exactSelected : 0;
     const expansionConfirmed = state.expansionSelectionKnown ? state.expansionSelected : 0;
-    state.selected = exactConfirmed + expansionConfirmed;
-    state.selectionTotalKnown = state.exactSelectionKnown && state.expansionSelectionKnown && !state.selectionStale;
+    const catalogConfirmed = state.catalogSelectionKnown ? state.catalogSelected : 0;
+    state.selected = exactConfirmed + expansionConfirmed + catalogConfirmed;
+    state.selectionTotalKnown = state.exactSelectionKnown && state.expansionSelectionKnown && state.catalogSelectionKnown && !state.selectionStale;
     $("#selectedCount").textContent = state.selectionTotalKnown ? state.selected.toLocaleString() : "Unknown";
     $("#exactSelectedCount").textContent = state.exactSelectionKnown ? state.exactSelected.toLocaleString() : "Unknown";
     $("#librarySelectedChartCount").textContent = state.exactSelectionKnown && !state.selectionStale ? state.exactSelected.toLocaleString() : "Unknown";
@@ -1338,7 +1353,8 @@
     $("#exactSelectedLabel").textContent = state.exactSelectionKnown && state.exactSelected === 1 ? "chart" : "charts";
     $("#selectedSongLabel").textContent = state.exactSelectedSongsKnown && state.exactSelectedSongs === 1 ? "song" : "songs";
     $("#expansionSelectedCount").textContent = state.expansionSelectionKnown ? state.expansionSelected.toLocaleString() : "Unknown";
-    const hasConfirmedSelection = exactConfirmed > 0 || expansionConfirmed > 0;
+    if ($("#catalogSelectedCount")) $("#catalogSelectedCount").textContent = state.catalogSelectionKnown ? state.catalogSelected.toLocaleString() : "Unknown";
+    const hasConfirmedSelection = exactConfirmed > 0 || expansionConfirmed > 0 || catalogConfirmed > 0;
     $("#continueDownloadButton").disabled = !hasConfirmedSelection || state.selectionBusy || state.selectionStale || state.expansionBusy;
     $("#continueDownloadButton").textContent = "Review ZIP";
     $("#continueDownloadButton").setAttribute(
@@ -1368,6 +1384,11 @@
     const rail = $("#selectionRail");
     const stage = $("#stageConfirm");
     if (!rail || !stage) return;
+    if ($("#catalogPlayerDock")) {
+      rail.classList.add("is-in-flow");
+      stage.style.removeProperty("padding-bottom");
+      return;
+    }
     const compact = window.matchMedia("(max-width: 1000px)").matches;
     if (!compact || stage.hidden) {
       rail.classList.remove("is-in-flow");
@@ -1404,7 +1425,7 @@
     const details = $(".selection-options");
     if (!details) return;
     const viewport = window.matchMedia("(max-width: 1000px)").matches ? "mobile" : "desktop";
-    if (document.body.dataset.riffUi === "riff-ux-20261010") {
+    if (["riff-ux-20261010", "riff-catalog-20261011"].includes(document.body.dataset.riffUi)) {
       if (!details.dataset.viewport) details.open = false;
       details.dataset.viewport = viewport;
       return;
@@ -1547,6 +1568,7 @@
       SAME_RECORDING_CHART_VARIANT: ["Same recording", "Same recording · different chart"],
       ALTERNATE_RECORDING: [live ? "Live alternate" : "Alternate recording", live ? "Live alternate" : "Alternate recording"],
       POSSIBLE_MATCH: ["Possible match", "Possible match · review required"],
+      CATALOG_CHOICE: ["Catalog choice", "Selected from the chart catalog"],
     };
     const [badge, label] = labels[candidate.result_tier] || [candidate.review?.label || "Chart", "Chart candidate"];
     return {badge, label, reason, uncertain: ["ALTERNATE_RECORDING", "POSSIBLE_MATCH"].includes(candidate.result_tier)};
@@ -2174,6 +2196,16 @@
     const revision = data?.selection_revision;
     if (!Number.isSafeInteger(revision) || revision < 0 || (state.selectionRevision !== null && revision < state.selectionRevision)) return;
     state.selectionRevision = revision;
+    if (Number.isSafeInteger(data?.exact_generation_id)) state.selectionGeneration = data.exact_generation_id;
+    const catalog = data?.catalog_summary || data?.summary?.catalog;
+    if (Number.isSafeInteger(catalog?.charts) && catalog.charts >= 0 && Number.isSafeInteger(catalog?.songs) && catalog.songs >= 0) {
+      state.catalogSelected = catalog.charts;
+      state.catalogSelectedSongs = catalog.songs;
+      state.catalogSelectionKnown = true;
+    } else if (data?.capabilities?.catalog_browse === false || !$("#catalogPlayerDock")) {
+      state.catalogSelected = state.catalogSelectedSongs = 0;
+      state.catalogSelectionKnown = true;
+    }
     if (data.undo && typeof data.undo.available === "boolean") state.selectionUndo = data.undo;
     syncSelectionUndo();
   }
@@ -2243,11 +2275,13 @@
       workspace: state.journey?.workspace_id ?? null,
       generation: $("#expansionChoices")?.dataset.generation || "",
       stage: document.body.dataset.riffStage,
-      busy: state.selectionBusy || state.expansionBusy || state.deliveryBusy,
+      busy: state.selectionBusy || state.expansionBusy || state.deliveryBusy || state.discoveryBusy,
       stale: state.selectionStale,
       known: state.selectionTotalKnown,
       charts: state.selected,
+      catalog_charts: state.catalogSelectionKnown ? state.catalogSelected : null,
       selection_revision: state.selectionRevision,
+      exact_generation_id: state.selectionGeneration,
       undo: state.selectionUndo,
     };
   }
@@ -2259,6 +2293,9 @@
   }
 
   function applySelectionResponse(data, {refreshSelected = true} = {}) {
+    if (Number.isSafeInteger(data?.selection_revision) && Number.isSafeInteger(state.selectionRevision)
+        && data.selection_revision < state.selectionRevision) return false;
+    if (!app?.isConnected) return false;
     captureSelectionHistory(data);
     const library = data?.summary?.library;
     const expansion = data?.summary?.expansion;
@@ -2301,6 +2338,7 @@
   }
 
   function beginStudioMutation() {
+    if (!app?.isConnected) return false;
     if (state.selectionBusy || state.selectionStale || state.expansionBusy || state.deliveryBusy) return false;
     state.selectionBusy = true;
     state.reviewRequest += 1;
@@ -2334,7 +2372,8 @@
   }
 
   function deliverySnapshot() {
-    return {exact: state.exactSelected, songs: state.exactSelectedSongsKnown ? state.exactSelectedSongs : null, expansion: state.expansionSelected, total: state.selected};
+    return {exact: state.exactSelected, songs: state.exactSelectedSongsKnown ? state.exactSelectedSongs : null, expansion: state.expansionSelected,
+      catalog: state.catalogSelectionKnown ? state.catalogSelected : null, selection_revision: state.selectionRevision, total: state.selected};
   }
 
   function downloadMatchesJob(download, job) {
@@ -2507,6 +2546,10 @@
       : state.expansionSelectionKnown
       ? `${chartCount(state.expansionSelected)} beyond your music`
       : "Additional chart count unavailable. It is not assumed to be zero.";
+    if ($("#downloadCatalogSummary")) $("#downloadCatalogSummary").textContent = !state.selectionTotalKnown && last && Number.isSafeInteger(last.catalog)
+      ? `Last confirmed: ${chartCount(last.catalog)} from catalog browsing`
+      : state.catalogSelectionKnown ? `${chartCount(state.catalogSelected)} from catalog browsing`
+        : "Catalog chart count unavailable. Refresh before preparing.";
   }
 
   async function cancelDownload() {
@@ -2533,8 +2576,15 @@
     }
   }
 
-  function renderDeliveryPage(exact, expansion, append = false) {
+  function renderDeliveryPage(exact, expansion, append = false, catalog = null) {
     const groups = [...(exact.tracks || []).map(song => ({...song, origin: "From your music"})), ...(expansion.songs || []).map(song => ({...song, origin: "Artist expansion"}))];
+    const catalogGroups = new Map();
+    for (const chart of catalog?.items || []) {
+      const key = chart.song_key || chart.catalog_key;
+      if (!catalogGroups.has(key)) catalogGroups.set(key, {artist: chart.artist, title: chart.title, origin: "Catalog browsing", candidates: []});
+      catalogGroups.get(key).candidates.push({...chart, selected: true});
+    }
+    groups.push(...catalogGroups.values());
     const html = groups.map(song => {
       const candidates = (song.candidates || []).filter(candidate => candidate.selected);
       if (!candidates.length) return "";
@@ -2549,9 +2599,11 @@
       exactTotal: exact.total ?? previous?.exactTotal ?? 0,
       expansionOffset: expansion.songs ? Number(expansion.offset || 0) + expansion.songs.length : previous?.expansionOffset || 0,
       expansionTotal: expansion.total ?? previous?.expansionTotal ?? 0,
+      catalogOffset: catalog?.items ? Number(catalog.offset || 0) + catalog.items.length : previous?.catalogOffset || 0,
+      catalogTotal: catalog?.total ?? previous?.catalogTotal ?? 0,
     };
     const pages = state.deliveryPages;
-    const more = pages.exactOffset < pages.exactTotal || (state.expansionSelected > 0 && pages.expansionOffset < pages.expansionTotal);
+    const more = pages.exactOffset < pages.exactTotal || (state.expansionSelected > 0 && pages.expansionOffset < pages.expansionTotal) || pages.catalogOffset < pages.catalogTotal;
     $("#deliverySelectionMore").hidden = !more;
     $("#deliverySelectionStatus").textContent = more
       ? "More song groups remain. Load more to inspect the rest of your selected charts."
@@ -2565,12 +2617,13 @@
     state.deliveryLoading = true;
     syncDeliveryControls();
     try {
-      const [exact, expansion] = await Promise.all([
+      const [exact, expansion, catalog] = await Promise.all([
         pages.exactOffset < pages.exactTotal ? api(`/api/workspace?selected=true&limit=25&offset=${pages.exactOffset}`) : Promise.resolve({}),
         pages.expansionOffset < pages.expansionTotal ? api(`/api/expansion/results?limit=25&offset=${pages.expansionOffset}`) : Promise.resolve({}),
+        pages.catalogOffset < pages.catalogTotal ? api(`/api/catalog/selections?limit=25&offset=${pages.catalogOffset}`) : Promise.resolve({}),
       ]);
       if (requestId !== state.deliveryRequest) return;
-      renderDeliveryPage(exact, expansion, true);
+      renderDeliveryPage(exact, expansion, true, catalog);
     } catch (error) {
       if (requestId === state.deliveryRequest) $("#deliverySelectionStatus").textContent = `${error.message} Use Load more chart details to retry.`;
     } finally {
@@ -2581,7 +2634,7 @@
     }
   }
 
-  async function openDownload(focus = true) {
+  async function openDownload(focus = true, {reviewCurrent = false} = {}) {
     if (state.deliveryBusy || state.deliveryLoading || state.expansionBusy) return;
     if (state.selectionBusy || state.selectionStale) {
       showSelectionError("Refresh the selection summary before continuing.");
@@ -2609,6 +2662,7 @@
       const journey = await api("/api/journey", {timeoutMs: 10000, timeoutMessage: "The preparation status check timed out."});
       if (requestId !== state.deliveryRequest) return;
       state.journey = journey;
+      captureSelectionHistory(journey);
       state.availableDownload = journey.download || null;
       const downloadJob = journey.download_job;
       if (downloadJob?.id) recordDownloadJob(downloadJob);
@@ -2617,7 +2671,7 @@
         attachDownloadJob(downloadJob.id);
         return;
       }
-      if (["complete", "partial"].includes(downloadJob?.status) && downloadMatchesJob(journey.download, downloadJob)) {
+      if (!reviewCurrent && ["complete", "partial"].includes(downloadJob?.status) && downloadMatchesJob(journey.download, downloadJob)) {
         const receipt = state.deliveryRecord.receipt;
         const selection = state.deliveryRecord.pendingSelection || (receipt?.token === journey.download.token ? receipt.selection : null);
         rememberDelivery({pending: false, pendingSelection: null, receipt: {token: journey.download.token, summary: downloadJob.result?.summary || null, selection, requested: false}});
@@ -2629,7 +2683,7 @@
       const created = availableNumber(journey.download, ["created_at"]);
       const previousCreated = availableNumber(state.deliveryRecord, ["previousCreatedAt"]);
       const newerArchive = state.deliveryRecord.previousToken === null || (created !== null && previousCreated !== null && created > previousCreated);
-      if (!downloadJob && state.deliveryRecord.pending && journey.download?.token && journey.download.token !== state.deliveryRecord.previousToken && newerArchive) {
+      if (!reviewCurrent && !downloadJob && state.deliveryRecord.pending && journey.download?.token && journey.download.token !== state.deliveryRecord.previousToken && newerArchive) {
         rememberDelivery({pending: false});
         renderDone(journey.download, null, focus !== false || Boolean(focusedControl));
         return;
@@ -2637,11 +2691,15 @@
       if (["queued", "running"].includes(journey.job?.status)) {
         throw new Error("A search or artist expansion is still active. Return to chart choices and wait for it to finish before preparing a ZIP.");
       }
-      const [exact, expansion] = await Promise.all([
+      const [exact, expansion, catalog] = await Promise.all([
         api("/api/workspace?selected=true&limit=25&offset=0", {timeoutMs: 10000}),
         $("#expansionPanel") ? api("/api/expansion/results?limit=25&offset=0", {timeoutMs: 10000}) : Promise.resolve({songs: [], total: 0, summary: {selected: 0}}),
+        api("/api/catalog/selections?limit=25&offset=0", {timeoutMs: 10000}),
       ]);
       if (requestId !== state.deliveryRequest) return;
+      captureSelectionHistory(exact);
+      captureSelectionHistory(expansion);
+      captureSelectionHistory(catalog);
       const exactCount = availableNumber(exact.summary, ["selected_charts", "selection_count"]);
       const songCount = availableNumber(exact.summary, ["selected_tracks", "selected"]);
       const expansionCount = availableNumber(expansion.summary, ["selected"]);
@@ -2652,7 +2710,7 @@
       if (songCount !== null) state.exactSelectedSongs = songCount;
       if (expansionCount !== null) state.expansionSelected = expansionCount;
       refreshSelectionUi();
-      renderDeliveryPage(exact, expansion);
+      renderDeliveryPage(exact, expansion, false, catalog);
       if (!state.selectionTotalKnown) throw new Error("The combined selection count is unavailable. Refresh before preparing; no unknown count is assumed to be zero.");
       rememberDelivery({lastSelection: {...deliverySnapshot(), checkedAt: Date.now()}});
       state.downloadRecovery = false;
@@ -2749,7 +2807,7 @@
     if (ready !== null) rows.push(["Selections represented", `${ready.toLocaleString()}${selected !== null ? ` of ${selected.toLocaleString()} processed` : ""}`]);
     if (published !== null && ready !== null && ready >= published) rows.push(["Duplicate selections collapsed", (ready - published).toLocaleString()]);
     if (selection) {
-      rows.push(["Selected before preparation", `${chartCount(selection.exact)} from your music${selection.songs !== null ? ` / ${selection.songs.toLocaleString()} imported ${selection.songs === 1 ? "song" : "songs"}` : ""}; ${chartCount(selection.expansion)} from artist expansion`]);
+      rows.push(["Selected before preparation", `${chartCount(selection.exact)} from your music${selection.songs !== null ? ` / ${selection.songs.toLocaleString()} imported ${selection.songs === 1 ? "song" : "songs"}` : ""}; ${chartCount(selection.expansion)} from artist expansion; ${chartCount(selection.catalog)} from catalog browsing`]);
     }
     $("#doneCounts").innerHTML = rows.map(([label, value]) => `<div><dt>${escapeHtml(label)}</dt><dd>${escapeHtml(value)}</dd></div>`).join("");
     $("#doneCounts").hidden = !rows.length;
@@ -2794,7 +2852,7 @@
   async function prepareAgain() {
     if (state.deliveryBusy || state.deliveryLoading) return;
     rememberDelivery({pending: false});
-    await openDownload();
+    await openDownload(true, {reviewCurrent: true});
   }
 
   function requestLibraryDownload(event) {
@@ -2951,6 +3009,30 @@
     stale: markSelectionStale, announce, difficulty: difficultyPresentation,
     guard: selectionGuard, undo: undoSelectionChange,
   });
-  $("#logoutButton")?.addEventListener("click", logout);
-  if (authenticated && app) bindAuthenticated(); else bindGuest();
+  const logoutButton = $("#logoutButton");
+  if (logoutButton && logoutButton.dataset.riffLogoutBound !== "true") {
+    logoutButton.dataset.riffLogoutBound = "true";
+    logoutButton.addEventListener("click", logout);
+  }
+  if (authenticated && app) {
+    document.addEventListener("riff:catalog-selection", event => {
+      if (!app.isConnected) return;
+      if (applySelectionResponse(event.detail, {refreshSelected: false})) {
+        state.selectionMode = "custom";
+        if ($("#catalogSelectionStatus")) $("#catalogSelectionStatus").textContent = `${chartCount(state.catalogSelected)} selected from the catalog.`;
+        if (document.body.dataset.riffStage === "download") {
+          state.deliveryPages = null;
+          $("#deliverySelectionStatus").textContent = "Catalog choices changed. Check preparation status to review the current selection before preparing.";
+          state.selectionTotalKnown = false;
+          syncDeliveryControls();
+        }
+      }
+    });
+    document.addEventListener("riff:catalog-review-zip", () => { if (app.isConnected) void openDownload(true, {reviewCurrent: true}); });
+    bindAuthenticated();
+    window.RiffStudio?.mount?.();
+  } else bindGuest();
+  }
+  window.RiffJourney = Object.freeze({mount: mountJourney});
+  mountJourney();
 })();

@@ -20,6 +20,10 @@ Spotify OAuth flow with persistent OS-keyring credentials:
 
 ## Validation
 
+Install Node.js 22+ for the provider-free JavaScript audio-container test
+harness. It is a test dependency; the production Python application has no
+Node server or frontend build step.
+
 Run these before opening a pull request:
 
 ```powershell

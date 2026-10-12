@@ -181,19 +181,22 @@ def test_matching_template_javascript_parses():
 
 
 def test_public_shell_uses_csp_compatible_external_assets(client):
+    from csv_to_clonehero.server.http_delivery import ASSET_VERSION
     response = client.get("/")
     html = response.get_data(as_text=True)
-    assert '<script src="/static/public.js?v=riff-ux-20261010" defer></script>' in html
-    assert '<link rel="stylesheet" href="/static/public.css?v=riff-ux-20261010">' in html
-    assert '<script src="/static/studio.js?v=riff-ux-20261010" defer></script>' in html
-    assert '<script src="/static/riff-scene.js?v=riff-ux-20261010" defer></script>' in html
-    assert '<link rel="stylesheet" href="/static/studio.css?v=riff-ux-20261010">' in html
+    assert f'<script src="/static/public.js?v={ASSET_VERSION}" defer></script>' in html
+    assert f'<link rel="stylesheet" href="/static/public.css?v={ASSET_VERSION}">' in html
+    assert f'<script src="/static/studio.js?v={ASSET_VERSION}" defer></script>' in html
+    assert f'<script src="/static/riff-scene.js?v={ASSET_VERSION}" defer></script>' in html
+    assert f'<link rel="stylesheet" href="/static/studio.css?v={ASSET_VERSION}">' in html
     assert "<script>" not in html
     assert " onclick=" not in html
     csp = response.headers["Content-Security-Policy"]
     assert "script-src 'self'" in csp
     assert "style-src 'self'" in csp
     assert "frame-src 'self' https://open.spotify.com" in csp
+    assert "connect-src 'self' https://files.enchor.us" in csp
+    assert "media-src 'self' blob:" in csp
     assert "'unsafe-inline'" not in csp
 
 

@@ -331,7 +331,7 @@ def test_delivery_counts_survive_confirm_done_and_reprepare(
         )
         playwright.expect(_done_count(page, "Selected before preparation")).to_have_text(
             f"{exact} charts from your music / {songs} imported "
-            f"{'song' if songs == 1 else 'songs'}; {expansion} charts from artist expansion"
+            f"{'song' if songs == 1 else 'songs'}; {expansion} charts from artist expansion; 0 charts from catalog browsing"
         )
         assert len(_posts(requests, "/api/download")) == attempt
         assert not [request for request in requests if "/api/download/" in request.url]

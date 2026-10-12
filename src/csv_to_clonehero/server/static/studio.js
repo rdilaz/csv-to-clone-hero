@@ -1,10 +1,13 @@
 (() => {
   "use strict";
 
+  function mount() {
   const $ = selector => document.querySelector(selector);
   const panel = $("#studio-panel");
   const bridge = window.RiffStudioAPI;
   if (!panel || !bridge || document.body.dataset.authenticated !== "true") return;
+  if (panel.dataset.riffStudioMounted === "true") return;
+  panel.dataset.riffStudioMounted = "true";
   const PAGE_SIZE = 100;
   const state = {
     epoch: 0, contextKey: "", items: [], order: [], cursor: -1,
@@ -21,9 +24,11 @@
   const current = () => state.items[state.order[state.cursor]] || null;
   const skipped = item => Boolean($("#studio-skip-selected")?.checked && (item.song_selected ?? item.selected));
   const spotifyId = item => /^[a-zA-Z0-9]{22}$/.test(item?.spotify_id || "") ? item.spotify_id : null;
+  const catalogKey = item => /^enchor:[1-9]\d*$/.test(item?.catalog_key || "") ? item.catalog_key
+    : item?.source === "enchor" && /^[1-9]\d*$/.test(String(item.chart_id || "")) ? `enchor:${item.chart_id}` : null;
   const formatCount = count => Number(count || 0).toLocaleString();
 
-  function reset(message = "Shuffle or browse your eligible songs. Nothing plays until you open the Spotify player.") {
+  function reset(message = "Shuffle or browse your eligible songs. Preview chart audio in the persistent player.") {
     state.epoch += 1;
     state.controller?.abort();
     Object.assign(state, {items: [], order: [], cursor: -1, total: 0, loaded: false, complete: false,
@@ -56,9 +61,9 @@
     if (undo) undo.disabled = blocked || !context.undo?.available || context.undo.revision !== context.selection_revision;
     const preview = $("#studio-player-toggle");
     if (preview) {
-      preview.disabled = state.loading || state.busy || (item && !spotifyId(item));
-      preview.textContent = state.preview ? "Close Spotify player" : "Preview original song";
-      preview.setAttribute("aria-expanded", String(state.preview));
+      preview.disabled = state.loading || state.busy || (item && !catalogKey(item));
+      preview.textContent = "Preview chart audio";
+      preview.removeAttribute("aria-expanded");
     }
     panel.setAttribute("aria-busy", String(state.busy || state.loading));
     requestSelectionPreview();
@@ -107,31 +112,17 @@
     syncControls();
   }
 
-  function openPlayer() {
+  async function openPlayer() {
     const item = current();
-    const id = spotifyId(item);
-    if (!id) {
-      status("No confirmed Spotify recording is available for this chart. You can still select the chart.");
+    const key = catalogKey(item);
+    if (!key || !window.RiffCatalog?.playKey) {
+      status("No confirmed catalog identity is available for this chart's preview. You can still select the chart.");
       return;
     }
-    const host = $("#studio-player-host");
-    if (!host) return;
-    host.replaceChildren();
-    const iframe = document.createElement("iframe");
-    iframe.src = `https://open.spotify.com/embed/track/${id}?theme=0`;
-    iframe.title = `Original song on Spotify: ${item.artist} — ${item.title}`;
-    iframe.width = "100%";
-    iframe.height = "152";
-    iframe.loading = "eager";
-    iframe.allow = "encrypted-media; fullscreen; picture-in-picture";
-    iframe.referrerPolicy = "strict-origin-when-cross-origin";
-    iframe.addEventListener("error", () => status("Spotify could not load here. Use Original song on Spotify to listen in Spotify.", true));
-    host.append(iframe);
-    host.hidden = false;
-    state.preview = true;
-    state.playerId = id;
-    syncControls();
-    status("This is the original Spotify song. Use Spotify’s Play control; playback depends on your account and region. The chart recording may differ.");
+    try {
+      if (await window.RiffCatalog.playKey(key) === false) return;
+      status("This chart's audio preview uses the persistent player. Listening and ZIP choices are separate.");
+    } catch (error) { status(error.message || "This chart's preview could not be opened.", true); }
   }
 
   function validatePage(data, expectedOffset) {
@@ -236,7 +227,7 @@
       const advanced = await advanceQueue();
       if (epoch !== state.epoch) return;
       render();
-      if (reopen && spotifyId(current())) openPlayer();
+      if (reopen && catalogKey(current())) await openPlayer();
       if (advanced) status(`${formatCount(state.cursor + 1)} of ${formatCount(state.total)} in the ${state.seed ? "shuffled " : ""}queue. ${current()?.scope === "expansion" ? "Artist expansion: no confirmed Spotify recording." : "Preview the original song or select its chart."}`);
     } catch (_) { /* loadQueue keeps the actionable message. */ }
   }
@@ -349,12 +340,14 @@
   });
   $("#studio-skip-selected")?.addEventListener("change", () => { render(); });
   $("#studio-player-toggle")?.addEventListener("click", async () => {
-    if (state.preview) { closePlayer(); return; }
     try {
+      const playerIntent = window.RiffCatalog?.intentToken?.();
       await loadQueue();
+      if (Number.isSafeInteger(playerIntent) && window.RiffCatalog?.intentToken?.() !== playerIntent) return;
       if (state.cursor < 0) await advanceQueue();
+      if (Number.isSafeInteger(playerIntent) && window.RiffCatalog?.intentToken?.() !== playerIntent) return;
       render();
-      openPlayer();
+      await openPlayer();
     } catch (_) { /* Queue message is already visible. */ }
   });
   document.addEventListener("riff:studio-reset", () => reset());
@@ -365,7 +358,6 @@
     state.contextKey = key;
     const allStatus = $("#studio-select-status");
     if (allStatus && context.known && /Loading your chart pool/.test(allStatus.textContent)) allStatus.textContent = "Ready · selections include every page.";
-    if (context.stage !== "confirm") closePlayer();
     syncControls();
   });
   document.addEventListener("riff:selection-state", syncControls);
@@ -394,4 +386,7 @@
   });
   window.addEventListener("pagehide", () => reset());
   render();
+  }
+  window.RiffStudio = Object.freeze({mount});
+  mount();
 })()

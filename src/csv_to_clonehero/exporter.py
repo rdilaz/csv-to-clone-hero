@@ -1818,7 +1818,7 @@ class ExportService:
         result_tier = str(_field(selection, "result_tier", "") or "").upper()
         tier_selectable = result_tier in {
             "RECOMMENDED_EXACT", "SAME_RECORDING_CHART_VARIANT",
-            "ALTERNATE_RECORDING", "POSSIBLE_MATCH",
+            "ALTERNATE_RECORDING", "POSSIBLE_MATCH", "CATALOG_CHOICE",
         }
         if eligibility is None:
             eligibility = _field(selection, "eligibility_state", None)
@@ -1954,7 +1954,7 @@ class ExportService:
             item.source_name = str(_field(candidate, "source", "") or _field(selection, "source", "") or "")
             item.chart_id = _field(candidate, "chart_id", _field(selection, "chart_id", ""))
             item.kind = str(_field(selection, "kind", "exact") or "exact").casefold()
-            if item.kind not in {"exact", "expansion"}:
+            if item.kind not in {"exact", "expansion", "catalog"}:
                 item.issues.append(PreflightIssue("invalid_selection_kind", f"unsupported selection kind: {item.kind!r}", selection_index=index))
             track_value = _field(selection, "track", None)
             if track_value is None:

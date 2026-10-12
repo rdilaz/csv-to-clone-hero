@@ -56,7 +56,7 @@ def test_select_all_crosses_pages_prefers_verified_multiple_and_preserves_other_
     response = client.post("/api/selection/all", json={"scope": "library"})
     assert response.status_code == 200, response.get_json()
     state = response.get_json()
-    assert state["summary"] == {"library": {"songs": 125, "charts": 125}, "expansion": {"songs": 1, "charts": 1}}
+    assert state["summary"] == {"library": {"songs": 125, "charts": 125}, "expansion": {"songs": 1, "charts": 1}, "catalog": {"songs": 0, "charts": 0}}
     library = state["selected"]["library"]
     assert any(item["candidate_id"] == ids[1] for item in library)
     assert all(item["candidate_id"] != wrong for item in library)
@@ -156,7 +156,8 @@ def test_selection_transaction_rolls_back_both_scopes_on_write_failure(client, c
 
 def test_studio_capabilities_and_embed_policy_are_public(client):
     health = client.get("/healthz")
-    assert health.get_json()["ui_release"] == "riff-ux-20261010"
+    from csv_to_clonehero.server.http_delivery import ASSET_VERSION
+    assert health.get_json()["ui_release"] == ASSET_VERSION
     assert health.get_json()["capabilities"]["select_all"]
     policy = health.headers["Content-Security-Policy"]
     assert "frame-src 'self' https://open.spotify.com;" in policy
