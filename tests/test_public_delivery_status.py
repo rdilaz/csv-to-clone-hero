@@ -131,4 +131,3 @@ def test_delivery_status_receipts_are_owner_scoped_and_do_not_consume_zip(client
     assert streamed.data == b"PK\x03\x04status-only"
     assert client.get("/api/delivery/status").get_json()["download"] is None
     assert client.get(payload["download"]["url"]).status_code == 404
-
