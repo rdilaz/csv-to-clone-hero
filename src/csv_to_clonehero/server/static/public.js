@@ -332,7 +332,12 @@
         return;
       }
       if (!activeSearch && (state.deliveryRecord.pending || ["download", "done"].includes(state.deliveryRecord.stage)
-          || ["queued", "running"].includes(journey.download_job?.status))) {
+          || ["queued", "running"].includes(journey.download_job?.status)
+          || (["complete", "partial"].includes(journey.download_job?.status)
+            && !["add", "confirm", "find"].includes(state.deliveryRecord.stage)))) {
+        // A fresh tab has no local receipt. Recover its completed preparation
+        // from lightweight server status, including an expired or missing link.
+        // openDownload still verifies archive identity before displaying Done.
         await openDownload(false);
         return;
       }
