@@ -6,12 +6,12 @@
   <meta name="theme-color" content="#090a0d">
   <title>{% block title %}Riff | Signal Check{% endblock %}</title>
   <link rel="icon" type="image/svg+xml" href="{{ url_for('static', filename='signal-knot.svg') }}">
-  <link rel="stylesheet" href="{{ url_for('static', filename='public.css', v='riff-catalog-20261011') }}">
-  <link rel="stylesheet" href="{{ url_for('static', filename='studio.css', v='riff-catalog-20261011') }}">
-  <link rel="stylesheet" href="{{ url_for('static', filename='catalog.css', v='riff-catalog-20261011') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='public.css', v=asset_version) }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='studio.css', v=asset_version) }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='catalog.css', v=asset_version) }}">
   {% block head %}{% endblock %}
 </head>
-<body data-authenticated="{{ 'true' if user else 'false' }}" data-riff-release="riff-v2-20261008" data-riff-ui="riff-catalog-20261011" data-riff-owner="{{ user.id if user else 'guest' }}">
+<body data-authenticated="{{ 'true' if user else 'false' }}" data-riff-release="riff-v2-20261008" data-riff-ui="{{ asset_version }}" data-riff-owner="{{ user.id if user else 'guest' }}">
   <a class="skip-link" href="#main-content">Skip to content</a>
 
   {% if config.monetization.gofundme_enabled and config.monetization.gofundme_banner and config.monetization.effective_gofundme_url %}
@@ -65,10 +65,10 @@
   </footer>
   <div class="sr-only" id="announcer" role="status" aria-live="polite" aria-atomic="true"></div>
   {% include 'catalog-player.html' %}
-  <script src="{{ url_for('static', filename='public.js', v='riff-catalog-20261011') }}" defer></script>
-  <script src="{{ url_for('static', filename='catalog-audio.js', v='riff-catalog-20261011') }}" defer></script>
-  <script src="{{ url_for('static', filename='catalog.js', v='riff-catalog-20261011') }}" defer></script>
-  <script src="{{ url_for('static', filename='studio.js', v='riff-catalog-20261011') }}" defer></script>
-  <script src="{{ url_for('static', filename='riff-scene.js', v='riff-catalog-20261011') }}" defer></script>
+  <script src="{{ url_for('static', filename='public.js', v=asset_version) }}" defer></script>
+  <script src="{{ url_for('static', filename='catalog-audio.js', v=asset_version) }}" defer></script>
+  <script src="{{ url_for('static', filename='catalog.js', v=asset_version) }}" defer></script>
+  <script src="{{ url_for('static', filename='studio.js', v=asset_version) }}" defer></script>
+  <script src="{{ url_for('static', filename='riff-scene.js', v=asset_version) }}" defer></script>
 </body>
 </html>

@@ -8,7 +8,7 @@ from pathlib import Path
 from flask import request
 
 
-ASSET_VERSION = "riff-catalog-20261011"
+ASSET_VERSION = "riff-catalog-zip-20261012"
 
 
 @lru_cache(maxsize=32)
@@ -18,6 +18,7 @@ def _gzip_asset(path: str, size: int, modified: int) -> bytes:
 
 
 def configure_asset_delivery(app):
+    app.jinja_env.globals["asset_version"] = ASSET_VERSION
     @app.after_request
     def asset_delivery(response):
         if request.endpoint != "static":

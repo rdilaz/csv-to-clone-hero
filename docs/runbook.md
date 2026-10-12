@@ -180,7 +180,12 @@ an older image after a schema change.
   Cached successful queries remain resumable.
 - `POST /api/download` queues a ZIP preparation job and returns HTTP 202 with
   its ID. The authenticated browser polls `GET /api/jobs/<id>` and reads the
-  single-use link from `/api/journey` only after the job completes. Preparation
+  single-use link from `/api/delivery/status` only after the job completes. This
+  lightweight authenticated endpoint reads saved selection counts and delivery
+  receipts without rebuilding the entire review pool. Chart details load only
+  when expanded and do not block preparation if they are slow. Saved counts are
+  not a promise of the final artifact count; the worker revalidates choices.
+  Preparation
   uses the same one-worker queue as matching; do not add another service worker
   to make large ZIPs appear faster.
 - Public chart ZIPs are short-lived and single-use. They are assembled in

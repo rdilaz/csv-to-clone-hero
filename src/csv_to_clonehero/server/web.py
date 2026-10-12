@@ -1733,6 +1733,62 @@ def create_app(
             db.close()
 
     # ---- browser download -----------------------------------------------------
+    @app.get("/api/delivery/status")
+    def delivery_status():
+        """Read saved choices and delivery receipts without rebuilding review.
+
+        Status recovery must stay quick even for thousands of saved charts.
+        Eligibility is rechecked by the archive job; this endpoint reports the
+        persisted selection count, not a promise of the final packaged count.
+        """
+        user = _require_user()
+        db = _user_db()
+        try:
+            key = user_workspace_key(user["spotify_user_id"])
+            # A reconnect is read-only: unlike initial journey setup, it must
+            # not create a workspace or change selections after a lost response.
+            db._conn.execute("BEGIN")
+            row = db.get_workspace(key)
+            workspace_id = int(row["id"]) if row is not None else None
+            summary = _saved_delivery_selection_summary(db, workspace_id)
+            receipt = db.public_selection_receipt(workspace_id) if workspace_id is not None else {
+                "catalog_summary": {"songs": 0, "charts": 0},
+                "selection_revision": 0,
+                "undo": {"available": False, "operation_id": None, "label": "",
+                         "revision": 0, "generation_id": 0, "reason": ""},
+            }
+            journey_jobs = [
+                jobs.latest_for_user_workspace(int(user["id"]), workspace_key=key, kind=kind)
+                for kind in ("discovery", "expansion")
+            ]
+            newest_job = max((job for job in journey_jobs if job is not None), key=lambda job: job.id, default=None)
+            download_job = jobs.latest_for_user_workspace(int(user["id"]), workspace_key=key, kind="download")
+            preflight_job = jobs.latest_for_user_workspace(int(user["id"]), workspace_key=key, kind="preflight")
+            download = downloads.latest_for_user_workspace(int(user["id"]), workspace_id) if workspace_id is not None else None
+            if download is not None:
+                download["url"] = url_for("stream_download", token=download["token"])
+            return jsonify({
+                **receipt,
+                "exact_generation_id": _public_generation_id(db, workspace_id) if workspace_id is not None else None,
+                "workspace_id": workspace_id,
+                "workspace_status": str(row["status"] or "") if row is not None else "",
+                "workspace": {
+                    "id": workspace_id,
+                    "status": str(row["status"] or "") if row is not None else "",
+                    "phase": str(row["phase"] or "") if row is not None else "",
+                    "updated_at": row["updated_at"] if row is not None else None,
+                },
+                "selection_summary": summary,
+                "selection_count": sum(scope["charts"] for scope in summary.values()),
+                "selection_counts_are_saved": True,
+                "job": _job_public(newest_job) if newest_job is not None else None,
+                "download_job": _job_public(download_job) if download_job is not None else None,
+                "preflight_job": _job_public(preflight_job) if preflight_job is not None else None,
+                "download": download,
+            })
+        finally:
+            db.close()
+
     @app.post("/api/download")
     def start_download():
         user = _require_user()
@@ -2187,6 +2243,33 @@ def _public_generation_id(db: Database, workspace_id: int) -> int | None:
         return None
     current = db.get_current_exact_generation(workspace_id)
     return int(current["id"]) if current is not None else -1
+
+
+def _saved_delivery_selection_summary(db: Database, workspace_id: int | None) -> dict[str, dict[str, int]]:
+    """Count owner-scoped saved entries without loading candidates or scoring.
+
+    Exact variants belong to one imported track; expansion and catalog variants
+    belong to the normalized song identity stored in the candidate metadata.
+    The candidate join matches the archive snapshot's existing selection query.
+    """
+    summary = {scope: {"songs": 0, "charts": 0} for scope in ("library", "expansion", "catalog")}
+    if workspace_id is None:
+        return summary
+    rows = db._conn.execute(
+        """SELECT s.kind, COUNT(*) AS charts,
+                  COUNT(DISTINCT CASE WHEN s.kind='exact' THEN CAST(COALESCE(s.track_id,0) AS TEXT)
+                       ELSE json_array(json_extract(c.data_json,'$.artist_norm'),
+                                       json_extract(c.data_json,'$.name_norm')) END) AS songs
+           FROM workspace_selections s JOIN candidate_charts c ON c.id=s.candidate_id
+           WHERE s.workspace_id=? AND s.status='selected'
+             AND s.kind IN ('exact','expansion','catalog')
+           GROUP BY s.kind""",
+        (workspace_id,),
+    )
+    for row in rows:
+        scope = "library" if row["kind"] == "exact" else str(row["kind"])
+        summary[scope] = {"songs": int(row["songs"]), "charts": int(row["charts"])}
+    return summary
 
 
 def _public_expansion_context(

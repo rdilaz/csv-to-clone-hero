@@ -132,6 +132,10 @@ class ArtifactInvalidError(ExportError):
     """Downloaded bytes were present but failed artifact integrity checks."""
 
 
+class ExportCapacityError(ExportError):
+    """Available disk capacity cannot safely accommodate an artifact."""
+
+
 @dataclass(frozen=True)
 class SourceHash:
     """A source-provided checksum that is explicitly trusted for bytes."""
@@ -253,6 +257,7 @@ class PreflightItem:
     target_relpath: str = ""
     target_path: Path | None = None
     estimated_bytes: int = 0
+    known_bytes: int | None = None
     source_hash: SourceHash | None = None
     artifact_key: str = ""
     download_info: Any = None
@@ -1890,16 +1895,22 @@ class ExportService:
         identity = identity.encode("utf-8", "surrogatepass")
         return hashlib.sha256(identity).hexdigest()
 
-    def _estimated_bytes(self, selection: Any, info: Any, options: ExportOptions) -> int:
+    @staticmethod
+    def _known_bytes(selection: Any, info: Any) -> int | None:
         for owner in (selection, info):
-            value = _field(owner, "planned_bytes", None)
-            if value is None:
-                value = _field(owner, "size_bytes", None)
-            try:
-                if value is not None and int(value) > 0:
-                    return int(value)
-            except (TypeError, ValueError):
-                pass
+            for name in ("planned_bytes", "size_bytes"):
+                value = _field(owner, name, None)
+                try:
+                    if value is not None and int(value) > 0:
+                        return int(value)
+                except (TypeError, ValueError):
+                    pass
+        return None
+
+    def _estimated_bytes(self, selection: Any, info: Any, options: ExportOptions) -> int:
+        known = self._known_bytes(selection, info)
+        if known is not None:
+            return known
         if options.estimated_chart_bytes is not None:
             return max(0, int(options.estimated_chart_bytes))
         if self.config is not None:
@@ -2021,6 +2032,7 @@ class ExportService:
                     str(getattr(candidate, "md5", "") or ""),
                 )
             item.estimated_bytes = self._estimated_bytes(selection, item.download_info, options)
+            item.known_bytes = self._known_bytes(selection, item.download_info)
             prepared.append(item)
 
         # Target collisions are unsafe when two different artifacts would
@@ -2123,8 +2135,15 @@ class ExportService:
                 continue
             reusable += 1
         result.reusable_count = reusable
-        projected_bytes = max(0, result.current_bytes + result.estimated_bytes - existing_targets)
-        if result.budget_bytes is not None and result.estimated_bytes and projected_bytes > result.budget_bytes:
+        # A per-chart fallback is useful for display, but is not evidence that
+        # an unknown-size ZIP exceeds its budget. Actual bytes remain guarded
+        # before publication; known planned/source sizes still block preflight.
+        capacity_bytes = (
+            sum(item.known_bytes or 0 for item in unique)
+            if mode == "zip" else result.estimated_bytes
+        )
+        projected_bytes = max(0, result.current_bytes + capacity_bytes - existing_targets)
+        if result.budget_bytes is not None and capacity_bytes and projected_bytes > result.budget_bytes:
             result.issues.append(PreflightIssue(
                 "configured_budget_exceeded",
                 f"estimated export uses {projected_bytes} bytes, above configured budget {result.budget_bytes}",
@@ -2136,7 +2155,7 @@ class ExportService:
             result.available_bytes = int(getattr(raw_usage, "free", raw_usage[2] if isinstance(raw_usage, tuple) else raw_usage))
         except (OSError, TypeError, ValueError, IndexError):
             result.available_bytes = None
-        required = result.estimated_bytes + max(0, int(options.minimum_free_bytes))
+        required = capacity_bytes + max(0, int(options.minimum_free_bytes))
         if result.available_bytes is not None and result.available_bytes < required:
             result.issues.append(PreflightIssue(
                 "insufficient_disk_space",
@@ -2346,7 +2365,9 @@ class ExportService:
             validation_version=str(getattr(validation, "validation_version", "") or ""),
         )
 
-    def _materialize(self, item: PreflightItem, options: ExportOptions) -> VerifiedArtifact:
+    def _materialize(
+        self, item: PreflightItem, options: ExportOptions, *, zip_capacity_checks: bool = False,
+    ) -> VerifiedArtifact:
         if item.candidate is None or item.source is None:
             raise ExportError("item was not eligible for materialization")
         with _artifact_lock(self.artifact_cache, item.artifact_key):
@@ -2387,6 +2408,10 @@ class ExportService:
             part.unlink(missing_ok=True)
             provider_hash: SourceHash | None = None
             try:
+                if zip_capacity_checks:
+                    error = self._capacity_check(self._staging_root, item.known_bytes or 1, options, "zip")
+                    if error:
+                        raise ExportCapacityError(error)
                 outcome = self._provider_result(item.candidate, item.source, part)
                 if isinstance(outcome, ArtifactDownload):
                     provider_hash = _source_hash_from_value(
@@ -2413,10 +2438,20 @@ class ExportService:
                     _write_payload(outcome, part)
                 if not part.is_file():
                     raise ExportError("artifact provider did not produce a file")
-                self._verify_artifact(part, item, options, provider_hash=provider_hash)
+                verified = self._verify_artifact(part, item, options, provider_hash=provider_hash)
+                if zip_capacity_checks:
+                    cache_root = Path(getattr(self.artifact_cache, "root", self._staging_root))
+                    error = self._capacity_check(cache_root, verified.size_bytes, options, "zip")
+                    if error:
+                        raise ExportCapacityError(error)
                 stored = self._cache_put(item.artifact_key, part)
                 try:
-                    return self._verify_artifact(stored, item, options, provider_hash=provider_hash)
+                    verified = self._verify_artifact(stored, item, options, provider_hash=provider_hash)
+                    if zip_capacity_checks:
+                        error = self._capacity_check(stored.parent, 1, options, "zip")
+                        if error:
+                            raise ExportCapacityError(error)
+                    return verified
                 except ExportError:
                     self._cache_delete(item.artifact_key)
                     raise
@@ -2443,6 +2478,8 @@ class ExportService:
         options: ExportOptions,
         cancellation_event: threading.Event | None = None,
         on_retry: Callable[[int], None] | None = None,
+        *,
+        zip_capacity_checks: bool = False,
     ) -> VerifiedArtifact:
         """Materialize a chart, retrying transient download/verify failures.
 
@@ -2455,8 +2492,8 @@ class ExportService:
             if self._cancel_requested(cancellation_event):
                 raise ExportCancelled("export cancelled")
             try:
-                return self._materialize(item, options)
-            except ExportCancelled:
+                return self._materialize(item, options, zip_capacity_checks=zip_capacity_checks)
+            except (ExportCancelled, ExportCapacityError):
                 raise
             except Exception as exc:  # noqa: BLE001 - retried at the export level
                 last_exc = exc
@@ -2482,6 +2519,7 @@ class ExportService:
         *,
         cancellation_event: threading.Event | None = None,
         item_progress: Callable[[ExportItemResult], None] | None = None,
+        zip_capacity_checks: bool = False,
     ) -> tuple[dict[int, VerifiedArtifact], list[str]]:
         """Materialize every eligible chart, optionally in parallel.
 
@@ -2539,6 +2577,7 @@ class ExportService:
                         result="retrying",
                         failure=f"retry {retry}",
                     ),
+                    zip_capacity_checks=zip_capacity_checks,
                 )
             except ExportCancelled as exc:
                 item_result = mark(
@@ -3282,6 +3321,7 @@ class ExportService:
             progress,
             cancellation_event=cancellation_event,
             item_progress=item_progress,
+            zip_capacity_checks=True,
         )
         cancelled = self._cancel_requested(cancellation_event) or any(
             item.status == "cancelled" for item in results
