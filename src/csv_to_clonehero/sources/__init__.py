@@ -18,8 +18,8 @@ from csv_to_clonehero.sources.enchor import EnchorSource
 __all__ = ["ChartSource", "SourceError", "EnchorSource", "build_sources"]
 
 
-def build_sources(config) -> list[ChartSource]:
-    """Instantiate the chart sources enabled in configuration."""
+def build_sources(config, *, include_video_background: bool = True) -> list[ChartSource]:
+    """Instantiate configured sources with the requested optional media policy."""
     sources: list[ChartSource] = []
     for name in config.sources.enabled:
         if name == "enchor":
@@ -31,6 +31,7 @@ def build_sources(config) -> list[ChartSource]:
                     head_size_enabled=getattr(config.network, "head_size_enabled", False),
                     download_request_delay=getattr(config.network, "download_request_delay", 0.1),
                     catalog_path=getattr(config, "catalog_path", None),
+                    include_video_background=include_video_background,
                 )
             )
         else:

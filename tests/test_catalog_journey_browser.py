@@ -180,7 +180,7 @@ def test_real_catalog_only_generation_zero_prepares_and_downloads_before_import(
     config, _rows, source = _installed_catalog(app, count=1)
     config.server.enforce_secret_key = True
     config.server.base_url = base_url
-    monkeypatch.setattr("csv_to_clonehero.sources.build_sources", lambda _: [source])
+    monkeypatch.setattr("csv_to_clonehero.sources.build_sources", lambda _, **_options: [source])
     monkeypatch.setattr("csv_to_clonehero.server.web._client_for", lambda *_: SimpleNamespace(close=lambda: None))
     app.extensions["jobs"].start()
     context, page, errors, external = _real_page(public_server, delivery_chromium, "/")

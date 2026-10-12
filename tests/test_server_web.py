@@ -1441,7 +1441,7 @@ def test_public_download_build_dto_restores_metadata_and_consumes_archive(
     source = FakeSource(files={chart.md5: content for chart in charts})
     source.download_hash_verified = False
     config.export.download_workers = 1
-    monkeypatch.setattr("csv_to_clonehero.sources.build_sources", lambda _config: [source])
+    monkeypatch.setattr("csv_to_clonehero.sources.build_sources", lambda _config, **_options: [source])
     db = Database(config.database_path)
     try:
         db.upsert_library_snapshot(workspace_id, LibrarySnapshot("spotify", [

@@ -11,6 +11,7 @@ desktop client's source, https://github.com/Geomitron/Bridge):
 * Response: {found, out_of, page, data: [chart metadata...]}
 * Download: GET https://files.enchor.us/{md5}.sng  (direct file download with
   Content-Length; the same URL the official Bridge client downloads from)
+  Declared video charts also have the official {md5}_novideo.sng variant.
 
 Downloads are .sng files, which Clone Hero scans directly - no extraction
 required. The md5 field identifies the source chart; Enchor may re-pack the
@@ -186,6 +187,7 @@ class EnchorSource:
         head_size_enabled: bool = False,
         download_request_delay: float = 0.1,
         catalog_path: Path | str | None = None,
+        include_video_background: bool = True,
     ) -> None:
         self.request_delay = request_delay
         self.retries = max(1, retries)
@@ -193,6 +195,7 @@ class EnchorSource:
         # tolerates far higher throughput, so downloads get their own, much
         # lighter AIMD throttle instead of inheriting the search delay.
         self.head_size_enabled = bool(head_size_enabled)
+        self.include_video_background = bool(include_video_background)
         self._download_delay = max(0.0, float(download_request_delay))
         self._download_min_delay = self._download_delay
         self._download_last = 0.0
@@ -656,6 +659,16 @@ class EnchorSource:
         return None
 
     # -------------------------------------------------------------- download
+    def _download_url(self, candidate: ChartCandidate) -> str:
+        # Bridge uses this provider variant for normal playable chart installs
+        # when optional background videos are disabled. The canonical md5 is
+        # still chart identity, not a checksum of either served package.
+        suffix = "_novideo" if (
+            not self.include_video_background
+            and getattr(candidate, "has_video_background", False) is True
+        ) else ""
+        return f"{FILES_BASE}/{candidate.md5}{suffix}.sng"
+
     def get_download_info(self, candidate: ChartCandidate) -> DownloadInfo:
         if not candidate.md5:
             return DownloadInfo(
@@ -665,13 +678,13 @@ class EnchorSource:
                 supports_direct_download=False,
                 notes="Enchor did not provide a chart hash for direct download",
             )
-        url = f"{FILES_BASE}/{candidate.md5}.sng"
+        url = self._download_url(candidate)
         size = self._head_size(url) if self.head_size_enabled else None
         return DownloadInfo(
             url=url,
             md5=candidate.md5,
             size_bytes=size,
-            filename=f"{candidate.md5}.sng",
+            filename=url.rsplit("/", 1)[-1],
             supports_direct_download=True,
             notes="The Enchor md5 identifies the chart; the service may re-pack the served .sng bytes",
         )
@@ -680,7 +693,7 @@ class EnchorSource:
         """Content-Length of the chart download, or None if unknown."""
         if not candidate.md5 or not self.head_size_enabled:
             return None
-        return self._head_size(f"{FILES_BASE}/{candidate.md5}.sng")
+        return self._head_size(self._download_url(candidate))
 
     def _head_size(self, url: str) -> int | None:
         try:
@@ -710,32 +723,41 @@ class EnchorSource:
 
     def download_chart(self, candidate: ChartCandidate, destination: Path) -> Path:
         """Stream the .sng to ``destination`` (a file path ending in .sng)."""
-        url = f"{FILES_BASE}/{candidate.md5}.sng"
+        url = self._download_url(candidate)
+        canonical_url = f"{FILES_BASE}/{candidate.md5}.sng"
+        urls = [url, canonical_url] if url != canonical_url else [url]
         destination.parent.mkdir(parents=True, exist_ok=True)
         part_path = destination.with_suffix(destination.suffix + ".part")
-        self._download_throttle()
         try:
-            with self._client.stream("GET", url, timeout=120) as response:
-                if response.status_code == 429:
-                    retry_after = response.headers.get("Retry-After")
-                    self._note_download_rate_limited()
-                    raise SourceError(
-                        f"Download of {candidate.name!r} rate limited (HTTP 429)",
-                        status=429,
-                    )
-                if response.status_code != 200:
-                    raise SourceError(
-                        f"Download of {candidate.name!r} failed: HTTP {response.status_code}",
-                        status=response.status_code,
-                    )
-                content_type = (response.headers.get("Content-Type") or "").split(";")[0].strip().lower()
-                if content_type in {"text/html", "application/json", "text/plain"}:
-                    raise SourceError(
-                        f"Download of {candidate.name!r} returned {content_type or 'non-chart'} content instead of a chart"
-                    )
-                with open(part_path, "wb") as fh:
-                    for chunk in response.iter_bytes(chunk_size=1024 * 1024):
-                        fh.write(chunk)
+            for index, url in enumerate(urls):
+                self._download_throttle()
+                with self._client.stream("GET", url, timeout=120) as response:
+                    # An optional package can be absent while its canonical
+                    # chart remains available. Only that response permits one
+                    # fallback, so it cannot poison the canonical ledger.
+                    if index == 0 and len(urls) == 2 and response.status_code in {404, 410}:
+                        continue
+                    if response.status_code == 429:
+                        retry_after = response.headers.get("Retry-After")
+                        self._note_download_rate_limited()
+                        raise SourceError(
+                            f"Download of {candidate.name!r} rate limited (HTTP 429)",
+                            status=429,
+                        )
+                    if response.status_code != 200:
+                        raise SourceError(
+                            f"Download of {candidate.name!r} failed: HTTP {response.status_code}",
+                            status=response.status_code,
+                        )
+                    content_type = (response.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+                    if content_type in {"text/html", "application/json", "text/plain"}:
+                        raise SourceError(
+                            f"Download of {candidate.name!r} returned {content_type or 'non-chart'} content instead of a chart"
+                        )
+                    with open(part_path, "wb") as fh:
+                        for chunk in response.iter_bytes(chunk_size=1024 * 1024):
+                            fh.write(chunk)
+                break
             if not _looks_like_sng(part_path):
                 raise SourceError(f"Download of {candidate.name!r} did not produce a valid .sng archive")
             part_path.replace(destination)  # atomic on same volume

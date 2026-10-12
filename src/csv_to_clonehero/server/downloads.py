@@ -361,7 +361,7 @@ def build_archive(
     if not source_map:
         from csv_to_clonehero.sources import build_sources
 
-        owned_sources = build_sources(config)
+        owned_sources = build_sources(config, include_video_background=False)
         source_map = {str(getattr(s, "name", "") or ""): s for s in owned_sources}
     tracks = db.get_spotify_tracks(True)
     track_map: dict[Any, Any] = {}
