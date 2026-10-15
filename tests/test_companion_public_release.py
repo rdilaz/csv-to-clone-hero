@@ -80,6 +80,9 @@ def test_guest_download_checksum_and_manifest_match_verified_archive(client, rel
     expected = fixture["artifacts"][0]["sha256"]
     checksum = client.get(f"/downloads/{COMPANION_CHECKSUM}")
     assert checksum.status_code == 200
+    checksum_alias = client.get("/downloads/SHA256SUMS.txt")
+    assert checksum_alias.status_code == 200
+    assert checksum_alias.data == checksum.data
     assert checksum.data.decode() == f"{expected}  {COMPANION_ARCHIVE}\n"
     manifest = client.get("/downloads/manifest.json")
     assert manifest.status_code == 200

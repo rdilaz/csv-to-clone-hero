@@ -20,7 +20,7 @@ from flask import abort, current_app, g, jsonify, render_template, send_file, ur
 COMPANION_VERSION = "2026.10.15"
 COMPANION_ARCHIVE = f"riff-companion-{COMPANION_VERSION}-windows-py312-x64.zip"
 COMPANION_CHECKSUM = f"{COMPANION_ARCHIVE}.sha256"
-_PUBLIC_FILES = frozenset({COMPANION_ARCHIVE, COMPANION_CHECKSUM, "manifest.json"})
+_PUBLIC_FILES = frozenset({COMPANION_ARCHIVE, COMPANION_CHECKSUM, "SHA256SUMS.txt", "manifest.json"})
 _MAX_MANIFEST_BYTES = 16_384
 
 
@@ -120,11 +120,11 @@ def register_companion_release(app) -> None:
             response = send_file(release["path"], mimetype="application/zip", as_attachment=True,
                                  download_name=COMPANION_ARCHIVE, conditional=True,
                                  etag=release["sha256"])
-        elif filename == COMPANION_CHECKSUM:
+        elif filename in {COMPANION_CHECKSUM, "SHA256SUMS.txt"}:
             response = current_app.response_class(
                 f"{release['sha256']}  {COMPANION_ARCHIVE}\n", mimetype="text/plain"
             )
-            response.headers["Content-Disposition"] = f'attachment; filename="{COMPANION_CHECKSUM}"'
+            response.headers["Content-Disposition"] = f'attachment; filename="{filename}"'
         else:
             response = jsonify({"version": release["version"], "artifacts": [{
                 "filename": release["filename"], "sha256": release["sha256"],
