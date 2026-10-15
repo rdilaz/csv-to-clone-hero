@@ -35,15 +35,24 @@
 </section>
 {% else %}
 <div class="app-shell" id="riffApp" data-user-name="{{ user.display_name }}" data-local-preview="{{ 'true' if local_preview else 'false' }}">
-  <nav class="journey-steps" aria-label="Music studio progress">
+  <div class="workflow-chrome">
+  <nav class="journey-steps" aria-label="Music studio steps">
     <ol>
-      <li data-step="add"><span>1</span><b><span class="step-label-full">Add Music</span><span class="step-label-short">Add</span></b></li>
-      <li data-step="find"><span>2</span><b><span class="step-label-full">Find Charts</span><span class="step-label-short">Find</span></b></li>
-      <li data-step="confirm"><span>3</span><b><span class="step-label-full">Build setlist</span><span class="step-label-short">Setlist</span></b></li>
-      <li data-step="download"><span>4</span><b><span class="step-label-full">Download</span><span class="step-label-short">Download</span></b></li>
-      <li data-step="done"><span>5</span><b><span class="step-label-full">Done</span><span class="step-label-short">Done</span></b></li>
+      <li data-step="add"><button type="button" data-navigate-step="add"><span>1</span><b><span class="step-label-full">Add Music</span><span class="step-label-short">Add</span></b></button></li>
+      <li data-step="find"><button type="button" data-navigate-step="find"><span>2</span><b><span class="step-label-full">Find Charts</span><span class="step-label-short">Find</span></b></button></li>
+      <li data-step="confirm"><button type="button" data-navigate-step="confirm"><span>3</span><b><span class="step-label-full">Build setlist</span><span class="step-label-short">Setlist</span></b></button></li>
+      <li data-step="download"><button type="button" data-navigate-step="download"><span>4</span><b><span class="step-label-full">Download</span><span class="step-label-short">Download</span></b></button></li>
+      <li data-step="done"><button type="button" data-navigate-step="done" disabled title="Available after ZIP preparation finishes"><span>5</span><b><span class="step-label-full">Done</span><span class="step-label-short">Done</span></b></button></li>
     </ol>
   </nav>
+  <div class="workflow-controls"><button type="button" class="text-button" id="workflowBackButton" disabled>Previous step</button><span id="workflowPosition"></span><button type="button" class="text-button" id="workflowNextButton" disabled>Next step</button></div>
+  <aside class="preparation-strip" id="preparationStrip" aria-label="ZIP preparation status" hidden>
+    <div><strong id="preparationStripTitle"></strong><span id="preparationStripDetail"></span></div>
+    <button type="button" class="text-button" id="returnToPreparationButton">Return to ZIP</button>
+    <button type="button" class="text-button" id="checkActiveJobButton">Check status</button>
+  </aside>
+  <p class="preparation-lock-note" id="preparationLockNote" hidden>Browse any step while this ZIP is prepared. Music imports and chart changes are paused to preserve this preparation's saved selection.</p>
+  </div>
 
   <div class="app-error" id="appError" role="alert" tabindex="-1" hidden></div>
 
@@ -310,6 +319,9 @@
       </header>
       <div class="delivery-status">
       <p id="downloadStatus" role="status" aria-live="polite">Checking the current saved selection.</p>
+      <div class="download-work-progress" id="downloadWorkProgress"></div>
+      <p class="fine-print" id="downloadCurrentItem"></p>
+      <dl class="download-activity-times" id="downloadActivityTimes" hidden></dl>
       <p class="fine-print" id="downloadLastCheck"></p>
       <div class="delivery-busy" id="downloadBusyIndicator" aria-hidden="true" hidden><span></span></div>
       </div>

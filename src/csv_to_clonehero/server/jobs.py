@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import logging
 import hashlib
+import inspect
 import threading
 import time
 from collections.abc import Callable, Mapping
@@ -82,6 +83,8 @@ def _job_payload(row: Any) -> dict[str, Any]:
     if not isinstance(result, dict):
         result = {}
     for key, value in list(progress.items()):
+        if key == "last_work_at" and isinstance(value, (int, float)):
+            continue
         try:
             progress[key] = int(value)
         except (TypeError, ValueError):
@@ -486,25 +489,78 @@ class JobManager:
             )
             cancel_event = self._cancel_events[job.id]
             last_update = 0.0
+            progress_state = {**job.progress, "completed": 0, "total": current_snapshot["selection_count"]}
+            progress_phase = "preparing"
+            builder = self.archive_builder or build_archive
+            # Injected/older builders retain their existing callback contract.
+            try:
+                parameters = inspect.signature(builder).parameters
+                detailed = "progress_details" in parameters or any(
+                    parameter.kind == inspect.Parameter.VAR_KEYWORD
+                    for parameter in parameters.values()
+                )
+            except (TypeError, ValueError):
+                detailed = False
 
-            def on_progress(completed: int, total: int, label: str) -> None:
-                nonlocal last_update
+            def on_progress_details(payload: Mapping[str, Any]) -> None:
+                nonlocal last_update, progress_state, progress_phase
+                phase = str(payload.get("phase") or "validating")
+                if phase not in {"checking", "validating", "packaging", "finalizing"}:
+                    return
+                previous = progress_state
+                next_progress = dict(previous)
+                if phase != progress_phase:
+                    for key in ("completed", "total", "files_completed", "files_total", "bytes_completed",
+                                "bytes_total", "bytes_kind", "current_item", "unit"):
+                        next_progress.pop(key, None)
+                for key in ("completed", "total", "files_completed", "files_total", "bytes_completed", "bytes_total"):
+                    if key in payload:
+                        next_progress[key] = max(0, int(payload[key]))
+                for key in ("unit", "bytes_kind"):
+                    if key in payload:
+                        next_progress[key] = str(payload[key])[:32]
+                if "current_item" in payload:
+                    # Only a display basename reaches the public job API.
+                    next_progress["current_item"] = str(payload["current_item"]).replace("\\", "/").rsplit("/", 1)[-1][:240]
+                advanced = bool(payload.get("work_advanced")) and any(
+                    int(next_progress.get(key) or 0) > (int(previous.get(key) or 0) if phase == progress_phase else 0)
+                    for key in ("completed", "files_completed", "bytes_completed")
+                )
+                if advanced:
+                    next_progress["last_work_at"] = time.time()
+                changed_phase = phase != progress_phase
+                progress_state = next_progress
+                progress_phase = phase
                 now = time.monotonic()
-                if now - last_update < 0.5 and completed < total:
+                terminal_count = (int(next_progress.get("total") or 0) > 0
+                                  and next_progress.get("completed") == next_progress.get("total"))
+                if not changed_phase and not terminal_count and now - last_update < 0.5:
                     return
                 last_update = now
+                messages = {"checking": "Checking selected charts", "validating": "Downloading and validating charts",
+                            "packaging": "Packaging ZIP archive", "finalizing": "Finalizing ZIP archive"}
+                self._mark(job.id, status="running", phase=phase, message=messages[phase],
+                           progress=next_progress, heartbeat_at=time.time())
+
+            def on_progress(completed: int, total: int, label: str) -> None:
+                checking = label == "Checking download sizes"
+                if detailed and not checking:
+                    return
                 packaging = label == "Writing ZIP archive"
-                self._mark(
-                    job.id, status="running", phase="packaging" if packaging else "validating",
-                    message="Packaging ZIP archive" if packaging else "Validating selected charts",
-                    progress={**job.progress, "completed": completed, "total": total},
-                    heartbeat_at=time.time(),
-                )
+                on_progress_details({
+                    "phase": "packaging" if packaging else "checking" if checking else "validating",
+                    # Legacy counters describe validation, never ZIP byte/file progress.
+                    "completed": 0 if packaging else completed, "total": 0 if packaging else total,
+                    "current_item": "" if checking or packaging else label.removeprefix("Validated "),
+                    "unit": "files" if packaging else "charts", "work_advanced": not packaging,
+                })
 
             with self.downloads.building(workspace_id):
-                archive, summary = (self.archive_builder or build_archive)(
+                detail_options = {"progress_details": on_progress_details} if detailed else {}
+                archive, summary = builder(
                     self.config, db, workspace_id, None, self.downloads.root,
                     progress=on_progress, cancellation_event=cancel_event,
+                    **detail_options,
                 )
                 after_build = selection_snapshot(db, workspace_id)
                 if (
@@ -529,7 +585,9 @@ class JobManager:
                 job.id,
                 status="partial" if partial else "complete",
                 message="ZIP ready with exceptions" if partial else "ZIP ready",
-                progress={**job.progress, "completed": summary.get("selected", 0), "total": summary.get("selected", 0)},
+                progress={**progress_state, "completed": summary.get("selected", 0),
+                          "total": summary.get("selected", 0), "unit": "charts", "current_item": "",
+                          "archive_bytes": summary.get("bytes", download["size_bytes"])},
                 result={
                     "summary": summary,
                     "archive_id": download["archive_id"],

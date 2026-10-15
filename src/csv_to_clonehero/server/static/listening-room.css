@@ -107,6 +107,38 @@ html:has(.riff-listening-room) { color-scheme: light; }
 .riff-listening-room .journey-steps li.is-complete { color: #52683b; }
 .riff-listening-room .journey-steps li.is-complete > span { color: #52683b; border-color: #8fa374; }
 .riff-listening-room .journey-steps li.is-complete::after { color: #607a3e; }
+.riff-listening-room .workflow-chrome { position: sticky; top: 0; z-index: 30; background: var(--room-paper, #f5f1e5); padding-bottom: 6px; margin-bottom: 18px; box-shadow: 0 4px 10px #352f2010; }
+.riff-listening-room .workflow-chrome .journey-steps { margin: 0; }
+.riff-listening-room .journey-steps li { padding: 0; }
+.riff-listening-room .journey-steps li > button { display: flex; width: 100%; min-width: 0; min-height: 58px; align-items: center; justify-content: center; gap: 7px; padding: 9px 5px; border: 0; border-radius: 0; background: transparent; color: inherit; font: inherit; letter-spacing: inherit; text-transform: inherit; cursor: pointer; }
+.riff-listening-room .journey-steps li > button:disabled { opacity: .5; cursor: default; }
+.riff-listening-room .journey-steps li > button > span { display: grid; width: 24px; height: 24px; flex: 0 0 auto; place-items: center; border: 1px solid #a2af91; color: #5d6c4e; font-size: .72rem; }
+.riff-listening-room .journey-steps li.is-current > button > span { background: #5f773e; border-color: #5f773e; color: #f0f4e7; }
+.riff-listening-room .journey-steps li.is-complete::after { display: none; }
+.riff-listening-room .workflow-controls { display: flex; align-items: center; justify-content: space-between; min-height: 38px; gap: 8px; font-size: .7rem; }
+.riff-listening-room .workflow-controls .text-button { font-size: .75rem; min-height: 34px; padding: 6px; }
+.riff-listening-room .workflow-controls > span { color: var(--room-muted); }
+.riff-listening-room .preparation-strip { display: flex; align-items: center; gap: 12px; padding: 9px 12px; border: 1px solid #a1af87; border-radius: 5px; background: #e8eddb; font-size: .76rem; }
+.riff-listening-room .preparation-strip > div { flex: 1; min-width: 0; }
+.riff-listening-room .preparation-strip strong, .riff-listening-room .preparation-strip span { display: block; overflow-wrap: anywhere; }
+.riff-listening-room .preparation-strip span { color: #576346; font-size: .7rem; margin-top: 3px; }
+.riff-listening-room .preparation-strip .text-button { flex: 0 0 auto; font-size: .72rem; min-height: 38px; padding: 5px; }
+.riff-listening-room .preparation-lock-note { margin: 6px 3px 0; color: var(--room-muted); font-size: .7rem; line-height: 1.4; }
+.riff-listening-room .download-work-progress p { margin: 7px 0; font-weight: 600; overflow-wrap: anywhere; }
+.riff-listening-room .download-work-progress small { display: block; color: var(--room-muted); }
+.riff-listening-room .download-work-progress progress { display: block; width: 100%; height: 12px; margin: 12px 0; accent-color: #718a46; }
+.riff-listening-room #downloadCurrentItem { overflow-wrap: anywhere; }
+.riff-listening-room .download-activity-times { display: flex; gap: 20px; flex-wrap: wrap; margin: 14px 0 4px; font-size: .74rem; }
+.riff-listening-room .download-activity-times dt { color: var(--room-muted); }
+.riff-listening-room .download-activity-times dd { margin: 2px 0 0; }
+@media (max-width: 640px) {
+  .riff-listening-room .journey-steps li > button { flex-direction: column; gap: 4px; padding: 8px 2px; font-size: .6rem; }
+  .riff-listening-room .journey-steps li > button > span { width: 20px; height: 20px; font-size: .65rem; }
+  .riff-listening-room .preparation-strip { gap: 5px; flex-wrap: wrap; padding: 7px 8px; }
+  .riff-listening-room .preparation-strip > div { flex-basis: 100%; }
+  .riff-listening-room .preparation-strip .text-button { min-height: 30px; padding: 3px; }
+  .riff-listening-room .preparation-lock-note { font-size: .65rem; }
+}
 .riff-listening-room :is(#stageAdd, #stageLoading, #stageDownload, #stageDone) { background: var(--room-sheet); border: 1px solid var(--room-line); border-radius: 10px; box-shadow: var(--shadow); }
 .riff-listening-room .stage-heading h1 { font-size: clamp(2.5rem, 4.8vw, 4.5rem); }
 .riff-listening-room .stage-heading > p:not(.kicker) { color: var(--room-muted); max-width: 650px; }

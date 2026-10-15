@@ -26,7 +26,7 @@ from typing import Any, Callable, Iterable
 
 from csv_to_clonehero.config import AppConfig
 from csv_to_clonehero.database import Database
-from csv_to_clonehero.exporter import ExportOptions, ExportService, SNG_VALIDATION_VERSION
+from csv_to_clonehero.exporter import ExportOptions, ExportService, SNG_VALIDATION_VERSION, _report_progress_details
 from csv_to_clonehero.models import ChartCandidate
 from csv_to_clonehero.sources.base import ChartSource
 
@@ -347,6 +347,7 @@ def build_archive(
     staging_dir: Path,
     *,
     progress: Callable[[int, int, str], None] | None = None,
+    progress_details: Callable[[dict[str, Any]], None] | None = None,
     cancellation_event: threading.Event | None = None,
 ) -> tuple[Path, dict[str, Any]]:
     """Assemble the selected charts into one ZIP and return (archive, summary).
@@ -424,6 +425,7 @@ def build_archive(
             options=options,
             eligibility_checker=checker,
             progress=progress,
+            progress_details=progress_details,
             cancellation_event=cancellation_event,
         )
         artifact_refs = {
@@ -432,7 +434,16 @@ def build_archive(
             for item in selections
         }
 
-        for item in result.items:
+        # Recording validation evidence can take noticeable time for a large
+        # selection. It is real finalization work, distinct from copying bytes.
+        for completed, item in enumerate(result.items):
+            if cancellation_event is not None and cancellation_event.is_set():
+                raise DownloadError("Download preparation cancelled")
+            _report_progress_details(progress_details, {
+                "phase": "finalizing", "completed": completed, "total": len(result.items),
+                "unit": "charts", "current_item": Path(item.target_relpath).name,
+                "work_advanced": completed > 0,
+            })
             try:
                 identity = (str(item.source).casefold(), int(item.chart_id))
             except (TypeError, ValueError):
@@ -475,6 +486,10 @@ def build_archive(
                         reason_code="SOURCE_UNAVAILABLE" if unavailable else "TRANSIENT_DOWNLOAD_FAILURE",
                         reason=item.failure,
                     )
+        _report_progress_details(progress_details, {
+            "phase": "finalizing", "completed": len(result.items), "total": len(result.items),
+            "unit": "charts", "current_item": "", "work_advanced": bool(result.items),
+        })
         summary = {
             "success": bool(result.success),
             "published": result.published_count,
@@ -495,6 +510,8 @@ def build_archive(
             raise DownloadError(
                 "Could not assemble a download: " + ("; ".join(result.errors or ()) or "no charts exported")
             )
+        if cancellation_event is not None and cancellation_event.is_set():
+            raise DownloadError("Download preparation cancelled")
         os.replace(temporary_archive, archive)
         return archive, summary
     finally:
