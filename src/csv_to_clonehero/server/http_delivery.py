@@ -8,7 +8,7 @@ from pathlib import Path
 from flask import request
 
 
-ASSET_VERSION = "riff-listening-room-20261015"
+ASSET_VERSION = "riff-progress-20261015"
 
 
 @lru_cache(maxsize=32)

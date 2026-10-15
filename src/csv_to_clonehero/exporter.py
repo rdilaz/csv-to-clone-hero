@@ -2521,6 +2521,7 @@ class ExportService:
         cancellation_event: threading.Event | None = None,
         item_progress: Callable[[ExportItemResult], None] | None = None,
         zip_capacity_checks: bool = False,
+        progress_details: Callable[[dict[str, Any]], None] | None = None,
     ) -> tuple[dict[int, VerifiedArtifact], list[str]]:
         """Materialize every eligible chart, optionally in parallel.
 
@@ -2534,6 +2535,13 @@ class ExportService:
         errors: list[str] = []
         progress_lock = threading.Lock()
         completed = 0
+
+        def detail(label: str, *, advanced: bool = False) -> None:
+            _report_progress_details(progress_details, {
+                "phase": "validating", "completed": completed, "total": total,
+                "current_item": Path(label).name, "unit": "charts",
+                "work_advanced": advanced,
+            })
 
         def notify(item_result: ExportItemResult) -> None:
             _report_item_progress(item_progress, item_result)
@@ -2555,6 +2563,8 @@ class ExportService:
         def materialize_one(item: PreflightItem) -> tuple[int, VerifiedArtifact | None, str | None]:
             nonlocal completed
             label = item.target_relpath or f"chart {item.index}"
+            with progress_lock:
+                detail(label)
             if self._cancel_requested(cancellation_event):
                 item_result = mark(
                     item,
@@ -2565,6 +2575,7 @@ class ExportService:
                 with progress_lock:
                     completed += 1
                     _report_progress(progress, completed, total, label)
+                    detail(label, advanced=True)
                 return item.index, None, item_result.failure
             mark(item, status="downloading", result="downloading")
             try:
@@ -2591,6 +2602,7 @@ class ExportService:
                 with progress_lock:
                     completed += 1
                     _report_progress(progress, completed, total, label)
+                    detail(label, advanced=True)
                 return item.index, None, message
             except ArtifactInvalidError as exc:
                 item_result = mark(
@@ -2605,6 +2617,7 @@ class ExportService:
                 with progress_lock:
                     completed += 1
                     _report_progress(progress, completed, total, label)
+                    detail(label, advanced=True)
                 return item.index, None, message
             except Exception as exc:  # noqa: BLE001 - reported per item
                 item_result = mark(
@@ -2617,6 +2630,7 @@ class ExportService:
                 with progress_lock:
                     completed += 1
                     _report_progress(progress, completed, total, label)
+                    detail(label, advanced=True)
                 return item.index, None, message
             item_result = self._result_for(results, item.index)
             item_result.status = "validated"
@@ -2632,6 +2646,7 @@ class ExportService:
             with progress_lock:
                 completed += 1
                 _report_progress(progress, completed, total, f"Validated {label}")
+                detail(label, advanced=True)
             return item.index, artifact, None
 
         if workers <= 1 or total <= 1:
@@ -2962,9 +2977,27 @@ class ExportService:
         archive_path: Path,
         manifest: ExportManifest,
         options: ExportOptions,
+        progress_details: Callable[[dict[str, Any]], None] | None = None,
+        cancellation_event: threading.Event | None = None,
     ) -> tuple[bool, list[str], int]:
         errors: list[str] = []
         actual_total = sum(artifact.size_bytes for artifact in artifacts.values())
+        copied_bytes = 0
+        completed_files = 0
+        current_item = ""
+
+        def check_cancelled() -> None:
+            if self._cancel_requested(cancellation_event):
+                raise ExportCancelled("ZIP preparation cancelled")
+
+        def detail(*, phase: str = "packaging", advanced: bool = False) -> None:
+            _report_progress_details(progress_details, {
+                "phase": phase, "completed": completed_files, "total": len(artifacts),
+                "files_completed": completed_files, "files_total": len(artifacts),
+                "bytes_completed": copied_bytes, "bytes_total": actual_total,
+                "bytes_kind": "source", "unit": "files", "current_item": current_item,
+                "work_advanced": advanced,
+            })
         budget = options.budget_bytes
         if budget is None and self.config is not None:
             budget = self.config.storage.max_library_bytes
@@ -2983,8 +3016,11 @@ class ExportService:
         except OSError as exc:
             return False, [f"cannot prepare ZIP destination: {exc}"], 0
         try:
+            check_cancelled()
+            detail()
             with zipfile.ZipFile(part, "w", compression=zipfile.ZIP_DEFLATED, allowZip64=True) as archive:
                 for index, artifact in artifacts.items():
+                    check_cancelled()
                     item_result = self._result_for(results, index)
                     arcname = item_result.target_relpath
                     try:
@@ -3000,9 +3036,17 @@ class ExportService:
                     info.compress_type = _artifact_zip_compression(artifact.path, artifact.size_bytes)
                     info.create_system = 0
                     info.external_attr = 0
-                    with archive.open(info, "w") as target, artifact.path.open("rb") as source:
+                    current_item = Path(arcname).name
+                    detail()
+                    with archive.open(info, "w", force_zip64=artifact.size_bytes >= zipfile.ZIP64_LIMIT) as target, artifact.path.open("rb") as source:
                         for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                            check_cancelled()
                             target.write(chunk)
+                            copied_bytes += len(chunk)
+                            detail(advanced=True)
+                            check_cancelled()
+                    completed_files += 1
+                    detail(advanced=True)
                     item_result.status = "published"
                     item_result.result = "archived"
                     item_result.bytes_count = artifact.size_bytes
@@ -3012,6 +3056,9 @@ class ExportService:
                     item_result.playable_note_count = artifact.playable_note_count
                     item_result.note_counts = artifact.note_counts
                     item_result.validation_version = artifact.validation_version
+                check_cancelled()
+                current_item = ""
+                detail(phase="finalizing")
                 manifest.records = self._make_manifest(
                     results,
                     root=Path(preflight.destination_root),
@@ -3024,8 +3071,10 @@ class ExportService:
                     info.create_system = 0
                     info.external_attr = 0
                     archive.writestr(info, manifest.to_json().encode("utf-8"))
+            check_cancelled()
             with part.open("r+b") as target:
                 os.fsync(target.fileno())
+            check_cancelled()
             os.replace(part, archive_path)
             return True, errors, archive_path.stat().st_size
         except (OSError, ExportError, zipfile.BadZipFile, RuntimeError) as exc:
@@ -3034,9 +3083,9 @@ class ExportService:
                 errors.append(str(exc))
             for index in artifacts:
                 item_result = self._result_for(results, index)
-                if item_result.status in {"pending", "published"}:
-                    item_result.status = "failed"
-                    item_result.result = "archive_failed"
+                if item_result.status in {"pending", "validated", "published"}:
+                    item_result.status = "cancelled" if isinstance(exc, ExportCancelled) else "failed"
+                    item_result.result = "cancelled" if isinstance(exc, ExportCancelled) else "archive_failed"
                     item_result.failure = str(exc)
             return False, errors, 0
         finally:
@@ -3282,6 +3331,7 @@ class ExportService:
         archive_root: Path | str | None = None,
         eligibility_checker: Callable[..., Any] | None = None,
         progress: Callable[[int, int, str], None] | None = None,
+        progress_details: Callable[[dict[str, Any]], None] | None = None,
         cancellation_event: threading.Event | None = None,
         cancel_event: threading.Event | None = None,
         item_progress: Callable[[ExportItemResult], None] | None = None,
@@ -3323,10 +3373,20 @@ class ExportService:
             cancellation_event=cancellation_event,
             item_progress=item_progress,
             zip_capacity_checks=True,
+            progress_details=progress_details,
         )
         cancelled = self._cancel_requested(cancellation_event) or any(
             item.status == "cancelled" for item in results
         )
+        if cancelled:
+            for item_result in results:
+                if item_result.status in {"pending", "validated"}:
+                    item_result.status = "cancelled"
+                    item_result.result = "cancelled"
+                    item_result.failure = "export cancelled"
+            _emit_item_progress(results, item_progress)
+            return self._result("zip", archive, preflight, results, success=False,
+                                errors=["export cancelled"], cancelled=True)
         if errors and not opts.continue_on_error and not cancelled:
             for item in preflight.eligible_items:
                 item_result = self._result_for(results, item.index)
@@ -3376,7 +3436,10 @@ class ExportService:
             archive_path=archive,
             manifest=manifest,
             options=opts,
+            progress_details=progress_details,
+            cancellation_event=cancellation_event,
         )
+        cancelled = self._cancel_requested(cancellation_event)
         if not publish_ok:
             self._mark_pending_failed(
                 results,
@@ -3464,6 +3527,21 @@ def _report_progress(progress: Callable[..., Any] | None, done: int, total: int,
         progress(int(done), int(total), str(label))
     except Exception:
         pass
+
+
+def _report_progress_details(
+    observer: Callable[[dict[str, Any]], None] | None, payload: dict[str, Any]
+) -> None:
+    """Optional measured progress, independent of the legacy three-argument observer.
+
+    ZIP byte counts measure source content copied into the archive, not compressed
+    output size or delivery to a browser. Observer failures never abort an export.
+    """
+    if observer is not None:
+        try:
+            observer(payload)
+        except Exception:
+            pass
 
 
 def _report_item_progress(
