@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#20231f">
+  <title>Riff · Your little listening room</title>
+  <link rel="icon" type="image/svg+xml" href="{{ url_for('static', filename='signal-knot.svg') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='companion.css') }}">
+</head>
+<body>
+  <main class="companion" id="companion" aria-label="Riff desktop companion">
+    <header class="masthead">
+      <div class="brand" aria-label="Riff">riff<span>®</span></div>
+      <span class="local-tag"><i></i> LOCAL PREVIEW</span>
+      <button class="icon-button folder-button" id="openFolder" aria-label="Choose sandbox song folder" title="Song folder"><svg viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h5l2 3h7a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z"/></svg></button>
+    </header>
+
+    <section class="player" aria-label="Song preview player">
+      <div class="deck" id="deck">
+        <div class="deck-caption"><span>THE LISTENING ROOM</span><span>33⅓</span></div>
+        <div class="record-sleeve" aria-hidden="true"><span>GOOD<br>THINGS<br>ON REPEAT.</span><i>RIFF RECORDS / VOL. 01</i></div>
+        <div class="record-wrap" id="recordWrap">
+          <div class="vinyl" id="record" data-riff-record aria-hidden="true">
+            <div class="record-label" id="recordLabel"><img id="recordArt" alt="" hidden><span class="label-brand">riff</span><span class="label-title" id="labelTitle">YOUR NEXT<br>GREAT FIND</span><span class="label-artist" id="labelArtist">PICK A RECORD</span><i class="spindle"></i><span class="label-side">SIDE A · LOCAL</span></div>
+          </div>
+        </div>
+        <div class="tonearm" aria-hidden="true"><span></span></div>
+        <span class="deck-bottom"><i id="playbackDot"></i><span id="deckState">READY WHEN YOU ARE</span></span>
+      </div>
+      <div class="now-playing">
+        <div class="now-heading"><span id="nowEyebrow">ON THE TURNTABLE</span><span class="metadata-badge" id="nowBadge">PREVIEW</span></div>
+        <h1 id="nowTitle">Find your next favorite.</h1>
+        <p id="nowArtist">A little room for a lot of music.</p>
+      </div>
+      <div class="transport">
+        <button class="icon-button" id="shuffle" aria-label="Shuffle catalog" aria-pressed="false" title="Shuffle catalog"><svg viewBox="0 0 24 24"><path d="m17 3 4 4-4 4M3 7h3c5 0 7 10 12 10h3m-4-4 4 4-4 4M3 17h3c1.4 0 2.6-.8 3.7-2.1M14 9.1c1.2-1.3 2.4-2.1 4-2.1h3"/></svg></button>
+        <button class="icon-button" id="previous" aria-label="Previous song" title="Previous song" disabled><svg viewBox="0 0 24 24"><path d="M5 5v14"/><path class="fill" d="m18 5-10 7 10 7Z"/></svg></button>
+        <button class="play-button" id="playPause" aria-label="Play preview" title="Play preview"><svg id="playIcon" viewBox="0 0 24 24"><path d="m9 5 11 7-11 7Z"/></svg><span class="loading-ring" hidden></span></button>
+        <button class="icon-button" id="next" aria-label="Next song" title="Next song" disabled><svg viewBox="0 0 24 24"><path d="M19 5v14"/><path class="fill" d="m6 5 10 7-10 7Z"/></svg></button>
+        <button class="icon-button" id="mute" aria-label="Mute preview" aria-pressed="false" title="Mute preview"><svg viewBox="0 0 24 24"><path class="fill" d="M4 9v6h4l5 4V5L8 9Z"/><path id="volumeWaves" d="M16 8c2 2 2 6 0 8m3-11c4 4 4 10 0 14"/></svg></button>
+      </div>
+      <div class="timeline"><span id="elapsed">0:00</span><input id="seek" type="range" min="0" max="100" value="0" step="0.1" aria-label="Preview position" disabled><span id="duration">—:—</span></div>
+      <p class="player-status" id="playerStatus" role="status">Chart audio availability is checked when opened.</p>
+    </section>
+
+    <section class="catalog" aria-label="Browse chart catalog">
+      <div class="catalog-heading"><h2>Your next record<span id="catalogCount">Loading catalog…</span></h2><div class="catalog-tools"><button id="cachedToggle" class="filter-button" aria-pressed="true" title="Show cached packages; audio is checked when opened"><span aria-hidden="true">◉</span> Cached packages</button><button id="libraryInfo" class="quiet-button" title="Read-only installed library"><svg viewBox="0 0 24 24"><path d="M4 4v16m5-16v16m5-16v16m4-15 3 14"/></svg><span id="installedCount">Library</span></button></div></div>
+      <form class="search-bar" id="searchForm" role="search"><svg viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 5 5"/></svg><label class="sr-only" for="search">Search title, artist or album</label><input id="search" type="search" placeholder="Title, artist, album…" autocomplete="off" maxlength="200"><label class="sr-only" for="decade">Filter by decade</label><select id="decade" aria-label="Filter by decade"><option value="">All years</option><option value="2020">2020s</option><option value="2010">2010s</option><option value="2000">2000s</option><option value="1990">1990s</option><option value="1980">1980s</option><option value="1970">1970s</option><option value="1960">1960s</option><option value="1950">1950s</option><option value="1940">1940s</option><option value="1930">1930s</option></select></form>
+      <div class="results" id="results" aria-busy="true"><p class="empty-state">Taking the records off the shelf…</p></div>
+      <div class="results-footer"><span id="resultsSummary">Local catalog</span><button class="text-button" id="loadMore" hidden>Load more <span aria-hidden="true">↓</span></button></div>
+    </section>
+    <footer class="companion-footer"><span><i></i> Made for a little more music.</span><button class="text-button" id="aboutButton" aria-label="About this local preview">Preview info <span aria-hidden="true">↗</span></button></footer>
+    <audio id="companionAudio" preload="none"></audio>
+  </main>
+
+  <dialog id="folderDialog" class="sheet" aria-labelledby="folderTitle">
+    <form method="dialog" class="sheet-top"><span class="sheet-kicker">YOUR SONGS, YOUR SPACE</span><button class="icon-button close-button" aria-label="Close folder settings">×</button></form>
+    <h2 id="folderTitle">A home for your records.</h2>
+    <p>This preview only adds validated, cached <strong>.sng packages</strong> to a folder inside its sandbox. Existing files are never replaced.</p>
+    <label class="field-label" for="folderPath">Sandbox destination folder</label><input class="path-input" id="folderPath" type="text" spellcheck="false" autocomplete="off">
+    <p class="field-help" id="sandboxHint"></p>
+    <button class="primary-button" id="saveFolder" type="button">Use this folder <span aria-hidden="true">→</span></button>
+    <p class="sheet-message" id="folderMessage" role="status"></p>
+    <div class="library-note"><span class="sheet-kicker">DETECTED LIBRARY · READ ONLY</span><p id="libraryPath">No library linked.</p><span id="libraryDetail">The real song library stays untouched.</span></div>
+  </dialog>
+  <dialog id="installDialog" class="sheet" aria-labelledby="installTitle">
+    <form method="dialog" class="sheet-top"><span class="sheet-kicker">ONE RECORD AT A TIME</span><button class="icon-button close-button" aria-label="Close install confirmation">×</button></form>
+    <h2 id="installTitle">Add this chart?</h2><p id="installSong"></p><p class="install-description">This adds one cached <strong>.sng package</strong>. Folder extraction is not part of this prototype.</p><div class="destination-card"><span class="sheet-kicker">DESTINATION</span><code id="installDestination"></code></div>
+    <p id="installReason" class="sheet-message" role="status"></p><button class="primary-button" id="confirmInstall" type="button">Add package to folder <span aria-hidden="true">↗</span></button><button class="secondary-button" id="changeFolder" type="button">Choose another sandbox folder</button>
+  </dialog>
+  <dialog id="aboutDialog" class="sheet" aria-labelledby="aboutTitle"><form method="dialog" class="sheet-top"><span class="sheet-kicker">A WORKING FIRST PRESSING</span><button class="icon-button close-button" aria-label="Close preview information">×</button></form><h2 id="aboutTitle">Small player.<br>Real records.</h2><p>This is a local browser prototype, using Riff's existing catalog, audio reader and inventory. Catalog counts and installed badges come from the loaded data.</p><p>Only cached packages can play here. Availability and codec support are confirmed when opened. Multi-stem previews are capped at 45 seconds; full tracks are not guaranteed.</p><p>Installing requires a specific chart and a selected sandbox folder. The real library stays read-only. Native desktop packaging is still to come.</p></dialog>
+  <script src="{{ url_for('static', filename='catalog-audio.js') }}" defer></script>
+  <script src="{{ url_for('static', filename='catalog.js') }}" defer></script>
+  <script src="{{ url_for('static', filename='riff-scene.js') }}" defer></script>
+  <script src="{{ url_for('static', filename='companion.js') }}" defer></script>
+</body>
+</html>

@@ -119,7 +119,7 @@ def test_support_banner_can_be_disabled_without_changing_the_shell(client, confi
     config.monetization.gofundme_banner = False
     html = client.get("/").get_data(as_text=True)
     assert "cause-bar" not in html
-    assert "Music studio" in html
+    assert "The listening room" in html
 
 
 def test_enabled_gofundme_banner_requires_explicit_destination(client, config):

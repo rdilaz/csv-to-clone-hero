@@ -45,7 +45,7 @@ csv-to-clonehero = "csv_to_clonehero.cli:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-csv_to_clonehero = ["default_config.yaml", "server/templates/*.html", "server/static/*.css", "server/static/*.js", "server/static/*.svg", "server/static/*.woff2", "server/static/*.txt", "templates/*.html", "static/*.css", "static/*.js"]
+csv_to_clonehero = ["default_config.yaml", "server/templates/*.html", "server/static/*.css", "server/static/*.js", "server/static/*.svg", "server/static/*.woff2", "server/static/*.txt", "server/releases/*", "templates/*.html", "static/*.css", "static/*.js"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

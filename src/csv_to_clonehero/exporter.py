@@ -1692,6 +1692,7 @@ class ExportService:
         artifact_provider: ArtifactProvider | Callable[..., Any] | None = None,
         artifact_cache: ArtifactCache | None = None,
         artifact_cache_dir: Path | str | None = None,
+        staging_root: Path | str | None = None,
         track_resolver: Mapping[Any, Track] | Callable[[Any], Track | None] | None = None,
         disk_usage: Callable[[Path], Any] | None = None,
         validator: Callable[..., SngValidation] = validate_sng,
@@ -1725,7 +1726,7 @@ class ExportService:
             self.artifact_cache = FileArtifactCache(artifact_cache_dir)
 
         self._staging_root = Path(
-            tempfile.mkdtemp(prefix="csv-to-clonehero-export-")
+            tempfile.mkdtemp(prefix="csv-to-clonehero-export-", dir=staging_root)
         )
 
     def close(self) -> None:

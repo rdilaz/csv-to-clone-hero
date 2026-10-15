@@ -23,6 +23,7 @@ from __future__ import annotations
 import json
 import hashlib
 import logging
+import os
 import re
 import threading
 import time
@@ -53,6 +54,8 @@ from csv_to_clonehero.normalization import normalize_artist, normalize_title
 from csv_to_clonehero.server.auth import build_oauth, build_soundcloud_oauth, user_workspace_key
 from csv_to_clonehero.server.downloads import BrowserDownloads, DownloadError, selection_snapshot
 from csv_to_clonehero.server.catalog_browse import catalog_key, catalog_compatibility, public_catalog_item
+from csv_to_clonehero.server.companion_release import is_companion_release_path, register_companion_release
+from csv_to_clonehero.server.apple_music_import import register_apple_music_import
 from csv_to_clonehero.server.jobs import JobManager
 from csv_to_clonehero.server.safeguards import (
     get_discovery_availability,
@@ -92,6 +95,7 @@ def create_app(
     config: AppConfig | None = None,
     *,
     source_factory: Callable[[AppConfig], list] | None = None,
+    archive_builder: Callable | None = None,
 ) -> Flask:
     """Create the public WSGI application and its durable worker services.
 
@@ -122,11 +126,12 @@ def create_app(
     app.jinja_env.globals["now_year"] = str(datetime.now().year)
 
     downloads = BrowserDownloads(config, secret_key)
-    jobs = JobManager(config, cipher, source_factory=source_factory, downloads=downloads)
+    jobs = JobManager(config, cipher, source_factory=source_factory, downloads=downloads, archive_builder=archive_builder)
 
     app.extensions["jobs"] = jobs
     app.extensions["downloads"] = downloads
     app.extensions["config"] = config
+    register_companion_release(app)
 
     @app.errorhandler(SelectionConflict)
     def selection_conflict(error):
@@ -214,6 +219,11 @@ def create_app(
             return int(_ensure_workspace(db, user))
         return _anonymous_workspace(db)
 
+    register_apple_music_import(
+        app, config, require_user=_require_user, user_db=_user_db,
+        request_workspace=_request_workspace, public_source_rows=_public_source_rows,
+    )
+
     # ---- public pages -------------------------------------------------------
     @app.get("/healthz")
     def healthz():
@@ -224,6 +234,7 @@ def create_app(
             "release": "riff-v2-20261008",
             "experience": "signal-check",
             "ui_release": ASSET_VERSION,
+            "source_revision": os.environ.get("RIFF_SOURCE_REVISION", "unknown"),
             "capabilities": _STUDIO_CAPABILITIES,
         })
 
@@ -999,6 +1010,10 @@ def create_app(
             order = request.args.get("order", "source")
             seed = str(request.args.get("seed", "0"))[:64]
             q = str(request.args.get("q", ""))[:200]
+            decade_value = request.args.get("decade", "").strip()
+            decade = int(decade_value) if decade_value else None
+            if decade is not None and (not 1800 <= decade <= 2190 or decade % 10):
+                raise ValueError("Choose a valid year-based decade.")
             if order not in {"source", "shuffle"}:
                 raise ValueError("Choose source or shuffle order.")
         except (TypeError, ValueError) as exc:
@@ -1014,12 +1029,12 @@ def create_app(
                                     "has_more": False, **_catalog_receipts(db, workspace)}), 503 if readiness["status"] == "unavailable" else 202
                 if request.args.get("snapshot_token") not in (None, readiness["snapshot_token"]):
                     raise SelectionConflict("The chart catalog changed. Reload the catalog browser.")
-                rows, total = jobs.catalog_browser.page(offset=offset, limit=limit, q=q, order=order, seed=seed)
+                rows, total = jobs.catalog_browser.page(offset=offset, limit=limit, q=q, order=order, seed=seed, decade=decade)
                 selected = _catalog_artifacts(db, workspace)
                 return jsonify({**readiness, "readiness": readiness,
                     "items": [public_catalog_item(config, db, chart, selected) for chart in rows],
                     "limit": limit, "offset": offset, "has_more": offset + len(rows) < total,
-                    "total_filtered_charts": total, "q": q, "order": order, "seed": seed, **_catalog_receipts(db, workspace)})
+                    "total_filtered_charts": total, "q": q, "order": order, "seed": seed, "decade": decade, **_catalog_receipts(db, workspace)})
         finally:
             db.close()
 
@@ -1839,6 +1854,8 @@ def _cookie_secure(config: AppConfig) -> bool:
 
 
 def _is_public_path(path: str) -> bool:
+    if is_companion_release_path(path):
+        return True
     if path.startswith("/static/") or path in {
         "/",
         "/favicon.ico",
