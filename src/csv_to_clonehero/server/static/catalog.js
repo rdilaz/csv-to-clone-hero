@@ -15,7 +15,9 @@
     tab: "catalog", opener: null, busy: false, receipt: null, current: null,
     loadEpoch: 0, loadController: null, resource: null, loadedKey: null,
     playback: "paused", previewError: false, autoFailures: 0, sourcePage: location.pathname, pageRequest: 0,
-    basePath: location.pathname, baseTitle: document.title, choiceChecks: new Map(), choiceRevisions: new Map(),
+    basePath: location.pathname, baseTitle: document.title,
+    baseUrl: location.pathname + location.search + location.hash, baseHistory: history.state, pageController: null,
+    choiceChecks: new Map(), choiceRevisions: new Map(),
     receiptPromise: null, receiptNotify: false, awaitingSelection: false,
     continueCatalog: true, continuationActive: false, feed: null, feedLoading: false, lookupKey: null,
     recordKey: null, recordPlayback: null, swapTimer: null};
@@ -287,6 +289,7 @@
     document.documentElement.style.setProperty("--catalog-dock-height", `${height}px`);
   }
   function drawer(tab = "catalog", opener = null) {
+    if (tab !== "site") cancelSiteLoad();
     if ($("#catalogDrawer").hidden) state.opener = opener || document.activeElement;
     state.tab = tab;
     $("#catalogDrawer").hidden = false;
@@ -305,6 +308,7 @@
     renderQueue();
   }
   function closeDrawer(restoreFocus = true) {
+    cancelSiteLoad();
     $("#catalogDrawer").hidden = true; delete document.body.dataset.catalogDrawerOpen;
     root.removeAttribute("role"); root.removeAttribute("aria-modal");
     for (const node of document.querySelectorAll("#main-content,.site-header,.site-footer,.ad-wrap,.cause-bar")) node.inert = false;
@@ -312,8 +316,8 @@
     if (restoreFocus && state.opener?.isConnected) state.opener.focus({preventScroll: true});
   }
   function leaveDrawer() {
-    const site = state.tab === "site"; closeDrawer();
-    if (site && location.pathname !== state.basePath) { history.pushState({riffPage: state.basePath}, "", state.basePath); document.title = state.baseTitle; }
+    if (state.tab === "site" && location.pathname !== state.basePath) { void softPage(state.basePath); return; }
+    closeDrawer();
   }
   async function browsePage(offset = 0) {
     const request = ++state.request; state.controller?.abort(); state.controller = new AbortController();
@@ -600,15 +604,38 @@
     const seek = $("#catalogSeek"); seek.disabled = !duration; seek.max = String(Math.floor(duration)); seek.value = String(Math.floor(audio.currentTime || 0));
     $("#catalogTime").textContent = `${time(audio.currentTime || 0)} / ${duration ? time(duration) : "—"}`;
   }
+  function cancelSiteLoad() {
+    state.pageRequest += 1;
+    state.pageController?.abort();
+    state.pageController = null;
+  }
   async function softPage(path, push = true) {
     if (!["/", "/about", "/terms", "/privacy", "/dmca"].includes(path)) return false;
-    const request = ++state.pageRequest;
-    if (path === "/" && $("#riffApp")) { closeDrawer(); document.title = "Riff | Signal Check"; if (push) history.pushState({riffPage: path}, "", path); state.sourcePage = path; return true; }
+    if (location.pathname === state.basePath && $("#catalogDrawer").hidden) {
+      state.baseUrl = location.pathname + location.search + location.hash;
+      state.baseHistory = history.state;
+    }
+    cancelSiteLoad();
+    const request = state.pageRequest;
+    if (path === state.basePath) {
+      // The original landing page or studio remains mounted below the drawer.
+      // Restore it without a fetch, remount, or player/job reset.
+      closeDrawer(); document.title = state.baseTitle; state.sourcePage = path;
+      if (push) history.pushState({...state.baseHistory, riffPage: path}, "", state.baseUrl);
+      return true;
+    }
+    // Record the intended page before its fetch so Back works during loading.
+    if (push) history.pushState({riffPage: path}, "", path);
+    const controller = new AbortController();
+    state.pageController = controller;
     drawer("site"); message("Opening this Riff page…", "#catalogDrawerTitle");
     try {
-      const response = await fetch(path, {credentials: "same-origin", headers: {"Accept": "text/html"}});
-      if (!response.ok || request !== state.pageRequest) throw new Error("This page could not be opened.");
-      const documentPage = new DOMParser().parseFromString(await response.text(), "text/html");
+      const response = await fetch(path, {credentials: "same-origin", headers: {"Accept": "text/html"}, signal: controller.signal});
+      if (request !== state.pageRequest) return false;
+      if (!response.ok) throw new Error("This page could not be opened.");
+      const source = await response.text();
+      if (request !== state.pageRequest) return false;
+      const documentPage = new DOMParser().parseFromString(source, "text/html");
       const main = documentPage.querySelector("#main-content"); if (!main) throw new Error("This Riff page could not be confirmed.");
       const authenticated = documentPage.body.dataset.authenticated;
       if (authenticated !== document.body.dataset.authenticated || documentPage.body.dataset.riffOwner !== document.body.dataset.riffOwner) {
@@ -620,18 +647,22 @@
       if (path === "/") {
         // Home is application-owned HTML. Forms are needed when mounting the journey.
         const home = documentPage.querySelector("#riffApp");
-        if (!home || !window.RiffJourney?.mount) throw new Error("Open Riff home directly to resume the music journey.");
-        $("#main-content").replaceChildren(home); closeDrawer(false); window.RiffJourney.mount(); window.RiffStudio?.mount(); window.RiffScene?.mount(home);
+        if ((authenticated === "true" && !home) || !window.RiffJourney?.mount) throw new Error("Open Riff home directly to resume the music journey.");
+        $("#main-content").replaceChildren(...(home ? [home] : main.childNodes)); closeDrawer(false);
+        window.RiffJourney.mount(); window.RiffStudio?.mount(); window.RiffScene?.mount(home || $("#main-content"));
         state.basePath = "/"; state.baseTitle = documentPage.title;
+        state.baseUrl = location.pathname + location.search + location.hash; state.baseHistory = history.state;
       } else {
         $("#catalogSitePage").replaceChildren(...main.childNodes);
         $("#catalogDrawerTitle").textContent = documentPage.title.split("|")[0].trim();
         $("#catalogSitePage").focus({preventScroll: true});
       }
       document.title = documentPage.title; state.sourcePage = path;
-      if (push) history.pushState({riffPage: path}, "", path);
       return true;
-    } catch (error) { $("#catalogSitePage").textContent = error.message || "This page could not be opened. Your player is preserved."; return false; }
+    } catch (error) {
+      if (request !== state.pageRequest || error.name === "AbortError") return false;
+      $("#catalogSitePage").textContent = error.message || "This page could not be opened. Your player is preserved."; return false;
+    } finally { if (state.pageController === controller) state.pageController = null; }
   }
   function stop(clear = false) {
     stopMedia(); if (clear) { state.queue = []; state.index = -1; state.current = null; state.feed = null; try { sessionStorage.removeItem(storageKey); } catch (_) {} render(); }
