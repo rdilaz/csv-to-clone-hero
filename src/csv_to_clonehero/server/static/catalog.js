@@ -1,27 +1,32 @@
 (() => {
   "use strict";
   const $ = selector => document.querySelector(selector);
+  // Shared with the local companion; the public workbench keeps its own state.
+  const count = value => Number(value || 0).toLocaleString();
+  const time = value => Number.isFinite(value) ? `${Math.floor(Math.max(0, value) / 60)}:${String(Math.floor(Math.max(0, value) % 60)).padStart(2, "0")}` : "-";
+  const newSeed = () => { const bytes = new Uint8Array(8); crypto.getRandomValues(bytes); return [...bytes].map(value => value.toString(16).padStart(2, "0")).join(""); };
+  window.RiffCatalogShared = Object.freeze({api, count, time, newSeed});
   const root = $("#catalogWorkbench"), audio = $("#catalogAudio");
   if (!root || !audio) return;
   const LIMIT = 50, QUEUE_LIMIT = 200, CONTINUATION_BATCH = 10;
   const storageKey = `riff:catalog-queue:1:${document.body.dataset.riffOwner || "guest"}`;
   const state = {items: [], queue: [], index: -1, offset: 0, total: 0, filtered: 0,
-    snapshot: null, q: "", seed: "", loading: false, request: 0, controller: null,
+    snapshot: null, q: "", decade: "", seed: "", loading: false, request: 0, controller: null,
     tab: "catalog", opener: null, busy: false, receipt: null, current: null,
     loadEpoch: 0, loadController: null, resource: null, loadedKey: null,
-    playback: "paused", autoFailures: 0, sourcePage: location.pathname, pageRequest: 0,
+    playback: "paused", previewError: false, autoFailures: 0, sourcePage: location.pathname, pageRequest: 0,
     basePath: location.pathname, baseTitle: document.title, choiceChecks: new Map(), choiceRevisions: new Map(),
     receiptPromise: null, receiptNotify: false, awaitingSelection: false,
-    continueCatalog: true, continuationActive: false, feed: null, feedLoading: false, lookupKey: null};
+    continueCatalog: true, continuationActive: false, feed: null, feedLoading: false, lookupKey: null,
+    recordKey: null, recordPlayback: null, swapTimer: null};
   const validKey = key => /^enchor:[1-9]\d*$/.test(key || "");
   const artifactKey = item => /^[a-f0-9]{32}$/i.test(item?.md5 || "") && item?.source
     ? `${item.source}:${item.md5.toLowerCase()}` : null;
-  const count = value => Number(value || 0).toLocaleString();
-  const time = value => Number.isFinite(value) ? `${Math.floor(Math.max(0, value) / 60)}:${String(Math.floor(Math.max(0, value) % 60)).padStart(2, "0")}` : "—";
   const message = (text, node = "#catalogPlayerStatus") => { $(node).textContent = text; };
   function save() {
     try { sessionStorage.setItem(storageKey, JSON.stringify({version: 1, index: state.index, continueCatalog: state.continueCatalog,
-      feed: state.feed && {q: state.feed.q, seed: state.feed.seed, offset: state.feed.offset,
+      muted: audio.muted, volume: audio.volume,
+      feed: state.feed && {q: state.feed.q, decade: state.feed.decade, seed: state.feed.seed, offset: state.feed.offset,
         snapshot: state.feed.snapshot, exhausted: state.feed.exhausted},
       queue: state.queue.slice(0, QUEUE_LIMIT).map(item => ({catalog_key: item.catalog_key,
         title: String(item.title || "").slice(0, 240), artist: String(item.artist || "").slice(0, 240),
@@ -35,8 +40,11 @@
         .map(item => ({catalog_key: item.catalog_key, title: String(item.title || "Chart").slice(0, 240),
           artist: String(item.artist || "").slice(0, 240), charter: String(item.charter || "").slice(0, 120), automatic: item.automatic === true}));
       state.continueCatalog = stored.continueCatalog !== false;
+      audio.muted = stored.muted === true;
+      if (typeof stored.volume === "number" && Number.isFinite(stored.volume) && stored.volume >= 0 && stored.volume <= 1) audio.volume = stored.volume;
+      $("#catalogVolume").value = String(audio.volume);
       if (stored.feed && Number.isSafeInteger(stored.feed.offset) && stored.feed.offset >= 0) {
-        state.feed = {q: String(stored.feed.q || "").slice(0, 200), seed: String(stored.feed.seed || "").slice(0, 64),
+        state.feed = {q: String(stored.feed.q || "").slice(0, 200), decade: /^(19\d0|20[0-2]0)$/.test(stored.feed.decade || "") ? stored.feed.decade : "", seed: String(stored.feed.seed || "").slice(0, 64),
           offset: stored.feed.offset, snapshot: typeof stored.feed.snapshot === "string" && stored.feed.snapshot.length <= 4096 ? stored.feed.snapshot : null,
           exhausted: stored.feed.exhausted === true};
       }
@@ -156,17 +164,21 @@
   function renderItems() {
     const host = $("#catalogResults");
     const key = JSON.stringify([state.snapshot, state.items.map(item => [item.catalog_key, item.title, item.artist,
-      item.charter, item.album, item.preview?.available, item.preview?.reason, item.blocked_reason,
+      item.charter, item.album, item.year, item.installed, item.preview?.available, item.preview?.reason, item.blocked_reason,
       item.selected, item.selected_in_scope, blocked(item), removeBlocked(item), state.queue.some(row => row.catalog_key === item.catalog_key)])]);
     if (host._catalogRenderKey === key) return;
     host._catalogRenderKey = key; host.replaceChildren();
-    for (const item of state.items) {
+    for (const [index, item] of state.items.entries()) {
       const card = document.createElement("article"); card.className = "catalog-card"; card.dataset.catalogKey = item.catalog_key;
-      const title = document.createElement("h3"); title.textContent = `${item.artist} — ${item.title}`;
-      const info = document.createElement("p"); info.textContent = `Chart by ${item.charter || "unknown charter"}${item.album ? ` · ${item.album}` : ""}`;
+      const number = document.createElement("span"); number.className = "catalog-track-number"; number.textContent = String(state.offset + index + 1).padStart(2, "0"); number.setAttribute("aria-hidden", "true");
+      const heading = document.createElement("div"); heading.className = "catalog-card-heading";
+      const title = document.createElement("h3"); title.textContent = item.title || "Untitled chart";
+      const info = document.createElement("p"); info.textContent = [item.artist || "Unknown artist", item.album, item.year].filter(Boolean).join(" \u00b7 ");
+      const credit = document.createElement("p"); credit.className = "catalog-credit"; credit.textContent = `Chart by ${item.charter || "unknown charter"}`;
       const availability = document.createElement("p"); availability.textContent = item.preview?.available === false
         ? item.preview.reason || "Audio preview unavailable" : "Chart audio is checked when played.";
       if (!item.selectable) availability.textContent += ` ${item.blocked_reason || "This chart cannot enter the ZIP."}`;
+      availability.className = "catalog-availability";
       const actions = document.createElement("div"); actions.className = "catalog-card-actions";
       const play = button("Play preview", playItem, item, item.preview?.available === false);
       const queue = button(state.queue.some(row => row.catalog_key === item.catalog_key) ? "Queued" : "Queue", enqueue, item);
@@ -177,7 +189,12 @@
         const remove = button("Remove from ZIP", row => addToZip(row, "clear"), item, removeBlocked(item));
         remove.dataset.catalogFocus = `${item.catalog_key}:card:3`; actions.append(remove);
       }
-      card.append(title, info, availability, actions); host.append(card);
+      heading.append(title, info, credit);
+      if (item.installed === true) {
+        const badge = document.createElement("span"); badge.className = "catalog-installed"; badge.textContent = "In library";
+        badge.title = "Matching song found in the linked .sng inventory; the exact chart version may differ."; heading.append(badge);
+      }
+      card.append(number, heading, availability, actions); host.append(card);
     }
   }
   function renderQueue() {
@@ -201,17 +218,47 @@
     });
     $("#catalogQueueCount").textContent = $("#catalogDockQueueCount").textContent = count(state.queue.length);
   }
+  function renderRecord(item) {
+    const key = item?.catalog_key || "", record = $("#catalogVinylButton");
+    if (key !== state.recordKey) {
+      if (state.recordKey !== null && key) {
+        record.classList.remove("swapping"); void record.offsetWidth; record.classList.add("swapping");
+        clearTimeout(state.swapTimer); state.swapTimer = setTimeout(() => record.classList.remove("swapping"), 500);
+      }
+      state.recordKey = key;
+    }
+    $(".catalog-vinyl-record").dataset.catalogKey = key;
+    $("#catalogRecordLabel").textContent = item?.title?.slice(0, 36) || "RIFF";
+    const art = item?.artwork_url || item?.art_url || item?.artwork?.url || item?.preview?.artwork_url;
+    const safeArt = typeof art === "string" && /^\/api\/companion\/artwork\/enchor\/[1-9]\d*\.jpg$/.test(art);
+    const image = $("#catalogRecordArt"); image.hidden = !safeArt || image.dataset.failedSrc === art;
+    if (safeArt) { if (image.getAttribute("src") !== art) image.src = art; } else image.removeAttribute("src");
+    $("#catalogInstalledBadge").hidden = item?.installed !== true;
+    $("#catalogInstalledBadge").title = "Matching song found in the linked .sng inventory; the exact chart version may differ.";
+    if (state.recordPlayback !== state.playback) {
+      state.recordPlayback = state.playback;
+      document.dispatchEvent(new CustomEvent("riff:catalog-playback", {detail: {state: state.playback}}));
+    }
+  }
+  function renderSound() {
+    const mute = $("#catalogMuteButton"); mute.setAttribute("aria-pressed", String(audio.muted));
+    mute.setAttribute("aria-label", audio.muted ? "Unmute preview" : "Mute preview"); mute.title = audio.muted ? "Unmute preview" : "Mute preview";
+    $("#catalogVolumeWaves").setAttribute("d", audio.muted ? "m17 9 5 6m0-6-5 6" : "M16 8c2 2 2 6 0 8m3-11c4 4 4 10 0 14");
+  }
   function render() {
     const focusKey = document.activeElement?.dataset?.catalogFocus;
     const item = state.current;
     $("#catalogNowTitle").textContent = item?.title || "Discover your next chart";
-    $("#catalogNowArtist").textContent = item ? `${item.artist || "Unknown artist"} · ${item.charter || "Unknown charter"}` : "Browse the full chart catalog";
+    $("#catalogNowArtist").textContent = item ? [item.artist || "Unknown artist", item.album, item.year].filter(Boolean).join(" \u00b7 ") : "Browse the full chart catalog";
     $("#catalogPlayerDock").dataset.playbackState = state.playback;
+    $("#catalogPlayerDock").dataset.previewError = String(state.previewError);
+    renderRecord(item); renderSound();
     const canPause = Boolean(audio.getAttribute("src") && !audio.paused);
     const loading = state.playback === "loading";
     $("#catalogVinylButton").disabled = !loading && (!item || item.preview?.available === false);
     $("#catalogVinylButton").setAttribute("aria-label", canPause ? "Pause preview" : loading ? "Cancel preview loading" : "Play preview");
-    $(".catalog-vinyl-symbol").textContent = canPause ? "Ⅱ" : loading ? "■" : "▶";
+    $("#catalogVinylButton").title = canPause ? "Pause preview" : loading ? "Cancel preview loading" : item?.preview?.available === false ? item.preview.reason || "Audio preview unavailable" : "Play preview";
+    $(".catalog-vinyl-symbol").textContent = canPause ? "\u275a\u275a" : loading ? "\u00d7" : "\u25b6";
     $("#catalogPlayerPrevious").disabled = state.index <= 0;
     $("#catalogPlayerNext").disabled = state.feedLoading || state.index < 0
       || (state.index + 1 >= state.queue.length && (!state.continueCatalog || state.feed?.exhausted));
@@ -219,7 +266,7 @@
     $("#catalogContinueCatalog").checked = state.continueCatalog;
     $("#catalogClearQueue").disabled = state.queue.length === 0 && !loading;
     $("#catalogContinuationContext").textContent = state.feed
-      ? `Continue ${state.feed.seed ? "the captured shuffled order" : "in catalog order"}${state.feed.q ? ` for “${state.feed.q}”` : ""}. Queued picks play first. Only the current chart's audio is loaded.`
+      ? `Continue ${state.feed.seed ? "the captured shuffled order" : "in catalog order"}${state.feed.q ? ` for "${state.feed.q}"` : ""}${state.feed.decade ? ` from the ${state.feed.decade}s` : ""}. Queued picks play first. Only the current chart's audio is loaded.`
       : "After you press Play, queued picks play first, then more charts from the current catalog search. Only the current chart's audio is loaded.";
     $("#catalogAddButton").disabled = item?.selection_check || state.awaitingSelection ? state.busy || document.body.dataset.authenticated !== "true" : blocked(item);
     $("#catalogAddButton").textContent = state.awaitingSelection ? "Check choices" : item?.selection_check ? "Check choice" : item?.selected ? "In ZIP selection" : "Add to ZIP";
@@ -272,9 +319,10 @@
     const request = ++state.request; state.controller?.abort(); state.controller = new AbortController();
     state.loading = true; $("#catalogResults").setAttribute("aria-busy", "true");
     $("#catalogRetryButton").hidden = true; $("#catalogPreviousPage").disabled = $("#catalogNextPage").disabled = true;
-    message("Checking the installed chart catalog…", "#catalogBrowseStatus");
+    message("Taking the records off the shelf.", "#catalogBrowseStatus");
     const params = new URLSearchParams({limit: String(LIMIT), offset: String(offset), q: state.q,
       order: state.seed ? "shuffle" : "source"});
+    if (state.decade) params.set("decade", state.decade);
     if (state.seed) params.set("seed", state.seed);
     if (state.snapshot && offset > 0) params.set("snapshot_token", state.snapshot);
     try {
@@ -291,15 +339,17 @@
       state.items = data.items.filter(item => validKey(item?.catalog_key)); state.offset = offset;
       state.total = data.total_charts; state.filtered = data.total_filtered_charts; state.snapshot = data.snapshot_token;
       applyReceipt(data); renderItems();
-      $("#catalogCounts").textContent = `${count(data.total_charts)} indexed charts · ${count(data.total_songs)} unique songs${state.q ? ` · ${count(data.total_filtered_charts)} matching charts` : ""}. Every catalog page is browsable.`;
+      $("#catalogCounts").textContent = `${count(data.total_charts)} indexed charts \u00b7 ${count(data.total_songs)} unique songs${state.q || state.decade ? ` \u00b7 ${count(data.total_filtered_charts)} matching charts` : ""}. Every catalog page is browsable.`;
       $("#catalogPagePosition").textContent = `${count(offset + (state.items.length ? 1 : 0))}–${count(offset + state.items.length)} of ${count(state.filtered)}`;
       $("#catalogPreviousPage").disabled = offset === 0; $("#catalogNextPage").disabled = !data.has_more;
       message(state.items.length ? "Choose Play preview, Queue, or Add to ZIP." : "No charts match this search.", "#catalogBrowseStatus");
+      return true;
     } catch (error) {
       if (request !== state.request || error.name === "AbortError") return;
       message(error.status === 409 ? "The installed catalog changed. Check again to browse its current pages." : error.message || "Catalog unavailable. Your listening queue is preserved.", "#catalogBrowseStatus");
       $("#catalogRetryButton").hidden = false;
       if (error.status === 409) state.snapshot = null;
+      return false;
     } finally { if (request === state.request) { state.loading = false; $("#catalogResults").setAttribute("aria-busy", "false"); } }
   }
   function enqueue(item) {
@@ -324,7 +374,7 @@
   }
   function captureFeed(item) {
     const position = state.items.findIndex(row => row.catalog_key === item.catalog_key);
-    state.feed = {q: state.q, seed: state.seed, offset: position >= 0 ? state.offset + position + 1 : 0,
+    state.feed = {q: state.q, decade: state.decade, seed: state.seed, offset: position >= 0 ? state.offset + position + 1 : 0,
       snapshot: state.snapshot, exhausted: false};
   }
   async function startQueue(index, capture = true) {
@@ -352,6 +402,7 @@
         const offset = feed.offset;
         const params = new URLSearchParams({limit: String(CONTINUATION_BATCH), offset: String(offset), q: feed.q,
           order: feed.seed ? "shuffle" : "source"});
+        if (feed.decade) params.set("decade", feed.decade);
         if (feed.seed) params.set("seed", feed.seed);
         if (feed.snapshot) params.set("snapshot_token", feed.snapshot);
         const data = await api(`/api/catalog?${params}`, {signal: controller.signal});
@@ -417,14 +468,14 @@
     state.lookupKey = null;
     if (cancelContinuation) state.continuationActive = false;
     audio.pause(); audio.removeAttribute("src"); audio.load();
-    state.resource?.cleanup?.(); state.resource = null; state.loadedKey = null; state.playback = "paused";
+    state.resource?.cleanup?.(); state.resource = null; state.loadedKey = null; state.playback = "paused"; state.previewError = false;
     updateTime(); render();
   }
   async function selectQueue(index, play = false, automatic = false) {
     if (index < 0 || index >= state.queue.length) return false;
     stopMedia(false); state.index = index; state.current = state.queue[index]; save(); render();
     const key = state.current.catalog_key;
-    if (!play) { message("Preview paused. Press Play to load this chart's audio."); return true; }
+    if (!play) { message(state.current.preview?.available === false ? state.current.preview.reason || "Audio preview unavailable for this chart. Listening queue and ZIP choices still work." : "Preview paused. Press Play to load this chart's audio."); return true; }
     const epoch = ++state.loadEpoch, controller = new AbortController(); state.loadController = controller;
     state.playback = "loading"; render(); message("Checking chart audio…");
     try {
@@ -435,7 +486,7 @@
       state.index = position; state.current = state.queue[position] = {...item, automatic: state.queue[position].automatic}; render();
       if (item.preview?.available === false) throw new Error(item.preview.reason || "Audio preview unavailable for this chart.");
       if (!window.RiffCatalogAudio?.load) throw new Error("The audio preview reader is unavailable. Browse and ZIP choices still work.");
-      const resource = await window.RiffCatalogAudio.load(item, {signal: controller.signal,
+      const resource = await window.RiffCatalogAudio.load(item, {signal: controller.signal, localUrl: item.preview?.local_url ?? null,
         onProgress: text => { if (epoch === state.loadEpoch) message(String(text)); }});
       if (epoch !== state.loadEpoch || state.current?.catalog_key !== key) { resource.cleanup?.(); return false; }
       if (!/^blob:/.test(resource.url || "")) { resource.cleanup?.(); throw new Error("The chart audio could not be safely opened."); }
@@ -453,7 +504,7 @@
       if (epoch !== state.loadEpoch || error.name === "AbortError") return false;
       audio.pause(); audio.removeAttribute("src"); audio.load();
       state.resource?.cleanup?.(); state.resource = null; state.loadedKey = null;
-      state.playback = "paused"; render();
+      state.playback = "paused"; state.previewError = error.name !== "NotAllowedError"; render();
       message(error.name === "NotAllowedError" ? "Your browser paused playback. Press Play to start the preview." : error.message || "This chart's audio preview could not be opened.");
       if (automatic && state.continuationActive && error.name !== "NotAllowedError") {
         if (++state.autoFailures < 3) return advanceQueue(true, true);
@@ -477,7 +528,7 @@
       return await playItem(item);
     } catch (error) {
       if (epoch !== state.loadEpoch || error.name === "AbortError") return false;
-      state.continuationActive = false; state.playback = "paused";
+      state.continuationActive = false; state.playback = "paused"; state.previewError = true;
       message(error.message || "This chart's preview could not be opened.");
       throw error;
     } finally {
@@ -489,10 +540,29 @@
     if (!state.current) { drawer("catalog", $("#catalogVinylButton")); return; }
     if (!audio.paused) { state.loadEpoch += 1; state.loadController = null; state.continuationActive = false; audio.pause(); return; }
     if (state.loadedKey === state.current.catalog_key && audio.src) {
+      state.previewError = false; render();
       state.continuationActive = true; state.autoFailures = 0;
       try { await audio.play(); } catch (_) { state.continuationActive = false; message("Your browser paused playback. Press Play to retry."); } return;
     }
     await startQueue(state.index, false);
+  }
+  async function shufflePlayback() {
+    const play = !audio.paused || (state.playback === "loading" && state.continuationActive);
+    stopMedia(false);
+    const epoch = state.loadEpoch;
+    state.seed = newSeed(); state.snapshot = null; state.continuationActive = play;
+    state.playback = "loading"; render(); message("Finding your next record in a fresh catalog order.");
+    const ready = await browsePage(0);
+    if (epoch !== state.loadEpoch) return;
+    if (!ready || !state.items.length) {
+      state.playback = "paused"; state.continuationActive = false; render();
+      message(ready ? "No charts match this search. Change the title, artist, album or decade." : "Shuffle could not be confirmed. Your listening queue is preserved.");
+      return;
+    }
+    const first = state.items.find(item => item.catalog_key !== state.current?.catalog_key) || state.items[0];
+    const index = enqueue(first);
+    if (index < 0) { state.playback = "paused"; state.continuationActive = false; render(); return; }
+    captureFeed(first); await selectQueue(index, play);
   }
   async function addToZip(item, action = "select") {
     if (action === "clear" ? removeBlocked(item) : blocked(item)) return;
@@ -551,7 +621,7 @@
         // Home is application-owned HTML. Forms are needed when mounting the journey.
         const home = documentPage.querySelector("#riffApp");
         if (!home || !window.RiffJourney?.mount) throw new Error("Open Riff home directly to resume the music journey.");
-        $("#main-content").replaceChildren(home); closeDrawer(false); window.RiffJourney.mount(); window.RiffStudio?.mount();
+        $("#main-content").replaceChildren(home); closeDrawer(false); window.RiffJourney.mount(); window.RiffStudio?.mount(); window.RiffScene?.mount(home);
         state.basePath = "/"; state.baseTitle = documentPage.title;
       } else {
         $("#catalogSitePage").replaceChildren(...main.childNodes);
@@ -570,12 +640,20 @@
   $("#catalogQueueButton").addEventListener("click", event => drawer("queue", event.currentTarget));
   $("#catalogCloseButton").addEventListener("click", leaveDrawer);
   $("#catalogTab").addEventListener("click", () => drawer("catalog")); $("#catalogQueueTab").addEventListener("click", () => drawer("queue"));
-  $("#catalogSearchForm").addEventListener("submit", event => { event.preventDefault(); state.q = $("#catalogSearch").value.trim().slice(0, 200); state.seed = ""; state.snapshot = null; void browsePage(0); });
+  function searchCatalog() {
+    state.q = $("#catalogSearch").value.trim().slice(0, 200); state.decade = $("#catalogDecade").value;
+    state.seed = ""; state.snapshot = null; void browsePage(0);
+  }
+  $("#catalogSearchForm").addEventListener("submit", event => { event.preventDefault(); searchCatalog(); });
+  $("#catalogDecade").addEventListener("change", searchCatalog);
   $("#catalogShuffleButton").addEventListener("click", () => { const bytes = new Uint8Array(8); crypto.getRandomValues(bytes); state.seed = [...bytes].map(value => value.toString(16).padStart(2, "0")).join(""); state.snapshot = null; void browsePage(0); });
   $("#catalogRetryButton").addEventListener("click", () => void browsePage(0));
   $("#catalogPreviousPage").addEventListener("click", () => void browsePage(Math.max(0, state.offset - LIMIT)));
   $("#catalogNextPage").addEventListener("click", () => void browsePage(state.offset + LIMIT));
   $("#catalogVinylButton").addEventListener("click", togglePlay);
+  $("#catalogPlayerShuffle").addEventListener("click", () => void shufflePlayback());
+  $("#catalogMuteButton").addEventListener("click", () => { audio.muted = !audio.muted; renderSound(); save(); });
+  $("#catalogRecordArt").addEventListener("error", event => { event.target.dataset.failedSrc = event.target.getAttribute("src"); event.target.hidden = true; });
   $("#catalogPlayerPrevious").addEventListener("click", () => { const play = !audio.paused || (state.playback === "loading" && state.continuationActive); state.continuationActive = play; state.autoFailures = 0; void selectQueue(state.index - 1, play); });
   $("#catalogPlayerNext").addEventListener("click", () => { const play = !audio.paused || (state.playback === "loading" && state.continuationActive); state.continuationActive = play; state.autoFailures = 0; void advanceQueue(play, play); });
   $("#catalogContinueCatalog").addEventListener("change", event => {
@@ -603,13 +681,13 @@
     }
     document.dispatchEvent(new CustomEvent("riff:catalog-review-zip"));
   });
-  $("#catalogVolume").addEventListener("input", event => { audio.volume = Number(event.target.value); }); audio.volume = .7;
+  $("#catalogVolume").addEventListener("input", event => { audio.volume = Number(event.target.value); save(); }); audio.volume = .7;
   $("#catalogSeek").addEventListener("input", event => { if (Number.isFinite(audio.duration)) audio.currentTime = Math.min(Number(event.target.value), audio.duration); });
-  audio.addEventListener("playing", () => { state.playback = "playing"; message(state.resource?.previewKind === "mixed-clip" ? `${Math.round(Number(state.resource.durationHint || 45000) / 1000)}s chart preview · mixed audio clip. ZIP choices are separate.` : "Playing chart audio. ZIP choices are separate."); render(); });
+  audio.addEventListener("playing", () => { state.playback = "playing"; state.previewError = false; message(state.resource?.previewKind === "mixed-clip" ? `${Math.round(Number(state.resource.durationHint || 45000) / 1000)}s chart preview · mixed audio clip. ZIP choices are separate.` : "Playing chart audio. ZIP choices are separate."); render(); });
   audio.addEventListener("pause", () => { if (state.playback !== "loading") { state.playback = "paused"; render(); } });
   audio.addEventListener("waiting", () => { if (audio.src) { state.playback = "buffering"; message("Buffering chart audio…"); render(); } });
   audio.addEventListener("timeupdate", updateTime); audio.addEventListener("durationchange", updateTime);
-  audio.addEventListener("error", () => { if (audio.src) { state.playback = "paused"; if (!state.loadController) state.continuationActive = false; message("This browser could not play the chart audio. Try another chart or check its audio format."); render(); } });
+  audio.addEventListener("error", () => { if (audio.src) { state.playback = "paused"; state.previewError = true; if (!state.loadController) state.continuationActive = false; message("This browser could not play the chart audio. Try another chart or check its audio format."); render(); } });
   audio.addEventListener("ended", () => {
     state.playback = "paused"; render();
     if (state.continuationActive) { state.autoFailures = 0; void advanceQueue(true, true); }
@@ -619,7 +697,7 @@
     if ($("#catalogDrawer").hidden) return;
     if (event.key === "Escape") { event.preventDefault(); leaveDrawer(); }
     if (event.key === "Tab") {
-      const controls = [...root.querySelectorAll("button,a[href],input,[tabindex='0']")].filter(node => !node.disabled && node.getClientRects().length);
+      const controls = [...root.querySelectorAll("button,a[href],input,select,[tabindex='0']")].filter(node => !node.disabled && node.getClientRects().length);
       const first = controls[0], last = controls[controls.length - 1];
       if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last?.focus(); }
       else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus(); }

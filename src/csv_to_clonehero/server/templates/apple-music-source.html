@@ -1,0 +1,21 @@
+<article class="source-card source-card--apple-music" data-apple-music-source>
+  <p class="source-card__channel">Optional source</p>
+  <div class="source-card__header">
+    <span class="source-icon" aria-hidden="true">AM</span>
+    <div class="source-card__identity"><h2>Apple Music</h2><p>Music / iTunes export</p></div>
+    <span class="status-pill status-pill--quiet" id="appleMusicCount">Not added</span>
+  </div>
+  <p class="fine-print">One-click account sync is not configured. It needs MusicKit setup and your permission. You can import a playlist export now.</p>
+  <details class="source-details">
+    <summary>Add an Apple Music export</summary>
+    <p class="fine-print">In Music or iTunes on your computer, select a playlist and choose File &gt; Library &gt; Export Playlist. Choose TXT or XML, up to 10 MB.</p>
+    <p class="fine-print"><a href="https://support.apple.com/guide/music/save-a-copy-of-your-playlists-mus27cd5060f/mac" target="_blank" rel="noopener noreferrer">Apple's export instructions</a></p>
+    <form id="appleMusicForm" class="upload-form upload-form--stacked">
+      <label class="file-control" for="appleMusicFile"><span>Choose TXT or XML</span><input id="appleMusicFile" name="file" type="file" accept=".txt,.xml" required></label>
+      <label for="appleMusicLabel">Export label<input id="appleMusicLabel" name="label" type="text" value="Apple Music export" maxlength="120" required></label>
+      <button class="button button--secondary" type="submit">Import export</button>
+      <p id="appleMusicMessage" class="form-message" role="status" aria-live="polite"></p>
+    </form>
+    <p class="fine-print">Imports song names, artists and albums only. One export becomes one playlist; XML playlist groups are not restored. A new export replaces your previous Apple Music import. No account access or Apple Music audio is imported. Find charts is a separate step.</p>
+  </details>
+</article>

@@ -51,10 +51,24 @@ jobs:
               "csv_to_clonehero/server/static/catalog-audio.js",
               "csv_to_clonehero/server/static/catalog.css",
               "csv_to_clonehero/server/catalog_browse.py",
+              "csv_to_clonehero/server/companion_release.py",
+              "csv_to_clonehero/server/templates/companion-download.html",
+              "csv_to_clonehero/server/static/listening-room.css",
+              "csv_to_clonehero/server/releases/manifest.json",
+              "csv_to_clonehero/server/releases/riff-companion-2026.10.15-windows-py312-x64.zip",
           }
           missing = required - names
           if missing:
               raise SystemExit(f"wheel is missing package assets: {sorted(missing)}")
+          import hashlib
+          import json
+          with zipfile.ZipFile(wheel) as package:
+              root = "csv_to_clonehero/server/releases/"
+              manifest = json.loads(package.read(root + "manifest.json"))
+              artifact = manifest["artifacts"][0]
+              data = package.read(root + artifact["filename"])
+              assert len(data) == artifact["size_bytes"]
+              assert hashlib.sha256(data).hexdigest() == artifact["sha256"]
           PY
       - name: Offline tests (no live network)
         run: python -m pytest -m "not integration" -q

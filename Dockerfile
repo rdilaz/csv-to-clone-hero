@@ -19,6 +19,10 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
+ARG RIFF_SOURCE_REVISION=unknown
+ENV RIFF_SOURCE_REVISION=${RIFF_SOURCE_REVISION}
+LABEL org.opencontainers.image.revision=${RIFF_SOURCE_REVISION}
+
 # Runtime dependencies first (caching layer).
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt

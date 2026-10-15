@@ -248,11 +248,15 @@
     }
   }
 
-  async function load(item, {signal, onProgress = () => {}} = {}) {
+  async function load(item, {signal, onProgress = () => {}, localUrl = null} = {}) {
     aborted(signal);
     const hash = item?.md5;
     if (!item || item.source !== "enchor" || typeof hash !== "string" || !/^[a-f0-9]{32}$/.test(hash)) fail("This chart has no verified Enchor package identity for audio.");
-    const url = `https://files.enchor.us/${hash}${item.has_video_background === true || item.hasVideoBackground === true ? "_novideo" : ""}.sng`;
+    // The isolated loopback companion can read an already cached package. This
+    // opt-in path never accepts a remote URL or changes public reader defaults.
+    if (localUrl !== null && (typeof localUrl !== "string" || !/^\/api\/companion\/audio\/[a-f0-9]{32}\.sng$/.test(localUrl)
+        || !["127.0.0.1", "localhost", "[::1]"].includes(location.hostname))) fail("The local preview package address is invalid.");
+    const url = localUrl || `https://files.enchor.us/${hash}${item.has_video_background === true || item.hasVideoBackground === true ? "_novideo" : ""}.sng`;
     onProgress("Reading chart audio index");
     const head = await range(url, 0, 42, signal);
     if (!Array.from("SNGPKG").every((char, i) => head[i] === char.charCodeAt(0))) fail("This chart package has an unsupported audio preview format.");

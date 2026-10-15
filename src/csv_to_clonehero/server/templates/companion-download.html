@@ -1,0 +1,52 @@
+{% extends "base.html" %}
+{% block title %}Riff Companion | Your little listening room{% endblock %}
+{% block content %}
+<section class="landing" aria-labelledby="companion-title">
+  <div class="landing__intro">
+    <p class="eyebrow"><span class="signal-dot" aria-hidden="true"></span> RIFF COMPANION / WINDOWS</p>
+    <h1 id="companion-title">Your little<br><em>listening room.</em></h1>
+    <p class="landing__subline">The record player, closer to your music.</p>
+  </div>
+  <div class="landing__art riff-scene-wrap" aria-hidden="true">
+    <div class="scene-fallback"><span></span><i></i></div>
+    <canvas data-riff-scene tabindex="-1"></canvas>
+    <div class="scene-caption"><span>RIFF COMPANION</span><span>SIDE B / ON YOUR COMPUTER</span></div>
+  </div>
+  <div class="landing__action">
+    <p class="lede">A compact vinyl player for your own local chart catalog and cache. Search, listen, shuffle, and check what is already in your library.</p>
+    {% if release %}
+    <a class="button button--large" href="{{ release.download_url }}" download>Download for Windows <span aria-hidden="true">&#8595;</span></a>
+    <p class="sign-in-note">Version {{ release.version }} &middot; {{ release.size_mb }} MB ZIP<br>Requires an existing 64-bit CPython 3.12 installation.</p>
+    <div class="search-recovery__actions"><a class="button button--secondary" href="{{ release.checksum_url }}" download>SHA-256 checksum</a><a class="button button--secondary" href="#companion-setup">Setup and limits</a></div>
+    {% else %}
+    <p class="calm-note" role="status"><strong>Download is not available yet.</strong> The release package is being prepared or verified. Please check back here.</p>
+    <p class="sign-in-note">Version {{ companion_version }} &middot; Windows &middot; 64-bit CPython 3.12</p>
+    <div class="search-recovery__actions"><a class="button button--secondary" href="#companion-setup">Read setup and limits</a><a class="button button--secondary" href="/">Open Riff Studio</a></div>
+    {% endif %}
+  </div>
+</section>
+
+<section class="path" aria-label="Companion scope">
+  <div><span class="path__icon" aria-hidden="true">01</span><strong>Local listening</strong><small>Runs on your computer's loopback address.</small></div>
+  <div><span class="path__icon" aria-hidden="true">02</span><strong>Your own catalog</strong><small>No song catalog or audio is bundled.</small></div>
+  <div><span class="path__icon" aria-hidden="true">03</span><strong>You choose</strong><small>Library access starts read-only.</small></div>
+</section>
+
+<section class="card static-page" id="companion-setup" aria-labelledby="companion-setup-title">
+  <p class="kicker">SETUP / VERSION {{ companion_version }}</p>
+  <h2 id="companion-setup-title">Bring your music home.</h2>
+  <ol>
+    <li>Download and extract the ZIP into a folder you control.</li>
+    <li>Read the included <strong>README.txt</strong>. You need Windows and an existing 64-bit CPython 3.12 installation; this release does not install Python.</li>
+    <li>Double-click <strong>START_COMPANION.cmd</strong>, then open <strong>http://127.0.0.1:8947/</strong>. Keep the terminal open while you listen; Ctrl+C stops the companion.</li>
+    <li>Run <strong>CONFIGURE_COMPANION.cmd</strong> to supply your existing checksum-valid catalog, package cache, and optional read-only Songs folder. The first launch shows an unavailable catalog until you supply one. Nothing is discovered or downloaded automatically.</li>
+  </ol>
+  <h2>What you are downloading</h2>
+  <p>A portable Python tool with its runtime dependencies included. It runs locally in your browser. This is an unsigned ZIP, not a native Windows application or a signed installer. It creates no new account and includes no catalog, cached audio, songs, or personal library inventory.</p>
+  <h2>Preview availability</h2>
+  <p>Audio is available only for supported packages already in your cache. Stem-mix previews are capped at 45 seconds. A chart in the catalog does not guarantee a playable preview or a downloadable song. Unavailable audio is shown clearly in the player.</p>
+  <h2>Your library stays in your hands</h2>
+  <p>The companion's library inventory is read-only. This release can copy a chosen cached .sng package into a separate local sandbox after an explicit action. It does not install into your real song library or extract song folders. This public page cannot read your folders or run local installation operations.</p>
+  <p><a class="button button--secondary" href="/">Open Riff Studio <span aria-hidden="true">&#8599;</span></a></p>
+</section>
+{% endblock %}

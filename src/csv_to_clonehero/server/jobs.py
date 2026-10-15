@@ -140,6 +140,7 @@ class JobManager:
         cipher: TokenCipher,
         *,
         source_factory: Callable[[AppConfig], list[ChartSource]] | None = None,
+        archive_builder: Callable | None = None,
         downloads: BrowserDownloads | None = None,
         sender: EmailSender | None = None,
         poll_interval: float = 1.0,
@@ -149,6 +150,7 @@ class JobManager:
         self.cipher = cipher
         self.source_factory = source_factory or _default_source_factory
         self.downloads = downloads
+        self.archive_builder = archive_builder
         self.sender = sender or EmailSender(config.notifications)
         self.poll_interval = max(0.1, float(poll_interval))
         self._cv = threading.Condition()
@@ -500,7 +502,7 @@ class JobManager:
                 )
 
             with self.downloads.building(workspace_id):
-                archive, summary = build_archive(
+                archive, summary = (self.archive_builder or build_archive)(
                     self.config, db, workspace_id, None, self.downloads.root,
                     progress=on_progress, cancellation_event=cancel_event,
                 )
@@ -718,8 +720,8 @@ class JobManager:
             ) or metadata.get("spotify_scope")
             soundcloud_scope = metadata.get("soundcloud_scope")
             persisted_tracks = _provider_tracks_from_provenance(db, workspace_id)
-            has_persisted_soundcloud = any(
-                track.provider == "soundcloud" for track in persisted_tracks
+            has_persisted_non_spotify = any(
+                track.provider != "spotify" for track in persisted_tracks
             )
             has_uploaded_soundcloud = any(
                 str(row["provider"]) == "soundcloud"
@@ -731,7 +733,7 @@ class JobManager:
                 )
             )
             combined_provider_discovery = (
-                has_persisted_soundcloud or _scope_selected(soundcloud_scope)
+                has_persisted_non_spotify or _scope_selected(soundcloud_scope)
             )
             pending_snapshots: list[tuple[Any, Mapping[str, Any] | None]] = []
             if (catalog.available or combined_provider_discovery) and _scope_selected(spotify_scope):

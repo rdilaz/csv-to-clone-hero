@@ -1,18 +1,25 @@
 {% extends "base.html" %}
 {% block title %}Riff | Your music, ready to play{% endblock %}
+{% macro listening_deck(extra_class='') %}
+  <section class="{{ extra_class }} riff-listening-panel" data-riff-listening-panel data-playback-state="idle" aria-label="Listening deck">
+    <div class="listening-panel-heading"><span>THE LISTENING ROOM</span><span class="listening-panel-state" data-listening-state>STANDBY</span></div>
+    <div class="listening-panel-visual riff-scene-wrap" aria-hidden="true"><div class="scene-fallback"><span></span><i></i></div><canvas{% if extra_class == 'landing__art' %} id="riff-scene"{% endif %} data-riff-scene data-listening-hero tabindex="-1"></canvas></div>
+    <div class="listening-panel-info">
+      <p class="listening-panel-title" data-listening-title>Your next record is waiting.</p>
+      <p class="listening-panel-artist" data-listening-artist>Browse charts. Hear a preview. Find your next song.</p>
+      <div class="listening-panel-footer"><p data-listening-note>Chart audio previews. Your ZIP choices stay separate.</p><button type="button" class="button button--secondary" data-listening-action>Find a record <span aria-hidden="true">&#8599;</span></button></div>
+    </div>
+  </section>
+{% endmacro %}
 {% block content %}
 {% if not authenticated %}
 <section class="landing" aria-labelledby="landing-title">
   <div class="landing__intro">
-    <p class="eyebrow"><span class="signal-dot" aria-hidden="true"></span> Your music. Your setlist.</p>
+    <p class="eyebrow"><span class="signal-dot" aria-hidden="true"></span> A little more music.</p>
     <h1 id="landing-title">Find your next<br><em>favorite riff.</em></h1>
     <p class="landing__subline">From your Spotify library to the Clone Hero stage.</p>
   </div>
-  <div class="landing__art riff-scene-wrap" aria-hidden="true">
-    <div class="scene-fallback"><span></span><i></i></div>
-    <canvas id="riff-scene" data-riff-scene tabindex="-1"></canvas>
-    <div class="scene-caption"><span>RIFF / PLAYER 01</span><span>BUILD YOUR SETLIST</span></div>
-  </div>
+  {{ listening_deck('landing__art') }}
   <div class="landing__action">
     <p class="lede">Discover playable community charts, shuffle through your finds, and build a ZIP full of songs you want to play.</p>
     <a class="button button--large" href="/login">Connect Spotify <span aria-hidden="true">↗</span></a>
@@ -27,8 +34,8 @@
   <div><span class="path__icon" aria-hidden="true">03</span><strong>Clone Hero</strong><small>Download only the charts you select.</small></div>
 </section>
 {% else %}
-<div class="app-shell" id="riffApp" data-user-name="{{ user.display_name }}">
-  <nav class="journey-steps" aria-label="Signal Check progress">
+<div class="app-shell" id="riffApp" data-user-name="{{ user.display_name }}" data-local-preview="{{ 'true' if local_preview else 'false' }}">
+  <nav class="journey-steps" aria-label="Music studio progress">
     <ol>
       <li data-step="add"><span>1</span><b><span class="step-label-full">Add Music</span><span class="step-label-short">Add</span></b></li>
       <li data-step="find"><span>2</span><b><span class="step-label-full">Find Charts</span><span class="step-label-short">Find</span></b></li>
@@ -55,7 +62,7 @@
       <p>You can also browse the chart catalog and add charts directly to your final ZIP. Importing a music library is optional for catalog browsing.</p>
       <button class="button button--secondary" type="button" data-open-catalog>Browse chart catalog</button>
     </header>
-    <div class="studio-stage-art riff-scene-wrap" aria-hidden="true"><div class="scene-fallback"><span></span><i></i></div><canvas data-riff-scene tabindex="-1"></canvas></div>
+    {{ listening_deck('studio-stage-art') }}
     </div>
 
     <div class="source-grid">
@@ -63,16 +70,16 @@
         <p class="source-card__channel">Primary source</p>
         <div class="source-card__header">
           <span class="source-icon source-icon--spotify" aria-hidden="true">S</span>
-          <div class="source-card__identity"><h2>Spotify</h2><p>{{ user.display_name }}</p></div>
-          <span class="status-pill">Connected</span>
+          <div class="source-card__identity"><h2>Spotify</h2><p>{{ 'Account access is unavailable in this preview' if local_preview else user.display_name }}</p></div>
+          <span class="status-pill">{{ 'Not connected' if local_preview else 'Connected' }}</span>
         </div>
         <div class="source-refresh">
           <p class="fine-print" id="spotifyFreshness" role="status">Restoring saved Spotify data...</p>
-          <button class="text-button" id="refreshSpotifyButton" type="button">Refresh Spotify</button>
+          <button class="text-button" id="refreshSpotifyButton" type="button"{% if local_preview %} disabled{% endif %}>Refresh Spotify</button>
         </div>
         <div class="playlist-actions" role="group" aria-label="Spotify playlist selection">
-          <button class="text-button" id="selectAllPlaylistsButton" type="button">Select all playlists</button>
-          <button class="text-button" id="clearPlaylistsButton" type="button">Clear playlist checks</button>
+          <button class="text-button" id="selectAllPlaylistsButton" type="button"{% if local_preview %} disabled{% endif %}>Select all playlists</button>
+          <button class="text-button" id="clearPlaylistsButton" type="button"{% if local_preview %} disabled{% endif %}>Clear playlist checks</button>
         </div>
         <div id="spotifyChoices" class="choice-list" aria-busy="true"><p>Loading your Spotify music...</p></div>
         <p class="fine-print" id="spotifyImportedSummary"></p>
@@ -85,6 +92,8 @@
           <div class="source-card__identity"><h2>SoundCloud</h2><p>CSV or JSON export</p></div>
           <span class="status-pill status-pill--quiet" id="soundcloudCount">Not added</span>
         </div>
+        <p class="fine-print" id="soundcloudSyncStatus">One-click account sync is not configured. You can import an existing export now.</p>
+        <p class="fine-print">Imports song and playlist metadata for chart matching. SoundCloud audio is not downloaded.</p>
         <details class="source-details">
           <summary>Add a SoundCloud export</summary>
           <form id="soundcloudForm" class="upload-form upload-form--stacked">
@@ -95,9 +104,10 @@
           <div id="soundcloudOauth" hidden>
             <a class="button button--secondary" href="/api/auth/soundcloud/start">Connect SoundCloud</a>
           </div>
-          <p class="fine-print"><a href="/browser-exporter.js">Optional metadata exporter</a></p>
+          <p class="fine-print"><a href="/browser-exporter.js">Optional metadata exporter</a> &middot; <a href="https://soundcloud.com/you/likes" target="_blank" rel="noopener noreferrer">Open SoundCloud</a></p>
         </details>
       </article>
+      {% include 'apple-music-source.html' %}
     </div>
 
     <aside class="music-tally" id="musicTally" aria-live="polite">

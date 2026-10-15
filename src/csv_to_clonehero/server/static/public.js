@@ -6,6 +6,7 @@
   const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
   const authenticated = document.body.dataset.authenticated === "true";
   const app = $("#riffApp");
+  const localPreview = app?.dataset.localPreview === "true";
   if (app?.dataset.riffMounted === "true") return;
   if (app) app.dataset.riffMounted = "true";
   const state = {
@@ -434,8 +435,8 @@
       state.scope = scope;
       renderSources(journey);
       renderScope(scope);
-      void loadSoundCloudAuth();
-      if (!scope.cache_available) {
+      if (!localPreview) void loadSoundCloudAuth();
+      if (!localPreview && !scope.cache_available) {
         window.setTimeout(() => { void refreshSpotify(true); }, 0);
       }
     } catch (error) {
@@ -444,6 +445,7 @@
   }
 
   async function loadSoundCloudAuth() {
+    if (localPreview) return;
     const soundcloud = await api("/api/auth/soundcloud/status").catch(() => ({configured: false}));
     await renderSoundCloudAuth(soundcloud);
   }
@@ -469,6 +471,7 @@
   }
 
   async function refreshSpotify(automatic = false) {
+    if (localPreview) return;
     const button = $("#refreshSpotifyButton");
     const freshness = $("#spotifyFreshness");
     const requestId = ++state.scopeRequest;
@@ -499,6 +502,13 @@
   function renderScope(payload, selectedScope = null) {
     const host = $("#spotifyChoices");
     if (!host) return;
+    if (localPreview) {
+      host.textContent = "Browse the chart catalog or import a local SoundCloud export to begin.";
+      host.setAttribute("aria-busy", "false");
+      $("#spotifyFreshness").textContent = "No Spotify account is connected in this local preview.";
+      updateMusicTally();
+      return;
+    }
     const saved = selectedScope || payload.workspace?.scope || {};
     const selectedIds = new Set(saved.playlist_ids || []);
     const playlists = [...(payload.playlists || [])];
@@ -564,11 +574,24 @@
           : "Not added";
       badge.classList.toggle("status-pill--quiet", !(count || playlistCount));
     }
+    const appleMusic = sources.find(source => source.provider === "apple_music");
+    const appleCount = Number(appleMusic?.unique_tracks || appleMusic?.tracks || 0);
+    const appleBadge = $("#appleMusicCount");
+    if (appleBadge) {
+      appleBadge.textContent = appleCount ? `${appleCount.toLocaleString()} unique ${appleCount === 1 ? "song" : "songs"} imported` : "Not added";
+      appleBadge.classList.toggle("status-pill--quiet", !appleCount);
+    }
     updateMusicTally();
   }
 
   async function renderSoundCloudAuth(status) {
     const host = $("#soundcloudOauth");
+    const syncStatus = $("#soundcloudSyncStatus");
+    if (syncStatus) syncStatus.textContent = !status.configured
+      ? "One-click account sync is not configured. Import a CSV or JSON export below."
+      : status.authenticated
+        ? "SoundCloud is connected. Choose library metadata to match with community charts."
+        : "Account connection is configured. Connect SoundCloud to choose library metadata.";
     if (!host || !status.configured) return;
     host.hidden = false;
     if (!status.authenticated) return;
@@ -585,6 +608,7 @@
         <p class="form-message" id="soundcloudScopeMessage" role="status" aria-live="polite"></p>`;
       $("#saveSoundcloudScope")?.addEventListener("click", saveSoundCloudScope);
     } catch (_) {
+      if (syncStatus) syncStatus.textContent = "SoundCloud is connected, but its library could not be loaded. You can still import an export.";
       host.innerHTML = "<p class=\"fine-print\">SoundCloud is connected, but its library could not be loaded. You can still use Spotify or upload an export.</p>";
     }
   }
@@ -660,6 +684,13 @@
     const sources = state.journey?.sources || [];
     const spotify = sources.find(source => source.provider === "spotify");
     const soundcloud = sources.find(source => source.provider === "soundcloud");
+    const otherSources = sources.filter(source => !["spotify", "soundcloud"].includes(source.provider)
+      && Number(source.unique_tracks || source.tracks || 0) > 0);
+    const providerLabel = source => source.provider === "apple_music" ? "Apple Music" : String(source.provider || "Other source").replaceAll("_", " ");
+    const otherCounts = otherSources.map(source => {
+      const count = Number(source.unique_tracks || source.tracks);
+      return `${count.toLocaleString()} unique ${providerLabel(source)} ${count === 1 ? "song" : "songs"}`;
+    });
     const spotifyUnique = Number(spotify?.unique_tracks || spotify?.tracks || state.scope?.known_unique_songs || 0);
     const soundcloudUnique = Number(soundcloud?.unique_tracks || soundcloud?.tracks || 0);
     const combinedUnique = Number(state.journey?.combined?.tracks || 0);
@@ -684,6 +715,7 @@
       const sourceCounts = [];
       if (spotifyUnique) sourceCounts.push(`${spotifyUnique.toLocaleString()} unique Spotify ${spotifyUnique === 1 ? "song" : "songs"}`);
       if (soundcloudUnique) sourceCounts.push(`${soundcloudUnique.toLocaleString()} unique SoundCloud ${soundcloudUnique === 1 ? "song" : "songs"}`);
+      sourceCounts.push(...otherCounts);
       small.textContent = `${sourceCounts.join(" and ")}${sourceCounts.length ? "; " : ""}${latestTotal.toLocaleString()} combined after cross-provider deduplication.`;
     } else if (spotifyChosen || hasUnknownPlaylistCount) {
       strong.textContent = hasUnknownPlaylistCount
@@ -694,7 +726,15 @@
           ? soundcloud?.status === "partial"
             ? ` ${soundcloudUnique.toLocaleString()} unique SoundCloud ${soundcloudUnique === 1 ? "song is" : "songs are"} saved from a partial import.`
             : ` ${soundcloudUnique.toLocaleString()} unique SoundCloud ${soundcloudUnique === 1 ? "song is" : "songs are"} already imported.`
-          : "");
+          : "") + (otherCounts.length ? ` ${otherCounts.join(" and ")} already imported.` : "");
+    } else if (otherSources.length) {
+      const importedCount = combinedUnique || Number(otherSources[0].unique_tracks || otherSources[0].tracks);
+      const hasPartialImport = sources.some(source => source.status === "partial");
+      strong.textContent = `${importedCount.toLocaleString()} combined unique ${importedCount === 1 ? "song" : "songs"} ${hasPartialImport ? "saved so far" : "imported"}`;
+      const sourceCounts = [...otherCounts];
+      if (soundcloudUnique) sourceCounts.unshift(`${soundcloudUnique.toLocaleString()} unique SoundCloud songs`);
+      if (spotifyUnique) sourceCounts.unshift(`${spotifyUnique.toLocaleString()} unique Spotify songs`);
+      small.textContent = `${sourceCounts.join(" and ")}; combined after cross-provider deduplication. ${hasPartialImport ? "A source import is partial; final totals may change." : "Choose Find charts when ready. Imported metadata does not include provider audio."}`;
     } else if (soundcloudUnique) {
       const soundcloudPartial = soundcloud?.status === "partial";
       strong.textContent = soundcloudPartial
@@ -707,7 +747,7 @@
           : "Choose Spotify music to add it before cross-provider deduplication.";
     } else {
       strong.textContent = "Choose music above";
-      small.textContent = "Liked Songs, playlists, or an optional SoundCloud export.";
+      small.textContent = "Liked Songs, playlists, or a SoundCloud / Apple Music export.";
     }
   }
 
@@ -840,7 +880,7 @@
     try {
       const spotifyChosen = await saveScopeIfChosen();
       const imported = Number(state.journey?.combined?.tracks || 0) > 0;
-      if (!spotifyChosen && !imported) throw new Error("Choose Liked Songs, a playlist, or import SoundCloud music first.");
+      if (!spotifyChosen && !imported) throw new Error("Choose Liked Songs, a playlist, or import a music export first.");
       state.reviewRequest += 1;
       state.expansionRequest += 1;
       state.reviewOffset = 0;
@@ -3055,6 +3095,13 @@
     logoutButton.addEventListener("click", logout);
   }
   if (authenticated && app) {
+    document.addEventListener("riff:library-imported", event => {
+      if (!app.isConnected || !event.detail?.ok) return;
+      state.journey ||= {};
+      state.journey.sources = event.detail.sources || [];
+      state.journey.combined = event.detail.combined || {};
+      renderSources(state.journey);
+    });
     document.addEventListener("riff:catalog-selection", event => {
       if (!app.isConnected) return;
       if (applySelectionResponse(event.detail, {refreshSelected: false})) {
@@ -3071,6 +3118,7 @@
     document.addEventListener("riff:catalog-review-zip", () => { if (app.isConnected) void openDownload(true, {reviewCurrent: true}); });
     bindAuthenticated();
     window.RiffStudio?.mount?.();
+    window.RiffAppleMusic?.mount?.();
   } else bindGuest();
   }
   window.RiffJourney = Object.freeze({mount: mountJourney});

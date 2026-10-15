@@ -415,6 +415,7 @@ def build_archive(
             config,
             source_map,
             artifact_cache_dir=artifact_cache,
+            staging_root=assembly_dir,
             track_resolver=track_map,
         )
         result = service.export_zip(

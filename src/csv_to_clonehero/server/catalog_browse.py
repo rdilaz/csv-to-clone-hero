@@ -20,6 +20,12 @@ def catalog_key(chart: Any) -> str:
     return f"{chart.source}:{int(chart.chart_id)}"
 
 
+def catalog_year(value: Any) -> int | None:
+    """Return an explicit year from chart metadata, without guessing missing dates."""
+    match = re.search(r"(?<!\d)((?:18|19|20|21)\d{2})(?!\d)", str(value or ""))
+    return int(match.group(1)) if match else None
+
+
 def catalog_compatibility(config: Any, chart: Any, db: Any) -> tuple[bool, str, dict]:
     if chart.source not in config.sources.enabled or not chart.supports_download:
         return False, "This chart source does not support downloads.", {}
@@ -85,6 +91,7 @@ def public_catalog_item(config: Any, db: Any, chart: Any, selected: dict) -> dic
         "song_key": "|".join((normalize_artist(chart.artist), normalize_title(chart.name))),
         "title": chart.name, "artist": chart.artist, "album": chart.album,
         "charter": chart.charter, "genre": chart.genre, "year": chart.year,
+        "parsed_year": catalog_year(chart.year),
         "instruments": list(chart.instruments or []), "song_length_ms": chart.song_length_ms,
         "preview_start_ms": _preview_start(chart), "md5": md5 if valid_md5 else "",
         "has_video_background": bool(chart.has_video_background),
@@ -109,6 +116,7 @@ class CatalogBrowser:
         self._catalog = None
         self._entries = ()
         self._search = ()
+        self._decades = ()
         self._songs = 0
         self._orders = OrderedDict()
 
@@ -146,10 +154,11 @@ class CatalogBrowser:
             entries = catalog.charts() if catalog.available else ()
             search = tuple(" ".join(str(value or "") for value in (chart.artist, chart.name, chart.charter, chart.album)).casefold() for chart in entries)
             songs = len({(normalize_artist(chart.artist), normalize_title(chart.name)) for chart in entries})
+            decades = tuple((year // 10 * 10) if (year := catalog_year(getattr(chart, "year", None))) is not None else None for chart in entries)
         except Exception:
             # A malformed optional metadata field must not kill the shared
             # worker or expose parser paths through public readiness.
-            catalog, entries, search, songs = None, (), (), 0
+            catalog, entries, search, songs, decades = None, (), (), 0, ()
         with self._lock:
             if identity != self.identity():
                 self._state = "check_required"
@@ -158,6 +167,7 @@ class CatalogBrowser:
             self._key = identity
             self._catalog = catalog if catalog is not None and catalog.available else None
             self._entries, self._search, self._songs = entries, search, songs
+            self._decades = decades
             self._orders.clear()
             self._state = "ready" if self._catalog is not None else "unavailable"
             self._requested_key = None
@@ -179,13 +189,14 @@ class CatalogBrowser:
                 return None
             return self._catalog.get_chart(source, chart_id)
 
-    def page(self, *, offset: int, limit: int, q: str, order: str, seed: str) -> tuple[tuple, int]:
+    def page(self, *, offset: int, limit: int, q: str, order: str, seed: str, decade: int | None = None) -> tuple[tuple, int]:
         with self._lock:
             terms = tuple(q.casefold().split())
-            cache_key = (terms, order, seed)
+            cache_key = (terms, order, seed, decade)
             indices = self._orders.get(cache_key)
             if indices is None:
-                indices = [index for index, text in enumerate(self._search) if all(term in text for term in terms)]
+                indices = [index for index, text in enumerate(self._search) if all(term in text for term in terms)
+                           and (decade is None or self._decades[index] == decade)]
                 if order == "shuffle":
                     random.Random(hashlib.sha256((self._catalog.sha256 + seed).encode()).digest()).shuffle(indices)
                 indices = tuple(indices)
