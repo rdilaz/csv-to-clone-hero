@@ -16,26 +16,32 @@
 }
 
 :root {
+  /* RIFF / SIGNAL CHECK tokens (final spec, section 2.1). */
   --world: #080b20;
-  --world-raised: #0d1230;
-  --surface: #f4f0e6;
-  --surface-alt: #e8e3d7;
-  --ink: #101324;
-  --muted: #646675;
-  --world-text: #f5f2e8;
-  --world-muted: #adb0c5;
-  --violet: #8d6cff;
-  --violet-ink: #6047be;
-  --cyan: #58ddd8;
+  --world-raised: #11162f;
+  --surface: #f2eee5;
+  --surface-alt: #e8e5df;
+  --ink: #15182b;
+  --muted: #535a70;
+  --world-text: #f2eee5;
+  --world-muted: #b8bcce;
+  --violet: #a99aff;
+  --violet-ink: #55419b;
+  --violet-hover: #bbaeff;
+  --cyan: #79e7e0;
   --cyan-ink: #0c6264;
-  --amber: #d59b28;
-  --amber-ink: #825800;
-  --danger: #9b3038;
-  --line: #cbc5b8;
-  --line-dark: #313650;
-  --control-line: #696863;
-  --disabled: #ded9cd;
-  --disabled-ink: #777681;
+  --cyan-surface: #d7f0ed;
+  --amber: #ffd18a;
+  --amber-ink: #805000;
+  --amber-surface: #fff0d7;
+  --danger: #982d43;
+  --danger-on-world: #ff9999;
+  --danger-surface: #f8e6e8;
+  --line: #c7c7ce;
+  --line-dark: #68718f;
+  --control-line: #74788a;
+  --disabled: #e0ddd6;
+  --disabled-ink: #535a70;
   --shadow: none;
   --font-body: "IBM Plex Sans Riff", "Segoe UI", Arial, sans-serif;
   --font-display: "Space Grotesk Riff", "Arial Narrow", "Segoe UI", sans-serif;

@@ -1,6 +1,6 @@
 /* The Listening Room — shared Studio presentation. Existing behavior and layout
    remain in public.css/studio.css; catalog.css owns the listening player. */
-:root {
+.riff-listening-room {
   --room-paper: #f0eee4;
   --room-sheet: #f8f6ed;
   --room-ink: #232720;

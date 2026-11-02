@@ -1,0 +1,223 @@
+/* RIFF / SIGNAL CHECK: the default public skin.
+   Haunted console outside (navy world), precise instrument panel inside
+   (opaque porcelain). public.css owns the tokens; this file styles the newer
+   studio, listening-deck and player components in the same system.
+   The Listening Room remains an opt-in skin (body.riff-listening-room). */
+
+.riff-signal-check { background: var(--world); color: var(--world-text); }
+html:has(.riff-signal-check) { color-scheme: dark; }
+
+/* Focus: two-layer ring. Luminous violet on navy, deep violet on porcelain. */
+.riff-signal-check :focus-visible { outline: 2px solid var(--violet); outline-offset: 2px; box-shadow: 0 0 0 4px var(--world); }
+.riff-signal-check :is(.journey-stage, .stage-plane, .source-card, .confirm-layout, .song-group, .selection-rail, .download-preparation-panel, .static-page) :focus-visible { outline-color: var(--violet-ink); box-shadow: 0 0 0 4px var(--surface); }
+
+/* Masthead */
+.riff-signal-check .site-header { background: var(--world); border-bottom: 1px solid var(--line-dark); }
+.riff-signal-check .brand__product { color: var(--world-muted); }
+.riff-signal-check .release-badge { border: 1px solid var(--line-dark); border-radius: 0; color: var(--cyan); }
+.riff-signal-check .site-nav a,
+.riff-signal-check .site-nav .text-button { color: var(--world-text); }
+.riff-signal-check .user-name { color: var(--world-muted); }
+.riff-signal-check .motion-control { min-height: 44px; padding: 6px 12px; border: 1px solid var(--line-dark); border-radius: 0; background: transparent; color: var(--world-muted); font-size: .75rem; cursor: pointer; transition: color .12s, border-color .12s; }
+.riff-signal-check .motion-control[aria-pressed="true"] { color: var(--violet); border-color: var(--violet); }
+.riff-signal-check .signal-dot { display: inline-block; width: 7px; height: 7px; margin-right: 8px; border-radius: 50%; background: var(--cyan); box-shadow: none; }
+
+/* Buttons: violet primary with midnight ink; porcelain/ink outline secondary. Square. */
+.riff-signal-check .button { min-height: 44px; border: 1px solid var(--violet); border-radius: 0; background: var(--violet); color: var(--ink); font-weight: 600; box-shadow: none; transition: background .12s, border-color .12s; }
+.riff-signal-check .button:hover { background: var(--violet-hover); border-color: var(--violet-hover); transform: none; }
+.riff-signal-check .button:active { transform: none; }
+.riff-signal-check .button--large { min-height: 48px; }
+.riff-signal-check .button--secondary { background: transparent; color: var(--world-text); border-color: var(--line-dark); }
+.riff-signal-check .button--secondary:hover { background: var(--world-raised); color: var(--world-text); border-color: var(--violet); }
+.riff-signal-check :is(.journey-stage, .source-card, .song-group, .selection-rail, .download-preparation-panel, .studio-quick-select, .static-page) .button--secondary { background: var(--surface); color: var(--ink); border-color: var(--control-line); }
+.riff-signal-check :is(.journey-stage, .source-card, .song-group, .selection-rail, .download-preparation-panel, .studio-quick-select, .static-page) .button--secondary:hover { background: var(--surface-alt); }
+.riff-signal-check .button:disabled { background: var(--disabled); border-color: var(--disabled); color: var(--disabled-ink); opacity: 1; cursor: not-allowed; }
+.riff-signal-check select { min-height: 44px; padding: 10px 32px 10px 12px; border: 1px solid var(--control-line); border-radius: 0; background: var(--surface); color: var(--ink); font-size: 1rem; }
+.riff-signal-check h1 em, .riff-signal-check h2 em { color: inherit; font-style: normal; text-decoration: underline; text-decoration-color: var(--violet); text-decoration-thickness: .08em; text-underline-offset: .12em; }
+
+/* Journey strip: five square cells; violet current cell with midnight text. */
+.riff-signal-check .workflow-chrome { position: sticky; top: 0; z-index: 30; margin-bottom: 20px; padding-bottom: 4px; background: var(--world); }
+.riff-signal-check .workflow-chrome .journey-steps { margin: 0; }
+.riff-signal-check .journey-steps ol { border-radius: 0; background: var(--world); }
+.riff-signal-check .journey-steps li { padding: 0; }
+.riff-signal-check .journey-steps li > button { display: flex; width: 100%; min-width: 0; min-height: 56px; align-items: center; justify-content: center; gap: 9px; padding: 8px 6px; border: 0; border-radius: 0; background: transparent; color: inherit; font: inherit; letter-spacing: inherit; text-transform: inherit; cursor: pointer; }
+.riff-signal-check .journey-steps li > button:hover:not(:disabled) { background: var(--world-raised); }
+.riff-signal-check .journey-steps li > button:disabled { cursor: default; }
+.riff-signal-check .journey-steps li > button > span { display: grid; width: 24px; height: 24px; flex: 0 0 auto; place-items: center; border: 1px solid var(--line-dark); color: var(--world-muted); font: 600 .72rem/1 var(--font-display); }
+.riff-signal-check .journey-steps li { color: var(--world-muted); }
+.riff-signal-check .journey-steps li.is-current { background: var(--violet); color: var(--ink); box-shadow: none; }
+.riff-signal-check .journey-steps li.is-current > button:hover { background: var(--violet-hover); }
+.riff-signal-check .journey-steps li.is-current > button > span { border-color: var(--ink); color: var(--ink); background: transparent; }
+.riff-signal-check .journey-steps li.is-complete { color: var(--world-text); }
+.riff-signal-check .journey-steps li.is-complete > button > span { border-color: var(--world-text); color: var(--world-text); }
+.riff-signal-check .journey-steps li.is-complete::after { display: none; }
+.riff-signal-check .journey-steps li.is-complete > button b::after { margin-left: 6px; content: "\2713"; font-weight: 700; }
+.riff-signal-check .workflow-controls { display: flex; align-items: center; justify-content: space-between; min-height: 40px; gap: 8px; font-size: .75rem; color: var(--world-muted); }
+.riff-signal-check .workflow-controls .text-button { min-height: 40px; padding: 6px 4px; color: var(--violet); font-size: .8rem; }
+.riff-signal-check .workflow-controls .text-button:disabled { color: var(--line-dark); text-decoration: none; }
+.riff-signal-check .preparation-strip { display: flex; align-items: center; gap: 12px; padding: 10px 14px; border: 1px solid var(--line); border-left: 3px solid var(--violet-ink); background: var(--surface); color: var(--ink); font-size: .8rem; }
+.riff-signal-check .preparation-strip > div { flex: 1; min-width: 0; }
+.riff-signal-check .preparation-strip strong,
+.riff-signal-check .preparation-strip span { display: block; overflow-wrap: anywhere; }
+.riff-signal-check .preparation-strip span { margin-top: 3px; color: var(--muted); }
+.riff-signal-check .preparation-strip .text-button { flex: 0 0 auto; min-height: 44px; color: var(--violet-ink); }
+.riff-signal-check .preparation-lock-note { margin: 6px 0 0; color: var(--world-muted); font-size: .78rem; line-height: 1.45; }
+
+/* Local preview boundary strip (sandbox only). */
+.riff-signal-check .preview-boundary { display: flex; align-items: center; justify-content: space-between; gap: 8px 24px; padding-block: 10px; border-bottom: 1px solid var(--line-dark); color: var(--world-muted); font-size: .78rem; }
+.riff-signal-check .preview-boundary > div { display: flex; flex-wrap: wrap; gap: 4px 18px; align-items: center; }
+.riff-signal-check .preview-boundary strong { color: var(--world-text); font-weight: 600; }
+.riff-signal-check .preview-boundary a { display: inline-flex; align-items: center; gap: 8px; min-height: 44px; color: var(--violet); }
+
+/* Working stages: one opaque porcelain plane. Square, no charcoal cards. */
+.riff-signal-check :is(#stageAdd, #stageLoading, #stageDownload, #stageDone) { border: 0; border-top: 3px solid var(--violet); border-radius: 0; background: var(--surface); color: var(--ink); box-shadow: none; }
+.riff-signal-check .studio-stage-hero { gap: 32px; }
+
+/* Listening deck: a navy instrument window inside the porcelain plane. */
+.riff-signal-check .riff-listening-panel { display: flex; flex-direction: column; align-items: stretch; min-width: 0; height: auto; overflow: hidden; border: 1px solid var(--line-dark); border-radius: 0; background: radial-gradient(ellipse at 50% 38%, #1a2050 0, var(--world) 70%); color: var(--world-text); isolation: isolate; }
+.riff-signal-check .riff-listening-panel::before { display: none; }
+.riff-signal-check .studio-stage-art.riff-listening-panel { align-self: center; min-height: 360px; }
+.riff-signal-check .landing__art.riff-listening-panel { min-height: 480px; }
+.riff-signal-check .listening-panel-heading { display: flex; justify-content: space-between; align-items: center; gap: 16px; padding: 16px 20px 0; color: var(--world-muted); font: 500 .68rem/1.3 var(--font-display); letter-spacing: .14em; }
+.riff-signal-check .listening-panel-state { display: inline-flex; align-items: center; gap: 7px; flex: 0 0 auto; }
+.riff-signal-check .listening-panel-state::before { width: 6px; height: 6px; border-radius: 50%; background: var(--cyan); content: ""; }
+.riff-signal-check .riff-listening-panel[data-playback-state="error"] .listening-panel-state::before { background: var(--danger-on-world); }
+.riff-signal-check .listening-panel-visual { position: relative; flex: 1 0 220px; width: 100%; min-height: 220px; background: transparent; }
+.riff-signal-check .landing__art .listening-panel-visual { min-height: 320px; }
+.riff-signal-check .listening-panel-visual .scene-fallback { width: 64%; top: 48%; }
+.riff-signal-check .listening-panel-info { position: relative; z-index: 3; min-width: 0; padding: 0 20px 20px; }
+.riff-signal-check .listening-panel-title { margin: 0; color: var(--world-text); font: 500 clamp(1.25rem, 1.9vw, 1.6rem)/1.15 var(--font-display); letter-spacing: -.02em; overflow-wrap: anywhere; }
+.riff-signal-check .listening-panel-artist { margin: 6px 0 14px; color: var(--world-muted); font-size: .875rem; line-height: 1.45; overflow-wrap: anywhere; }
+.riff-signal-check .listening-panel-footer { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding-top: 14px; border-top: 1px solid var(--line-dark); }
+.riff-signal-check .listening-panel-footer p { margin: 0; max-width: 28ch; color: var(--world-muted); font-size: .78rem; line-height: 1.45; overflow-wrap: anywhere; }
+.riff-signal-check .listening-panel-footer .button { flex: 0 0 auto; background: var(--violet); border-color: var(--violet); color: var(--ink); }
+.riff-signal-check .riff-listening-panel :focus-visible { outline-color: var(--violet); box-shadow: 0 0 0 4px var(--world); }
+
+/* Studio quick select + listening deck (Confirm stage). */
+.riff-signal-check .studio-quick-select,
+.riff-signal-check .studio-deck { border: 1px solid var(--line); border-radius: 0; box-shadow: none; }
+.riff-signal-check .studio-quick-select { background: var(--surface); color: var(--ink); }
+.riff-signal-check .studio-panel-copy,
+.riff-signal-check .studio-select-controls label,
+.riff-signal-check .studio-action-status { color: var(--muted); }
+.riff-signal-check .studio-deck { background: var(--world-raised); color: var(--world-text); border-color: var(--line-dark); }
+.riff-signal-check .studio-deck-mark,
+.riff-signal-check .studio-now-tier,
+.riff-signal-check .studio-deck-track > p,
+.riff-signal-check .studio-deck-track .studio-now-coverage,
+.riff-signal-check .studio-deck-options label { color: var(--world-muted); }
+.riff-signal-check .studio-deck-track .studio-chart-title,
+.riff-signal-check .studio-deck-options .text-button { color: var(--violet); }
+.riff-signal-check .studio-deck-options .text-button:disabled { color: var(--line-dark); }
+.riff-signal-check .studio-deck-art { border: 1px solid var(--line-dark); border-radius: 0; background: radial-gradient(ellipse, #1a2050, var(--world) 75%); }
+.riff-signal-check .studio-deck-options input,
+.riff-signal-check .studio-uncertain-choice input,
+.riff-signal-check :is(.choice-list, .expansion-choices, .expansion-all-artists, .expansion-coverage) input { accent-color: var(--cyan-ink); }
+.riff-signal-check .studio-player-host { border-radius: 0; background: var(--world); }
+.riff-signal-check .selection-options > summary { border: 1px solid var(--control-line); border-radius: 0; background: var(--surface); color: var(--ink); }
+.riff-signal-check .selection-options > summary::after { color: var(--violet-ink); }
+.riff-signal-check .selection-options[open] > summary { background: var(--surface-alt); }
+.riff-signal-check .selection-options > div { border: 1px solid var(--line); border-radius: 0; background: var(--surface); }
+.riff-signal-check .studio-selection-preview,
+.riff-signal-check .selection-change-receipt { border: 1px solid var(--line); border-left: 3px solid var(--violet-ink); border-radius: 0; background: var(--surface); color: var(--ink); }
+.riff-signal-check .studio-uncertain-choice,
+.riff-signal-check .studio-queue-position { color: var(--ink); }
+.riff-signal-check .studio-key-hints { color: var(--muted); }
+
+/* ZIP crate glyph: violet/cyan line art, no lime. */
+.riff-signal-check .zip-crate-icon { border-color: var(--line-dark); border-radius: 0; background: var(--world); }
+.riff-signal-check .zip-crate-icon::after { border-color: var(--cyan); color: var(--cyan); }
+.riff-signal-check .zip-crate-icon span { border-color: var(--line-dark); border-radius: 0; background: var(--world-raised); }
+.riff-signal-check .zip-crate-icon span:nth-child(2) { background: #2b2560; }
+.riff-signal-check .zip-crate-icon span:nth-child(3) { background: #0f3d40; }
+
+/* Download preparation: calm porcelain panel. */
+.riff-signal-check .download-preparation-panel { border: 1px solid var(--line); border-left: 3px solid var(--violet-ink); border-radius: 0; background: var(--surface); color: var(--ink); }
+.riff-signal-check .download-preparation-panel.is-unavailable { border-left-color: var(--danger); background: var(--danger-surface); }
+.riff-signal-check .delivery-technical,
+.riff-signal-check #downloadSelectionFreshness { color: var(--muted); }
+
+/* Expansion foldout: violet label accent, porcelain ledger grammar. */
+.riff-signal-check .expansion-panel__heading h2 em { color: var(--violet-ink); text-decoration: none; }
+.riff-signal-check .expansion-choices label:has(input:checked) { border-color: var(--cyan-ink); background: var(--cyan-surface); }
+
+/* Global player dock: navy band, porcelain type, violet controls. */
+.riff-signal-check .catalog-workbench { --catalog-paper: var(--world); --catalog-ink: var(--world-text); --catalog-muted: var(--world-muted); --catalog-line: var(--line-dark); --catalog-accent: var(--violet); }
+.riff-signal-check .catalog-workbench :is(button, input, select, a, summary):focus-visible { outline: 2px solid var(--violet); outline-offset: 2px; }
+.riff-signal-check .catalog-player-dock { box-shadow: none; }
+.riff-signal-check #catalogNowTitle { font: 500 1.25rem/1.2 var(--font-display); letter-spacing: -.01em; }
+.riff-signal-check .catalog-vinyl { border-color: var(--line-dark); color: var(--violet); background: var(--world); box-shadow: none; }
+.riff-signal-check .catalog-vinyl-record { background: repeating-radial-gradient(circle, #05071a 0 2px, #1d2350 3px, #0b0f2a 4px); }
+.riff-signal-check .catalog-vinyl-label { border-color: var(--world); color: var(--ink); background: var(--violet); }
+.riff-signal-check .catalog-vinyl-label::after { background: var(--world); }
+.riff-signal-check .catalog-vinyl-symbol { border-color: var(--world); color: var(--ink); background: var(--cyan); }
+.riff-signal-check .catalog-player-dock :is(button, .button) { border-radius: 0; }
+.riff-signal-check .catalog-player-dock input[type="range"] { accent-color: var(--violet); }
+
+@media (max-width: 767px) {
+  .riff-signal-check .journey-steps li > button { flex-direction: column; gap: 4px; min-height: 56px; padding: 6px 2px; }
+  .riff-signal-check .journey-steps li > button > span { width: 21px; height: 21px; }
+  .riff-signal-check .preview-boundary { align-items: flex-start; font-size: .75rem; }
+  .riff-signal-check .preview-boundary > div { display: grid; gap: 4px; }
+  .riff-signal-check .studio-stage-art.riff-listening-panel { display: flex; min-height: 320px; margin: 8px 0 20px; }
+  .riff-signal-check .landing__art.riff-listening-panel { min-height: 340px; margin: 0; }
+  .riff-signal-check .listening-panel-heading { padding: 14px 14px 0; font-size: .62rem; }
+  .riff-signal-check .listening-panel-visual { flex-basis: 196px; min-height: 196px; }
+  .riff-signal-check .listening-panel-info { padding: 0 14px 16px; }
+  .riff-signal-check .preparation-strip { flex-wrap: wrap; gap: 6px; }
+  .riff-signal-check .preparation-strip > div { flex-basis: 100%; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .riff-signal-check * { transition-duration: 0s !important; animation: none !important; }
+}
+
+@media (forced-colors: active) {
+  .riff-signal-check .riff-listening-panel { color: CanvasText; background: Canvas; border-color: CanvasText; }
+  .riff-signal-check .journey-steps li.is-current { forced-color-adjust: none; background: Highlight; color: HighlightText; }
+}
+
+/* Second pass: headings, player controls, browse drawer. */
+.riff-signal-check h1 em, .riff-signal-check h2 em { color: var(--violet); text-decoration: none; }
+.riff-signal-check :is(#stageAdd, #stageLoading, #stageDownload, #stageDone, .confirm-layout, .static-page) :is(h1 em, h2 em) { color: var(--violet-ink); }
+.riff-signal-check .catalog-vinyl { border-radius: 50%; }
+.riff-signal-check body .catalog-player-controls .catalog-icon-button,
+.riff-signal-check .catalog-player-controls .catalog-icon-button { border-radius: 0; border-color: transparent; background: transparent; color: var(--world-text); }
+.riff-signal-check .catalog-player-controls .catalog-icon-button:hover:not(:disabled) { background: var(--world-raised); }
+.riff-signal-check .catalog-player-controls .catalog-icon-button:disabled { background: transparent; color: var(--line-dark); }
+.riff-signal-check .catalog-player-controls #catalogMuteButton[aria-pressed="true"] { background: var(--world-raised); border-color: var(--violet); }
+.riff-signal-check .catalog-player-controls .button--secondary,
+.riff-signal-check .catalog-player-controls .button:not(:disabled):not(#catalogAddButton) { background: transparent; color: var(--world-text); border-color: var(--line-dark); }
+.riff-signal-check .catalog-player-controls .button--secondary:hover { border-color: var(--violet); background: var(--world-raised); }
+.riff-signal-check .catalog-timeline input { accent-color: var(--violet); }
+.riff-signal-check .catalog-drawer { --catalog-paper: var(--surface); --catalog-ink: var(--ink); --catalog-muted: var(--muted); --catalog-line: var(--line); border-radius: 0; background: var(--surface); color: var(--ink); box-shadow: 0 0 0 1px var(--line-dark); }
+.riff-signal-check .catalog-tabs [aria-pressed="true"] { border-color: var(--cyan-ink); background: var(--cyan-surface); color: var(--ink); }
+.riff-signal-check :is(.catalog-search input, .catalog-search select) { border: 1px solid var(--control-line); border-radius: 0; background: var(--surface); color: var(--ink); }
+.riff-signal-check .catalog-continuation input { accent-color: var(--cyan-ink); }
+.riff-signal-check .catalog-track-number { color: var(--muted); }
+.riff-signal-check .catalog-installed { border-color: var(--cyan-ink); border-radius: 0; color: var(--cyan-ink); background: var(--cyan-surface); }
+.riff-signal-check .catalog-queue li[data-current="true"] { border-left-color: var(--cyan-ink); }
+.riff-signal-check .catalog-site-nav a { color: var(--violet-ink); }
+.riff-signal-check .catalog-player-dock .catalog-vinyl { border-radius: 50%; }
+.riff-signal-check .catalog-player-dock .catalog-player-controls .catalog-icon-button { border-color: transparent; }
+
+/* Confirm ledger: porcelain plane with real inset; counts in ink/cyan-ink. */
+.riff-signal-check .confirm-ledger { padding: 28px 32px 32px; }
+.riff-signal-check .library-totals > div + div { border-left: 1px solid var(--line); }
+.riff-signal-check .library-totals dd { color: var(--ink); }
+.riff-signal-check .library-totals > div:last-child dd { color: var(--cyan-ink); }
+.riff-signal-check .scene-fallback span { border-color: var(--violet); background: var(--violet); }
+.riff-signal-check .scene-fallback span::after { background: var(--world); }
+.riff-signal-check .studio-stage-art { border-radius: 0; }
+@media (max-width: 767px) {
+  .riff-signal-check .confirm-ledger { padding: 16px 14px 24px; }
+}
+
+/* Normal browser-only delivery is information, not a warning (spec 3: Notices). */
+.riff-signal-check .boundary-note { border: 1px solid var(--line); border-left: 3px solid var(--violet-ink); border-radius: 0; background: var(--surface); color: var(--ink); }
+.riff-signal-check .boundary-note span { color: var(--muted); }
+.riff-signal-check .delivery-warnings { border-radius: 0; background: var(--amber-surface); border-left-color: var(--amber-ink); color: var(--ink); }
+/* Download: centered 720px preparation panel on desktop (spec 4, Download). */
+@media (min-width: 1000px) {
+  .riff-signal-check #stageDownload .download-preparation-panel { max-width: 720px; margin-inline: auto; }
+}

@@ -54,6 +54,7 @@ jobs:
               "csv_to_clonehero/server/companion_release.py",
               "csv_to_clonehero/server/templates/companion-download.html",
               "csv_to_clonehero/server/static/listening-room.css",
+              "csv_to_clonehero/server/static/signal-check.css",
               "csv_to_clonehero/server/releases/manifest.json",
               "csv_to_clonehero/server/releases/riff-companion-2026.10.15-windows-py312-x64.zip",
           }
