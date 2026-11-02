@@ -404,6 +404,33 @@ def cmd_doctor(config, _args) -> int:
     return 1
 
 
+def _warm_catalog_in_background(config) -> None:
+    """Index the chart catalog while the browser opens.
+
+    Loading ~94k charts takes several seconds; doing it up front means the
+    first "Find chart matches" click starts matching right away. The loader
+    is cached per process, so the later real call reuses this work.
+    """
+    import threading
+
+    try:
+        path = Path(config.catalog_path)
+        if not path.is_file():
+            return
+    except (OSError, TypeError, ValueError):
+        return
+
+    def warm() -> None:
+        try:
+            from csv_to_clonehero.catalog import load_enchor_catalog
+
+            load_enchor_catalog(path)
+        except Exception:  # warm-up is best effort; the real call reports errors
+            pass
+
+    threading.Thread(target=warm, name="catalog-warmup", daemon=True).start()
+
+
 def cmd_web(config, args) -> int:
     import webbrowser
 
@@ -454,6 +481,8 @@ def cmd_web(config, args) -> int:
     except RuntimeError as exc:
         console.print(f"[red]Could not start the local web app: {exc}[/red]")
         return 2
+    if not reload_enabled or reloader_child:
+        _warm_catalog_in_background(config)
     local_url = f"http://127.0.0.1:{args.port}/"
     console.print(f"[green bold]Web interface running locally at {local_url}[/green bold]")
     console.print(f"[dim]Python: {sys.executable}[/dim]")

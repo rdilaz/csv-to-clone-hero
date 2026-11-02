@@ -107,7 +107,7 @@ log = logging.getLogger(__name__)
 
 _SPOTIFY_WORKSPACE_KEY = "spotify"
 JOURNEY_SCHEMA_VERSION = 1
-JOURNEY_ASSET_VERSION = "2.6.0-ux"
+JOURNEY_ASSET_VERSION = "2.6.1-ux"
 JOURNEY_MATCHING_FAILURE_CODE = "MATCHING_WORKER_FAILED"
 JOURNEY_MATCHING_START_CONFLICT_CODE = "MATCHING_START_CONFLICT"
 JOURNEY_MATCHING_START_REJECTED_CODE = "MATCHING_START_REJECTED"
@@ -8383,6 +8383,7 @@ def create_app(
         records = _journey_records(db, workspace)
         spotify = source_rows.get("spotify", {})
         soundcloud = source_rows.get("soundcloud", {})
+        apple = source_rows.get("apple_music", {})
         spotify_connected = _is_authenticated()
         soundcloud_job_state = soundcloud_import_job.snapshot()
         progress = db.get_workspace_progress(workspace)
@@ -8730,6 +8731,9 @@ def create_app(
             "attention" if soundcloud_failed else
             "added" if soundcloud_imported else "not_added"
         )
+        apple_imported = bool(apple)
+        apple_count = int(apple.get("tracks", 0) or 0)
+        apple_state = "added" if apple_imported else "not_added"
 
         def source_payload(
             key: str,
@@ -8751,7 +8755,7 @@ def create_app(
                 # Source removal is deliberately not exposed until its safe
                 # destructive operation has a complete product contract.
                 "remove_music": False,
-                "import_music": bool(key == "soundcloud"),
+                "import_music": bool(key in {"soundcloud", "apple"}),
             }
             return {
                 "source_key": key,
@@ -8796,8 +8800,11 @@ def create_app(
                         if soundcloud_failed else ""),
             ),
         }
+        sources["apple"] = source_payload(
+            "apple", "Apple Music / iTunes", apple, apple_state,
+            apple_count, imported=apple_imported,
+        )
         for key, label in (
-            ("apple", "Apple Music / iTunes"),
             ("youtube", "YouTube Music"),
             ("tidal", "Tidal"),
             ("local", "Local audio"),
@@ -9013,6 +9020,81 @@ def create_app(
             return jsonify({"workspace_id": workspace, "workspace_key": key, "sources": summaries,
                             "combined": db.get_combined_summary(workspace),
                             "journey": _local_journey_payload(db, workspace)})
+        finally:
+            db.close()
+
+    @app.post("/api/sources/apple/import")
+    @app.post("/api/sources/apple-music/import")
+    def import_apple_music_export():
+        """Import a Music/iTunes TXT or XML library export (metadata only)."""
+        busy = _busy_response()
+        if busy is not None:
+            return busy
+        uploaded = request.files.get("file") or request.files.get("files")
+        if uploaded is None or not uploaded.filename:
+            return {"error": "Choose a Music/iTunes TXT or XML export."}, 400
+        filename = Path(uploaded.filename).name
+        suffix = Path(filename).suffix.casefold().lstrip(".")
+        if suffix not in {"txt", "xml"}:
+            return {"error": "Apple Music imports support only TXT or XML exports."}, 400
+        from csv_to_clonehero.library_pipeline import run_library_import
+        from csv_to_clonehero.providers.apple_music import (
+            MAX_LOCAL_EXPORT_BYTES,
+            AppleMusicExportProvider,
+        )
+
+        raw = uploaded.stream.read(MAX_LOCAL_EXPORT_BYTES + 1)
+        if len(raw) > MAX_LOCAL_EXPORT_BYTES:
+            return {"error": "The Apple Music export is too large (maximum 50 MB)."}, 413
+        try:
+            provider = AppleMusicExportProvider.from_bytes(
+                raw, extension=suffix,
+                label=(Path(filename).stem or "Apple Music export")[:120],
+                max_bytes=MAX_LOCAL_EXPORT_BYTES,
+            )
+        except ValueError as exc:
+            return {"error": _safe_message(exc)}, 422
+        finally:
+            del raw
+        workspace, key = _get_local_library_workspace()
+        db = Database(config.database_path)
+        try:
+            previous_fingerprint = db.get_library_matching_fingerprint(workspace)
+            imported = run_library_import(config, db, workspace, {"apple_music": provider})
+            result = imported.sources.get("apple_music")
+            if result is None or result.status != "complete":
+                return {
+                    "error": "The Apple Music export could not be saved. Your previous music was kept.",
+                }, 500
+            current_fingerprint = db.get_library_matching_fingerprint(workspace)
+            if not previous_fingerprint or current_fingerprint != previous_fingerprint:
+                # New songs change the canonical library, so old exact results
+                # cannot be reused; matching runs again on the next click.
+                db.clear_workspace_candidates(workspace, kind="exact")
+                db.update_workspace(
+                    workspace,
+                    status="ready_for_matching",
+                    phase="ready_for_matching",
+                    message="Music imported; ready to find charts.",
+                    error="",
+                )
+                db.update_workspace_progress(
+                    workspace,
+                    status="ready_for_matching",
+                    phase="ready_for_matching",
+                    message="Music imported; ready to find charts.",
+                    error="",
+                    metadata={"scan_key": "import"},
+                )
+            return jsonify({
+                "ok": True,
+                "status": "complete",
+                "workspace_id": workspace,
+                "workspace_key": key,
+                "source": result.__dict__,
+                "combined": imported.combined_summary,
+                "message": f"Imported {result.tracks} Apple Music songs.",
+            })
         finally:
             db.close()
 

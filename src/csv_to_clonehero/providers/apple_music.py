@@ -28,6 +28,9 @@ from csv_to_clonehero.providers.base import (
 MAX_EXPORT_BYTES = 10 * 1024 * 1024
 MAX_EXPORT_ROWS = 100_000
 MAX_METADATA_LENGTH = 1024
+# The local single-user app reads the person's own full Library.xml, which
+# often passes 10 MB; match the XML importer's own 50 MB guard there.
+MAX_LOCAL_EXPORT_BYTES = 50 * 1024 * 1024
 
 
 class AppleMusicExportProvider:
@@ -48,15 +51,16 @@ class AppleMusicExportProvider:
     @classmethod
     def from_bytes(
         cls, raw: bytes, *, extension: str, label: str = "Apple Music export",
-        max_tracks: int = 50_000,
+        max_tracks: int = 50_000, max_bytes: int = MAX_EXPORT_BYTES,
     ) -> "AppleMusicExportProvider":
         extension = extension.casefold().lstrip(".")
         if extension not in {"txt", "xml"}:
             raise ValueError("Choose a Music/iTunes TXT or XML export.")
         if not raw:
             raise ValueError("The export is empty.")
-        if len(raw) > MAX_EXPORT_BYTES:
-            raise ValueError("The Apple Music export exceeds the 10 MB limit.")
+        if len(raw) > int(max_bytes):
+            limit_mb = max(1, int(max_bytes) // (1024 * 1024))
+            raise ValueError(f"The Apple Music export exceeds the {limit_mb} MB limit.")
         label = str(label or "Apple Music export").strip()
         if not label or len(label) > 120 or any(ord(char) < 32 for char in label):
             raise ValueError("Use an export label of 1–120 characters.")
