@@ -2759,7 +2759,7 @@ def test_open_folder_prefers_actual_completed_export_destination(client, config,
 
 def test_primary_root_does_not_serve_the_retired_build_surface(client):
     html = client.get("/").get_data(as_text=True)
-    assert "journey.js?v=2.6.0-ux" in html
+    assert "journey.js?v=2.6.1-ux" in html
     assert "done: status.done" not in html
     assert "Calculating build preview" not in html
     assert "LIBRARY READY" not in html

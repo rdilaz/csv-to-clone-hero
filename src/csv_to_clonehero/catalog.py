@@ -92,6 +92,7 @@ class EnchorCatalog:
         self._title_fuzzy_cache: dict[tuple[str, int], tuple[str, ...]] = {}
         self._chart_identities: dict[tuple[str, int], ChartCandidate] = {}
         self._known_chart_identities: set[tuple[str, int]] = set()
+        self._chart_count: int | None = None
         started = time.perf_counter()
         self._load()
         self.load_seconds = time.perf_counter() - started
@@ -102,7 +103,11 @@ class EnchorCatalog:
 
     @property
     def chart_count(self) -> int:
-        return sum(len(rows) for rows in self._songs.values())
+        # The snapshot is immutable once loaded, and this is read once per
+        # song while matching; summing ~94k rows each time dominated runs.
+        if self._chart_count is None:
+            self._chart_count = sum(len(rows) for rows in self._songs.values())
+        return self._chart_count
 
     @property
     def known_chart_count(self) -> int:

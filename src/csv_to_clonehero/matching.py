@@ -588,13 +588,20 @@ def _artist_identity_forms(track: Track, chart: ChartCandidate) -> tuple[set[str
 def _directional_artist_credit_extension(shorter: str, longer: str) -> bool:
     shorter = str(shorter or "").strip()
     longer = str(longer or "").strip()
-    if not shorter or not longer:
+    if not shorter or not longer or len(longer) <= len(shorter):
+        # The pattern needs the whole shorter name plus a separator.
         return False
-    return bool(re.match(
+    return bool(_artist_credit_extension_pattern(shorter).match(longer))
+
+
+@lru_cache(maxsize=8192)
+def _artist_credit_extension_pattern(shorter: str) -> "re.Pattern[str]":
+    # One pattern per artist name; re's own 512-entry cache thrashed on big
+    # libraries and recompiled thousands of times per run.
+    return re.compile(
         rf"^\s*{re.escape(shorter)}(?:\s*(?:&|,|;)|\s+(?:and|feat\.?|ft\.?|featuring|with)\b)",
-        longer,
         flags=re.IGNORECASE,
-    ))
+    )
 
 
 def _title_identity_evidence(

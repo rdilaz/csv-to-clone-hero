@@ -218,7 +218,7 @@
 
   function sourcesEmpty(snapshot) {
     const sources = snapshot.sources;
-    return shell('<section class="source-stage stage-section"><div class="source-intro"><p class="overline">Add music</p><h1>Start with the music you already love.</h1><p class="lead-copy">Bring your listening history into one library, then find the charts that fit it.</p><div class="journey-note"><span class="journey-note-mark">' + icons.sparkle + '</span><span><strong>One simple path</strong><small>Add music. Choose charts. Play.</small></span></div></div><section class="source-drawer" aria-labelledby="source-drawer-heading"><header class="drawer-head"><div><p class="overline">Your music sources</p><h2 id="source-drawer-heading">Add a source</h2></div><span class="drawer-meta">Ready when you are</span></header><div class="source-grid source-grid-supported">' + sourceTile(sources.spotify) + sourceTile(sources.soundcloud) + '</div><div class="future-heading"><span>On the way</span><span class="future-rule"></span><small>Coming soon</small></div><div class="source-grid source-grid-future">' + sourceTile(sources.apple) + sourceTile(sources.youtube) + sourceTile(sources.tidal) + sourceTile(sources.local) + '</div></section></section>', "Add music");
+    return shell('<section class="source-stage stage-section"><div class="source-intro"><p class="overline">Add music</p><h1>Start with the music you already love.</h1><p class="lead-copy">Bring your listening history into one library, then find the charts that fit it.</p><div class="journey-note"><span class="journey-note-mark">' + icons.sparkle + '</span><span><strong>One simple path</strong><small>Add music. Choose charts. Play.</small></span></div></div><section class="source-drawer" aria-labelledby="source-drawer-heading"><header class="drawer-head"><div><p class="overline">Your music sources</p><h2 id="source-drawer-heading">Add a source</h2></div><span class="drawer-meta">Ready when you are</span></header><div class="source-grid source-grid-supported">' + sourceTile(sources.spotify) + sourceTile(sources.soundcloud) + sourceTile(sources.apple) + '</div><div class="future-heading"><span>On the way</span><span class="future-rule"></span><small>Coming soon</small></div><div class="source-grid source-grid-future">' + sourceTile(sources.youtube) + sourceTile(sources.tidal) + sourceTile(sources.local) + '</div></section></section>', "Add music");
   }
 
   function sourceSummary(source, count) {
@@ -850,15 +850,20 @@
     const imported = Boolean(source.imported);
     const spotify = source.source_key === "spotify";
     const soundcloud = source.source_key === "soundcloud";
+    const apple = source.source_key === "apple";
+    const applePicker = '<label class="file-picker"><span>Choose your Music or iTunes export (XML or TXT)</span><input id="apple-file" type="file" accept=".xml,.txt,text/xml,application/xml,text/plain"></label>';
+    const appleHelp = '<p class="sheet-updated">In Music or iTunes: File, then Library, then Export Library. Or right-click a playlist and choose Export.</p>';
     let body = "";
     if (imported) {
       const date = source.updated_at ? new Date(source.updated_at).toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" }) : "recently";
       const spotifyActions = source.connected ? '<button class="button primary" data-action="update-spotify">Update music</button><button class="button secondary" data-action="reconnect-source">Reconnect</button>' : '<button class="button primary" data-action="reconnect-source">Reconnect to update</button>';
       const sourceItems = (source.raw_item_count_is_lower_bound ? "at least " : "") + number(source.raw_item_count || source.song_count) + " source items";
       const scopeDetail = (source.playlist_count ? number(source.playlist_count) + " " + (source.playlist_count === 1 ? "playlist" : "playlists") + (source.include_liked ? " + Liked Songs" : "") + "; " : "") + sourceItems + " became " + number(source.song_count) + " unique " + (source.song_count === 1 ? "song" : "songs") + (source.playlist_only_count ? ", including " + number(source.playlist_only_count) + " playlist-only" : "") + ".";
-      body = '<p class="sheet-lead">Your imported music is part of this library.</p><div class="sheet-stat"><strong>' + number(source.song_count) + '</strong><span>unique songs imported</span></div><p class="sheet-updated">' + escapeHtml(scopeDetail) + '</p><p class="sheet-updated">Last updated ' + escapeHtml(date) + '</p>' + (source.state === "attention" ? '<div class="attention-note"><span class="attention-symbol">!</span><span><strong>Reconnect to update</strong><small>Your imported songs are still here.</small></span></div>' : "") + (soundcloud ? '<label class="file-picker"><span>Choose a replacement export</span><input id="soundcloud-file" type="file" accept=".csv,.json,text/csv,application/json"></label>' : "") + '<div class="sheet-actions">' + (spotify ? spotifyActions : '<button class="button primary" data-action="import-soundcloud">Replace import</button>') + '<button class="button quiet" data-action="view-imported">View imported music</button></div>' + (spotify && model.spotifyScope ? spotifyScopeChooser(model.spotifyScope) : "");
+      body = '<p class="sheet-lead">Your imported music is part of this library.</p><div class="sheet-stat"><strong>' + number(source.song_count) + '</strong><span>unique songs imported</span></div><p class="sheet-updated">' + escapeHtml(scopeDetail) + '</p><p class="sheet-updated">Last updated ' + escapeHtml(date) + '</p>' + (source.state === "attention" ? '<div class="attention-note"><span class="attention-symbol">!</span><span><strong>Reconnect to update</strong><small>Your imported songs are still here.</small></span></div>' : "") + (soundcloud ? '<label class="file-picker"><span>Choose a replacement export</span><input id="soundcloud-file" type="file" accept=".csv,.json,text/csv,application/json"></label>' : "") + (apple ? applePicker : "") + '<div class="sheet-actions">' + (spotify ? spotifyActions : apple ? '<button class="button primary" data-action="import-apple">Replace import</button>' : '<button class="button primary" data-action="import-soundcloud">Replace import</button>') + '<button class="button quiet" data-action="view-imported">View imported music</button></div>' + (spotify && model.spotifyScope ? spotifyScopeChooser(model.spotifyScope) : "");
     } else if (spotify) {
       body = '<p class="sheet-lead">Bring your listening history into this music library.</p><div class="sheet-preview"><span class="preview-mark">' + icons.sparkle + '</span><div><strong>Ready to bring it in</strong><small>Liked songs and saved albums stay in your library.</small></div></div><div class="sheet-actions"><button class="button primary" data-action="' + (source.connected ? 'update-spotify' : 'reconnect-source') + '">' + (source.connected ? 'Add Spotify music' : 'Connect Spotify') + '</button></div>' + (source.connected && model.spotifyScope ? spotifyScopeChooser(model.spotifyScope) : "");
+    } else if (apple) {
+      body = '<p class="sheet-lead">Bring your Apple Music or iTunes library into this music library.</p>' + appleHelp + applePicker + '<div class="sheet-actions"><button class="button primary" data-action="import-apple">Import Apple Music</button></div>';
     } else {
       body = '<p class="sheet-lead">Bring this source into your music library.</p><div class="sheet-preview"><span class="preview-mark">' + icons.sparkle + '</span><div><strong>Import a CSV or JSON export</strong><small>Your existing music stays safe if a replacement fails.</small></div></div><label class="file-picker"><span>Choose SoundCloud export</span><input id="soundcloud-file" type="file" accept=".csv,.json,text/csv,application/json"></label><div class="sheet-actions"><button class="button primary" data-action="import-soundcloud">Import SoundCloud music</button></div>';
     }
@@ -1172,6 +1177,24 @@
       model.overlay = null;
       model.pendingAction = "";
       announce("SoundCloud import started.");
+      await refresh();
+    } catch (error) {
+      model.pendingAction = "";
+      announce(error.message);
+    }
+  }
+
+  async function importApple() {
+    const input = document.getElementById("apple-file");
+    if (!input || !input.files[0]) { announce("Choose an XML or TXT export from Music or iTunes first."); return; }
+    model.pendingAction = "import";
+    const body = new FormData();
+    body.append("file", input.files[0]);
+    try {
+      const result = await api("/api/sources/apple/import", { method: "POST", body: body });
+      model.overlay = null;
+      model.pendingAction = "";
+      announce((result && result.message) || "Apple Music imported.");
       await refresh();
     } catch (error) {
       model.pendingAction = "";
@@ -1581,6 +1604,7 @@
     else if (action === "choose-format") { window.location.assign(apiUrl("/api/library/export?format=" + encodeURIComponent(target.dataset.format))); }
     else if (action === "manage-sources") { model.opener = { action: "manage-sources" }; model.overlay = model.snapshot.sources.spotify.imported || model.snapshot.sources.spotify.state === "attention" ? "spotify" : "soundcloud"; render(true); }
     else if (action === "import-soundcloud") { importSoundCloud(); }
+    else if (action === "import-apple") { importApple(); }
     else if (action === "update-spotify") { updateSpotify(); }
     else if (action === "save-spotify-scope") { saveSpotifyScope(); }
     else if (action === "reconnect-source") { window.location.assign(apiUrl("/api/auth/spotify/start")); }
