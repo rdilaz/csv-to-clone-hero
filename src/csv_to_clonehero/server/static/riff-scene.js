@@ -27,6 +27,7 @@
     refresh();
   }
   const canvases = new Set();
+  const signalCheck = document.body.classList.contains("riff-signal-check");
   const toggle = document.getElementById("riff-motion-toggle");
   const reduced = matchMedia("(prefers-reduced-motion: reduce)");
   const scenes = new Map();
@@ -45,6 +46,7 @@
       toggle.title = reduced.matches && !manualMotion ? "Your device asks for reduced motion. Enable movement for this visit." : "Pause decorative 3D movement to save power";
     }
     for (const panel of panels) panel.dataset.motion = motion() ? "on" : "off";
+    document.documentElement.dataset.riffMotion = motion() ? "on" : "off";
     for (const scene of scenes.values()) scene.refresh();
   }
   toggle?.addEventListener("click", () => {
@@ -308,7 +310,9 @@
     }
     for (const canvas of root.querySelectorAll("[data-riff-scene]")) {
       if (canvases.has(canvas)) continue;
-      canvases.add(canvas); lazy.observe(canvas);
+      canvases.add(canvas);
+      // Signal Check shows the static signal knot instead of the WebGL turntable.
+      if (!signalCheck) lazy.observe(canvas);
     }
     if (toggle) toggle.hidden = !canvases.size && !records.length;
     syncListening(); syncMotion();

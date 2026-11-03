@@ -22,6 +22,13 @@ def _add_fixtures():
     return fixtures
 
 
+def _knot(page, scope="#stageAdd"):
+    return page.locator(f"{scope} [data-riff-listening-panel] .riff-scene-wrap").evaluate("""wrap => {
+      const art = getComputedStyle(wrap, '::after');
+      return {image: art.backgroundImage, name: art.animationName, duration: art.animationDuration};
+    }""")
+
+
 def _capture(page, name, tmp_path):
     target = Path(os.environ.get("RIFF_TURNTABLE_EVIDENCE", str(tmp_path)))
     target.mkdir(parents=True, exist_ok=True)
@@ -38,9 +45,9 @@ def test_idle_deck_is_useful_reachable_and_fits_the_add_music_screen(catalog_pag
     playwright.expect(panel).to_have_attribute("data-playback-state", "idle")
     playwright.expect(panel.locator("[data-listening-state]")).to_have_text("STANDBY")
     playwright.expect(panel.locator("[data-listening-note]")).to_contain_text("ZIP choices stay separate")
-    canvas = panel.locator("canvas")
-    playwright.expect(canvas).to_have_attribute("data-renderer", "webgl", timeout=10000)
-    playwright.expect(canvas).to_have_attribute("data-record-spinning", "false")
+    # Signal Check: the knot is the art; no WebGL turntable is started.
+    assert "signal-knot.svg" in _knot(page)["image"]
+    assert page.locator("canvas[data-renderer]").count() == 0
     action = panel.locator("[data-listening-action]")
     box = action.bounding_box()
     assert box and box["height"] >= 44
@@ -56,24 +63,18 @@ def test_idle_deck_is_useful_reachable_and_fits_the_add_music_screen(catalog_pag
     assert not _posts(fixtures)
 
 
-def test_standby_animates_scene_without_rotating_a_silent_record(catalog_page):
+def test_standby_floats_the_knot_slowly_and_stops_with_motion_off(catalog_page):
     page, _ = catalog_page(_add_fixtures())
-    canvas = page.locator("#stageAdd canvas")
-    canvas.scroll_into_view_if_needed()
-    playwright.expect(canvas).to_have_attribute("data-renderer", "webgl", timeout=10000)
+    page.locator("#stageAdd [data-riff-listening-panel]").scroll_into_view_if_needed()
     page.emulate_media(reduced_motion="no-preference")
-    playwright.expect(canvas).to_have_attribute("data-animating", "true")
-    before = canvas.get_attribute("data-record-angle")
-    frames = int(canvas.get_attribute("data-frames"))
-    page.wait_for_function("before => Number(document.querySelector('#stageAdd canvas').dataset.frames) > before + 2", arg=frames)
-    assert canvas.get_attribute("data-record-angle") == before
+    playwright.expect(page.locator("html")).to_have_attribute("data-riff-motion", "on")
+    art = _knot(page)
+    assert (art["name"], art["duration"]) == ("riff-knot-suspend", "11s")
     assert page.locator("#catalogAudio").evaluate("audio => audio.paused")
     assert page.locator(".listening-panel-state").evaluate("node => getComputedStyle(node,'::before').animationName") == "riff-standby-light"
     page.locator("#riff-motion-toggle").click()
-    playwright.expect(canvas).to_have_attribute("data-animating", "false")
+    assert _knot(page)["name"] == "none"
     assert page.locator(".listening-panel-state").evaluate("node => getComputedStyle(node,'::before').animationName") == "none"
-    page.emulate_media(reduced_motion="reduce")
-    playwright.expect(canvas).to_have_attribute("data-record-spinning", "false")
 
 
 def test_panel_controls_native_playback_and_shows_the_current_record(catalog_page, tmp_path):
@@ -87,21 +88,20 @@ def test_panel_controls_native_playback_and_shows_the_current_record(catalog_pag
     playwright.expect(panel).to_have_attribute("data-playback-state", "playing")
     playwright.expect(panel.locator("[data-listening-title]")).to_have_text("Catalog song 1")
     playwright.expect(panel.locator("[data-listening-artist]")).to_contain_text("Synthetic artist")
-    canvas = panel.locator("canvas")
-    playwright.expect(canvas).to_have_attribute("data-record-spinning", "true")
-    angle = canvas.get_attribute("data-record-angle")
-    page.wait_for_function("angle => document.querySelector('#stageAdd canvas').dataset.recordAngle !== angle", arg=angle)
+    # Playing quickens the knot's float; pausing settles it back.
+    assert _knot(page)["duration"] == "6s"
     _capture(page, "listening-deck-playing-1440.png", tmp_path)
     panel.get_by_role("button", name="Pause preview").click()
     playwright.expect(panel).to_have_attribute("data-playback-state", "paused")
-    playwright.expect(canvas).to_have_attribute("data-record-spinning", "false")
+    assert _knot(page)["duration"] == "11s"
     assert page.locator("#catalogAudio").evaluate("audio => audio.paused")
     panel.get_by_role("button", name="Play preview").click()
     playwright.expect(panel).to_have_attribute("data-playback-state", "playing")
     page.locator("#catalogMuteButton").click()
     playwright.expect(panel.locator("[data-listening-state]")).to_have_text("PLAYING · MUTED")
     page.emulate_media(reduced_motion="reduce")
-    playwright.expect(canvas).to_have_attribute("data-record-spinning", "false")
+    playwright.expect(page.locator("html")).to_have_attribute("data-riff-motion", "off")
+    assert _knot(page)["name"] == "none"
     assert page.locator("#catalogAudio").evaluate("audio => !audio.paused && audio.muted")
     assert not _posts(fixtures)
 
@@ -160,10 +160,10 @@ def test_home_adoption_mounts_a_live_deck_without_replacing_audio_or_double_bind
     panel = page.locator("#stageAdd [data-riff-listening-panel]")
     panel.scroll_into_view_if_needed()
     playwright.expect(panel).to_be_visible()
-    playwright.expect(panel.locator("canvas")).to_have_attribute("data-renderer", "webgl", timeout=10000)
+    assert "signal-knot.svg" in _knot(page)["image"]
     playwright.expect(panel.locator("[data-listening-title]")).to_have_text("Catalog song 1")
     playwright.expect(panel).to_have_attribute("data-playback-state", "playing")
-    playwright.expect(panel.locator("canvas")).to_have_attribute("data-record-spinning", "true")
+    assert _knot(page)["duration"] == "6s"
     assert page.locator("#catalogAudio").count() == 1
     assert page.evaluate("window.originalListeningAudio === document.querySelector('#catalogAudio')")
     page.evaluate("window.RiffScene.mount(document.querySelector('#riffApp')); window.RiffScene.mount()")

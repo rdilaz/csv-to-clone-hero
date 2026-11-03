@@ -79,8 +79,9 @@ def test_no_source_drawer_and_coming_soon_tiles(browser_page):
     page = browser_page
     assert page.get_by_role("heading", name="Start with the music you already love.").is_visible()
     assert page.get_by_role("button", name="Open Spotify source").is_visible()
-    assert page.get_by_role("article", name="Apple Music / iTunes, coming soon").is_visible()
-    assert page.locator(".source-coming").count() == 4
+    # Apple Music imports from a local library export now, so it is a live tile.
+    assert page.get_by_role("button", name="Open Apple Music / iTunes source").is_visible()
+    assert page.locator(".source-coming").count() == 3
     page.get_by_role("button", name="Open Spotify source").focus()
     page.keyboard.press("Enter")
     assert page.get_by_role("dialog", name="Spotify").is_visible()

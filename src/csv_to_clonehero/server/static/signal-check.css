@@ -36,7 +36,7 @@ html:has(.riff-signal-check) { color-scheme: dark; }
 .riff-signal-check h1 em, .riff-signal-check h2 em { color: inherit; font-style: normal; text-decoration: underline; text-decoration-color: var(--violet); text-decoration-thickness: .08em; text-underline-offset: .12em; }
 
 /* Journey strip: five square cells; violet current cell with midnight text. */
-.riff-signal-check .workflow-chrome { position: sticky; top: 0; z-index: 30; margin-bottom: 20px; padding-bottom: 4px; background: var(--world); }
+.riff-signal-check .workflow-chrome { position: relative; z-index: 30; margin-bottom: 20px; padding-bottom: 4px; background: var(--world); }
 .riff-signal-check .workflow-chrome .journey-steps { margin: 0; }
 .riff-signal-check .journey-steps ol { border-radius: 0; background: var(--world); }
 .riff-signal-check .journey-steps li { padding: 0; }
@@ -220,4 +220,149 @@ html:has(.riff-signal-check) { color-scheme: dark; }
 /* Download: centered 720px preparation panel on desktop (spec 4, Download). */
 @media (min-width: 1000px) {
   .riff-signal-check #stageDownload .download-preparation-panel { max-width: 720px; margin-inline: auto; }
+}
+
+/* Signal knot: the approved Signal Check art replaces the WebGL turntable.
+   Decorative only; it floats gently when motion is on and stays still for
+   reduced motion or Motion off. */
+.riff-signal-check .riff-scene-wrap canvas,
+.riff-signal-check .riff-scene-wrap .scene-fallback { display: none; }
+.riff-signal-check .riff-scene-wrap { position: relative; }
+.riff-signal-check .riff-scene-wrap::after { position: absolute; z-index: 2; inset: 6% 8%; display: block; background: url("signal-knot.svg") center / contain no-repeat; content: ""; pointer-events: none; transform-origin: 50% 50%; }
+html[data-riff-motion="on"] .riff-signal-check .riff-scene-wrap::after { animation: riff-knot-suspend 11s ease-in-out infinite; }
+html[data-riff-motion="on"] .riff-signal-check [data-playback-state="playing"] .riff-scene-wrap::after { animation-duration: 6s; }
+@keyframes riff-knot-suspend {
+  0%, 100% { transform: translateY(0) rotate(-1.5deg); }
+  50% { transform: translateY(-8px) rotate(1.5deg); }
+}
+/* Reduced motion: riff-scene.js turns data-riff-motion off unless this visit opts in. */
+
+/* Selection rail stays in view while the song list scrolls (spec 4, Confirm).
+   It stops above the player dock and scrolls inside itself if it must. */
+@media (min-width: 1200px) {
+  .riff-signal-check .selection-rail:not(.is-in-flow) { position: sticky; top: 16px; align-self: start; max-height: calc(100vh - var(--catalog-dock-height) - 32px); overflow-y: auto; overscroll-behavior: contain; }
+}
+
+/* Phone player: two short rows (now playing + Add, then transport), every
+   control kept at 44px, so the dock stops eating the song list. */
+@media (max-width: 767px) {
+  .riff-signal-check .catalog-player-dock { gap: 6px; grid-template-columns: minmax(0, 1fr); padding: 6px 10px calc(6px + env(safe-area-inset-bottom)); }
+  .riff-signal-check .catalog-now { gap: 10px; min-width: 0; align-items: center; }
+  .riff-signal-check .catalog-now > div { flex: 1; min-width: 0; }
+  .riff-signal-check .catalog-player-dock .catalog-vinyl { flex-basis: 44px; width: 44px; height: 44px; }
+  .riff-signal-check .catalog-vinyl-symbol { width: 18px; height: 18px; font-size: .5rem; }
+  .riff-signal-check .catalog-now-eyebrow { margin-bottom: 1px; font-size: .52rem; }
+  .riff-signal-check #catalogNowTitle { display: block; overflow: hidden; font-size: .95rem; text-overflow: ellipsis; white-space: nowrap; }
+  .riff-signal-check :is(#catalogNowArtist, #catalogPlayerStatus) { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+  .riff-signal-check .catalog-player-controls { display: grid; grid-template-columns: repeat(4, 44px) minmax(0, 1fr) minmax(0, 1fr); gap: 4px; }
+  .riff-signal-check .catalog-player-controls .catalog-icon-button { width: 44px; }
+  .riff-signal-check .catalog-player-controls .button { min-height: 44px; padding: 4px 6px; font-size: .74rem; }
+  .riff-signal-check .catalog-player-dock #catalogAddButton { position: absolute; top: 6px; right: 10px; width: auto; min-width: 88px; grid-column: auto; }
+  .riff-signal-check .catalog-player-dock .catalog-now { padding-right: 96px; }
+  .riff-signal-check .catalog-player-dock .catalog-timeline { display: none; }
+}
+
+/* Bulk selection disclosure: open and summary-free on wide screens. */
+.riff-signal-check .studio-disclosure > summary { display: none; }
+@media (max-width: 767px) {
+  .riff-signal-check .studio-disclosure { margin: 0 0 8px; border: 1px solid var(--line); background: var(--surface); }
+  .riff-signal-check .studio-disclosure > summary { display: flex; min-height: 44px; padding: 10px 14px; align-items: center; cursor: pointer; color: var(--ink); font-weight: 600; }
+  .riff-signal-check .studio-disclosure[open] > summary { border-bottom: 1px solid var(--line); }
+  .riff-signal-check .studio-disclosure .studio-panel { margin: 0; }
+  /* Spec 4.5: no knot inside the ledger on phones. */
+  .riff-signal-check .studio-deck-art { display: none; }
+
+  /* Mobile first-chart budget (spec 4.5): compact title, then search and filters. */
+  .riff-signal-check #stageConfirm .confirm-ledger { padding-top: 12px; }
+  .riff-signal-check .confirm-heading { margin-bottom: 10px; }
+  .riff-signal-check .confirm-heading .kicker { display: none; }
+  .riff-signal-check .confirm-heading h1 { margin: 0 0 8px; font-size: 1.7rem; line-height: 1.05; }
+  .riff-signal-check .library-totals { gap: 0; margin: 0; }
+  .riff-signal-check .library-totals > div { min-width: 0; padding: 0 8px; }
+  .riff-signal-check .library-totals > div:first-child { padding-left: 0; }
+  .riff-signal-check .library-totals dt { font-size: .62rem; line-height: 1.2; overflow-wrap: anywhere; }
+  .riff-signal-check .library-totals dd { margin: 2px 0 0; font-size: 1.3rem; line-height: 1; }
+  .riff-signal-check .library-context { gap: 4px 12px; margin: 6px 0 0; font-size: .72rem; }
+  .riff-signal-check .library-context .library-boundary { display: none; }
+  .riff-signal-check .library-context :is(p, a) { margin: 0; font-size: .72rem; }
+  .riff-signal-check .selection-tools { margin: 0 0 10px; }
+  .riff-signal-check .selection-tools .selection-scope { display: none; }
+  .riff-signal-check .review-toolbar { gap: 8px; margin-bottom: 8px; }
+  .riff-signal-check .review-toolbar .kicker, .riff-signal-check #reviewSummary { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+  .riff-signal-check #quickReviewTitle { margin: 0; font-size: 1.05rem; }
+  .riff-signal-check .review-toolbar .search-field, .riff-signal-check #reviewSearch { width: 100%; }
+  .riff-signal-check .filter-row { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-bottom: 10px; }
+  .riff-signal-check .filter-row button { min-height: 44px; padding: 6px 8px; font-size: .78rem; }
+  .riff-signal-check .selection-change-receipt:has(#selectionUndoButton:disabled):has(#selectionMessage:empty) { display: none; }
+}
+@media (max-width: 767px) {
+  .riff-signal-check .site-header__inner { min-height: 52px; padding-block: 4px; }
+  .riff-signal-check .journey-steps li { min-height: 46px; }
+  .riff-signal-check .journey-steps li > button { min-height: 46px; gap: 2px; padding: 4px 2px; }
+  .riff-signal-check .journey-steps li > button > span { width: 18px; height: 18px; font-size: .62rem; }
+  .riff-signal-check .journey-steps li.is-complete::after { position: absolute; top: 3px; right: 5px; margin: 0; font-size: .62rem; }
+  .riff-signal-check .journey-steps li { position: relative; }
+  .riff-signal-check .workflow-chrome { margin-bottom: 8px; padding-bottom: 0; }
+  .riff-signal-check .workflow-controls { min-height: 36px; }
+  .riff-signal-check .workflow-controls .text-button { min-height: 36px; }
+  .riff-signal-check .library-totals > div { display: flex; flex-direction: column-reverse; justify-content: flex-end; }
+  .riff-signal-check .library-totals dd { margin: 0 0 3px; }
+  .riff-signal-check .filter-row { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .riff-signal-check .filter-row button { min-width: 0; white-space: normal; overflow-wrap: anywhere; line-height: 1.15; }
+}
+@media (max-width: 767px) {
+  /* The step strip already navigates; phones skip the duplicate prev/next row. */
+  .riff-signal-check .workflow-controls { display: none; }
+  /* The two option disclosures share one row until either opens. */
+  .riff-signal-check #stageConfirm .confirm-ledger { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); column-gap: 8px; }
+  .riff-signal-check #stageConfirm .confirm-ledger > * { grid-column: 1 / -1; min-width: 0; }
+  .riff-signal-check #stageConfirm .confirm-ledger > .studio-disclosure:not([open]) { grid-column: 1; }
+  .riff-signal-check #stageConfirm .confirm-ledger > .selection-tools:not(:has(.selection-options[open])) { grid-column: 2; }
+  .riff-signal-check #stageConfirm .confirm-ledger:has(> .studio-disclosure[open]) > .selection-tools { grid-column: 1 / -1; }
+  .riff-signal-check .studio-disclosure:not([open]) > summary, .riff-signal-check .selection-options:not([open]) > summary { height: 100%; }
+  .riff-signal-check .studio-disclosure > summary, .riff-signal-check .selection-options > summary { min-height: 48px; padding: 6px 10px; font-size: .78rem; line-height: 1.2; }
+  .riff-signal-check .studio-disclosure, .riff-signal-check .selection-tools { margin-bottom: 10px; }
+  .riff-signal-check #quickReviewTitle { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+}
+@media (max-width: 767px) {
+  /* Totals read as one short line on phones; full labels stay for screen readers. */
+  .riff-signal-check .library-totals { display: flex; flex-wrap: wrap; gap: 4px 14px; padding: 0; }
+  .riff-signal-check .library-totals > div { display: flex; flex-direction: row; align-items: baseline; gap: 4px; padding: 0; border: 0; }
+  .riff-signal-check .library-totals > div + div { border-left: 0; }
+  .riff-signal-check .library-totals > div::after { color: var(--muted); font-size: .76rem; content: attr(data-short) / ""; }
+  .riff-signal-check .library-totals dt { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+  .riff-signal-check .library-totals dd { margin: 0; font-size: 1.15rem; }
+  .riff-signal-check .confirm-heading h1 { margin-bottom: 6px; }
+  .riff-signal-check #stageConfirm .review-list { margin-top: 0; }
+}
+@media (max-width: 767px) {
+  .riff-signal-check .workflow-chrome { margin-bottom: 6px; }
+  .riff-signal-check .confirm-heading { margin-bottom: 8px; }
+  .riff-signal-check .studio-disclosure > summary, .riff-signal-check .selection-options > summary { min-height: 44px; padding-block: 4px; }
+  .riff-signal-check .studio-disclosure, .riff-signal-check .selection-tools { margin-bottom: 8px; }
+  .riff-signal-check .review-toolbar { margin-bottom: 6px; }
+  .riff-signal-check .filter-row { margin: 0 0 6px; }
+}
+/* Spec 4.5 and 6: no knot inside the Confirm ledger, so the deck drops its art. */
+.riff-signal-check .studio-deck-art { display: none; }
+.riff-signal-check .studio-deck-now { grid-template-columns: minmax(0, 1fr); }
+@media (max-width: 767px) {
+  .riff-signal-check .library-context { flex-wrap: nowrap; align-items: baseline; }
+  .riff-signal-check .library-context > div { flex: 1; min-width: 0; }
+  .riff-signal-check #catalogCoverageBrief { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .riff-signal-check .library-context .expansion-jump { flex: none; min-height: 0; padding: 0; }
+}
+.riff-signal-check .studio-disclosure > summary { list-style: none; justify-content: space-between; gap: 6px; }
+.riff-signal-check .studio-disclosure > summary::-webkit-details-marker { display: none; }
+.riff-signal-check .studio-disclosure > summary::after { flex: none; color: var(--violet-ink); content: "+"; font-size: 1.1rem; }
+.riff-signal-check .studio-disclosure[open] > summary::after { content: "−"; }
+/* Standby: the cyan status dot breathes while idle and motion is on. */
+.riff-signal-check .riff-listening-panel[data-playback-state="idle"][data-motion="on"] .listening-panel-state::before { animation: riff-standby-light 4s ease-in-out infinite; }
+/* Disclosure summaries get the same visible focus ring as the other ledger controls. */
+.riff-signal-check :is(.selection-options, .studio-disclosure) > summary:focus { outline: 2px solid var(--violet-ink); outline-offset: 2px; box-shadow: 0 0 0 4px var(--surface); }
+.riff-signal-check :is(.selection-options, .studio-disclosure) > summary:focus:not(:focus-visible) { outline-color: transparent; }
+.riff-signal-check .expansion-coverage { min-width: 0; }
+@media (max-width: 359px) {
+  .riff-signal-check .catalog-player-controls { gap: 3px; }
+  .riff-signal-check .catalog-player-controls .button:not(.catalog-icon-button) { padding-inline: 2px; font-size: .66rem; }
 }

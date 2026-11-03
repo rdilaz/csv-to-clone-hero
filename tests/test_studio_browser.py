@@ -107,6 +107,9 @@ def _requests(requests, path, method="GET"):
 def test_all_page_one_song_selection_is_one_post_with_authoritative_totals(delivery_page, width):
     fixtures = StudioFixtures()
     page, requests = delivery_page(fixtures, viewport={"width": width, "height": 844 if width == 390 else 900})
+    # Phones keep bulk selection in a disclosure so the first song shows first.
+    if page.locator("#studioDisclosure > summary").is_visible():
+        page.locator("#studioDisclosure > summary").click()
     assert page.locator("#studio-select-status").inner_text() == "Ready · selections include every page."
     assert "results changed" not in page.locator("#studio-deck-status").inner_text().lower()
     page.evaluate("window.originalStudioSong = document.querySelector('#reviewCards > article')")
@@ -322,7 +325,8 @@ def test_unknown_recount_keeps_download_blocked(delivery_page):
     page.locator("#studio-select-all").click()
     playwright.expect(page.locator("#continueDownloadButton")).to_be_disabled()
     playwright.expect(page.locator("#retrySelectionButton")).to_be_visible()
-    assert "not confirmed" in page.locator("#studio-select-status").inner_text().lower()
+    # The status line settles just after the retry control appears.
+    playwright.expect(page.locator("#studio-select-status")).to_contain_text("not confirmed")
 
 
 def test_repeated_add_taps_make_one_mutation(delivery_page):

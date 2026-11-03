@@ -266,6 +266,9 @@ def test_bulk_settings_preview_precede_action_and_uncertainty_is_explicit(delive
     fixtures = UXFixtures()
     page, requests = delivery_page(fixtures, viewport={"width": width, "height": 900})
     page.on("dialog", lambda dialog: dialog.accept())
+    # Phones keep bulk selection in a disclosure so the first song shows first.
+    if page.locator("#studioDisclosure > summary").is_visible():
+        page.locator("#studioDisclosure > summary").click()
     page.locator("#studio-select-scope").select_option("library")
     playwright.expect(page.locator("#studio-selection-preview")).to_contain_text(
         re.compile(r"song|chart", re.I))

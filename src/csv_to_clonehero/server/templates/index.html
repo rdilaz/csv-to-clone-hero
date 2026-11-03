@@ -178,9 +178,9 @@
           <p class="kicker">YOUR MUSIC STUDIO</p>
           <h1 id="confirmTitle">Build your <em>setlist.</em></h1>
           <dl class="library-totals" aria-label="Imported music and chart counts">
-            <div><dt>All imported unique songs</dt><dd id="librarySongCount">...</dd></div>
-            <div><dt id="chartsFoundLabel">Songs with recommended charts</dt><dd id="chartsFoundCount">...</dd></div>
-            <div><dt>Selected charts from your music</dt><dd id="librarySelectedChartCount">...</dd></div>
+            <div data-short="songs"><dt>All imported unique songs</dt><dd id="librarySongCount">...</dd></div>
+            <div data-short="with charts"><dt id="chartsFoundLabel">Songs with recommended charts</dt><dd id="chartsFoundCount">...</dd></div>
+            <div data-short="selected"><dt>Selected charts from your music</dt><dd id="librarySelectedChartCount">...</dd></div>
           </dl>
           <div class="library-context">
             <div><p class="library-boundary">Selected imports only</p><p class="catalog-brief" id="catalogCoverageBrief" role="status">Loading chart catalog coverage...</p></div>
@@ -188,6 +188,8 @@
           </div>
         </header>
 
+        <details class="studio-disclosure" id="studioDisclosure" open>
+          <summary>Bulk selection &amp; shuffle deck</summary>
         <section class="studio-panel" id="studio-panel" aria-labelledby="studio-panel-title">
           <div class="studio-quick-select">
             <p class="kicker">BULK SELECTION</p>
@@ -219,6 +221,7 @@
             <p class="studio-action-status" id="studio-deck-status" role="status" aria-live="polite">Chart audio is checked when played. Listening and ZIP choices are separate.</p>
           </section>
         </section>
+        </details>
 
         <section class="selection-tools" aria-labelledby="selectionToolsTitle">
           <h2 class="sr-only" id="selectionToolsTitle">Selection options</h2>

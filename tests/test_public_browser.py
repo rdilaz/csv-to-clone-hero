@@ -281,11 +281,27 @@ def test_signal_check_confirm_keeps_multi_chart_selection_truthful(
         assert page.get_by_text("Different live recording.", exact=True).is_visible()
         _assert_no_overflow(page)
 
-        # The persistent player owns the fixed bottom area. The selection
-        # summary stays in document flow, with every chart action reachable.
+        # The persistent player owns the fixed bottom area. On phones the
+        # selection summary stays in document flow; on desktop the rail is
+        # sticky 16px below the top and stops above the player (spec 5).
         rail = page.locator("#selectionRail")
-        assert "is-in-flow" in (rail.get_attribute("class") or "")
-        assert rail.evaluate("element => getComputedStyle(element).position") == "relative"
+        if viewport["width"] == 390:
+            assert "is-in-flow" in (rail.get_attribute("class") or "")
+            assert rail.evaluate("element => getComputedStyle(element).position") == "relative"
+            # Spec 4.5: the first song and its action come before bulk tools.
+            first_action = page.locator('[data-candidate="101"]').bounding_box()
+            dock_box = page.locator("#catalogPlayerDock").bounding_box()
+            assert first_action and dock_box and first_action["y"] + first_action["height"] <= dock_box["y"]
+            page.locator("#studioDisclosure > summary").click()
+        else:
+            assert "is-in-flow" not in (rail.get_attribute("class") or "")
+            assert rail.evaluate("element => getComputedStyle(element).position") == "sticky"
+            page.mouse.wheel(0, 1500)
+            page.wait_for_timeout(200)
+            rail_box = rail.bounding_box()
+            dock_box = page.locator("#catalogPlayerDock").bounding_box()
+            assert rail_box and dock_box and abs(rail_box["y"] - 16) <= 1
+            assert rail_box["y"] + rail_box["height"] <= dock_box["y"]
         _assert_control_reachable_above_player(page, "#studio-select-all")
         action_box = _assert_control_reachable_above_player(page, '[data-candidate="101"]')
         group_box = page.locator(".song-group").first.bounding_box()
@@ -693,6 +709,9 @@ def test_signal_check_reflows_at_320_and_respects_reduced_motion(public_server, 
         page.route("**/api/**", fixtures.fulfill)
         page.goto(base_url + "/", wait_until="networkidle")
 
+        _assert_no_overflow(page)
+        # Phones open bulk selection on demand so the first song comes first.
+        page.locator("#studioDisclosure > summary").click()
         _assert_no_overflow(page)
         _assert_control_reachable_above_player(page, "#studio-select-all")
         assert page.evaluate("""() => ['studio-select-scope', 'studio-select-policy',

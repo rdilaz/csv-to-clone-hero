@@ -1566,19 +1566,24 @@
     const rail = $("#selectionRail");
     const stage = $("#stageConfirm");
     if (!rail || !stage) return;
-    if ($("#catalogPlayerDock")) {
+    const compact = window.matchMedia("(max-width: 1000px)").matches;
+    const dock = $("#catalogPlayerDock");
+    // Below the 1200px desktop layout the player owns the bottom; the rail
+    // stays in flow. At 1200px+ it is a sticky side column (spec 5).
+    if (dock && window.matchMedia("(max-width: 1199px)").matches && !stage.hidden) {
       rail.classList.add("is-in-flow");
       stage.style.removeProperty("padding-bottom");
       return;
     }
-    const compact = window.matchMedia("(max-width: 1000px)").matches;
+    // On narrow screens the player dock owns the only fixed bottom surface.
+    // On desktop the rail is a side column, so it can stay sticky above it.
+    if (dock && compact) {
+      rail.classList.add("is-in-flow");
+      stage.style.removeProperty("padding-bottom");
+      return;
+    }
     if (!compact || stage.hidden) {
       rail.classList.remove("is-in-flow");
-      if (!stage.hidden && !compact) {
-        const stickyTop = parseFloat(window.getComputedStyle(rail).top) || 0;
-        const tooTall = rail.getBoundingClientRect().height + stickyTop + 16 > window.innerHeight;
-        rail.classList.toggle("is-in-flow", tooTall);
-      }
       stage.style.removeProperty("padding-bottom");
       document.documentElement.style.removeProperty("scroll-padding-bottom");
       return;
@@ -1604,6 +1609,15 @@
   }
 
   function syncSelectionOptions() {
+    // Phones get the first song in view: bulk selection waits in a disclosure.
+    const studio = $("#studioDisclosure");
+    if (studio) {
+      const studioViewport = window.matchMedia("(max-width: 767px)").matches ? "phone" : "wide";
+      if (studio.dataset.viewport !== studioViewport) {
+        studio.dataset.viewport = studioViewport;
+        studio.open = studioViewport === "wide";
+      }
+    }
     const details = $(".selection-options");
     if (!details) return;
     const viewport = window.matchMedia("(max-width: 1000px)").matches ? "mobile" : "desktop";

@@ -234,7 +234,9 @@ def test_catalog_large_count_bounded_pages_and_single_mobile_dock(catalog_page, 
         assert close.bounding_box()["y"] + close.bounding_box()["height"] < page.locator("#catalogPlayerDock").bounding_box()["y"]
         assert close.evaluate("node => {const r=node.getBoundingClientRect();const hit=document.elementFromPoint(r.x+r.width/2,r.y+r.height/2);return hit===node||node.contains(hit);}")
     assert not _posts(fixtures)
-    assert page.locator("#selectionRail").evaluate("node => getComputedStyle(node).position") == "relative"
+    # Desktop (1200px+) keeps the selection rail sticky above the player.
+    expected = "sticky" if width >= 1200 else "relative"
+    assert page.locator("#selectionRail").evaluate("node => getComputedStyle(node).position") == expected
     for selector in ["#catalogVinylButton", "#catalogPlayerNext", "#catalogBrowseButton", "#catalogQueueButton", "#catalogAddButton"]:
         assert page.locator(selector).bounding_box()["height"] >= 44
     _assert_no_overflow(page)
