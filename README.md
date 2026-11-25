@@ -1,8 +1,9 @@
-# CSV to Clone Hero
+# Riff (CSV to Clone Hero)
 
-The public product is **Riff V2 / Signal Check**. For the existing Docker-hosted
-site, use the [V2 release guide](docs/V2_RELEASE.md); the local launcher below
-opens a separate single-user interface.
+Riff V2 / Signal Check is the multi-user web app in this repo. You host it
+yourself with Docker using the [V2 release guide](docs/V2_RELEASE.md); there is
+no public instance running right now. The local launcher below opens a separate
+single-user interface.
 
 Turn music-library exports or Spotify data into a Clone Hero / YARG song
 library: normalize tracks, find playable charts on
@@ -14,7 +15,7 @@ There are **two ways to run it**:
 | Mode | Who it's for | Command |
 |------|--------------|---------|
 | **Local (single-user)** | Run on your own PC; downloads land on that PC | `WEB_INTERFACE.bat` or `python -m csv_to_clonehero web` |
-| **Cloud (multi-user)** | The hosted web product behind Cloudflare | `python -m csv_to_clonehero serve` (or Docker) |
+| **Cloud (multi-user)** | The multi-user web app, self-hosted on your own server | `python -m csv_to_clonehero serve` (or Docker) |
 
 Everything below is the same matching/scoring engine under both.
 
@@ -79,9 +80,9 @@ and register `<tunnel>/api/auth/spotify/callback` as a redirect URI.
 
 ---
 
-## 2. Cloud multi-user product (the hosted web app)
+## 2. Cloud multi-user app (self-hosted)
 
-The `server/` package is the public product: real Spotify login, per-user
+The `server/` package is the multi-user web app: real Spotify login, per-user
 identity, background jobs, and browser-only ZIP downloads. Public discovery
 uses a complete checksum-valid catalog from persistent server state and makes
 no Enchor search requests in that mode. A bounded live search remains a
@@ -114,7 +115,7 @@ Required environment variables (see [`.env.example`](.env.example)):
 | `SPOTIFY_CLIENT_ID` | public Spotify app id (PKCE, no secret) |
 | `SOUNDCLOUD_CLIENT_ID` | optional SoundCloud OAuth client id |
 | `SOUNDCLOUD_CLIENT_SECRET` | optional SoundCloud OAuth client secret |
-| `APP_BASE_URL` | public HTTPS origin, `https://riff.ryo-nd.com` |
+| `APP_BASE_URL` | public HTTPS origin of your deployment, e.g. `https://riff.example.com` |
 | `SECRET_KEY` | session signing key (`python -m csv_to_clonehero keys`) |
 | `TOKEN_ENCRYPTION_KEY` | Fernet key encrypting per-user refresh tokens |
 | `NOTIFICATIONS_API_KEY` | optional transactional email key |
@@ -260,7 +261,7 @@ src/csv_to_clonehero/
   providers/         Spotify/SoundCloud library adapters
   sources/           ChartSource adapters (base.py, enchor.py)
   server/            CLOUD multi-user product
-    web.py             WSGI app factory (public product)
+    web.py             WSGI app factory (multi-user web app)
     auth.py            per-user encrypted token store + OAuth
     jobs.py            durable job queue + global worker
     throttle.py        global Enchor egress gate
